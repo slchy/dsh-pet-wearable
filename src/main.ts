@@ -8,11 +8,12 @@
  * - VAD 从 webrtcvad 换成 silero-vad（ONNX），实测能正确忽略远场回声
  * - 其余链路不变，判停口径仍以"静音 4 秒"为准
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createServer } from 'node:net';
+import { join } from 'node:path';
 
-import { asr, pcmToWav } from './mimo.ts';
+import { asr, pcmToWav, tts, TTS_SAMPLE_RATE } from './mimo.ts';
 import { SileroVad, sliceFrames, SAMPLE_RATE, WINDOW } from './vad.ts';
 
 /** 静音判停：4 秒 / 32 ms = 125 帧 */
@@ -23,7 +24,39 @@ const VAD_THRESHOLD = 0.4;
 const MAX_UTTERANCE_SEC = 60;
 const FRAME_BYTES = WINDOW * 2;
 
+/** adb 目标设备，可用 ADB_SERIAL 覆盖 */
+const ADB_SERIAL = process.env.ADB_SERIAL ?? '192.168.1.100:5555';
+const REMOTE_JAR = '/data/local/tmp/miai.jar';
+const REMOTE_PCM = '/data/local/tmp/reply.pcm';
+const LOCAL_TMP = join(process.cwd(), '..', 'tmp');
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+
+/**
+ * 把 PCM 推回手机并从眼镜播出。
+ *
+ * TTS 输出是 **24 kHz**，不是上行的 16 kHz —— 搞错会 1.5 倍速升调。
+ * 这条路依赖 adb，所以只在 harness 与手机同机（开发期 adb reverse）时可用；
+ * 将来 harness 上 VPS 后要换成手机主动拉流。
+ */
+async function speak(pcm: Buffer): Promise<void> {
+  mkdirSync(LOCAL_TMP, { recursive: true });
+  const local = join(LOCAL_TMP, `reply_${Date.now()}.pcm`);
+  writeFileSync(local, pcm);
+
+  execFileSync('adb', ['-s', ADB_SERIAL, 'push', local, REMOTE_PCM], { stdio: 'pipe' });
+
+  const shell = `app_process -Djava.class.path=${REMOTE_JAR} /system/bin `
+    + `com.miaiglasses.MainPlay ${REMOTE_PCM} ${TTS_SAMPLE_RATE}`;
+  const out = execFileSync('adb', ['-s', ADB_SERIAL, 'shell', shell], {
+    timeout: 120_000,
+    encoding: 'utf8',
+  });
+
+  const passed = out.includes('MainPlay PASSED');
+  const written = /written=\d+/.exec(out)?.[0] ?? 'written=?';
+  console.log(`  播放    ${passed ? '✓' : '✗'} ${written}`);
+}
 
 class Pipeline {
   private ff: ChildProcessWithoutNullStreams;
@@ -40,8 +73,10 @@ class Pipeline {
   private finishedResolve: (() => void) | null = null;
   private readonly finishedPromise: Promise<void>;
   private readonly startedAt = Date.now();
+  private readonly echo: boolean;
 
-  constructor(ffmpeg: string) {
+  constructor(ffmpeg: string, echo: boolean) {
+    this.echo = echo;
     this.finishedPromise = new Promise((r) => { this.finishedResolve = r; });
 
     this.ff = spawn(ffmpeg, [
@@ -162,8 +197,16 @@ class Pipeline {
       console.log(`  ASR     ${((Date.now() - t0) / 1000).toFixed(2)} s  chunks=${chunks}`);
       console.log(`  文本    ${JSON.stringify(text)}`);
       console.log(`\nASR_TEXT=${text}`);
+
+      if (this.echo && text) {
+        const t1 = Date.now();
+        const { pcm: reply, chunks: ttsChunks } = await tts(text);
+        console.log(`  TTS     ${((Date.now() - t1) / 1000).toFixed(2)} s  chunks=${ttsChunks}`);
+        console.log(`  回放    ${reply.length} 字节  ${(reply.length / (TTS_SAMPLE_RATE * 2)).toFixed(2)} s`);
+        await speak(reply);
+      }
     } catch (e) {
-      console.log(`  ✗ ASR 失败: ${(e as Error).message}`);
+      console.log(`  ✗ ASR/TTS 失败: ${(e as Error).message}`);
     } finally {
       this.finishedResolve?.();
     }
@@ -235,6 +278,7 @@ async function main(): Promise<void> {
   const listen = Number(opt('--listen', '0'));
   const ffmpeg = opt('--ffmpeg', 'ffmpeg');
   const gapMs = Number(opt('--gap-ms', '20'));
+  const echo = argv.includes('--echo');
 
   if (!replay && !listen) {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port>');
@@ -246,7 +290,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const pipe = new Pipeline(ffmpeg);
+  const pipe = new Pipeline(ffmpeg, echo);
   await sleep(200);       // 等 VAD 初始化
 
   const code = replay
