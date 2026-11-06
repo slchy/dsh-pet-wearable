@@ -17,6 +17,7 @@ import { join } from 'node:path';
 
 import { VoiceAgent } from './agent.ts';
 import { AliyunAsr } from './aliyun-asr.ts';
+import { DialogFsm } from './dialog-fsm.ts';
 import { asr, pcmToWav, ttsStream, TTS_SAMPLE_RATE } from './mimo.ts';
 import { DshSession, type ImageAttachment } from './session.ts';
 import { SmartTurn } from './smart-turn.ts';
@@ -681,8 +682,8 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           return;
         }
         if (req.url === '/end_session') {
-          endRequested = true;
           console.log('  退出    模型判定该结束了（说完这句就挂断）');
+          fsm.requestEnd();
           res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('ok');
           return;
         }
@@ -725,11 +726,12 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       });
       toolCtl.listen(PHOTO_CTL_PORT, '127.0.0.1');
 
-      /** 模型调了 `end_session`：本轮播完就挂断 */
-      let endRequested = false;
+      /**
+       * 对话状态机。所有「现在算不算在播」「这一轮该不该继续」的判断
+       * 全部集中在它那里，不再散成一堆互斥布尔量。
+       */
+      const fsm = new DialogFsm((l) => { console.log(l); });
 
-      let turns = 0;
-      let speaking = false;
       /** 播放期间的上行 PCM，用于 AEC 分析 */
       let upDuringPlayback: Buffer[] = [];
       /** 本轮下行 TTS 参考，同样是 AEC 分析用 */
@@ -742,6 +744,7 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
        * 所以 sock close 时也要再兜一次，否则整轮白跑。
        */
       const flushDump = (): void => {
+        const turns = fsm.turn;
         if (!DUMP_DIR || turns === 0 || dumpedTurn === turns) return;
         dumpedTurn = turns;
         try {
@@ -756,25 +759,17 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       };
       let chain: Promise<void> = Promise.resolve();
       /**
-       * 队列代次。每次打断就 ++，让所有已入队但还没开跑的轮次作废。
-       *
-       * 为什么必须有：一轮 = dsh 2–5 s + 播放 5–20 s，用户在这期间又说一句，
-       * 那句话就排队。真机日志里积压到 40 s，用户已经问到「退出」了，
-       * agent 还在回答「拖一下」——只停掉当前音频不够，得把后面排队的也废掉。
-       */
-      let queueGen = 0;
-      /**
        * 串行队列。三条要求缺一不可：
        *   1. 严格串行 —— 上一轮 TTS 没发完时不能开下一轮
        *   2. 错误隔离 —— 某一轮抛错只能作废该轮，不能让 chain 变成
        *      rejected 状态，否则后续所有 `.then` 都会短路，整个连接哑掉
-       *   3. 可作废 —— 执行时发现代次已变就跳过（用户已打断，这轮过时了）
+       *   3. 可作废 —— 出队时票据代次已变就跳过（用户已插话，这轮过时了）
        */
       const enqueue = (fn: () => Promise<void>): void => {
-        const gen = queueGen;
+        const ticket = fsm.ticket();
         chain = chain.then(() => {
-          if (gen !== queueGen) {
-            console.log('  （丢弃：用户已打断，这一轮过时了）');
+          if (fsm.isStale(ticket)) {
+            console.log('  （丢弃：用户已插话，这一轮过时了）');
             return;
           }
           return fn();
@@ -793,31 +788,24 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
         if (s) console.error('[ffmpeg] ' + s);
       });
 
-      /** 本轮是否被用户打断 */
-      let bargeIn = false;
-      /** 播放中：只有真的在往下行写音频时才算，思考期不算 */
-      let playing = false;
-
       /**
-       * 用户打断：停播 + 中止本轮剩余 TTS。
+       * 用户插话：停播 + 作废排队轮次。
        *
        * 靠 ASR 中间结果触发，不靠能量 —— 纯能量判据在环境噪声下误触率太高。
        * 中间结果非空就说明服务端真的听出了字，不是“有点像人声”。
+       * 「能不能插话」由状态机判定：只有 speaking 才算（thinking 期间
+       * 回复还没出声，打断它等于白白丢掉一个刚准备好的回答）。
        */
-      const triggerBargeIn = (why: string): void => {
-        if (bargeIn) return;
-        bargeIn = true;
-        // 作废所有还没开跑的轮次：用户已经在说新的话了，旧问题不必再答
-        queueGen += 1;
-        console.log(`  打断    ${why} → 停止播放，佭止排队中的轮次`);
+      const tryBargeIn = (why: string): void => {
+        if (!fsm.bargeIn(why)) return;
+        console.log(`  打断    ${why} → 停止播放，已排队的轮次作废`);
         writeDown(FRAME_DOWN_CONTROL, Buffer.from('stop', 'utf8'));
       };
 
       const handleTurn = async (text: string, image?: ImageAttachment): Promise<void> => {
-        turns += 1;
-        speaking = true;
-        bargeIn = false;
-        // 全双工：**不再挂断 ASR**。
+        const ticket = fsm.beginTurn();
+        if (!ticket) return;
+        // 全双工：**不挂断 ASR**。
         //
         // 以前播放期先 close + 预重连，因为“没有 AEC，不挡就会听到自己”。
         // 实测固件自带回声消除（播放期回波底噪 −80 dBFS，ERL ≥ 75 dB 估算），
@@ -834,13 +822,10 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           let bytes = 0;
           let firstAt = 0;
           for await (const pcm of ttsStream(r.speech)) {
-            if (bargeIn) break;
+            if (fsm.isStale(ticket)) break;
             if (firstAt === 0) {
               firstAt = Date.now();
-              // 只有真的开始往下行写音频才算「在播」。
-              // 实测：从前在 TTS 首块到达前就把 playing 置上，用户一句正常的话
-              // 会打断掉一个还没出声的回复（日志：回放 0 字节，被中断）。
-              playing = true;
+              fsm.audioStarted(ticket);
               console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
             }
             bytes += pcm.length;
@@ -848,39 +833,35 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
             writeDown(FRAME_DOWN_AUDIO, pcm);
           }
           const secs = bytes / (TTS_SAMPLE_RATE * 2);
-          console.log(bargeIn
-            ? `  回放    ${bytes} 字节  ${secs.toFixed(2)} s（被中断）`
-            : `  回放    ${bytes} 字节  ${secs.toFixed(2)} s`);
+          const cut = fsm.isStale(ticket);
+          console.log(`  回放    ${bytes} 字节  ${secs.toFixed(2)} s${cut ? '（被中断）' : ''}`);
 
           // 一行结构化汇总，便于事后 grep 统计 P50/P95：
           //   grep '^TURN ' harness.log
           const ttsFirstMs = firstAt ? firstAt - t1 : -1;
-          console.log(`TURN n=${turns} text_len=${text.length} dsh_ms=${r.durationMs}`
+          console.log(`TURN n=${ticket.no} text_len=${text.length} dsh_ms=${r.durationMs}`
             + ` tts_first_ms=${ttsFirstMs} audio_s=${secs.toFixed(2)}`
-            + (bargeIn ? ' barge_in=1' : ''));
+            + (cut ? ' barge_in=1' : ''));
 
           // 等手机把这段播完再恢复收音，否则下一轮会识别到自己。
-          //
-          // playing 必须覆盖这整段时间：早先在 TTS 生成结束时就置了 false，
-          // 于是只有生成那 ~1 s 里打断算数，后面 10-20 s 真正在响的时候
-          // 插话根本不触发（真机 13 轮只成功打断 1 次）。
-          // 同时这个等待必须可被打断，否则用户插话后要干等到倒计时结束。
-          if (!bargeIn) {
+          // 状态机在整个等待期间保持 `speaking`（不是「TTS 生成结束」就
+          // 回 listening），否则真正响的那 10–20 s 里插话不算数。
+          // 等待必须可被插话提前结束。
+          if (!cut) {
             const until = Date.now() + secs * 1000 + 600;
-            while (!bargeIn && Date.now() < until) {
+            while (!fsm.isStale(ticket) && Date.now() < until) {
               await sleep(100);
             }
           }
 
-          // 落盘必须在 sleep 之后：sleep 期间才是真正的播放期，
+          // 落盘必须在等待之后：那段时间才是真正的播放期，
           // 放在前面只能录到「agent 思考 + TTS 生成」，录不到回声。
           flushDump();
         } catch (e) {
           console.log(`  ✗ 本轮失败: ${(e as Error).message}`);
         } finally {
-          speaking = false;
-          playing = false;
-          if (endRequested) {
+          fsm.audioDone(ticket);
+          if (fsm.state === 'ending') {
             console.log('\n--- 会话结束（模型判定）---');
             if (!sock.destroyed) sock.end();
           }
@@ -984,10 +965,8 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           console.log(`  … ${t}`);
           // 全双工打断：播放期只要服务端真的解出了字，就当用户在插话。
           // 用「非空中间结果」而不是能量阀值 —— 环境噪声能骗过峰值，骗不过识别器。
-          if (playing && !bargeIn) {
-            const bare = t.replace(/[\s。.,，!！?？、~～]/g, '');
-            if (bare.length >= 2) triggerBargeIn(`听到「${t}」`);
-          }
+          const bare = t.replace(/[\s。.,，!！?？、~～]/g, '');
+          if (bare.length >= 2) tryBargeIn(t);
         },
         onSentence: (t, idx) => {
           console.log(`  句 ${idx}  ${JSON.stringify(t)}`);
@@ -1052,8 +1031,8 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       let prerollBytes = 0;
 
       ff.stdout.on('data', (chunk: Buffer) => {
-        // 播放期间的音频正常会因 dropping 被丢弃，但 AEC 分析正需要它
-        if (speaking && DUMP_DIR) upDuringPlayback.push(Buffer.from(chunk));
+        // 播放期间的音频正常会因状态机处于 speaking 而只用于 AEC 分析
+        if (fsm.state === 'speaking' && DUMP_DIR) upDuringPlayback.push(Buffer.from(chunk));
 
         const peak = peakDbfs(chunk);
         const now = Date.now();
@@ -1147,7 +1126,8 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       });
 
       sock.on('close', () => {
-        console.log(`\n连接结束，${turns} 轮`);
+        console.log(`\n连接结束，${fsm.turn} 轮`);
+        fsm.close();
         smartTurn?.stop();
         toolCtl.close();
         // 手机 listen 窗口到点会主动断，这里兜一次落盘
