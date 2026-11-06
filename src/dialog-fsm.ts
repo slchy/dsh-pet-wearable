@@ -118,6 +118,17 @@ export class DialogFsm {
     return this._gen;
   }
 
+  /**
+   * 本轮是否已被标记为「播完就结束」。
+   *
+   * 只读观测点，供形式化验证与诊断使用 —— 它不参与任何外部判定，
+   * 暴露它是为了让验证脚本能识别「同状态但标志不同」的配置，
+   * 否则会把两个行为不同的配置误当成同一个。
+   */
+  get endAfterSpeech(): boolean {
+    return this._endAfterSpeech;
+  }
+
   /** 当前代次的票据。入队任务应当持有它，出队时用 {@link isStale} 校验。 */
   ticket(): TurnTicket {
     return { no: this._turn, gen: this._gen };
@@ -216,6 +227,13 @@ export class DialogFsm {
 
   private transition(to: DialogState, why: string): void {
     if (this._state === to) {
+      return;
+    }
+    // closed 是吸收态：连接已经断了，任何迟到的回调都不得把状态拉回去。
+    // 反例（由 tests/fsm-verify.ts 的 P2 抓到）：close 之后本轮 finally 里
+    // 的 audioDone 会把 closed 拉回 listening。
+    if (this._state === 'closed') {
+      this.log(`  状态    ⚠ 已 closed，忽略转移 ${to}（${why}）`);
       return;
     }
     this.log(`  状态    ${this._state} → ${to}   (${why})`);
