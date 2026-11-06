@@ -815,12 +815,16 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           const t1 = Date.now();
           let bytes = 0;
           let firstAt = 0;
-          playing = true;
+          playing = false;
           try {
             for await (const pcm of ttsStream(r.speech)) {
               if (bargeIn) break;
               if (firstAt === 0) {
                 firstAt = Date.now();
+                // 只有真的开始往下行写音频才算「在播」。
+                // 实测：从前在 TTS 首块到达前就把 playing 置上，用户一句正常的话
+                // 会打断掉一个还没出声的回复（日志：回放 0 字节，被中断）。
+                playing = true;
                 console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
               }
               bytes += pcm.length;
@@ -972,12 +976,11 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
 
           pendingText = pendingText ? pendingText + t : t;
 
-          // 问号结尾 = 明确在提问，不必再等合并窗口
-          if (/[?？]\s*$/.test(t)) {
-            flushPending();
-            return;
-          }
-
+          // 早先这里有一条「问号结尾直接收下这一轮」的快路径。
+          // 实测它把一句话拆成了三轮：
+          //   「你在运行什么？」（句中停顿被判成句尾）→「平台上。」
+          // ASR 的 `？` 是按语调加的，不代表语义完整，所以取消了，
+          // 统一交给 Smart Turn 看音频本身（代价只多 SMART_TURN_QUIET_MS）。
           if (pendingTimer) clearTimeout(pendingTimer);
           pendingTimer = setTimeout(
             () => { void evaluateTurn(); },
@@ -1008,11 +1011,21 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       const VOICE_PEAK_DBFS = -58;
       /** 有声之后再多喂这么久：覆盖 max_sentence_silence=800 与服务端收尾 */
       const VOICE_HOLD_MS = 2000;
-      /** 开门前保留的音频块，避免把第一个音节吐掉 */
-      const PREROLL_CHUNKS = 8;
+      /**
+       * 开门前保留的音频（毫秒）。**必须按字节算，不能按块数。**
+       *
+       * 实测：ffmpeg 每次吐的块大小不固定 —— 同一次会话里既见过「8 块 = 105 ms」
+       * 也见过「3 块 = 225 ms」。旧代码 PREROLL_CHUNKS=8 在第一种情况下
+       * 只能盖 105 ms，连一个中文音节都不够，于是开头被削：
+       * 「你在运行什么」被识别成「李运行在什么」（nǐ→lǐ）。
+       */
+      const PREROLL_MS = 800;
+      /** 16 kHz × 2 B = 32 B/ms */
+      const PREROLL_BYTES = PREROLL_MS * 32;
       let lastVoiceAt = 0;
       let uploading = false;
       let preroll: Buffer[] = [];
+      let prerollBytes = 0;
 
       ff.stdout.on('data', (chunk: Buffer) => {
         // 播放期间的音频正常会因 dropping 被丢弃，但 AEC 分析正需要它
@@ -1025,13 +1038,11 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           lastVoiceAt = now;
           if (!uploading) {
             uploading = true;
-            // 把预卷折成毫秒打出来：判断「首音节够不够覆盖」靠这个数，
-            // 不靠猜块数。16 kHz × 2 B = 32 B/ms。
-            const preBytes = preroll.reduce((a, b) => a + b.length, 0);
             console.log(`  上行    有声 ${peak.toFixed(1)} dBFS → 开始推送`
-              + `（补 ${preroll.length} 块 / ${Math.round(preBytes / 32)} ms）`);
+              + `（补 ${preroll.length} 块 / ${Math.round(prerollBytes / 32)} ms）`);
             for (const p of preroll) asrClient.feed(p);
             preroll = [];
+            prerollBytes = 0;
           }
         }
         if (uploading) {
@@ -1043,7 +1054,10 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           }
         } else {
           preroll.push(chunk);
-          if (preroll.length > PREROLL_CHUNKS) preroll.shift();
+          prerollBytes += chunk.length;
+          while (prerollBytes > PREROLL_BYTES && preroll.length > 1) {
+            prerollBytes -= preroll.shift()!.length;
+          }
         }
       });
 
