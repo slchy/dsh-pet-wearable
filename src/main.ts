@@ -756,13 +756,29 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       };
       let chain: Promise<void> = Promise.resolve();
       /**
-       * 串行队列。两条要求缺一不可：
+       * 队列代次。每次打断就 ++，让所有已入队但还没开跑的轮次作废。
+       *
+       * 为什么必须有：一轮 = dsh 2–5 s + 播放 5–20 s，用户在这期间又说一句，
+       * 那句话就排队。真机日志里积压到 40 s，用户已经问到「退出」了，
+       * agent 还在回答「拖一下」——只停掉当前音频不够，得把后面排队的也废掉。
+       */
+      let queueGen = 0;
+      /**
+       * 串行队列。三条要求缺一不可：
        *   1. 严格串行 —— 上一轮 TTS 没发完时不能开下一轮
        *   2. 错误隔离 —— 某一轮抛错只能作废该轮，不能让 chain 变成
        *      rejected 状态，否则后续所有 `.then` 都会短路，整个连接哑掉
+       *   3. 可作废 —— 执行时发现代次已变就跳过（用户已打断，这轮过时了）
        */
       const enqueue = (fn: () => Promise<void>): void => {
-        chain = chain.then(fn).catch((e: Error) => {
+        const gen = queueGen;
+        chain = chain.then(() => {
+          if (gen !== queueGen) {
+            console.log('  （丢弃：用户已打断，这一轮过时了）');
+            return;
+          }
+          return fn();
+        }).catch((e: Error) => {
           console.error(`  ✗ 队列任务失败（不影响后续）: ${e.message}`);
         });
       };
@@ -791,7 +807,9 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       const triggerBargeIn = (why: string): void => {
         if (bargeIn) return;
         bargeIn = true;
-        console.log(`  打断    ${why} → 停止播放`);
+        // 作废所有还没开跑的轮次：用户已经在说新的话了，旧问题不必再答
+        queueGen += 1;
+        console.log(`  打断    ${why} → 停止播放，佭止排队中的轮次`);
         writeDown(FRAME_DOWN_CONTROL, Buffer.from('stop', 'utf8'));
       };
 
@@ -815,24 +833,19 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           const t1 = Date.now();
           let bytes = 0;
           let firstAt = 0;
-          playing = false;
-          try {
-            for await (const pcm of ttsStream(r.speech)) {
-              if (bargeIn) break;
-              if (firstAt === 0) {
-                firstAt = Date.now();
-                // 只有真的开始往下行写音频才算「在播」。
-                // 实测：从前在 TTS 首块到达前就把 playing 置上，用户一句正常的话
-                // 会打断掉一个还没出声的回复（日志：回放 0 字节，被中断）。
-                playing = true;
-                console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
-              }
-              bytes += pcm.length;
-              if (DUMP_DIR) downChunks.push(Buffer.from(pcm));
-              writeDown(FRAME_DOWN_AUDIO, pcm);
+          for await (const pcm of ttsStream(r.speech)) {
+            if (bargeIn) break;
+            if (firstAt === 0) {
+              firstAt = Date.now();
+              // 只有真的开始往下行写音频才算「在播」。
+              // 实测：从前在 TTS 首块到达前就把 playing 置上，用户一句正常的话
+              // 会打断掉一个还没出声的回复（日志：回放 0 字节，被中断）。
+              playing = true;
+              console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
             }
-          } finally {
-            playing = false;
+            bytes += pcm.length;
+            if (DUMP_DIR) downChunks.push(Buffer.from(pcm));
+            writeDown(FRAME_DOWN_AUDIO, pcm);
           }
           const secs = bytes / (TTS_SAMPLE_RATE * 2);
           console.log(bargeIn
@@ -846,8 +859,18 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
             + ` tts_first_ms=${ttsFirstMs} audio_s=${secs.toFixed(2)}`
             + (bargeIn ? ' barge_in=1' : ''));
 
-          // 被打断时手机已经 flush 了缓冲，不必再等排空
-          if (!bargeIn) await sleep(secs * 1000 + 600);
+          // 等手机把这段播完再恢复收音，否则下一轮会识别到自己。
+          //
+          // playing 必须覆盖这整段时间：早先在 TTS 生成结束时就置了 false，
+          // 于是只有生成那 ~1 s 里打断算数，后面 10-20 s 真正在响的时候
+          // 插话根本不触发（真机 13 轮只成功打断 1 次）。
+          // 同时这个等待必须可被打断，否则用户插话后要干等到倒计时结束。
+          if (!bargeIn) {
+            const until = Date.now() + secs * 1000 + 600;
+            while (!bargeIn && Date.now() < until) {
+              await sleep(100);
+            }
+          }
 
           // 落盘必须在 sleep 之后：sleep 期间才是真正的播放期，
           // 放在前面只能录到「agent 思考 + TTS 生成」，录不到回声。
@@ -856,6 +879,7 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           console.log(`  ✗ 本轮失败: ${(e as Error).message}`);
         } finally {
           speaking = false;
+          playing = false;
           if (endRequested) {
             console.log('\n--- 会话结束（模型判定）---');
             if (!sock.destroyed) sock.end();
