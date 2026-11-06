@@ -22,6 +22,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 
 import { AliyunAsr } from './aliyun-asr.ts';
+import { isBackchannelOnly } from './backchannel.ts';
 import { DialogFsm, type TurnTicket } from './dialog-fsm.ts';
 import { EnergyGate } from './energy-gate.ts';
 import {
@@ -177,6 +178,14 @@ class AliyunConnection {
         ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
         : undefined,
       onUtterance: (text) => {
+        // 旁听反馈不单独成轮。实测：「嗯嗯，我知道了我知道了。」曾触发一次
+        // 完整 agent 调用，回了句「行，那有需要再喊我」—— 像逐客令，
+        // 用户下一句就是「哎，别别别别退。」。
+        if (isBackchannelOnly(text)) {
+          console.log('\n--- 忽略 ---');
+          console.log(`  文本    ${JSON.stringify(text)}（旁听反馈，不单独成轮）`);
+          return;
+        }
         console.log('\n--- 本轮 ---');
         console.log(`  文本    ${JSON.stringify(text)}`);
         this.enqueueTurn(text);
