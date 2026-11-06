@@ -10,14 +10,58 @@
  */
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { asr, pcmToWav, tts, TTS_SAMPLE_RATE } from './mimo.ts';
+import { VoiceAgent } from './agent.ts';
+import { AliyunAsr } from './aliyun-asr.ts';
+import { asr, pcmToWav, ttsStream, TTS_SAMPLE_RATE } from './mimo.ts';
+import { DshSession, type ImageAttachment } from './session.ts';
+import { SmartTurn } from './smart-turn.ts';
 import { SileroVad, sliceFrames, SAMPLE_RATE, WINDOW } from './vad.ts';
 
-/** 静音判停：4 秒 / 32 ms = 125 帧 */
-const SILENCE_FRAMES = 125;
+/**
+ * 判停之后拿识别文本做什么。
+ * - `none`  只识别，不回复（冒烟用）
+ * - `echo`  原样念回去（验证下行通路）
+ * - `agent` 交给 dsh，念它给的回复
+ */
+type ReplyMode = 'none' | 'echo' | 'agent';
+
+/**
+ * 下行音频的出口。
+ *
+ * - 本机调试：先收完再用 adb push 给手机播（adb 没有流式播放）
+ * - 上手机：直接写回同一条 TCP，手机边收边播
+ */
+interface AudioSink {
+  write(chunk: Buffer): void | Promise<void>;
+  end?(): void | Promise<void>;
+}
+
+/**
+ * 双阈值判停。
+ *
+ * 单一阈值解决不了「正常提问该快」和「思考停顿不该被切断」的矛盾：
+ * 4 秒太慢（业界对话助手普遍 0.5–1 s），1 秒又会切断实测到的 3.6 s 停顿。
+ *
+ * - 短阈值 1.0 s（32 ms/帧 × 31）：先做一次「预判 ASR」，文本完整就进入确认窗口
+ * - 长阈值 2.5 s（× 78）：文本不完整时的兼底，届时重新识别完整音频
+ * - 确认窗口 0.5 s（× 16）：预判出「说完了」后再静听 0.5 s，
+ *   这期间又出声就把预判作废。句号不等于说完了 —— 实测用户会在
+ *   「音乐场景。」后面接着说「下一个是谁」，没有这个窗口就只拿到前半句。
+ *
+ * 短阈值取 1.0 s：0.6 s 实测会把「嗯，你觉得呢？」这种句子中间的短停顿
+ * 当成说完，直接切断。1.0 s 接近业界对话助手的上限，仍然比原来的 4 s 快。
+ *
+ * 预判是异步的，不阻塞 VAD 主循环；期间继续累积音频，用户又开口就作废重来。
+ */
+const SHORT_SILENCE_FRAMES = 31;
+const LONG_SILENCE_FRAMES = 78;
+/** 预判命中后的确认窗口：再安静这么久才算真的说完 */
+const CONFIRM_SILENCE_FRAMES = 16;
 /** 标定值，见 src/vad.ts 顶部注释 */
 const VAD_THRESHOLD = 0.4;
 /** 单轮上限，防止设备一直推时无限累积 */
@@ -30,7 +74,38 @@ const REMOTE_JAR = '/data/local/tmp/miai.jar';
 const REMOTE_PCM = '/data/local/tmp/reply.pcm';
 const LOCAL_TMP = join(process.cwd(), '..', 'tmp');
 
+/** 句末标点。MiMo ASR 会带标点，所以优先看标点。 */
+const SENTENCE_END = /[。！？!?…]$/;
+/** 没有标点时退化为语气词判断 */
+const MODAL_END = /[吗呢吧啊呀嘛哦哈嘛]$/;
+
+/**
+ * 这句看起来说完了吗。
+ *
+ * 宁可偏向「没说完」：漏判的代价是多等 1.5 秒，误判的代价是把话切断。
+ * 所以短到「嗯」「啊」这种一律不算，必须有实质内容。
+ */
+function looksComplete(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  const bare = t.replace(/[\s，,、。.!?！？…]/g, '');
+  if (bare.length < 2) return false;
+  return SENTENCE_END.test(t) || MODAL_END.test(t);
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+
+/** PCM16 小端单声道峰值电平（dBFS）。用来判「这段到底有没有人声」。 */
+function peakDbfs(pcm: Buffer): number {
+  let peak = 0;
+  const n = pcm.length >> 1;
+  for (let i = 0; i < n; i += 1) {
+    const v = pcm.readInt16LE(i << 1);
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+  }
+  return peak === 0 ? -120 : 20 * Math.log10(peak / 32768);
+}
 
 /**
  * 把 PCM 推回手机并从眼镜播出。
@@ -39,7 +114,25 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, 
  * 这条路依赖 adb，所以只在 harness 与手机同机（开发期 adb reverse）时可用；
  * 将来 harness 上 VPS 后要换成手机主动拉流。
  */
+/**
+ * 本机调试用的 sink：攒齐整段 PCM，再 adb push 给手机播。
+ * adb 没有流式播放能力，所以本机路径天然是「收完再播」。
+ */
+function adbSink(): AudioSink {
+  const parts: Buffer[] = [];
+  return {
+    write: (chunk: Buffer) => { parts.push(chunk); },
+    end: async () => { await speak(Buffer.concat(parts)); },
+  };
+}
+
 async function speak(pcm: Buffer): Promise<void> {
+  // 服务器上没有 adb，也不该从服务器扬声器出声。上 VPS 后这里会换成
+  // 「把 PCM 写回同一条 TCP」；在那之前用 --no-play 只验到 TTS 产出为止。
+  if (process.argv.includes('--no-play')) {
+    console.log(`  播放    跳过（--no-play）`);
+    return;
+  }
   mkdirSync(LOCAL_TMP, { recursive: true });
   const local = join(LOCAL_TMP, `reply_${Date.now()}.pcm`);
   writeFileSync(local, pcm);
@@ -61,22 +154,36 @@ async function speak(pcm: Buffer): Promise<void> {
 class Pipeline {
   private ff: ChildProcessWithoutNullStreams;
   private vad = new SileroVad();
-  private pending = Buffer.alloc(0);        // 尚未凑满一帧的 PCM
-  private utterance = Buffer.alloc(0);      // 本轮累积的 PCM（判停后送 ASR）
+  private pending: Buffer = Buffer.alloc(0);        // 尚未凑满一帧的 PCM
+  private utterance: Buffer = Buffer.alloc(0);      // 本轮累积的 PCM（判停后送 ASR）
   private queue: Float32Array[] = [];
   private processing = false;
   private silenceFrames = 0;
   private hasSpoken = false;
+  /** 本轮静音是否已发起过语义预判（重新出现语音就重置） */
+  private prefetching = false;
+  /** 预判还在飞行中。长阈值到时不能自己判停，否则预判结果白做。 */
+  private prefetchPending = false;
+  /** 预判说「完整」但还在确认窗口里，尚未判停 */
+  private pendingTrigger: { text: string; pcm: Buffer } | null = null;
+  /** 确认窗口已静听的帧数 */
+  private confirmSilence = 0;
   private frames = 0;
   private speechFrames = 0;
   private finished = false;
   private finishedResolve: (() => void) | null = null;
-  private readonly finishedPromise: Promise<void>;
+  private finishedPromise: Promise<void>;
+  /** 本轮 TTS 写出的字节数，用来估算播放时长 */
+  private replyBytes = 0;
   private readonly startedAt = Date.now();
-  private readonly echo: boolean;
+  private readonly mode: ReplyMode;
+  private readonly agent: VoiceAgent | null;
+  private sink: AudioSink;
 
-  constructor(ffmpeg: string, echo: boolean) {
-    this.echo = echo;
+  constructor(ffmpeg: string, mode: ReplyMode, agent: VoiceAgent | null = null, sink?: AudioSink) {
+    this.mode = mode;
+    this.agent = agent;
+    this.sink = sink ?? adbSink();
     this.finishedPromise = new Promise((r) => { this.finishedResolve = r; });
 
     this.ff = spawn(ffmpeg, [
@@ -110,6 +217,11 @@ class Pipeline {
     return this.finished;
   }
 
+  /** 切换下行音频出口。listen 模式在连接建立时指向 socket。 */
+  setSink(sink: AudioSink): void {
+    this.sink = sink;
+  }
+
   feed(msbc: Buffer): void {
     if (this.finished) return;
     if (!this.ff.stdin.destroyed) this.ff.stdin.write(msbc);
@@ -121,6 +233,37 @@ class Pipeline {
 
   wait(): Promise<void> {
     return this.finishedPromise;
+  }
+
+  /** 本轮回复的音频时长（毫秒）。多轮时用来等播放结束再恢复收音。 */
+  get replyDurationMs(): number {
+    return (this.replyBytes / (TTS_SAMPLE_RATE * 2)) * 1000;
+  }
+
+  /**
+   * 重置到「等待新一轮」的状态。
+   *
+   * ffmpeg 进程不复用也不重建：mSBC 是自包含帧，解码器可以一直跑，
+   * 这里只重置**判停相关**的状态（VAD 的 LSTM 隐状态、累积音频、计数）。
+   * VAD 必须 reset：上一轮的语音上下文留着会让新一轮开头就误判成语音。
+   */
+  reset(): void {
+    this.vad.reset();
+    this.pending = Buffer.alloc(0);
+    this.utterance = Buffer.alloc(0);
+    this.queue = [];
+    this.silenceFrames = 0;
+    this.hasSpoken = false;
+    this.prefetching = false;
+    this.prefetchPending = false;
+    this.pendingTrigger = null;
+    this.confirmSilence = 0;
+    this.frames = 0;
+    this.speechFrames = 0;
+    this.replyBytes = 0;
+    this.finished = false;
+    this.finishedResolve = null;
+    this.finishedPromise = new Promise<void>((r) => { this.finishedResolve = r; });
   }
 
   // ---------------------------------------------------------------- 内部
@@ -141,7 +284,9 @@ class Pipeline {
   }
 
   private async onFrame(frame: Float32Array): Promise<void> {
-    // 累积原始 PCM：判停后要整段送 ASR
+    // 整段累积，不裁前后静音：实测裁掉 1.15 s 静音后 ASR 结果一字未变，
+    // 说明 MiMo 内部已在处理静音。裁剪只会多出「削掉开口弱音」
+    // 和「切掉轻声结尾」两个风险，没有收益。
     const buf = Buffer.alloc(FRAME_BYTES);
     for (let i = 0; i < WINDOW; i += 1) {
       const v = Math.max(-1, Math.min(1, frame[i] ?? 0));
@@ -156,29 +301,117 @@ class Pipeline {
       this.hasSpoken = true;
       this.speechFrames += 1;
       this.silenceFrames = 0;
+      this.prefetching = false;   // 又说话了，上一轮预判作废
+      // 确认窗口里又出声：用户没说完，预判作废，继续听
+      this.pendingTrigger = null;
+      this.confirmSilence = 0;
     } else {
       this.silenceFrames += 1;
     }
 
-    if (this.hasSpoken && this.silenceFrames >= SILENCE_FRAMES) {
-      this.trigger('静音判停');
-    } else if (this.utterance.length >= MAX_UTTERANCE_SEC * SAMPLE_RATE * 2) {
+    if (!this.hasSpoken) return;
+
+    if (this.utterance.length >= MAX_UTTERANCE_SEC * SAMPLE_RATE * 2) {
       this.trigger('达到上限');
+      return;
+    }
+
+    // 确认窗口：预判已说「完整」，再静听 0.5 s 才真判停
+    if (this.pendingTrigger) {
+      this.confirmSilence += 1;
+      if (this.confirmSilence >= CONFIRM_SILENCE_FRAMES) {
+        const p = this.pendingTrigger;
+        this.pendingTrigger = null;
+        this.trigger('语义判停', p.text, p.pcm);
+        return;
+      }
+    }
+
+    // 长阈值：预判还在跑就等它；已经有 pending 就直接用它，不重复识别
+    if (this.silenceFrames >= LONG_SILENCE_FRAMES && !this.prefetchPending) {
+      const p = this.pendingTrigger;
+      this.pendingTrigger = null;
+      this.trigger('静音 2.5 s', p?.text ?? null, p?.pcm ?? null);
+      return;
+    }
+
+    // 短阈值：发起一次语义预判（已有 pending 就不用再猜）
+    if (this.silenceFrames >= SHORT_SILENCE_FRAMES && !this.prefetching && !this.pendingTrigger) {
+      this.prefetching = true;
+      void this.prefetch();
     }
   }
 
-  private trigger(reason: string): void {
+  /**
+   * 语义预判：静音刚满 1 秒时先识别一次，看这句是不是说完了。
+   *
+   * 异步执行，不堵塞 VAD。返回时如果用户又开口了（silenceFrames 被清零），
+   * 这次预判直接作废——音频已经变了，结论不再成立。
+   */
+  private async prefetch(): Promise<void> {
+    if (this.finished) return;
+    const pcm = this.utterance;
+    if (pcm.length === 0) return;
+
+    this.prefetchPending = true;
+    const t0 = Date.now();
+    try {
+      const { text } = await asr(pcmToWav(pcm));
+      if (this.finished) return;
+
+      const ms = ((Date.now() - t0) / 1000).toFixed(2);
+
+      // 识别期间用户又开口了：这段音频已经不代表当前句子，作废
+      if (this.silenceFrames < SHORT_SILENCE_FRAMES) {
+        console.log(`  预判    ${ms} s  已被新语音打断，丢弃`);
+        return;
+      }
+
+      if (looksComplete(text)) {
+        // 不直接判停：先进确认窗口，防止「句号说完、但其实还在说」
+        console.log(`\n  预判    ${ms} s  ${JSON.stringify(text)}  → 看起来说完了，再确认 0.5 s`);
+        this.pendingTrigger = { text, pcm };
+        this.confirmSilence = 0;
+        return;
+      }
+
+      console.log(`\n  预判    ${ms} s  ${JSON.stringify(text)}  → 没说完，继续等`);
+      // 已经过了长阈值：用完整音频重新识别一次（少了尾部会丢内容）
+      if (this.silenceFrames >= LONG_SILENCE_FRAMES) {
+        this.trigger('静音 2.5 s（预判不完整）');
+      }
+    } catch (e) {
+      // 预判只是加速手段，失败就退化成纯长阈值，不影响本轮
+      console.log(`  预判失败: ${(e as Error).message}`);
+      if (this.silenceFrames >= LONG_SILENCE_FRAMES) this.trigger('静音 2.5 s');
+    } finally {
+      this.prefetchPending = false;
+    }
+  }
+
+  private trigger(
+    reason: string,
+    presetText: string | null = null,
+    presetPcm: Buffer | null = null,
+  ): void {
     if (this.finished) return;
     this.finished = true;
 
-    const pcm = this.utterance;
+    // 预判命中时音频必须用同一快照：否则日志里的时长和文本对不上，
+    // 多出来的是预判之后的静音尾巴。
+    const pcm = presetPcm ?? this.utterance;
     this.utterance = Buffer.alloc(0);
     const elapsed = (Date.now() - this.startedAt) / 1000;
 
-    void this.recognize(pcm, reason, elapsed);
+    void this.recognize(pcm, reason, elapsed, presetText);
   }
 
-  private async recognize(pcm: Buffer, reason: string, elapsed: number): Promise<void> {
+  private async recognize(
+    pcm: Buffer,
+    reason: string,
+    elapsed: number,
+    presetText: string | null = null,
+  ): Promise<void> {
     const sec = pcm.length / (SAMPLE_RATE * 2);
     console.log(`\n--- 判停（${reason}）---`);
     console.log(`  音频    ${pcm.length} 字节  ${sec.toFixed(2)} s`);
@@ -193,17 +426,53 @@ class Pipeline {
 
     const t0 = Date.now();
     try {
-      const { text, chunks } = await asr(pcmToWav(pcm));
-      console.log(`  ASR     ${((Date.now() - t0) / 1000).toFixed(2)} s  chunks=${chunks}`);
+      let text = presetText ?? '';
+      if (presetText === null) {
+        const r = await asr(pcmToWav(pcm));
+        text = r.text;
+        console.log(`  ASR     ${((Date.now() - t0) / 1000).toFixed(2)} s  chunks=${r.chunks}`);
+      } else {
+        // 语义预判已经识别过同一段音频，不再重复调用
+        console.log(`  ASR     跳过（预判已识别）`);
+      }
       console.log(`  文本    ${JSON.stringify(text)}`);
       console.log(`\nASR_TEXT=${text}`);
 
-      if (this.echo && text) {
-        const t1 = Date.now();
-        const { pcm: reply, chunks: ttsChunks } = await tts(text);
-        console.log(`  TTS     ${((Date.now() - t1) / 1000).toFixed(2)} s  chunks=${ttsChunks}`);
-        console.log(`  回放    ${reply.length} 字节  ${(reply.length / (TTS_SAMPLE_RATE * 2)).toFixed(2)} s`);
-        await speak(reply);
+      if (this.mode !== 'none' && text) {
+        let speech = text;
+
+        if (this.mode === 'agent' && this.agent) {
+          const t0a = Date.now();
+          try {
+            const r = await this.agent.reply(text);
+            speech = r.speech;
+            console.log(`  agent   ${((Date.now() - t0a) / 1000).toFixed(2)} s  `
+              + `${r.resumed ? '续会话' : '新会话'}  ${JSON.stringify(r.text.slice(0, 160))}`);
+          } catch (e) {
+            // agent 挂了不该吞掉本轮：退回原样念回去，至少链路是通的
+            console.log(`  ✗ agent 失败: ${(e as Error).message}（退回回声）`);
+          }
+        }
+
+        if (speech) {
+          const t1 = Date.now();
+          let bytes = 0;
+          let chunks = 0;
+          let firstAt = 0;
+          for await (const pcm of ttsStream(speech)) {
+            if (firstAt === 0) {
+              firstAt = Date.now();
+              console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s  ${pcm.length} 字节`);
+            }
+            bytes += pcm.length;
+            chunks += 1;
+            await this.sink.write(pcm);
+          }
+          this.replyBytes = bytes;
+          console.log(`  TTS     ${((Date.now() - t1) / 1000).toFixed(2)} s  chunks=${chunks}`);
+          console.log(`  回放    ${bytes} 字节  ${(bytes / (TTS_SAMPLE_RATE * 2)).toFixed(2)} s`);
+          await this.sink.end?.();
+        }
       }
     } catch (e) {
       console.log(`  ✗ ASR/TTS 失败: ${(e as Error).message}`);
@@ -239,17 +508,46 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
     const server = createServer((sock) => {
       console.log(`已连接 ${sock.remoteAddress}:${sock.remotePort}\n`);
       let total = 0;
+      let turns = 0;
+
+      // 下行音频直接写回同一条连接：手机边收边播。
+      pipe.setSink({
+        write: (chunk: Buffer) => {
+          if (!sock.destroyed) sock.write(chunk);
+        },
+        // 多轮：一轮结束**不发 EOF**，连接保持，手机端到 listenMs 自己断。
+        end: () => {},
+      });
 
       sock.on('data', (d: Buffer) => {
         total += d.length;
         pipe.feed(d);
-        if (pipe.isFinished) sock.end();
       });
 
-      sock.on('close', async () => {
-        console.log(`\n连接结束，共收 ${total} 字节`);
+      // 轮次循环：一轮结束 → 等回复播完 → 重置 → 继续听
+      const loop = async (): Promise<void> => {
+        for (;;) {
+          await pipe.wait();
+          turns += 1;
+          if (sock.destroyed) break;
+
+          // 必须等回复播完再恢复收音：否则眼镜扬声器的声音会被自己的
+          // 麦克风收进去，下一轮开头就变成「听到自己说话」。
+          // 云端拿不到 AudioTrack 的真实播放进度，用音频时长 + 固定余量估算。
+          const waitMs = pipe.replyDurationMs + 600;
+          console.log(`\n--- 第 ${turns} 轮结束，${(waitMs / 1000).toFixed(1)} s 后继续听 ---`);
+          await sleep(waitMs);
+          if (sock.destroyed) break;
+
+          pipe.reset();
+          console.log('--- 继续听 ---\n');
+        }
+      };
+      void loop();
+
+      sock.on('close', () => {
+        console.log(`\n连接结束，共收 ${total} 字节，${turns} 轮`);
         pipe.closeInput();
-        await Promise.race([pipe.wait(), sleep(30_000)]);
         server.close();
         resolve(0);
       });
@@ -260,7 +558,558 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
     });
 
     server.listen(port, '127.0.0.1', () => {
-      console.log(`监听 127.0.0.1:${port}`);
+      console.log(`监听 127.0.0.1:${port}（多轮）`);
+      console.log(`手机侧先执行： adb reverse tcp:${port} tcp:${port}\n`);
+    });
+  });
+}
+
+/**
+ * 唤醒词。单独成句时**不是一轮对话**，直接丢掉。
+ *
+ * 实测：「小爱同学。」和「我眼前的是什么？」会被服务端拆成两个 SentenceEnd，
+ * 第二个才是真正的命令。Smart Turn 对「小爱同学。」给 0.957（它确实是完整的一句话），
+ * 所以模型治不了这个，只能靠这条领域规则。
+ */
+const WAKE_WORDS = new Set(['小爱同学', '小爱', '小爱小爱']);
+
+function isWakeWordOnly(text: string): boolean {
+  const bare = text.replace(/[\s。.,，!！?？、~～]/g, '');
+  return WAKE_WORDS.has(bare);
+}
+
+/**
+ * 显式退出词。归一化（去标点/空白）后整句匹配，避免「结束了」这种
+ * 正常语句被当成指令。
+ */
+const EXIT_WORDS = new Set([
+  '退出', '结束', '再见', '关闭', '停下', '停止', '不聊了', '就这样', '没事了', '关掉',
+]);
+const EXIT_REPLY = '好，先这样，需要时再叫我。';
+
+function isExitWord(text: string): boolean {
+  const bare = text.replace(/[\s。.,，!！?？、~～]/g, '');
+  return EXIT_WORDS.has(bare);
+}
+
+// ------------------------------------------------------------------ 阿里云流式识别
+interface AliyunRunOptions {
+  ffmpeg: string;
+  agent: VoiceAgent;
+  akId: string;
+  akSecret: string;
+  appkey: string;
+  region: string;
+  maxSentenceSilenceMs?: number;
+}
+
+/**
+ * 阿里云流式识别模式。
+ *
+ * 跟 MiMo 分支的根本区别：**判停不在本地做**。服务端检测到句子结束就发
+ * `SentenceEnd`，直接拿来当一轮的起点；本地 silero VAD + 双阈值那套全部退役。
+ *
+ * 半双工：TTS 播放期间暂停推音频。没有 AEC，眼镜的扬声器会被自己的麦克风
+ * 收进去，不挡的话下一轮开头就是它自己刚才说的话。
+ */
+/**
+ * 设了就把每轮的「下行 TTS」与「播放期间的麦克风」落盘，
+ * 供 AEC 可行性分析（延迟 / 回声衰减 / 线性可预测性）。
+ */
+const DUMP_DIR = process.env['DUMP_DIR'] ?? '';
+/** 眼镜拍到的图片落在哪里 */
+const PHOTO_DIR = process.env['PHOTO_DIR'] ?? join(homedir(), 'miai-photos');
+/** 给 MCP 工具 take_photo 用的本机控制口 */
+const PHOTO_CTL_PORT = Number(process.env['PHOTO_CTL_PORT'] ?? 8767);
+/** 等设备回图的超时 */
+const PHOTO_TIMEOUT_MS = 20_000;
+
+// ---------------------------------------------------------------- 判停（Smart Turn）
+/** 置 0 退回旧的「固定 600 ms 合并窗口」行为 */
+const SMART_TURN_ENABLED = process.env['SMART_TURN'] !== '0';
+const SMART_TURN_PYTHON = process.env['SMART_TURN_PYTHON'] ?? '';
+const SMART_TURN_SCRIPT = process.env['SMART_TURN_SCRIPT'] ?? '';
+/** 句子结束后先静候这么久，给用户一个自然接话的间隙 */
+const SMART_TURN_QUIET_MS = Number(process.env['SMART_TURN_QUIET_MS'] ?? 350);
+/** 判为「没说完」时再多等这么久再判一次 */
+const SMART_TURN_EXTEND_MS = Number(process.env['SMART_TURN_EXTEND_MS'] ?? 700);
+/** 最多再等几轮，防止一直不认完 */
+const SMART_TURN_MAX_EXT = Number(process.env['SMART_TURN_MAX_EXT'] ?? 3);
+/** 概率阀值：≥ 此值就叫停 */
+const SMART_TURN_THRESHOLD = Number(process.env['SMART_TURN_THRESHOLD'] ?? 0.5);
+/** 送进模型的最近音频上限（16 kHz × 2 B × 8 s） */
+const RECENT_MAX_BYTES = 16_000 * 2 * 8;
+
+/** 下行帧类型：PCM（24 kHz） */
+const FRAME_DOWN_AUDIO = 1;
+/** 下行帧类型：控制指令 */
+const FRAME_DOWN_CONTROL = 2;
+
+async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<number> {
+  return await new Promise<number>((resolve) => {
+    const server = createServer((sock) => {
+      console.log(`已连接 ${sock.remoteAddress}:${sock.remotePort}\n`);
+
+      /** 下行帧：{@code [type:u8][len:u32 LE][payload]}，与手机侧一致 */
+      const writeDown = (type: number, payload: Buffer): void => {
+        if (sock.destroyed) return;
+        const head = Buffer.allocUnsafe(5);
+        head[0] = type;
+        head.writeUInt32LE(payload.length, 1);
+        sock.write(head);
+        sock.write(payload);
+      };
+
+      /** 最近一次 WakeUpEvent 的上下文（手机侧已缓存，这里只做诊断展示） */
+      let wakeRef: { transactionId: string; requestId: string } | null = null;
+      /** 等照片的 resolver；同一时刻只允许一个在途请求 */
+      let pendingPhoto: ((jpeg: Buffer | null) => void) | null = null;
+
+      /**
+       * 给 dsh 的 MCP 工具 `take_photo` 用的本机控制口。
+       *
+       * 工具是 dsh spawn 的独立进程，走 HTTP 回来；harness 在这里下发拍照指令、
+       * 等设备回图，再以 JPEG 响应。这样工具侧只需要知道一个 URL。
+       */
+      const photoCtl = createHttpServer((req, res) => {
+        if (req.method !== 'POST' || req.url !== '/take_photo') {
+          res.writeHead(404).end();
+          return;
+        }
+        if (pendingPhoto) {
+          res.writeHead(409, { 'content-type': 'text/plain; charset=utf-8' })
+            .end('已有拍照请求在途');
+          return;
+        }
+        const wait = new Promise<Buffer | null>((resolve) => { pendingPhoto = resolve; });
+        writeDown(FRAME_DOWN_CONTROL, Buffer.from('take_photo', 'utf8'));
+        console.log('  拍照    已下发指令，等设备回图…');
+        const timer = setTimeout(() => {
+          const r = pendingPhoto;
+          pendingPhoto = null;
+          r?.(null);
+        }, PHOTO_TIMEOUT_MS);
+        void wait.then((jpeg) => {
+          clearTimeout(timer);
+          if (!res.writableEnded) {
+            if (!jpeg) {
+              res.writeHead(504).end('等图超时');
+            } else {
+              res.writeHead(200, {
+                'content-type': 'image/jpeg',
+                'content-length': String(jpeg.length),
+              });
+              res.end(jpeg);
+            }
+          }
+        });
+      });
+      photoCtl.listen(PHOTO_CTL_PORT, '127.0.0.1');
+
+      let turns = 0;
+      let speaking = false;
+      /** 播放期间的上行 PCM，用于 AEC 分析 */
+      let upDuringPlayback: Buffer[] = [];
+      /** 本轮下行 TTS 参考，同样是 AEC 分析用 */
+      let downChunks: Buffer[] = [];
+      /** 已经落过盘的轮次，防止重复写 */
+      let dumpedTurn = 0;
+      /**
+       * 落盘。正常在 sleep 之后调（那时才是完整播放期），
+       * 但手机 listen 窗口到点会主动断开，进程随即退出 ——
+       * 所以 sock close 时也要再兜一次，否则整轮白跑。
+       */
+      const flushDump = (): void => {
+        if (!DUMP_DIR || turns === 0 || dumpedTurn === turns) return;
+        dumpedTurn = turns;
+        try {
+          mkdirSync(DUMP_DIR, { recursive: true });
+          writeFileSync(join(DUMP_DIR, `down_${turns}.pcm`), Buffer.concat(downChunks));
+          writeFileSync(join(DUMP_DIR, `up_${turns}.pcm`), Buffer.concat(upDuringPlayback));
+          console.log(`  落盘    down_${turns}.pcm ${Buffer.concat(downChunks).length}B`
+            + `  up_${turns}.pcm ${Buffer.concat(upDuringPlayback).length}B`);
+        } catch (e) {
+          console.error(`  ✗ 落盘失败: ${(e as Error).message}`);
+        }
+      };
+      let chain: Promise<void> = Promise.resolve();
+      /**
+       * 串行队列。两条要求缺一不可：
+       *   1. 严格串行 —— 上一轮 TTS 没发完时不能开下一轮
+       *   2. 错误隔离 —— 某一轮抛错只能作废该轮，不能让 chain 变成
+       *      rejected 状态，否则后续所有 `.then` 都会短路，整个连接哑掉
+       */
+      const enqueue = (fn: () => Promise<void>): void => {
+        chain = chain.then(fn).catch((e: Error) => {
+          console.error(`  ✗ 队列任务失败（不影响后续）: ${e.message}`);
+        });
+      };
+
+      const ff = spawn(o.ffmpeg, [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'sbc', '-i', 'pipe:0',
+        '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1',
+      ], { stdio: ['pipe', 'pipe', 'pipe'] });
+      ff.stderr.on('data', (d: Buffer) => {
+        const s = d.toString().trim();
+        if (s) console.error('[ffmpeg] ' + s);
+      });
+
+      const handleTurn = async (text: string, image?: ImageAttachment): Promise<void> => {
+        turns += 1;
+        speaking = true;
+        // 挂断识别（不能把自己的 TTS 当输入），但**立即开始重连**：
+        // 重连要 token + WebSocket 握手（1–2 s），跟播放并行就看不见了。
+        // 只要播放时长 < 服务端 10 s 的 IDLE_TIMEOUT，播放结束时连接已就绪，
+        // 用户开口就是即时的（以前是播完才开始重连，白等 1–2 s）。
+        asrClient.close();
+        void asrClient.connect().catch((e: Error) => {
+          console.error(`  ✗ ASR 预重连失败: ${e.message}`);
+        });
+        upDuringPlayback = [];
+        downChunks = [];
+        try {
+          const t0 = Date.now();
+          const r = await o.agent.reply(text, image);
+          console.log(`  agent   ${((Date.now() - t0) / 1000).toFixed(2)} s  `
+            + `${JSON.stringify(r.text.slice(0, 120))}`);
+
+          const t1 = Date.now();
+          let bytes = 0;
+          let firstAt = 0;
+          for await (const pcm of ttsStream(r.speech)) {
+            if (firstAt === 0) {
+              firstAt = Date.now();
+              console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
+            }
+            bytes += pcm.length;
+            if (DUMP_DIR) downChunks.push(Buffer.from(pcm));
+            writeDown(FRAME_DOWN_AUDIO, pcm);
+          }
+          const secs = bytes / (TTS_SAMPLE_RATE * 2);
+          console.log(`  回放    ${bytes} 字节  ${secs.toFixed(2)} s`);
+
+          // 一行结构化汇总，便于事后 grep 统计 P50/P95：
+          //   grep '^TURN ' harness.log
+          const ttsFirstMs = firstAt ? firstAt - t1 : -1;
+          console.log(`TURN n=${turns} text_len=${text.length} dsh_ms=${r.durationMs}`
+            + ` tts_first_ms=${ttsFirstMs} audio_s=${secs.toFixed(2)}`);
+
+          // 等手机把这段播完再恢复收音，否则下一轮会识别到自己
+          await sleep(secs * 1000 + 600);
+
+          // 落盘必须在 sleep 之后：sleep 期间才是真正的播放期，
+          // 放在前面只能录到「agent 思考 + TTS 生成」，录不到回声。
+          flushDump();
+        } catch (e) {
+          console.log(`  ✗ 本轮失败: ${(e as Error).message}`);
+        } finally {
+          speaking = false;
+          // 不在这里主动重连：空连接会被 IDLE_TIMEOUT。
+          // 下次真有音频进来时 feed() 会懒建立。
+          asrClient.resume();
+        }
+      };
+
+      /** 收到退出词后，本轮流完就挂断整个会话 */
+      let exiting = false;
+
+      /**
+       * 句子合并窗口。
+       *
+       * 服务端的 `SentenceEnd` 只是**句子**边界，不是**轮次**边界：
+       * 「嗯。」「我问你在干什么？」会各发一次，直接照单全收就是两轮问答。
+       * 所以收到后先攒着，窗口内再来一句就拼上一起处理。
+       *
+       * 例外：以问号结尾的句子立刻触发 —— 用户在提问，没有再等下去的道理。
+       */
+      let pendingText = '';
+      let pendingTimer: NodeJS.Timeout | null = null;
+      /** 旧行为（SMART_TURN=0 时）的固定合并窗口 */
+      const MERGE_WINDOW_MS = 600;
+      /** Smart Turn 已连续判了几次「没说完」 */
+      let extensions = 0;
+
+      const smartTurn = SMART_TURN_ENABLED && SMART_TURN_PYTHON && SMART_TURN_SCRIPT
+        ? new SmartTurn({
+            python: SMART_TURN_PYTHON,
+            script: SMART_TURN_SCRIPT,
+            log: (l) => { console.log(`  ${l}`); },
+          })
+        : null;
+
+      /** 最近的音频（16 kHz PCM），给 Smart Turn 用 */
+      let recentChunks: Buffer[] = [];
+      let recentBytes = 0;
+      const pushRecent = (c: Buffer): void => {
+        recentChunks.push(Buffer.from(c));
+        recentBytes += c.length;
+        while (recentBytes > RECENT_MAX_BYTES && recentChunks.length > 1) {
+          const drop = recentChunks.shift();
+          recentBytes -= drop?.length ?? 0;
+        }
+      };
+
+      const flushPending = (): void => {
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          pendingTimer = null;
+        }
+        extensions = 0;
+        const text = pendingText.trim();
+        pendingText = '';
+        if (!text) return;
+        console.log('\n--- 本轮 ---');
+        console.log(`  文本    ${JSON.stringify(text)}`);
+        enqueue(() => handleTurn(text));
+      };
+
+      /**
+       * 句子结束后「要不要把这一轮定下来」。
+       *
+       * 服务端的 SentenceEnd 只是**句子**边界：实测「小爱同学。」和
+       * 「我眼前的是什么？」会各发一次，照着收就是两轮问答（白烧一次 dsh）。
+       * 固定 600 ms 窗口搞不定 —— 这个间隔实测 1.2 s。
+       * 所以交给 Smart Turn 看**音频本身**说没说完；它说没说完就再等一段。
+       */
+      const evaluateTurn = async (): Promise<void> => {
+        pendingTimer = null;
+        if (!pendingText.trim()) return;
+
+        if (!smartTurn) {
+          flushPending();
+          return;
+        }
+
+        const audio = Buffer.concat(recentChunks);
+        const prob = await smartTurn.predict(audio);
+        const shown = prob < 0 ? '故障' : prob.toFixed(3);
+        if (prob < 0) {
+          // 侧车出问题就退回保守策略，别把一轮吞掉
+          console.log(`  判停    ${shown} → 侧车不可用，直接结束本轮`);
+          flushPending();
+          return;
+        }
+        if (prob >= SMART_TURN_THRESHOLD || extensions >= SMART_TURN_MAX_EXT) {
+          console.log(`  判停    ${shown} → 收下这一轮`);
+          flushPending();
+          return;
+        }
+        extensions += 1;
+        console.log(`  判停    ${shown} → 没说完，再等 ${SMART_TURN_EXTEND_MS} ms`);
+        pendingTimer = setTimeout(() => { void evaluateTurn(); }, SMART_TURN_EXTEND_MS);
+      };
+
+      const handleExit = async (): Promise<void> => {
+        exiting = true;
+        speaking = true;
+        asrClient.close();
+        try {
+          let bytes = 0;
+          for await (const pcm of ttsStream(EXIT_REPLY)) {
+            bytes += pcm.length;
+            writeDown(FRAME_DOWN_AUDIO, pcm);
+          }
+          // 等手机把告别语播完再断，否则最后几个字会被截
+          await sleep((bytes / (TTS_SAMPLE_RATE * 2)) * 1000 + 500);
+        } catch (e) {
+          console.log(`  ✗ 告别语失败: ${(e as Error).message}`);
+        } finally {
+          speaking = false;
+          console.log('\n--- 会话结束（退出词）---');
+          if (!sock.destroyed) sock.end();
+        }
+      };
+
+      const asrClient = new AliyunAsr({
+        akId: o.akId,
+        akSecret: o.akSecret,
+        appkey: o.appkey,
+        region: o.region,
+        maxSentenceSilenceMs: o.maxSentenceSilenceMs,
+        log: (l) => { console.log(`  ${l}`); },
+        onPartial: (t) => { console.log(`  … ${t}`); },
+        onSentence: (t, idx) => {
+          console.log(`  句 ${idx}  ${JSON.stringify(t)}`);
+
+          // 退出词不参与合并，命中就立刻结束
+          if (isExitWord(t)) {
+            console.log('  → 命中退出词');
+            pendingText = '';
+            if (pendingTimer) {
+              clearTimeout(pendingTimer);
+              pendingTimer = null;
+            }
+            enqueue(handleExit);
+            return;
+          }
+
+          // 唤醒词单独成句：不是一轮，丢掉继续听
+          if (isWakeWordOnly(t)) {
+            console.log('  → 唤醒词，丢弃（不算一轮）');
+            return;
+          }
+
+          pendingText = pendingText ? pendingText + t : t;
+
+          // 问号结尾 = 明确在提问，不必再等合并窗口
+          if (/[?？]\s*$/.test(t)) {
+            flushPending();
+            return;
+          }
+
+          if (pendingTimer) clearTimeout(pendingTimer);
+          pendingTimer = setTimeout(
+            () => { void evaluateTurn(); },
+            smartTurn ? SMART_TURN_QUIET_MS : MERGE_WINDOW_MS,
+          );
+        },
+        onError: (e) => {
+          // 空闲挂断是预期行为（网关对「没听到有效语音」的连接 10 s 就踢），
+          // 不是故障，不要用 ✗ 污染日志。
+          if (e.message.includes('IDLE_TIMEOUT')) {
+            console.log('  [asr] 空闲挂断（无有效语音，正常）');
+          } else {
+            console.error(`  ✗ ASR: ${e.message}`);
+          }
+        },
+      });
+
+      // 不在这里预建 ASR 连接：网关对「没听到有效语音」的连接 10 s 就判
+      // IDLE_TIMEOUT，而眼镜唤醒前根本不推帧。建连现在完全由下面的能量门驱动。
+
+      /**
+       * 上行能量门。
+       *
+       * 阿里云网关对「没听到有效语音」的连接 10 s 就判 IDLE_TIMEOUT（推静音不算活动），
+       * 而眼镜唤醒后会持续推帧、安静时是接近数字零的静音（实测峰值 −78 dBFS、RMS −91.6）。
+       * 所以用能量做闸门：没声音就根本不建连，有声音再连并把预卷补推上去。
+       */
+      const VOICE_PEAK_DBFS = -55;
+      /** 有声之后再多喂这么久：覆盖 max_sentence_silence=500 与服务端收尾 */
+      const VOICE_HOLD_MS = 2000;
+      /** 开门前保留的音频块，避免把第一个音节吐掉 */
+      const PREROLL_CHUNKS = 8;
+      let lastVoiceAt = 0;
+      let uploading = false;
+      let preroll: Buffer[] = [];
+
+      ff.stdout.on('data', (chunk: Buffer) => {
+        // 播放期间的音频正常会因 dropping 被丢弃，但 AEC 分析正需要它
+        if (speaking && DUMP_DIR) upDuringPlayback.push(Buffer.from(chunk));
+
+        const peak = peakDbfs(chunk);
+        const now = Date.now();
+        pushRecent(chunk);
+        if (peak > VOICE_PEAK_DBFS) {
+          lastVoiceAt = now;
+          if (!uploading) {
+            uploading = true;
+            console.log(`  上行    有声 ${peak.toFixed(1)} dBFS → 开始推送（补 ${preroll.length} 块）`);
+            for (const p of preroll) asrClient.feed(p);
+            preroll = [];
+          }
+        }
+        if (uploading) {
+          asrClient.feed(chunk);
+          if (now - lastVoiceAt > VOICE_HOLD_MS) {
+            uploading = false;
+            console.log('  上行    持续静音 → 停推并挂断（避免 IDLE_TIMEOUT）');
+            asrClient.hangup();
+          }
+        } else {
+          preroll.push(chunk);
+          if (preroll.length > PREROLL_CHUNKS) preroll.shift();
+        }
+      });
+
+      /** 把图片落盘（诊断用），返回路径 */
+      const persistPhoto = (jpeg: Buffer): string => {
+        mkdirSync(PHOTO_DIR, { recursive: true });
+        const file = join(PHOTO_DIR, `photo_${Date.now()}.jpg`);
+        writeFileSync(file, jpeg);
+        console.log(`  图片    ${jpeg.length} B  ${file}`);
+        return file;
+      };
+
+      /** 眼镜拍完一张图：落盘后交给 dsh 看，结果朗读出来 */
+      const handleImage = (jpeg: Buffer): void => {
+        persistPhoto(jpeg);
+        enqueue(() => handleTurn('这张图里有什么？用一两句话口语化描述。', {
+          mimeType: 'image/jpeg',
+          data: jpeg.toString('base64'),
+        }));
+      };
+
+      /**
+       * 上行帧解复用：{@code [type:u8][len:u32 LE][payload]}。
+       *
+       * type 1 = mSBC 语音（喂给 ffmpeg），type 2 = JPEG（交给 dsh）。
+       * 两者必须分开：整段图片要是被当成 SBC 解码，就是一片噪声。
+       */
+      let rxBuf: Buffer = Buffer.alloc(0);
+      sock.on('data', (d: Buffer) => {
+        rxBuf = rxBuf.length === 0 ? d : Buffer.concat([rxBuf, d]);
+        while (rxBuf.length >= 5) {
+          const type = rxBuf[0] ?? 0;
+          const len = rxBuf.readUInt32LE(1);
+          if (len > (32 << 20)) {
+            console.error(`  ✗ 帧长异常 ${len}，丢弃整个缓冲`);
+            rxBuf = Buffer.alloc(0);
+            break;
+          }
+          if (rxBuf.length < 5 + len) break;
+          const payload = rxBuf.subarray(5, 5 + len);
+          rxBuf = rxBuf.subarray(5 + len);
+          if (type === 1) {
+            if (!ff.stdin.destroyed) ff.stdin.write(payload);
+          } else if (type === 2) {
+            // 图片：优先给在等的 take_photo 工具，没人等就当普通识图轮次
+            if (pendingPhoto) {
+              persistPhoto(payload);
+              const r = pendingPhoto;
+              pendingPhoto = null;
+              r(payload);
+            } else {
+              handleImage(payload);
+            }
+          } else if (type === 3) {
+            const [txn = '', rid = ''] = payload.toString('utf8').split('\n');
+            wakeRef = { transactionId: txn, requestId: rid };
+            console.log(`  唤醒    transactionId=${wakeRef.transactionId}`
+              + `  requestId=${wakeRef.requestId.slice(0, 8)}…`);
+          } else {
+            console.error(`  ✗ 未知帧类型 ${type}（${len} B），已丢弃`);
+          }
+        }
+      });
+
+      sock.on('close', () => {
+        console.log(`\n连接结束，${turns} 轮`);
+        smartTurn?.stop();
+        photoCtl.close();
+        // 手机 listen 窗口到点会主动断，这里兜一次落盘
+        flushDump();
+        asrClient.close();
+        if (!ff.stdin.destroyed) ff.stdin.end();
+        setTimeout(() => {
+          try {
+            ff.kill();
+          } catch {
+            // 已退出
+          }
+        }, 1000).unref?.();
+        server.close();
+        resolve(0);
+      });
+
+      sock.on('error', (e: Error) => {
+        console.error('socket 错误: ' + e.message);
+      });
+    });
+
+    server.listen(port, '127.0.0.1', () => {
+      console.log(`监听 127.0.0.1:${port}（阿里云流式识别）`);
       console.log(`手机侧先执行： adb reverse tcp:${port} tcp:${port}\n`);
     });
   });
@@ -278,11 +1127,17 @@ async function main(): Promise<void> {
   const listen = Number(opt('--listen', '0'));
   const ffmpeg = opt('--ffmpeg', 'ffmpeg');
   const gapMs = Number(opt('--gap-ms', '20'));
-  const echo = argv.includes('--echo');
+  const workDir = opt('--work-dir', join(homedir(), 'voice-workspace'));
+  /** 冒烟用：把一张本地图片交给 dsh，打印它的描述后退出 */
+  const askImage = opt('--ask-image', '');
 
-  if (!replay && !listen) {
-    console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port>');
-    console.error('      [--ffmpeg <path>] [--gap-ms 20]');
+  const mode: ReplyMode = argv.includes('--agent')
+    ? 'agent'
+    : argv.includes('--echo') ? 'echo' : 'none';
+
+  if (!replay && !listen && !askImage) {
+    console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>')
+    console.error('      [--agent | --echo] [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
     process.exit(2);
   }
   if (!process.env.MIMO_API_KEY) {
@@ -290,13 +1145,92 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const pipe = new Pipeline(ffmpeg, echo);
+  let agent: VoiceAgent | null = null;
+  let dshSession: DshSession | null = null;
+  if (mode === 'agent') {
+    // SDK 模式：一个常驻进程跑多轮，省掉每轮的进程启动与会话重加载。
+    // 实测 headless 每轮 5–7 s，其中 2–3 s 是冷启动。
+    const useSdk = argv.includes('--dsh-sdk');
+    dshSession = new DshSession({
+      workDir,
+      program: process.env['DSH_BIN'],
+      mode: useSdk ? 'sdk' : 'headless',
+      patch: process.env['DSH_PATCH'],
+      provider: opt('--provider', 'deepseek-official'),
+      model: opt('--model', 'deepseek-flash'),
+      log: (l: string) => { console.log(`  [session] ${l}`); },
+    });
+    agent = new VoiceAgent(dshSession, (l: string) => { console.log(l); });
+    console.log(`agent 已就绪  workDir=${workDir}  dsh=${process.env['DSH_BIN'] ?? 'dsh'}  mode=${useSdk ? 'sdk' : 'headless'}`);
+    console.log(`会话      ${dshSession.currentSessionId ?? '（新会话）'}\n`);
+  }
+
+  // ---------------------------------------------------------------- 图片 -> dsh 冒烟
+  if (askImage) {
+    if (!agent) {
+      console.error('--ask-image 需要 --agent（图片只能交给 dsh 看）');
+      process.exit(2);
+    }
+    const buf = readFileSync(askImage);
+    const ext = askImage.toLowerCase().split('.').pop() ?? '';
+    const mime = ext === 'png' ? 'image/png'
+      : ext === 'webp' ? 'image/webp'
+        : ext === 'gif' ? 'image/gif'
+          : 'image/jpeg';
+    console.log(`图片    ${askImage}  ${buf.length} B  ${mime}`);
+    const t0 = Date.now();
+    const r = await agent.reply('这张图里有什么？用一两句话口语化描述。', {
+      mimeType: mime,
+      data: buf.toString('base64'),
+    });
+    console.log(`dsh     ${((Date.now() - t0) / 1000).toFixed(2)} s`);
+    console.log(`回答    ${JSON.stringify(r.text)}`);
+    dshSession?.stop();
+    process.exit(0);
+  }
+
+  // ---------------------------------------------------------------- 阿里云分支
+  const asrBackend = opt('--asr', 'mimo');
+  if (asrBackend === 'aliyun') {
+    const akId = process.env['ALIYUN_AK_ID'] ?? '';
+    const akSecret = process.env['ALIYUN_AK_SECRET'] ?? '';
+    const appkey = process.env['ALIYUN_APPKEY'] ?? '';
+    const region = process.env['ALIYUN_NLS_REGION'] ?? 'cn-shanghai';
+    if (!akId || !akSecret || !appkey) {
+      console.error('阿里云模式需要 ALIYUN_AK_ID / ALIYUN_AK_SECRET / ALIYUN_APPKEY');
+      process.exit(2);
+    }
+    if (!listen) {
+      console.error('阿里云模式只支持 --listen（流式识别没有 --replay 语义）');
+      process.exit(2);
+    }
+    if (!agent) {
+      console.error('阿里云模式需要 --agent（收到 SentenceEnd 就要接一轮对话）');
+      process.exit(2);
+    }
+    console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${opt('--sentence-silence', '500')} ms\n`);
+    const code = await runListenAliyun(listen, {
+      ffmpeg,
+      agent,
+      akId,
+      akSecret,
+      appkey,
+      region,
+      maxSentenceSilenceMs: Number(opt('--sentence-silence', '500')),
+    });
+    dshSession?.stop();
+    process.exit(code);
+  }
+
+  const pipe = new Pipeline(ffmpeg, mode, agent);
   await sleep(200);       // 等 VAD 初始化
 
   const code = replay
     ? await runReplay(replay, pipe, gapMs)
     : await runListen(listen, pipe);
 
+  // 常驻进程要显式关，否则 node 会因为子进程 stdin 仍打开而不退出
+  dshSession?.stop();
   process.exit(code);
 }
 
