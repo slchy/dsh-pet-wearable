@@ -10,7 +10,19 @@
  * 阈值 0.4 是标定出来的：同一段 37 秒录音在 0.9~0.02 之间判停点完全一致（10.08~10.18 s），
  * 说明判决稳定；0.01 会开始把噪声当语音。
  */
-import * as ort from 'onnxruntime-node';
+import type * as ort from 'onnxruntime-node';
+
+/**
+ * onnxruntime-node 的**惰性加载**。
+ *
+ * 只有 MiMo（本地 silero VAD）那条老路径才用得上它，而它装完是 300 MB 量级。
+ * 阿里云路径把判停完全交给了服务端，根本用不到 —— 所以改成用到时才 import。
+ */
+let ortPromise: Promise<typeof ort> | null = null;
+const ortModule = (): Promise<typeof ort> => {
+  ortPromise ??= import('onnxruntime-node');
+  return ortPromise;
+};
 
 export const SAMPLE_RATE = 16_000;
 /** 每帧采样点数（32 ms） */
@@ -29,13 +41,20 @@ export class SileroVad {
   }
 
   async init(): Promise<void> {
-    this.session = await ort.InferenceSession.create(this.modelPath);
-    this.reset();
+    const o = await ortModule();
+    this.session = await o.InferenceSession.create(this.modelPath);
+    this.reset(await ortModule());
   }
 
-  reset(): void {
+  reset(o?: typeof ort): void {
     // LSTM 的 h/c 两个状态，[2, batch, 128]
-    this.state = new ort.Tensor('float32', new Float32Array(2 * 1 * 128), [2, 1, 128]);
+    const ortRef = o;
+    if (ortRef) {
+      this.state = new ortRef.Tensor('float32', new Float32Array(2 * 1 * 128), [2, 1, 128]);
+    } else {
+      // 没传模块时只清 context，state 等 init 时再建
+      this.state = null;
+    }
     this.context = new Float32Array(CONTEXT);
   }
 
@@ -52,10 +71,11 @@ export class SileroVad {
     x.set(this.context, 0);
     x.set(frame, CONTEXT);
 
+    const o = await ortModule();
     const out = await this.session.run({
-      input: new ort.Tensor('float32', x, [1, CONTEXT + WINDOW]),
+      input: new o.Tensor('float32', x, [1, CONTEXT + WINDOW]),
       state: this.state,
-      sr: new ort.Tensor('int64', BigInt64Array.from([BigInt(SAMPLE_RATE)]), []),
+      sr: new o.Tensor('int64', BigInt64Array.from([BigInt(SAMPLE_RATE)]), []),
     });
 
     this.state = out.stateN as ort.Tensor;
