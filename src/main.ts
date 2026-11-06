@@ -578,20 +578,6 @@ function isWakeWordOnly(text: string): boolean {
   return WAKE_WORDS.has(bare);
 }
 
-/**
- * 显式退出词。归一化（去标点/空白）后整句匹配，避免「结束了」这种
- * 正常语句被当成指令。
- */
-const EXIT_WORDS = new Set([
-  '退出', '结束', '再见', '关闭', '停下', '停止', '不聊了', '就这样', '没事了', '关掉',
-]);
-const EXIT_REPLY = '好，先这样，需要时再叫我。';
-
-function isExitWord(text: string): boolean {
-  const bare = text.replace(/[\s。.,，!！?？、~～]/g, '');
-  return EXIT_WORDS.has(bare);
-}
-
 // ------------------------------------------------------------------ 阿里云流式识别
 interface AliyunRunOptions {
   ffmpeg: string;
@@ -625,7 +611,16 @@ interface AliyunRunOptions {
 const DUMP_DIR = process.env['DUMP_DIR'] ?? '';
 /** 眼镜拍到的图片落在哪里 */
 const PHOTO_DIR = process.env['PHOTO_DIR'] ?? join(homedir(), 'miai-photos');
-/** 给 MCP 工具 take_photo 用的本机控制口 */
+/**
+ * 服务端断句静音阈值。
+ *
+ * 阿里云文档：取值范围 200～2000，**默认 800**。
+ * 早先压到 500，比默认还激进 —— 中文一句话中间的停顿（尤其「退下吧」
+ * 这种短命令）很容易被切成独立句子，后面就错上加错。回退到默认值。
+ */
+const DEFAULT_SENTENCE_SILENCE_MS = 800;
+
+/** 给 MCP 工具 take_photo / end_session 用的本机控制口 */
 const PHOTO_CTL_PORT = Number(process.env['PHOTO_CTL_PORT'] ?? 8767);
 /** 等设备回图的超时 */
 const PHOTO_TIMEOUT_MS = 20_000;
@@ -672,13 +667,26 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       let pendingPhoto: ((jpeg: Buffer | null) => void) | null = null;
 
       /**
-       * 给 dsh 的 MCP 工具 `take_photo` 用的本机控制口。
+       * 给 dsh 的 MCP 工具用的本机控制口。
        *
-       * 工具是 dsh spawn 的独立进程，走 HTTP 回来；harness 在这里下发拍照指令、
-       * 等设备回图，再以 JPEG 响应。这样工具侧只需要知道一个 URL。
+       * 工具是 dsh spawn 的独立进程，走 HTTP 回来；harness 在这里下发硬件指令
+       * 或置会话状态，工具侧只需要知道一个 URL。
+       *
+       * - `POST /take_photo`  → 下发拍照指令，等设备回图，回应 JPEG
+       * - `POST /end_session` → 挂「本轮说完就结束」的旗子
        */
-      const photoCtl = createHttpServer((req, res) => {
-        if (req.method !== 'POST' || req.url !== '/take_photo') {
+      const toolCtl = createHttpServer((req, res) => {
+        if (req.method !== 'POST') {
+          res.writeHead(404).end();
+          return;
+        }
+        if (req.url === '/end_session') {
+          endRequested = true;
+          console.log('  退出    模型判定该结束了（说完这句就挂断）');
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('ok');
+          return;
+        }
+        if (req.url !== '/take_photo') {
           res.writeHead(404).end();
           return;
         }
@@ -710,7 +718,15 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           }
         });
       });
-      photoCtl.listen(PHOTO_CTL_PORT, '127.0.0.1');
+      // 每个连接都新建一个控制口。旧连接没关干净时端口会占着，
+      // 没有 error 监听会让整个 harness 崩掉 —— 这里只记一笔，不退出。
+      toolCtl.on('error', (e: Error) => {
+        console.error(`  ✗ 控制口 ${PHOTO_CTL_PORT}: ${e.message}`);
+      });
+      toolCtl.listen(PHOTO_CTL_PORT, '127.0.0.1');
+
+      /** 模型调了 `end_session`：本轮播完就挂断 */
+      let endRequested = false;
 
       let turns = 0;
       let speaking = false;
@@ -814,11 +830,12 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           // 不在这里主动重连：空连接会被 IDLE_TIMEOUT。
           // 下次真有音频进来时 feed() 会懒建立。
           asrClient.resume();
+          if (endRequested) {
+            console.log('\n--- 会话结束（模型判定）---');
+            if (!sock.destroyed) sock.end();
+          }
         }
       };
-
-      /** 收到退出词后，本轮流完就挂断整个会话 */
-      let exiting = false;
 
       /**
        * 句子合并窗口。
@@ -906,27 +923,6 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
         pendingTimer = setTimeout(() => { void evaluateTurn(); }, SMART_TURN_EXTEND_MS);
       };
 
-      const handleExit = async (): Promise<void> => {
-        exiting = true;
-        speaking = true;
-        asrClient.close();
-        try {
-          let bytes = 0;
-          for await (const pcm of ttsStream(EXIT_REPLY)) {
-            bytes += pcm.length;
-            writeDown(FRAME_DOWN_AUDIO, pcm);
-          }
-          // 等手机把告别语播完再断，否则最后几个字会被截
-          await sleep((bytes / (TTS_SAMPLE_RATE * 2)) * 1000 + 500);
-        } catch (e) {
-          console.log(`  ✗ 告别语失败: ${(e as Error).message}`);
-        } finally {
-          speaking = false;
-          console.log('\n--- 会话结束（退出词）---');
-          if (!sock.destroyed) sock.end();
-        }
-      };
-
       const asrClient = new AliyunAsr({
         akId: o.akId,
         akSecret: o.akSecret,
@@ -937,18 +933,6 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
         onPartial: (t) => { console.log(`  … ${t}`); },
         onSentence: (t, idx) => {
           console.log(`  句 ${idx}  ${JSON.stringify(t)}`);
-
-          // 退出词不参与合并，命中就立刻结束
-          if (isExitWord(t)) {
-            console.log('  → 命中退出词');
-            pendingText = '';
-            if (pendingTimer) {
-              clearTimeout(pendingTimer);
-              pendingTimer = null;
-            }
-            enqueue(handleExit);
-            return;
-          }
 
           // 唤醒词单独成句：不是一轮，丢掉继续听
           if (isWakeWordOnly(t)) {
@@ -991,8 +975,8 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
        * 而眼镜唤醒后会持续推帧、安静时是接近数字零的静音（实测峰值 −78 dBFS、RMS −91.6）。
        * 所以用能量做闸门：没声音就根本不建连，有声音再连并把预卷补推上去。
        */
-      const VOICE_PEAK_DBFS = -55;
-      /** 有声之后再多喂这么久：覆盖 max_sentence_silence=500 与服务端收尾 */
+      const VOICE_PEAK_DBFS = -58;
+      /** 有声之后再多喂这么久：覆盖 max_sentence_silence=800 与服务端收尾 */
       const VOICE_HOLD_MS = 2000;
       /** 开门前保留的音频块，避免把第一个音节吐掉 */
       const PREROLL_CHUNKS = 8;
@@ -1093,7 +1077,7 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
       sock.on('close', () => {
         console.log(`\n连接结束，${turns} 轮`);
         smartTurn?.stop();
-        photoCtl.close();
+        toolCtl.close();
         // 手机 listen 窗口到点会主动断，这里兜一次落盘
         flushDump();
         asrClient.close();
@@ -1214,7 +1198,7 @@ async function main(): Promise<void> {
       console.error('阿里云模式需要 --agent（收到 SentenceEnd 就要接一轮对话）');
       process.exit(2);
     }
-    console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${opt('--sentence-silence', '500')} ms\n`);
+    console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS))} ms\n`);
     const code = await runListenAliyun(listen, {
       ffmpeg,
       agent,
@@ -1222,7 +1206,7 @@ async function main(): Promise<void> {
       akSecret,
       appkey,
       region,
-      maxSentenceSilenceMs: Number(opt('--sentence-silence', '500')),
+      maxSentenceSilenceMs: Number(opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS))),
     });
     dshSession?.stop();
     process.exit(code);
