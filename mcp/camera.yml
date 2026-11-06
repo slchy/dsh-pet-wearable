@@ -1,0 +1,23 @@
+# dsh profile patch：把眼镜相机挂成 MCP 工具
+#
+# 用法：dsh --profile sdk --patch <部署路径>/miai-cloud/mcp/camera.yml
+# 工具名对模型是 mcp__camera__take_photo。
+#
+# 注意 patch 的格式（见 dsh-app-boot 的 applyEntryPatches）：
+#   - 裸条目 = 按 id 覆盖已有节点，找不到就报 "entry not found"
+#   - 要**新增**节点必须用 `insert:`，不带顶层 id 时追加到最外层
+#
+# 真正干活的是 mcp-camera.mjs：它 POST 本机 8767/take_photo，
+# harness 会经那条常驻 TCP 让手机复用 WakeUpEvent 的
+# transactionId/requestId 发 multiModel，再把 JPEG 回给它。
+- insert:
+    - id: mcp-camera
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: camera
+        transport: stdio
+        command: node
+        args:
+          - <部署路径>/miai-cloud/mcp/mcp-camera.mjs
+        toolCallTimeoutMs: 30000
+        failOnStartupError: false
