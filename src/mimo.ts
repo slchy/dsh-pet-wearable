@@ -131,15 +131,18 @@ export async function asr(wav: Buffer, language = 'auto'): Promise<{ text: strin
   return { text: pieces.join(''), chunks };
 }
 
-/** 文本 → PCM16 单声道 24 kHz。 */
-export async function tts(
+/**
+ * 文本 → PCM16 单声道 24 kHz，**流式**逐块吐出。
+ *
+ * 实测：首块 7680 字节（0.16 s 音频），首块延迟 0.77–0.88 s。
+ * 等整段收完再播，等于把"音频总时长"整个加到端到端延迟上
+ * （12 s 的回复就要多等 3.8 s）；边收边播把这一项降到首块延迟。
+ */
+export async function* ttsStream(
   text: string,
   voice = 'Chloe',
   style = 'Calm, natural, conversational.',
-): Promise<{ pcm: Buffer; chunks: number }> {
-  const parts: Buffer[] = [];
-  let chunks = 0;
-
+): AsyncGenerator<Buffer> {
   for await (const obj of sse({
     model: TTS_MODEL,
     messages: [
@@ -151,9 +154,19 @@ export async function tts(
   })) {
     const d = deltaAudio(obj);
     if (!d) continue;
-    parts.push(Buffer.from(d, 'base64'));
-    chunks += 1;
+    yield Buffer.from(d, 'base64');
   }
+}
 
-  return { pcm: Buffer.concat(parts), chunks };
+/** 文本 → PCM16 单声道 24 kHz。整段版本，内部就是收完 ttsStream。 */
+export async function tts(
+  text: string,
+  voice = 'Chloe',
+  style = 'Calm, natural, conversational.',
+): Promise<{ pcm: Buffer; chunks: number }> {
+  const parts: Buffer[] = [];
+  for await (const pcm of ttsStream(text, voice, style)) {
+    parts.push(pcm);
+  }
+  return { pcm: Buffer.concat(parts), chunks: parts.length };
 }
