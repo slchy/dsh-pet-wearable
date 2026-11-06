@@ -8,21 +8,17 @@
  * - VAD 从 webrtcvad 换成 silero-vad（ONNX），实测能正确忽略远场回声
  * - 其余链路不变，判停口径仍以"静音 4 秒"为准
  */
-import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { createServer as createHttpServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { VoiceAgent } from './agent.ts';
-import { AliyunAsr } from './aliyun-asr.ts';
-import { DialogFsm } from './dialog-fsm.ts';
-import { asr, pcmToWav, ttsStream, TTS_SAMPLE_RATE } from './mimo.ts';
-import { DshSession, type ImageAttachment } from './session.ts';
-import { SmartTurn } from './smart-turn.ts';
+import { ttsStream, TTS_SAMPLE_RATE } from './mimo.ts';
+import { DshSession } from './session.ts';
+import { runAliyunServer } from './aliyun-session.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
-import { sleep, peakDbfs } from './util.ts';
+import { sleep } from './util.ts';
 
 // ------------------------------------------------------------------ 入口
 async function runReplay(path: string, pipe: Pipeline, gapMs: number): Promise<number> {
@@ -113,589 +109,18 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
  * 第二个才是真正的命令。Smart Turn 对「小爱同学。」给 0.957（它确实是完整的一句话），
  * 所以模型治不了这个，只能靠这条领域规则。
  */
-const WAKE_WORDS = new Set(['小爱同学', '小爱', '小爱小爱']);
-
-function isWakeWordOnly(text: string): boolean {
-  const bare = text.replace(/[\s。.,，!！?？、~～]/g, '');
-  return WAKE_WORDS.has(bare);
-}
-
-// ------------------------------------------------------------------ 阿里云流式识别
-interface AliyunRunOptions {
-  ffmpeg: string;
-  agent: VoiceAgent;
-  akId: string;
-  akSecret: string;
-  appkey: string;
-  region: string;
-  maxSentenceSilenceMs?: number;
-}
-
-/**
- * 阿里云流式识别模式。
- *
- * 跟 MiMo 分支的根本区别：**音频是边推边出字的**。服务端检测到句子结束就发
- * `SentenceEnd`，本地 silero VAD + 双阈值那套退役。
- *
- * 判停分两级：
- * 1. 服务端 `SentenceEnd` 给出「可能说完了」的候选点；
- * 2. 本地 Smart Turn 对候选点做语义确认（见 `evaluateTurn`），
- *    概率不足就延长窗口。服务端的静音阈值只是候选，不是最终判决。
- *
- * 半双工（暂）：TTS 播放期间不把上行送进 ASR。
- * 实测固件**自带回声消除**（ERL ≈ 75 dB，双讲期噪声底 -80 dBFS 以下），
- * 所以这一条不是技术限制，只是还没做打断控制 —— 见 TODO T-005。
- */
-/**
- * 设了就把每轮的「下行 TTS」与「播放期间的麦克风」落盘，
- * 供 AEC 可行性分析（延迟 / 回声衰减 / 线性可预测性）。
- */
-const DUMP_DIR = process.env['DUMP_DIR'] ?? '';
-/** 眼镜拍到的图片落在哪里 */
-const PHOTO_DIR = process.env['PHOTO_DIR'] ?? join(homedir(), 'miai-photos');
-/**
- * 服务端断句静音阈值。
- *
- * 阿里云文档：取值范围 200～2000，**默认 800**。
- * 早先压到 500，比默认还激进 —— 中文一句话中间的停顿（尤其「退下吧」
- * 这种短命令）很容易被切成独立句子，后面就错上加错。回退到默认值。
- */
+/** 服务端断句静音阈值。阿里云默认 800 ms；早先压到 500，比默认还激进。 */
 const DEFAULT_SENTENCE_SILENCE_MS = 800;
 
-/** 给 MCP 工具 take_photo / end_session 用的本机控制口 */
-const PHOTO_CTL_PORT = Number(process.env['PHOTO_CTL_PORT'] ?? 8767);
-/** 等设备回图的超时 */
-const PHOTO_TIMEOUT_MS = 20_000;
-
-// ---------------------------------------------------------------- 判停（Smart Turn）
-/** 置 0 退回旧的「固定 600 ms 合并窗口」行为 */
-const SMART_TURN_ENABLED = process.env['SMART_TURN'] !== '0';
-const SMART_TURN_PYTHON = process.env['SMART_TURN_PYTHON'] ?? '';
-const SMART_TURN_SCRIPT = process.env['SMART_TURN_SCRIPT'] ?? '';
-/** 句子结束后先静候这么久，给用户一个自然接话的间隙 */
-const SMART_TURN_QUIET_MS = Number(process.env['SMART_TURN_QUIET_MS'] ?? 350);
-/** 判为「没说完」时再多等这么久再判一次 */
+/** Smart Turn 判为「没说完」时再多等多久 */
 const SMART_TURN_EXTEND_MS = Number(process.env['SMART_TURN_EXTEND_MS'] ?? 700);
-/** 最多再等几轮，防止一直不认完 */
-const SMART_TURN_MAX_EXT = Number(process.env['SMART_TURN_MAX_EXT'] ?? 3);
-/** 概率阀值：≥ 此值就叫停 */
-const SMART_TURN_THRESHOLD = Number(process.env['SMART_TURN_THRESHOLD'] ?? 0.5);
-/** 送进模型的最近音频上限（16 kHz × 2 B × 8 s） */
-const RECENT_MAX_BYTES = 16_000 * 2 * 8;
 
-/** 下行帧类型：PCM（24 kHz） */
-const FRAME_DOWN_AUDIO = 1;
-/** 下行帧类型：控制指令 */
-const FRAME_DOWN_CONTROL = 2;
-
-async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<number> {
-  return await new Promise<number>((resolve) => {
-    const server = createServer((sock) => {
-      console.log(`已连接 ${sock.remoteAddress}:${sock.remotePort}\n`);
-
-      /** 下行帧：{@code [type:u8][len:u32 LE][payload]}，与手机侧一致 */
-      const writeDown = (type: number, payload: Buffer): void => {
-        if (sock.destroyed) return;
-        const head = Buffer.allocUnsafe(5);
-        head[0] = type;
-        head.writeUInt32LE(payload.length, 1);
-        sock.write(head);
-        sock.write(payload);
-      };
-
-      /** 最近一次 WakeUpEvent 的上下文（手机侧已缓存，这里只做诊断展示） */
-      let wakeRef: { transactionId: string; requestId: string } | null = null;
-      /** 等照片的 resolver；同一时刻只允许一个在途请求 */
-      let pendingPhoto: ((jpeg: Buffer | null) => void) | null = null;
-
-      /**
-       * 给 dsh 的 MCP 工具用的本机控制口。
-       *
-       * 工具是 dsh spawn 的独立进程，走 HTTP 回来；harness 在这里下发硬件指令
-       * 或置会话状态，工具侧只需要知道一个 URL。
-       *
-       * - `POST /take_photo`  → 下发拍照指令，等设备回图，回应 JPEG
-       * - `POST /end_session` → 挂「本轮说完就结束」的旗子
-       */
-      const toolCtl = createHttpServer((req, res) => {
-        if (req.method !== 'POST') {
-          res.writeHead(404).end();
-          return;
-        }
-        if (req.url === '/end_session') {
-          console.log('  退出    模型判定该结束了（说完这句就挂断）');
-          fsm.requestEnd();
-          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('ok');
-          return;
-        }
-        if (req.url !== '/take_photo') {
-          res.writeHead(404).end();
-          return;
-        }
-        if (pendingPhoto) {
-          res.writeHead(409, { 'content-type': 'text/plain; charset=utf-8' })
-            .end('已有拍照请求在途');
-          return;
-        }
-        const wait = new Promise<Buffer | null>((resolve) => { pendingPhoto = resolve; });
-        writeDown(FRAME_DOWN_CONTROL, Buffer.from('take_photo', 'utf8'));
-        console.log('  拍照    已下发指令，等设备回图…');
-        const timer = setTimeout(() => {
-          const r = pendingPhoto;
-          pendingPhoto = null;
-          r?.(null);
-        }, PHOTO_TIMEOUT_MS);
-        void wait.then((jpeg) => {
-          clearTimeout(timer);
-          if (!res.writableEnded) {
-            if (!jpeg) {
-              res.writeHead(504).end('等图超时');
-            } else {
-              res.writeHead(200, {
-                'content-type': 'image/jpeg',
-                'content-length': String(jpeg.length),
-              });
-              res.end(jpeg);
-            }
-          }
-        });
-      });
-      // 每个连接都新建一个控制口。旧连接没关干净时端口会占着，
-      // 没有 error 监听会让整个 harness 崩掉 —— 这里只记一笔，不退出。
-      toolCtl.on('error', (e: Error) => {
-        console.error(`  ✗ 控制口 ${PHOTO_CTL_PORT}: ${e.message}`);
-      });
-      toolCtl.listen(PHOTO_CTL_PORT, '127.0.0.1');
-
-      /**
-       * 对话状态机。所有「现在算不算在播」「这一轮该不该继续」的判断
-       * 全部集中在它那里，不再散成一堆互斥布尔量。
-       */
-      const fsm = new DialogFsm((l) => { console.log(l); });
-
-      /** 播放期间的上行 PCM，用于 AEC 分析 */
-      let upDuringPlayback: Buffer[] = [];
-      /** 本轮下行 TTS 参考，同样是 AEC 分析用 */
-      let downChunks: Buffer[] = [];
-      /** 已经落过盘的轮次，防止重复写 */
-      let dumpedTurn = 0;
-      /**
-       * 落盘。正常在 sleep 之后调（那时才是完整播放期），
-       * 但手机 listen 窗口到点会主动断开，进程随即退出 ——
-       * 所以 sock close 时也要再兜一次，否则整轮白跑。
-       */
-      const flushDump = (): void => {
-        const turns = fsm.turn;
-        if (!DUMP_DIR || turns === 0 || dumpedTurn === turns) return;
-        dumpedTurn = turns;
-        try {
-          mkdirSync(DUMP_DIR, { recursive: true });
-          writeFileSync(join(DUMP_DIR, `down_${turns}.pcm`), Buffer.concat(downChunks));
-          writeFileSync(join(DUMP_DIR, `up_${turns}.pcm`), Buffer.concat(upDuringPlayback));
-          console.log(`  落盘    down_${turns}.pcm ${Buffer.concat(downChunks).length}B`
-            + `  up_${turns}.pcm ${Buffer.concat(upDuringPlayback).length}B`);
-        } catch (e) {
-          console.error(`  ✗ 落盘失败: ${(e as Error).message}`);
-        }
-      };
-      let chain: Promise<void> = Promise.resolve();
-      /**
-       * 串行队列。三条要求缺一不可：
-       *   1. 严格串行 —— 上一轮 TTS 没发完时不能开下一轮
-       *   2. 错误隔离 —— 某一轮抛错只能作废该轮，不能让 chain 变成
-       *      rejected 状态，否则后续所有 `.then` 都会短路，整个连接哑掉
-       *   3. 可作废 —— 出队时票据代次已变就跳过（用户已插话，这轮过时了）
-       */
-      const enqueue = (fn: () => Promise<void>): void => {
-        const ticket = fsm.ticket();
-        chain = chain.then(() => {
-          if (fsm.isStale(ticket)) {
-            console.log('  （丢弃：用户已插话，这一轮过时了）');
-            return;
-          }
-          return fn();
-        }).catch((e: Error) => {
-          console.error(`  ✗ 队列任务失败（不影响后续）: ${e.message}`);
-        });
-      };
-
-      const ff = spawn(o.ffmpeg, [
-        '-hide_banner', '-loglevel', 'error',
-        '-f', 'sbc', '-i', 'pipe:0',
-        '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1',
-      ], { stdio: ['pipe', 'pipe', 'pipe'] });
-      ff.stderr.on('data', (d: Buffer) => {
-        const s = d.toString().trim();
-        if (s) console.error('[ffmpeg] ' + s);
-      });
-
-      /**
-       * 用户插话：停播 + 作废排队轮次。
-       *
-       * 靠 ASR 中间结果触发，不靠能量 —— 纯能量判据在环境噪声下误触率太高。
-       * 中间结果非空就说明服务端真的听出了字，不是“有点像人声”。
-       * 「能不能插话」由状态机判定：只有 speaking 才算（thinking 期间
-       * 回复还没出声，打断它等于白白丢掉一个刚准备好的回答）。
-       */
-      const tryBargeIn = (why: string): void => {
-        if (!fsm.bargeIn(why)) return;
-        console.log(`  打断    ${why} → 停止播放，已排队的轮次作废`);
-        writeDown(FRAME_DOWN_CONTROL, Buffer.from('stop', 'utf8'));
-      };
-
-      const handleTurn = async (text: string, image?: ImageAttachment): Promise<void> => {
-        const ticket = fsm.beginTurn();
-        if (!ticket) return;
-        // 全双工：**不挂断 ASR**。
-        //
-        // 以前播放期先 close + 预重连，因为“没有 AEC，不挡就会听到自己”。
-        // 实测固件自带回声消除（播放期回波底噪 −80 dBFS，ERL ≥ 75 dB 估算），
-        // 远低于能量门 −58 dBFS —— 回声根本进不了 ASR。
-        upDuringPlayback = [];
-        downChunks = [];
-        try {
-          const t0 = Date.now();
-          const r = await o.agent.reply(text, image);
-          console.log(`  agent   ${((Date.now() - t0) / 1000).toFixed(2)} s  `
-            + `${JSON.stringify(r.text.slice(0, 120))}`);
-
-          const t1 = Date.now();
-          let bytes = 0;
-          let firstAt = 0;
-          for await (const pcm of ttsStream(r.speech)) {
-            if (fsm.isStale(ticket)) break;
-            if (firstAt === 0) {
-              firstAt = Date.now();
-              fsm.audioStarted(ticket);
-              console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
-            }
-            bytes += pcm.length;
-            if (DUMP_DIR) downChunks.push(Buffer.from(pcm));
-            writeDown(FRAME_DOWN_AUDIO, pcm);
-          }
-          const secs = bytes / (TTS_SAMPLE_RATE * 2);
-          const cut = fsm.isStale(ticket);
-          console.log(`  回放    ${bytes} 字节  ${secs.toFixed(2)} s${cut ? '（被中断）' : ''}`);
-
-          // 一行结构化汇总，便于事后 grep 统计 P50/P95：
-          //   grep '^TURN ' harness.log
-          const ttsFirstMs = firstAt ? firstAt - t1 : -1;
-          console.log(`TURN n=${ticket.no} text_len=${text.length} dsh_ms=${r.durationMs}`
-            + ` tts_first_ms=${ttsFirstMs} audio_s=${secs.toFixed(2)}`
-            + (cut ? ' barge_in=1' : ''));
-
-          // 等手机把这段播完再恢复收音，否则下一轮会识别到自己。
-          // 状态机在整个等待期间保持 `speaking`（不是「TTS 生成结束」就
-          // 回 listening），否则真正响的那 10–20 s 里插话不算数。
-          // 等待必须可被插话提前结束。
-          if (!cut) {
-            const until = Date.now() + secs * 1000 + 600;
-            while (!fsm.isStale(ticket) && Date.now() < until) {
-              await sleep(100);
-            }
-          }
-
-          // 落盘必须在等待之后：那段时间才是真正的播放期，
-          // 放在前面只能录到「agent 思考 + TTS 生成」，录不到回声。
-          flushDump();
-        } catch (e) {
-          console.log(`  ✗ 本轮失败: ${(e as Error).message}`);
-        } finally {
-          fsm.audioDone(ticket);
-          if (fsm.state === 'ending') {
-            console.log('\n--- 会话结束（模型判定）---');
-            if (!sock.destroyed) sock.end();
-          }
-        }
-      };
-
-      /**
-       * 句子合并窗口。
-       *
-       * 服务端的 `SentenceEnd` 只是**句子**边界，不是**轮次**边界：
-       * 「嗯。」「我问你在干什么？」会各发一次，直接照单全收就是两轮问答。
-       * 所以收到后先攒着，窗口内再来一句就拼上一起处理。
-       *
-       * 例外：以问号结尾的句子立刻触发 —— 用户在提问，没有再等下去的道理。
-       */
-      let pendingText = '';
-      let pendingTimer: NodeJS.Timeout | null = null;
-      /** 旧行为（SMART_TURN=0 时）的固定合并窗口 */
-      const MERGE_WINDOW_MS = 600;
-      /** Smart Turn 已连续判了几次「没说完」 */
-      let extensions = 0;
-
-      const smartTurn = SMART_TURN_ENABLED && SMART_TURN_PYTHON && SMART_TURN_SCRIPT
-        ? new SmartTurn({
-            python: SMART_TURN_PYTHON,
-            script: SMART_TURN_SCRIPT,
-            log: (l) => { console.log(`  ${l}`); },
-          })
-        : null;
-
-      /** 最近的音频（16 kHz PCM），给 Smart Turn 用 */
-      let recentChunks: Buffer[] = [];
-      let recentBytes = 0;
-      const pushRecent = (c: Buffer): void => {
-        recentChunks.push(Buffer.from(c));
-        recentBytes += c.length;
-        while (recentBytes > RECENT_MAX_BYTES && recentChunks.length > 1) {
-          const drop = recentChunks.shift();
-          recentBytes -= drop?.length ?? 0;
-        }
-      };
-
-      const flushPending = (): void => {
-        if (pendingTimer) {
-          clearTimeout(pendingTimer);
-          pendingTimer = null;
-        }
-        extensions = 0;
-        const text = pendingText.trim();
-        pendingText = '';
-        if (!text) return;
-        console.log('\n--- 本轮 ---');
-        console.log(`  文本    ${JSON.stringify(text)}`);
-        enqueue(() => handleTurn(text));
-      };
-
-      /**
-       * 句子结束后「要不要把这一轮定下来」。
-       *
-       * 服务端的 SentenceEnd 只是**句子**边界：实测「小爱同学。」和
-       * 「我眼前的是什么？」会各发一次，照着收就是两轮问答（白烧一次 dsh）。
-       * 固定 600 ms 窗口搞不定 —— 这个间隔实测 1.2 s。
-       * 所以交给 Smart Turn 看**音频本身**说没说完；它说没说完就再等一段。
-       */
-      const evaluateTurn = async (): Promise<void> => {
-        pendingTimer = null;
-        if (!pendingText.trim()) return;
-
-        if (!smartTurn) {
-          flushPending();
-          return;
-        }
-
-        const audio = Buffer.concat(recentChunks);
-        const prob = await smartTurn.predict(audio);
-        const shown = prob < 0 ? '故障' : prob.toFixed(3);
-        if (prob < 0) {
-          // 侧车出问题就退回保守策略，别把一轮吞掉
-          console.log(`  判停    ${shown} → 侧车不可用，直接结束本轮`);
-          flushPending();
-          return;
-        }
-        if (prob >= SMART_TURN_THRESHOLD || extensions >= SMART_TURN_MAX_EXT) {
-          console.log(`  判停    ${shown} → 收下这一轮`);
-          flushPending();
-          return;
-        }
-        extensions += 1;
-        console.log(`  判停    ${shown} → 没说完，再等 ${SMART_TURN_EXTEND_MS} ms`);
-        pendingTimer = setTimeout(() => { void evaluateTurn(); }, SMART_TURN_EXTEND_MS);
-      };
-
-      const asrClient = new AliyunAsr({
-        akId: o.akId,
-        akSecret: o.akSecret,
-        appkey: o.appkey,
-        region: o.region,
-        maxSentenceSilenceMs: o.maxSentenceSilenceMs,
-        log: (l) => { console.log(`  ${l}`); },
-        onPartial: (t) => {
-          console.log(`  … ${t}`);
-          // 全双工打断：播放期只要服务端真的解出了字，就当用户在插话。
-          // 用「非空中间结果」而不是能量阀值 —— 环境噪声能骗过峰值，骗不过识别器。
-          const bare = t.replace(/[\s。.,，!！?？、~～]/g, '');
-          if (bare.length >= 2) tryBargeIn(t);
-        },
-        onSentence: (t, idx) => {
-          console.log(`  句 ${idx}  ${JSON.stringify(t)}`);
-
-          // 唤醒词单独成句：不是一轮，丢掉继续听
-          if (isWakeWordOnly(t)) {
-            console.log('  → 唤醒词，丢弃（不算一轮）');
-            return;
-          }
-
-          pendingText = pendingText ? pendingText + t : t;
-
-          // 早先这里有一条「问号结尾直接收下这一轮」的快路径。
-          // 实测它把一句话拆成了三轮：
-          //   「你在运行什么？」（句中停顿被判成句尾）→「平台上。」
-          // ASR 的 `？` 是按语调加的，不代表语义完整，所以取消了，
-          // 统一交给 Smart Turn 看音频本身（代价只多 SMART_TURN_QUIET_MS）。
-          if (pendingTimer) clearTimeout(pendingTimer);
-          pendingTimer = setTimeout(
-            () => { void evaluateTurn(); },
-            smartTurn ? SMART_TURN_QUIET_MS : MERGE_WINDOW_MS,
-          );
-        },
-        onError: (e) => {
-          // 空闲挂断是预期行为（网关对「没听到有效语音」的连接 10 s 就踢），
-          // 不是故障，不要用 ✗ 污染日志。
-          if (e.message.includes('IDLE_TIMEOUT')) {
-            console.log('  [asr] 空闲挂断（无有效语音，正常）');
-          } else {
-            console.error(`  ✗ ASR: ${e.message}`);
-          }
-        },
-      });
-
-      // 不在这里预建 ASR 连接：网关对「没听到有效语音」的连接 10 s 就判
-      // IDLE_TIMEOUT，而眼镜唤醒前根本不推帧。建连现在完全由下面的能量门驱动。
-
-      /**
-       * 上行能量门。
-       *
-       * 阿里云网关对「没听到有效语音」的连接 10 s 就判 IDLE_TIMEOUT（推静音不算活动），
-       * 而眼镜唤醒后会持续推帧、安静时是接近数字零的静音（实测峰值 −78 dBFS、RMS −91.6）。
-       * 所以用能量做闸门：没声音就根本不建连，有声音再连并把预卷补推上去。
-       */
-      const VOICE_PEAK_DBFS = -58;
-      /** 有声之后再多喂这么久：覆盖 max_sentence_silence=800 与服务端收尾 */
-      const VOICE_HOLD_MS = 2000;
-      /**
-       * 开门前保留的音频（毫秒）。**必须按字节算，不能按块数。**
-       *
-       * 实测：ffmpeg 每次吐的块大小不固定 —— 同一次会话里既见过「8 块 = 105 ms」
-       * 也见过「3 块 = 225 ms」。旧代码 PREROLL_CHUNKS=8 在第一种情况下
-       * 只能盖 105 ms，连一个中文音节都不够，于是开头被削：
-       * 「你在运行什么」被识别成「李运行在什么」（nǐ→lǐ）。
-       */
-      const PREROLL_MS = 800;
-      /** 16 kHz × 2 B = 32 B/ms */
-      const PREROLL_BYTES = PREROLL_MS * 32;
-      let lastVoiceAt = 0;
-      let uploading = false;
-      let preroll: Buffer[] = [];
-      let prerollBytes = 0;
-
-      ff.stdout.on('data', (chunk: Buffer) => {
-        // 播放期间的音频正常会因状态机处于 speaking 而只用于 AEC 分析
-        if (fsm.state === 'speaking' && DUMP_DIR) upDuringPlayback.push(Buffer.from(chunk));
-
-        const peak = peakDbfs(chunk);
-        const now = Date.now();
-        pushRecent(chunk);
-        if (peak > VOICE_PEAK_DBFS) {
-          lastVoiceAt = now;
-          if (!uploading) {
-            uploading = true;
-            console.log(`  上行    有声 ${peak.toFixed(1)} dBFS → 开始推送`
-              + `（补 ${preroll.length} 块 / ${Math.round(prerollBytes / 32)} ms）`);
-            for (const p of preroll) asrClient.feed(p);
-            preroll = [];
-            prerollBytes = 0;
-          }
-        }
-        if (uploading) {
-          asrClient.feed(chunk);
-          if (now - lastVoiceAt > VOICE_HOLD_MS) {
-            uploading = false;
-            console.log('  上行    持续静音 → 停推并挂断（避免 IDLE_TIMEOUT）');
-            asrClient.hangup();
-          }
-        } else {
-          preroll.push(chunk);
-          prerollBytes += chunk.length;
-          while (prerollBytes > PREROLL_BYTES && preroll.length > 1) {
-            prerollBytes -= preroll.shift()!.length;
-          }
-        }
-      });
-
-      /** 把图片落盘（诊断用），返回路径 */
-      const persistPhoto = (jpeg: Buffer): string => {
-        mkdirSync(PHOTO_DIR, { recursive: true });
-        const file = join(PHOTO_DIR, `photo_${Date.now()}.jpg`);
-        writeFileSync(file, jpeg);
-        console.log(`  图片    ${jpeg.length} B  ${file}`);
-        return file;
-      };
-
-      /** 眼镜拍完一张图：落盘后交给 dsh 看，结果朗读出来 */
-      const handleImage = (jpeg: Buffer): void => {
-        persistPhoto(jpeg);
-        enqueue(() => handleTurn('这张图里有什么？用一两句话口语化描述。', {
-          mimeType: 'image/jpeg',
-          data: jpeg.toString('base64'),
-        }));
-      };
-
-      /**
-       * 上行帧解复用：{@code [type:u8][len:u32 LE][payload]}。
-       *
-       * type 1 = mSBC 语音（喂给 ffmpeg），type 2 = JPEG（交给 dsh）。
-       * 两者必须分开：整段图片要是被当成 SBC 解码，就是一片噪声。
-       */
-      let rxBuf: Buffer = Buffer.alloc(0);
-      sock.on('data', (d: Buffer) => {
-        rxBuf = rxBuf.length === 0 ? d : Buffer.concat([rxBuf, d]);
-        while (rxBuf.length >= 5) {
-          const type = rxBuf[0] ?? 0;
-          const len = rxBuf.readUInt32LE(1);
-          if (len > (32 << 20)) {
-            console.error(`  ✗ 帧长异常 ${len}，丢弃整个缓冲`);
-            rxBuf = Buffer.alloc(0);
-            break;
-          }
-          if (rxBuf.length < 5 + len) break;
-          const payload = rxBuf.subarray(5, 5 + len);
-          rxBuf = rxBuf.subarray(5 + len);
-          if (type === 1) {
-            if (!ff.stdin.destroyed) ff.stdin.write(payload);
-          } else if (type === 2) {
-            // 图片：优先给在等的 take_photo 工具，没人等就当普通识图轮次
-            if (pendingPhoto) {
-              persistPhoto(payload);
-              const r = pendingPhoto;
-              pendingPhoto = null;
-              r(payload);
-            } else {
-              handleImage(payload);
-            }
-          } else if (type === 3) {
-            const [txn = '', rid = ''] = payload.toString('utf8').split('\n');
-            wakeRef = { transactionId: txn, requestId: rid };
-            console.log(`  唤醒    transactionId=${wakeRef.transactionId}`
-              + `  requestId=${wakeRef.requestId.slice(0, 8)}…`);
-          } else {
-            console.error(`  ✗ 未知帧类型 ${type}（${len} B），已丢弃`);
-          }
-        }
-      });
-
-      sock.on('close', () => {
-        console.log(`\n连接结束，${fsm.turn} 轮`);
-        fsm.close();
-        smartTurn?.stop();
-        toolCtl.close();
-        // 手机 listen 窗口到点会主动断，这里兜一次落盘
-        flushDump();
-        asrClient.close();
-        if (!ff.stdin.destroyed) ff.stdin.end();
-        setTimeout(() => {
-          try {
-            ff.kill();
-          } catch {
-            // 已退出
-          }
-        }, 1000).unref?.();
-        server.close();
-        resolve(0);
-      });
-
-      sock.on('error', (e: Error) => {
-        console.error('socket 错误: ' + e.message);
-      });
-    });
-
-    server.listen(port, '127.0.0.1', () => {
-      console.log(`监听 127.0.0.1:${port}（阿里云流式识别）`);
-      console.log(`手机侧先执行： adb reverse tcp:${port} tcp:${port}\n`);
-    });
-  });
+/** 读一个数字型环境变量，非法值退回默认 */
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 async function main(): Promise<void> {
@@ -791,15 +216,44 @@ async function main(): Promise<void> {
       console.error('阿里云模式需要 --agent（收到 SentenceEnd 就要接一轮对话）');
       process.exit(2);
     }
-    console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS))} ms\n`);
-    const code = await runListenAliyun(listen, {
-      ffmpeg,
+    const sentenceSilenceMs = Number(
+      opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS)),
+    );
+    console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms\n`);
+
+    const smartTurnPython = process.env['SMART_TURN_PYTHON'] ?? '';
+    const smartTurnScript = process.env['SMART_TURN_SCRIPT'] ?? '';
+    const smartTurnEnabled = process.env['SMART_TURN'] !== '0'
+      && smartTurnPython !== '' && smartTurnScript !== '';
+
+    const code = await runAliyunServer({
+      port: listen,
+      ffmpegPath: ffmpeg,
       agent,
-      akId,
-      akSecret,
-      appkey,
-      region,
-      maxSentenceSilenceMs: Number(opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS))),
+      asr: { akId, akSecret, appkey, region, maxSentenceSilenceMs: sentenceSilenceMs },
+      smartTurn: smartTurnEnabled
+        ? {
+          pythonPath: smartTurnPython,
+          scriptPath: smartTurnScript,
+          quietMs: envNumber('SMART_TURN_QUIET_MS', 350),
+          extendMs: SMART_TURN_EXTEND_MS,
+          maxExtensions: envNumber('SMART_TURN_MAX_EXT', 3),
+          threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
+        }
+        : undefined,
+      gate: {
+        thresholdDbfs: envNumber('VOICE_PEAK_DBFS', -58),
+        holdMs: envNumber('VOICE_HOLD_MS', 2000),
+        prerollMs: envNumber('VOICE_PREROLL_MS', 800),
+      },
+      ttsSampleRate: TTS_SAMPLE_RATE,
+      playbackTailMs: 600,
+      dumpDir: process.env['DUMP_DIR'] ?? '',
+      photoDir: process.env['PHOTO_DIR'] ?? join(homedir(), 'miai-photos'),
+      controlPort: envNumber('PHOTO_CTL_PORT', 8767),
+      photoTimeoutMs: 20_000,
+      imageQuestion: '这张图里有什么？用一两句话口语化描述。',
+      synthesize: (t: string) => ttsStream(t),
     });
     dshSession?.stop();
     process.exit(code);

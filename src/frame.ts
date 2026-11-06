@@ -1,0 +1,102 @@
+/**
+ * 手机 ↔ 云端的分帧协议：`[type:u8][length:u32 LE][payload]`。
+ *
+ * 本模块**只做编解码**，不认识任何业务语义；I/O 由调用方负责
+ * （{@link FrameWriter} 只依赖 `Writable`，不依赖 `net.Socket`）。
+ */
+import type { Writable } from 'node:stream';
+
+/** 帧头长度：1 字节类型 + 4 字节长度 */
+export const FRAME_HEADER_BYTES = 5;
+
+/**
+ * 单帧上限。超过就判定为长度字段错位，丢弃整个接收缓冲 ——
+ * 否则会一直等一个永远不会凑齐的长度。
+ */
+export const FRAME_MAX_BYTES = 32 << 20;
+
+/** 上行帧类型（手机 → 云端） */
+export const UpstreamFrameType = {
+  /** mSBC 原始字节，未解码 */
+  Audio: 1,
+  /** JPEG */
+  Image: 2,
+  /** 唤醒上下文：`transactionId\nrequestId` */
+  Wake: 3,
+} as const;
+
+/** 下行帧类型（云端 → 手机） */
+export const DownstreamFrameType = {
+  /** PCM16 24 kHz */
+  Audio: 1,
+  /** UTF-8 控制串：`take_photo` / `stop` */
+  Control: 2,
+} as const;
+
+export interface DecodedFrame {
+  readonly type: number;
+  readonly payload: Buffer;
+}
+
+/**
+ * 增量解帧。
+ *
+ * `push` 可以喂任意切分的字节流（TCP 会任意切），返回本次凑齐的完整帧；
+ * 未凑齐的留在内部缓冲里。**半包必须处理** —— 假设一次 `read` 拿到完整帧
+ * 是这类协议最常见的错。
+ */
+export class FrameDecoder {
+  private readonly onProtocolError: (message: string) => void;
+  private buffer: Buffer = Buffer.alloc(0);
+
+  constructor(onProtocolError: (message: string) => void) {
+    this.onProtocolError = onProtocolError;
+  }
+
+  push(chunk: Buffer): DecodedFrame[] {
+    this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+
+    const frames: DecodedFrame[] = [];
+    while (this.buffer.length >= FRAME_HEADER_BYTES) {
+      const type = this.buffer[0] ?? 0;
+      const length = this.buffer.readUInt32LE(1);
+      if (length > FRAME_MAX_BYTES) {
+        this.onProtocolError(`帧长异常 ${length}，丢弃整个缓冲`);
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+      if (this.buffer.length < FRAME_HEADER_BYTES + length) {
+        break;
+      }
+      const start = FRAME_HEADER_BYTES;
+      const end = FRAME_HEADER_BYTES + length;
+      frames.push({ type, payload: this.buffer.subarray(start, end) });
+      this.buffer = this.buffer.subarray(end);
+    }
+    return frames;
+  }
+}
+
+/** 下行帧写出。头与载荷分两次写，避免大 JPEG 多拷一份。 */
+export class FrameWriter {
+  private readonly sink: Writable;
+
+  constructor(sink: Writable) {
+    this.sink = sink;
+  }
+
+  write(type: number, payload: Buffer): void {
+    if (this.sink.destroyed) {
+      return;
+    }
+    const header = Buffer.allocUnsafe(FRAME_HEADER_BYTES);
+    header[0] = type;
+    header.writeUInt32LE(payload.length, 1);
+    this.sink.write(header);
+    this.sink.write(payload);
+  }
+
+  writeText(type: number, text: string): void {
+    this.write(type, Buffer.from(text, 'utf8'));
+  }
+}
