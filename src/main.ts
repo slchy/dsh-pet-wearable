@@ -777,17 +777,33 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
         if (s) console.error('[ffmpeg] ' + s);
       });
 
+      /** 本轮是否被用户打断 */
+      let bargeIn = false;
+      /** 播放中：只有真的在往下行写音频时才算，思考期不算 */
+      let playing = false;
+
+      /**
+       * 用户打断：停播 + 中止本轮剩余 TTS。
+       *
+       * 靠 ASR 中间结果触发，不靠能量 —— 纯能量判据在环境噪声下误触率太高。
+       * 中间结果非空就说明服务端真的听出了字，不是“有点像人声”。
+       */
+      const triggerBargeIn = (why: string): void => {
+        if (bargeIn) return;
+        bargeIn = true;
+        console.log(`  打断    ${why} → 停止播放`);
+        writeDown(FRAME_DOWN_CONTROL, Buffer.from('stop', 'utf8'));
+      };
+
       const handleTurn = async (text: string, image?: ImageAttachment): Promise<void> => {
         turns += 1;
         speaking = true;
-        // 挂断识别（不能把自己的 TTS 当输入），但**立即开始重连**：
-        // 重连要 token + WebSocket 握手（1–2 s），跟播放并行就看不见了。
-        // 只要播放时长 < 服务端 10 s 的 IDLE_TIMEOUT，播放结束时连接已就绪，
-        // 用户开口就是即时的（以前是播完才开始重连，白等 1–2 s）。
-        asrClient.close();
-        void asrClient.connect().catch((e: Error) => {
-          console.error(`  ✗ ASR 预重连失败: ${e.message}`);
-        });
+        bargeIn = false;
+        // 全双工：**不再挂断 ASR**。
+        //
+        // 以前播放期先 close + 预重连，因为“没有 AEC，不挡就会听到自己”。
+        // 实测固件自带回声消除（播放期回波底噪 −80 dBFS，ERL ≥ 75 dB 估算），
+        // 远低于能量门 −58 dBFS —— 回声根本进不了 ASR。
         upDuringPlayback = [];
         downChunks = [];
         try {
@@ -799,26 +815,35 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           const t1 = Date.now();
           let bytes = 0;
           let firstAt = 0;
-          for await (const pcm of ttsStream(r.speech)) {
-            if (firstAt === 0) {
-              firstAt = Date.now();
-              console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
+          playing = true;
+          try {
+            for await (const pcm of ttsStream(r.speech)) {
+              if (bargeIn) break;
+              if (firstAt === 0) {
+                firstAt = Date.now();
+                console.log(`  TTS首块 ${((firstAt - t1) / 1000).toFixed(2)} s`);
+              }
+              bytes += pcm.length;
+              if (DUMP_DIR) downChunks.push(Buffer.from(pcm));
+              writeDown(FRAME_DOWN_AUDIO, pcm);
             }
-            bytes += pcm.length;
-            if (DUMP_DIR) downChunks.push(Buffer.from(pcm));
-            writeDown(FRAME_DOWN_AUDIO, pcm);
+          } finally {
+            playing = false;
           }
           const secs = bytes / (TTS_SAMPLE_RATE * 2);
-          console.log(`  回放    ${bytes} 字节  ${secs.toFixed(2)} s`);
+          console.log(bargeIn
+            ? `  回放    ${bytes} 字节  ${secs.toFixed(2)} s（被中断）`
+            : `  回放    ${bytes} 字节  ${secs.toFixed(2)} s`);
 
           // 一行结构化汇总，便于事后 grep 统计 P50/P95：
           //   grep '^TURN ' harness.log
           const ttsFirstMs = firstAt ? firstAt - t1 : -1;
           console.log(`TURN n=${turns} text_len=${text.length} dsh_ms=${r.durationMs}`
-            + ` tts_first_ms=${ttsFirstMs} audio_s=${secs.toFixed(2)}`);
+            + ` tts_first_ms=${ttsFirstMs} audio_s=${secs.toFixed(2)}`
+            + (bargeIn ? ' barge_in=1' : ''));
 
-          // 等手机把这段播完再恢复收音，否则下一轮会识别到自己
-          await sleep(secs * 1000 + 600);
+          // 被打断时手机已经 flush 了缓冲，不必再等排空
+          if (!bargeIn) await sleep(secs * 1000 + 600);
 
           // 落盘必须在 sleep 之后：sleep 期间才是真正的播放期，
           // 放在前面只能录到「agent 思考 + TTS 生成」，录不到回声。
@@ -827,9 +852,6 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           console.log(`  ✗ 本轮失败: ${(e as Error).message}`);
         } finally {
           speaking = false;
-          // 不在这里主动重连：空连接会被 IDLE_TIMEOUT。
-          // 下次真有音频进来时 feed() 会懒建立。
-          asrClient.resume();
           if (endRequested) {
             console.log('\n--- 会话结束（模型判定）---');
             if (!sock.destroyed) sock.end();
@@ -930,7 +952,15 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
         region: o.region,
         maxSentenceSilenceMs: o.maxSentenceSilenceMs,
         log: (l) => { console.log(`  ${l}`); },
-        onPartial: (t) => { console.log(`  … ${t}`); },
+        onPartial: (t) => {
+          console.log(`  … ${t}`);
+          // 全双工打断：播放期只要服务端真的解出了字，就当用户在插话。
+          // 用「非空中间结果」而不是能量阀值 —— 环境噪声能骗过峰值，骗不过识别器。
+          if (playing && !bargeIn) {
+            const bare = t.replace(/[\s。.,，!！?？、~～]/g, '');
+            if (bare.length >= 2) triggerBargeIn(`听到「${t}」`);
+          }
+        },
         onSentence: (t, idx) => {
           console.log(`  句 ${idx}  ${JSON.stringify(t)}`);
 
@@ -995,7 +1025,11 @@ async function runListenAliyun(port: number, o: AliyunRunOptions): Promise<numbe
           lastVoiceAt = now;
           if (!uploading) {
             uploading = true;
-            console.log(`  上行    有声 ${peak.toFixed(1)} dBFS → 开始推送（补 ${preroll.length} 块）`);
+            // 把预卷折成毫秒打出来：判断「首音节够不够覆盖」靠这个数，
+            // 不靠猜块数。16 kHz × 2 B = 32 B/ms。
+            const preBytes = preroll.reduce((a, b) => a + b.length, 0);
+            console.log(`  上行    有声 ${peak.toFixed(1)} dBFS → 开始推送`
+              + `（补 ${preroll.length} 块 / ${Math.round(preBytes / 32)} ms）`);
             for (const p of preroll) asrClient.feed(p);
             preroll = [];
           }
