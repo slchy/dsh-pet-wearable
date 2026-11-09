@@ -112,8 +112,9 @@ export class AliyunAsr {
   /**
    * true 时丢弃一切输入。
    *
-   * TTS 播放期用：那时我们主动挂断了连接（阿里云对纯静音也判 IDLE_TIMEOUT，
-   * 推静音保活无效），这期间的音频不该进 backlog。
+   * 只在 `close()` 置位：表示本条会话已结束，之后即使还有上游音频推来
+   * 也不该再进 backlog。**播放期不置位** —— 打断/全双工要求播报期间
+   * 上行持续送识别（见 `TODO.md` T-005）。
    */
   private dropping = false;
   /**
@@ -149,7 +150,7 @@ export class AliyunAsr {
     this.connecting = true;
     try {
       // 不在 connect 里清 dropping：
-      // 播放期间的并行重连必须继续丢音频（否则会把自己的回声推上去）。
+      // dropping 只表示「本条会话已结束」，播放期并不置位。
       // 解 dropping 的时机只有两个：初始值，以及显式 resume()。
       this.backlog = [];
       const token = await this.token();
@@ -246,10 +247,10 @@ export class AliyunAsr {
   }
 
   /**
-   * 解除 dropping（TTS 播完后调用）。
+   * 解除 dropping 并按需重建连接。
    *
-   * 正常情况下播放期间的预重连已经建好连接，这里只是把开关放开。
-   * 但回复很长时（>10 s）连接会先被 IDLE_TIMEOUT 踢掉，那就得重建。
+   * 当前无调用点：`dropping` 只由 `close()` 置位，会话结束后不再恢复。
+   * 保留给「需要复用同一实例」的场景（例如显式重连）。
    */
   resume(): void {
     this.dropping = false;
