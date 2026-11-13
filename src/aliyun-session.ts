@@ -26,6 +26,7 @@ import { SessionCore, type CoreEffect } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { SmartTurn } from './smart-turn.ts';
 import { startToolControl, type ToolControl } from './tool-control.ts';
+import { wantsHighRes } from './hq-intent.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
 import { UplinkPipeline } from './uplink-pipeline.ts';
@@ -357,14 +358,31 @@ class AliyunConnection {
   // ------------------------------------------------------------------ 一轮
 
   private enqueueTurn(text: string, image: ImageAttachment | undefined, ticket: TurnTicket): void {
-    this.serialChain = this.serialChain.then(() => {
+    this.serialChain = this.serialChain.then(async () => {
       if (this.core.fsm.isStale(ticket)) {
         console.log('  （丢弃：用户已插话，这一轮过时了）');
         return;
       }
       this.downlinkChunks = [];
       this.uplinkDuringPlayback = [];
-      return this.runner.run(text, image).then(() => undefined);
+
+      // 用户**说**要看清细节时，不等模型自己选工具：直接先把高清图拍好塞给它。
+      // 实测 deepseek-flash 不会稳定地按工具描述选 `take_photo_hq`（同一句话
+      // 三次里两次挑了低清），所以「要不要高清」由**用户的话**决定，不由模型决定。
+      let shot = image;
+      let spoken = text;
+      if (shot === undefined && wantsHighRes(text)) {
+        console.log('  拍照    用户要求看清细节 → 先拍高清（P2P）');
+        const hq = await this.photos.request('hq');
+        if (hq === null) {
+          console.log('  ✗ 高清照失败，本轮按纯文本继续（模型可自行调低清）');
+        } else {
+          shot = { mimeType: 'image/jpeg', data: hq.toString('base64') };
+          spoken = `${text}\n（已附一张高清晰度照片，直接根据它回答，不要再调用拍照工具。）`;
+        }
+      }
+
+      return this.runner.run(spoken, shot).then(() => undefined);
     }).catch((error: Error) => {
       console.error(`  ✗ 队列任务失败（不影响后续）: ${error.message}`);
     });
