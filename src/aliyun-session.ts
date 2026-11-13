@@ -33,6 +33,21 @@ import { UtteranceAssembler } from './utterance-assembler.ts';
 /** 上行采样率：mSBC 解码后固定 16 kHz */
 export const UPSTREAM_SAMPLE_RATE = 16_000;
 
+/**
+ * 没有判停器（SmartTurn 关掉）时的固定合并窗口。
+ *
+ * 旧行为：收到一句 ASR 就再等 600 ms 看有没有下文，没有就定稿。
+ */
+const ASSEMBLER_FALLBACK_WINDOW_MS = 600;
+
+/**
+ * 送给判停器的「最近音频」上限（秒）。
+ *
+ * 判停器要听到整句话的尾巴才能判「说完了」，8 s 足够覆盖常见的一句话，
+ * 又不至于把整段对话都留在内存里。
+ */
+const ASSEMBLER_RECENT_SECONDS = 8;
+
 export interface AliyunSessionOptions {
   /** 监听端口 */
   readonly port: number;
@@ -210,9 +225,9 @@ class AliyunConnection {
       quietMs: smartTurnOptions?.quietMs ?? 0,
       extendMs: smartTurnOptions?.extendMs ?? 0,
       maxExtensions: smartTurnOptions?.maxExtensions ?? 0,
-      fallbackWindowMs: 600,
+      fallbackWindowMs: ASSEMBLER_FALLBACK_WINDOW_MS,
       threshold: smartTurnOptions?.threshold ?? 1,
-      recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * 8,
+      recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       predict: this.smartTurn
         ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
         : undefined,

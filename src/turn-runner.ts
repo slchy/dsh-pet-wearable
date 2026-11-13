@@ -18,6 +18,14 @@ import { sleep } from './util.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
+/**
+ * 等播放结束时的轮询间隔。
+ *
+ * 播放进度只能靠时间估（PCM 时长 + 余量），所以要隔一会儿看一眼「是不是被打断了」。
+ * 100 ms 是「用户感觉不到延迟」和「不空转 CPU」的折中。
+ */
+const PLAYBACK_POLL_MS = 100;
+
 export interface TurnRunnerOptions {
   readonly agent: AgentProvider;
   /** TTS provider：采样率与合成都在里面，宿主不再各配一份 */
@@ -98,7 +106,7 @@ export class TurnRunner {
       // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
       const until = Date.now() + seconds * 1000 + this.options.playbackTailMs;
       while (Date.now() < until && !this.cannedCancelled) {
-        await sleep(100);
+        await sleep(PLAYBACK_POLL_MS);
       }
     };
     const next = this.speechChain.then(run, run);
@@ -174,7 +182,7 @@ export class TurnRunner {
       if (!interrupted) {
         const until = Date.now() + audioSeconds * 1000 + this.options.playbackTailMs;
         while (!fsm.isStale(ticket) && Date.now() < until) {
-          await sleep(100);
+          await sleep(PLAYBACK_POLL_MS);
         }
         interrupted = fsm.isStale(ticket);
       }

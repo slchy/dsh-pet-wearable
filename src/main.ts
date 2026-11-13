@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { VoiceAgent } from './agent.ts';
-import { AnnounceStore } from './announce-store.ts';
+import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_HQ_ARM_TIMEOUT_MS, DEFAULT_HQ_SHUTTER_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
@@ -346,7 +346,7 @@ async function main(): Promise<void> {
    */
   const announceStore = AnnounceStore.open({
     file: process.env['MIAI_ANNOUNCE_FILE'] ?? join(homedir(), '.voice-agent', 'announce.jsonl'),
-    maxItems: envNumber('MIAI_ANNOUNCE_MAX', 20),
+    maxItems: envNumber('MIAI_ANNOUNCE_MAX', DEFAULT_ANNOUNCE_MAX),
     log: (line) => { console.log(line); },
   });
   try {

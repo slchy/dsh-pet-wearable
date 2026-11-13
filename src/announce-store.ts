@@ -25,6 +25,14 @@ export interface AnnounceStoreOptions {
   readonly log?: (line: string) => void;
 }
 
+/**
+ * 默认上限条数。
+ *
+ * 导出而不是各写一份：`main.ts` 读环境变量时要用同一个默认值，
+ * 否则「不配环境变量」和「显式配 20」会走到两个不同的数字上。
+ */
+export const DEFAULT_ANNOUNCE_MAX = 20;
+
 interface Entry {
   readonly t: number;
   readonly text: string;
@@ -50,7 +58,7 @@ export class AnnounceStore {
 
   private constructor(options: AnnounceStoreOptions) {
     this.file = options.file;
-    this.maxItems = options.maxItems ?? 20;
+    this.maxItems = options.maxItems ?? DEFAULT_ANNOUNCE_MAX;
     this.log = options.log ?? (() => {});
   }
 
