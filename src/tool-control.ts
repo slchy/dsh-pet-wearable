@@ -10,24 +10,32 @@
  * - `POST /end_session` → 调 {@link ToolControlHandlers.endSession}
  * - `POST /say`         → 当作「用户说了这句话」，起一轮（**调试/联调用**，
  *   没有麦克风也能验证 agent→TTS→下发整条链）
+ * - `POST /control`     → 原样下发一条控制串（**只给调试用**：`stop_capture` /
+ *   `start_capture` 这类"要让设备配合做动作"的实验，没法从对话里自然触发）
  */
 import { createServer, type Server } from 'node:http';
+import type { PhotoOutcome } from './photo-inbox.ts';
 
 export interface ToolControlHandlers {
-  /** 取一张照片；返回 null 表示超时/失败 */
-  readonly takePhoto: () => Promise<Buffer | null>;
-  /** 取一张**高清**照片（手机侧开一次 P2P 拉原图再缩），无此能力时回落到 [takePhoto] */
-  readonly takePhotoHq?: () => Promise<Buffer | null>;
+  /** 取一张照片；`ok:false` 表示超时/失败，`reason` 会原样写回模型 */
+  readonly takePhoto: () => Promise<PhotoOutcome>;
+  /** 取一张**高清**照片（手机侧开一次 P2P 拉原图再缩，需要用户按快门），无此能力时回落到 [takePhoto] */
+  readonly takePhotoHq?: () => Promise<PhotoOutcome>;
   /** 模型判定应当结束会话 */
   readonly endSession: () => void;
   /** 注入一句话，按正常轮次处理（调试/联调） */
   readonly say?: (text: string) => void;
+  /** 原样下发一条控制串（调试用；`stop_capture` / `start_capture` 这类实验） */
+  readonly control?: (text: string) => void;
   readonly log?: (line: string) => void;
 }
 
 export interface ToolControlOptions {
   readonly port: number;
+  /** `spp` 等图的硬上限（收件箱自己也会超时，这里只是兜底） */
   readonly photoTimeoutMs: number;
+  /** `hq` 等图的硬上限：要覆盖「建 P2P 15 s + 等用户按快门 25 s」 */
+  readonly hqTimeoutMs?: number;
   readonly handlers: ToolControlHandlers;
 }
 
@@ -75,6 +83,22 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
       return;
     }
 
+    if (req.url === '/control') {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+      req.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        if (!text || !handlers.control) {
+          res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('need text');
+          return;
+        }
+        handlers.log?.(`  控制    下发 ${JSON.stringify(text)}（调试口）`);
+        handlers.control(text);
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('ok');
+      });
+      return;
+    }
+
     if (req.url !== '/take_photo' && req.url !== '/take_photo_hq') {
       res.writeHead(404).end();
       return;
@@ -93,20 +117,24 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
     const timer = setTimeout(() => {
       photoInFlight = false;
       if (!res.writableEnded) {
-        res.writeHead(504).end('等图超时');
+        res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
+          .end('等图超时');
       }
-    }, options.photoTimeoutMs);
+    }, wantHq ? (options.hqTimeoutMs ?? options.photoTimeoutMs) : options.photoTimeoutMs);
 
-    void shooter().then((jpeg) => {
+    void shooter().then((outcome) => {
       clearTimeout(timer);
       photoInFlight = false;
       if (res.writableEnded) {
         return;
       }
-      if (!jpeg) {
-        res.writeHead(504).end('等图超时');
+      if (!outcome.ok) {
+        handlers.log?.(`  拍照    ✗ 失败（${outcome.reason}）`);
+        res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
+          .end(`拍照失败：${outcome.reason}`);
         return;
       }
+      const jpeg = outcome.jpeg;
       res.writeHead(200, {
         'content-type': 'image/jpeg',
         'content-length': String(jpeg.length),
@@ -129,6 +157,11 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
   return {
     close: () => {
       server.close();
+      // `close()` 只是停止**接受**新连接；已经建立的长连接（工具进程、keep-alive）会
+      // 一直占着端口，于是下一条设备连接绑定同一个端口就 EADDRINUSE —— 那个旧 server
+      // 还在活着，并且把 `/say`、`take_photo` 路由给**上一条已关闭的连接**。
+      // 实测：手机重连一次之后，MCP 拍照就全都没反应了。
+      server.closeAllConnections();
     },
   };
 }

@@ -118,3 +118,81 @@ test('连接结束是吸收态', () => {
   core.dispatch({ type: 'endRequested' });
   assert.equal(core.phase, 'closed');
 });
+
+// ---------------------------------------------------------------- 高清照流程
+
+test('说「看清细节」：先进 awaiting_shot，不直接开轮', () => {
+  const { core } = newCore();
+  const effects = core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  assert.deepEqual(effects.map((e) => e.type), ['awaitShot']);
+  assert.equal(core.phase, 'awaiting_shot');
+  // 还没开轮：等图期间说话不该被票据挡住
+  assert.equal(core.turn, 0);
+});
+
+test('拿到高清图：开一轮，图挂在 text 后面一起交给模型', () => {
+  const { core } = newCore();
+  core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  const jpeg = Buffer.from([1, 2, 3]);
+  const effects = core.dispatch({ type: 'shotResult', ok: true, jpeg });
+  assert.equal(effects.length, 1);
+  const turn = effects[0];
+  assert.equal(turn?.type, 'turn');
+  assert.ok(turn?.type === 'turn' && turn.text.startsWith('看看上面写的什么字'));
+  assert.ok(turn?.type === 'turn' && turn.text.includes('不要再调用拍照工具'));
+  assert.equal(turn?.type === 'turn' && turn.image?.mimeType, 'image/jpeg');
+  assert.equal(turn?.type === 'turn' && turn.image?.data, jpeg.toString('base64'));
+});
+
+test('没拿到高清图：照常开一轮，并把「请按快门」告诉模型', () => {
+  const { core } = newCore();
+  core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  const effects = core.dispatch({ type: 'shotResult', ok: false, reason: 'no_shutter' });
+  const turn = effects[0];
+  assert.equal(turn?.type, 'turn');
+  assert.equal(turn?.type === 'turn' && turn.image, undefined);
+  assert.ok(turn?.type === 'turn' && turn.text.includes('按一下眼镜上的快门'));
+});
+
+test('等快门时又改主意：取消拍照、打断旁白，再开新一轮', () => {
+  const { core } = newCore();
+  core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  const effects = core.dispatch({ type: 'utterance', text: '算了，今天天气怎么样' });
+  assert.deepEqual(effects.map((e) => e.type), ['cancel_shot', 'stop', 'turn']);
+  assert.equal(core.phase, 'listening');
+});
+
+test('等快门时又要高清：取消旧的，重新等', () => {
+  const { core } = newCore();
+  core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  const effects = core.dispatch({ type: 'utterance', text: '算了，凑近看清楚点' });
+  assert.deepEqual(effects.map((e) => e.type), ['cancel_shot', 'stop', 'awaitShot']);
+  assert.equal(core.phase, 'awaiting_shot');
+});
+
+test('等快门时收尾：取消拍照 + 停采集 + 立刻挂断', () => {
+  const { core } = newCore();
+  core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  const effects = core.dispatch({ type: 'endRequested' });
+  assert.deepEqual(
+    effects.map((e) => e.type),
+    ['cancel_shot', 'stop', 'stop_capture', 'end'],
+  );
+  assert.equal(core.phase, 'ending');
+});
+
+test('拍照结果迟到：没有待处理的句子就丢弃', () => {
+  const { core } = newCore();
+  const effects = core.dispatch({ type: 'shotResult', ok: true, jpeg: Buffer.from([1]) });
+  assert.deepEqual(effects, [{ type: 'drop', why: 'shot-stale' }]);
+  assert.equal(core.phase, 'listening');
+});
+
+test('等高清图期间收到低清回图：丢掉，不另起一轮', () => {
+  const { core } = newCore();
+  core.dispatch({ type: 'utterance', text: '看看上面写的什么字' });
+  assert.deepEqual(core.dispatch({ type: 'image', jpeg: Buffer.from([1]) }), [
+    { type: 'drop', why: 'spp-during-shot' },
+  ]);
+  assert.equal(core.phase, 'awaiting_shot');
+});

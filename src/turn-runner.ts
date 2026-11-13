@@ -55,10 +55,60 @@ export interface TurnResult {
 export class TurnRunner {
   private readonly options: TurnRunnerOptions;
   private readonly log: (line: string) => void;
+  /** 旁白与本轮回答共用一条下行音频，必须串行，否则两段 PCM 会交织在一起 */
+  private speechChain: Promise<void> = Promise.resolve();
+  /** 用户在旁白播到一半改主意：停止下发，也别让下一轮排在它后面 */
+  private cannedCancelled = false;
 
   constructor(options: TurnRunnerOptions) {
     this.options = options;
     this.log = options.log;
+  }
+
+  /**
+   * 播一句**系统旁白**（不是模型的回答）。
+   *
+   * 高清照要等用户按下快门，这几十秒里没有「一轮」可挂 —— 但总得有人告诉他去按。
+   * 所以旁白**不改状态机**，只借同一条 TTS 通道说话；它和本轮回答通过
+   * {@link speechChain} 串行，两段音频不会撞在一起。
+   */
+  speakCanned(text: string, emotion?: string): Promise<void> {
+    this.cannedCancelled = false;
+    const run = async (): Promise<void> => {
+      const startedAt = Date.now();
+      let bytes = 0;
+      let firstChunkAtMs = -1;
+      for await (const chunk of this.options.tts.synthesize(text, emotion)) {
+        if (this.cannedCancelled) {
+          this.log('  旁白    被打断，停止下发');
+          return;
+        }
+        if (firstChunkAtMs < 0) {
+          firstChunkAtMs = Date.now() - startedAt;
+        }
+        bytes += chunk.length;
+        this.options.onDownlinkChunk?.(chunk);
+        this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
+      }
+      const seconds = pcm16DurationMs(bytes, this.options.tts.sampleRate) / 1000;
+      this.log(
+        `  旁白    ${JSON.stringify(text)} ${bytes} B / ${seconds.toFixed(2)} s`
+        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
+      );
+      // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
+      const until = Date.now() + seconds * 1000 + this.options.playbackTailMs;
+      while (Date.now() < until && !this.cannedCancelled) {
+        await sleep(100);
+      }
+    };
+    const next = this.speechChain.then(run, run);
+    this.speechChain = next.catch(() => undefined);
+    return next;
+  }
+
+  /** 用户改主意：旁白不必播完，后面排队的那一轮也不必等它 */
+  cancelCanned(): void {
+    this.cannedCancelled = true;
   }
 
   /**
@@ -86,6 +136,9 @@ export class TurnRunner {
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `
         + JSON.stringify(reply.text.slice(0, 120)),
       );
+
+      // 旁白还没播完就先让路：否则「请按快门」和回答会叠在一起
+      await this.speechChain;
 
       const ttsStarted = Date.now();
       for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {

@@ -28,6 +28,11 @@
  *   listening ──requestEnd()（不在播，没有告别语要等）──▶ ending
  *   speaking  ──bargeIn()────────────────────────────▶ listening（代次 +1）
  *   任意状态  ──断连 / 致命错误─────────────────────▶ closed
+ *
+ *   listening ──说「看清细节」──▶ awaiting_shot ──拿到高清图──▶ thinking
+ *                                     │  ▲
+ *                                     │  └── 手机回报「相册就绪」（顺带播提示语，状态不变）
+ *                                     └───── 用户改主意 / 收尾 ──▶ listening / ending
  * ```
  *
  * `audioDone` 是**事件**不是状态：它在 `thinking` 或 `speaking` 内部完成判定，
@@ -70,9 +75,24 @@
  *   所以 `speaking` 结束得比真实出声略晚，插话窗口也略宽 —— 偏保守方向。
  * - **插话不取消上游 dsh 请求**（无法中断），只是停止消费其输出；
  *   对话历史里那条助手回复仍是完整文本，不截断。已知限制。
+ *
+ * <h2>`awaiting_shot`：等用户按快门</h2>
+ *
+ * 高清照必须由**人按下快门**才会落盘（程序化快门不写相册，见
+ * `EXPERIMENTS.md §38.5`），所以「等一张照片」是一段真实存在的、几十秒的对话时间。
+ * 把它塞进 `thinking` 会得到三个后果，都实测发生过：用户在等的时候说话被排队、
+ * 收尾命令取消不了它、指示灯一直停在「思考」。
+ *
+ * 规矩（和第 1 条约束一致：**能不能打断由状态定，不由特判定**）：
+ *
+ * - 它属于 **listening 一族**：用户说话天经地义，所以不参与 `bargeIn`
+ * - 用户在 `awaiting_shot` 里说话 = **改主意**：取消拍照，新句子重新判意图
+ * - 取消**不靠票据**：这期间代次不会变，`isStale` 永远是 false。取消只走
+ *   `utterance` / `requestEnd` / `closed` 三条边 —— 别在这里加 stale 判定
+ * - 提示语（"请按一下快门"）不改状态：它是 `awaiting_shot` 内部的旁白
  */
 
-export type DialogState = 'listening' | 'thinking' | 'speaking' | 'ending' | 'closed';
+export type DialogState = 'listening' | 'awaiting_shot' | 'thinking' | 'speaking' | 'ending' | 'closed';
 
 /**
  * 一轮的票据。
@@ -145,7 +165,9 @@ export class DialogFsm {
   }
 
   /**
-   * 开一轮：`listening → thinking`。
+   * 开一轮：`listening | awaiting_shot → thinking`。
+   *
+   * `awaiting_shot` 是合法前驱：高清照到手或明确失败之后，那一轮才真正开跑。
    *
    * @returns 该轮票据；已在收尾/已关闭时返回 `null`，调用方应直接放弃这一轮
    */
@@ -154,7 +176,7 @@ export class DialogFsm {
       this.log(`  状态    ✗ 拒绝开新一轮（当前 ${this._state}）`);
       return null;
     }
-    if (this._state !== 'listening') {
+    if (this._state !== 'listening' && this._state !== 'awaiting_shot') {
       // 串行队列保证不会到这里；真到了就是调度 bug，必须看见
       this.log(`  状态    ⚠ 在 ${this._state} 时开新一轮，按 thinking 处理`);
     }
@@ -162,6 +184,28 @@ export class DialogFsm {
     this._endAfterSpeech = false;
     this.transition('thinking', `第 ${this._turn} 轮`);
     return this.ticket();
+  }
+
+  /**
+   * 进去等一张高清照：`listening → awaiting_shot`。
+   *
+   * @returns 票据；不在 `listening` 时返回 `null`（调用方按普通轮次处理）
+   */
+  beginAwaitShot(): TurnTicket | null {
+    if (this._state !== 'listening') {
+      this.log(`  状态    ⚠ 在 ${this._state} 时想等高清照，忽略`);
+      return null;
+    }
+    this.transition('awaiting_shot', '等一张高清照');
+    return this.ticket();
+  }
+
+  /** 不拍了（用户改主意）：`awaiting_shot → listening`。代次不变。 */
+  abortAwaitShot(why: string): void {
+    if (this._state !== 'awaiting_shot') {
+      return;
+    }
+    this.transition('listening', `放弃拍照（${why}）`);
   }
 
   /** 首块音频真正写出：`thinking → speaking` */
@@ -209,11 +253,12 @@ export class DialogFsm {
    *
    * - 在 `speaking`：只置标志，等这段播完再进 `ending`（告别语不截断）
    * - 在 `thinking`：同样只置标志，等本轮音频结束（可能还有告别语）
-   * - 在 `listening`：没有音频要等，直接进 `ending`
+   * - 在 `listening` / `awaiting_shot`：没有音频要等，直接进 `ending`
+   *   （`awaiting_shot` 的拍照请求由调用方在收到 `ending` 时一并取消）
    */
   requestEnd(): void {
     this._endAfterSpeech = true;
-    if (this._state === 'listening') {
+    if (this._state === 'listening' || this._state === 'awaiting_shot') {
       this.transition('ending', '模型要求结束（当前无音频）');
       return;
     }

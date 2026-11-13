@@ -214,9 +214,39 @@ headless 模式（不带 `--dsh-sdk`）的 `dsh headless` 不接 `--patch`，MCP
 |---|---|---|
 | `stop` | 用户插话，云端判定这一轮作废 | 立刻停止播放并清空播放队列 |
 | `stop_capture` | 模型调了「退出」工具 | **立刻停止麦克风采集**（SDK：`endVoiceSession()`），但别断开蓝牙会话 —— 告别语还要靠它播完 |
-| `take_photo` | 模型调了拍照工具 | 让眼镜拍一张并回 `Image` 帧 |
+| `take_photo` | 模型调了拍照工具 | 让眼镜拍一张并回 `Image` 帧（SPP，1 s，576×432） |
+| `take_photo_hq` | 会话里有人要看细节 | 走协作式高清：建 P2P → 回 `hq_armed` → **等用户按快门** → 回 `hq_image` + `Image` |
+| `hq_cancel` | 云端不再需要那张高清图 | 立刻解散 P2P（别占着），回 `hq_failed`（`reason=cancelled`） |
 | `end_session` | 云端认为会话该结束了 | 收尾并断开 |
 | `auth_required` / `auth_failed` | 鉴权失败 | 检查 token，别重试同一份凭据 |
 
 `stop_capture` 是 2026-11-13 补的：之前模型一调退出工具，眼镜会继续采集到整段告别语
 播完（实测多采了 2–5 秒），既费电又容易把周围对话再喂进 ASR。
+
+### 上行状态帧（`Status=5` 的 payload，UTF-8 JSON）
+
+高清照必须由**人按下快门**才落盘（程序化快门不写相册，见
+`docs/protocol/device/EXPERIMENTS.md §38.5`），所以这条链路上有几十秒是「等用户」。
+没有状态帧时，手机早就放弃了云端还在干等总超时。四个事件：
+
+| 事件 | 字段 | 云端动作 |
+|---|---|---|
+| `hq_armed` | `fresh`（`"true"` 表示相机里已经有新图） | 结束「等就绪」，开始「等快门」；`fresh=false` 时播一句「请按一下眼镜上的快门」 |
+| `hq_image` | — | 紧接着的 `Image` 帧算**高清原图**（不是 SPP 低清回图） |
+| `hq_failed` | `reason`：`no_shutter` / `p2p` / `join` / `connect` / `arm` / `download` / `decode` / `send` / `cancelled` | 立刻结束等待，把原因翻成一句可执行的话给模型 |
+
+**为什么必须有 `hq_image` 公告**：等高清图的时候，用户按快门会让相机同时回一张 SPP
+低清图，没有公告就只能按到达顺序猜 —— 实测把 17 KB 的糊图当成原图交付过。
+
+### 高清照的时间预算
+
+| 段 | 典型 | 兜底（手机侧 / 云端侧） |
+|---|---|---|
+| 建组 + 入组 + 连相册 | 5.4 s | 15 s / — |
+| 提示语 | 1.5 s | — |
+| 等用户按快门 + LLHDR + 落盘 | 5–9 s | 20 s / 25 s |
+| 下载 8 MB + 缩图 + 上行 1.1 MB | 2 s | 20 + 10 + 5 s / — |
+
+可调：`MIAI_HQ_ARM_TIMEOUT_MS`（默认 15000）、`MIAI_HQ_SHUTTER_TIMEOUT_MS`
+（默认 25000）。手机侧放弃得更早（20 s）并主动上报，所以正常情况下永远是**手机的
+原因先到**，云端那 25 s 只是「手机也没消息」的兜底。

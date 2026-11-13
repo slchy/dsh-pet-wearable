@@ -30,6 +30,17 @@ export const UpstreamFrameType = {
    */
   Ping: 4,
   /**
+   * 状态事件。payload 是 UTF-8 JSON：`{"ev":"hq_armed","fresh":"false"}`。
+   *
+   * 高清照流程靠它说话 —— 没有这条通道时，手机早已放弃，云端还得自己干等到
+   * 超时才有人知道「用户没按快门」。
+   *
+   * - `hq_armed`：P2P 与相册都通了，`fresh` 表示相机里是否**已经有**新图
+   * - `hq_image`：紧接一个 {@link Image} 帧，说明它是高清原图（不是 SPP 低清）
+   * - `hq_failed`：`reason` 见 `photo-inbox.ts` 的 `PhotoFailReason`
+   */
+  Status: 5,
+  /**
    * 首帧身份。payload 是 UTF-8 JSON：
    * `{"proto":1,"deviceId":"...","token":"..."}`
    *
@@ -43,7 +54,7 @@ export const UpstreamFrameType = {
 export const DownstreamFrameType = {
   /** PCM16 24 kHz */
   Audio: 1,
-  /** UTF-8 控制串：`take_photo` / `stop` */
+  /** UTF-8 控制串：`take_photo` / `take_photo_hq` / `stop_capture` / `hq_cancel` / `stop` */
   Control: 2,
   /** 心跳应答，payload 为空 */
   Pong: 5,
