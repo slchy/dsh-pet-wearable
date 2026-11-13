@@ -11,6 +11,7 @@
  */
 import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
+import type { AnnounceStore } from './announce-store.ts';
 import { emotionTagList, parseEmotion, stripEmotionTags } from './emotion.ts';
 
 /**
@@ -45,6 +46,12 @@ const VOICE_SYSTEM = `【身份】你是「米馍」，是运行在后端服务�
 
 【情绪标签】每句回复的**最开头**写一个标签，从这五个里选一个：${emotionTagList()}
 标签只给语音合成用，不会被念出来。正文里不要再出现方括号。
+
+【长任务】需要跑几十秒以上的活（编译、检索、批量处理、长时间命令）时，用工具的后台模式
+（bash 工具带 run_in_background: true）派出去，立刻回一句「我让后台去办了」，不要让哥干等，
+也不要用 job_output 去等它跑完 —— 后台跑完系统会再给你一次汇报机会。
+哥说「算了 / 别跑了 / 停一下」而你有后台任务还在跑时，真的把它停掉（job_list 查、job_kill 停），
+不要只是嘴上说停了。
 
 哥刚才说：
 `;
@@ -82,10 +89,46 @@ export class VoiceAgent {
 
   private readonly session: DshSession;
   private readonly log: (line: string) => void;
+  /** 播报出口。第二个参数是情绪 key，没有就按平静处理 */
+  private announcer: ((speech: string, emotion?: string) => void) | null = null;
+  /** 没有连接时把汇报存下来，等下次连上补播（null = 不持久化） */
+  private readonly announceStore: AnnounceStore | null;
 
-  constructor(session: DshSession, log: (line: string) => void = () => {}) {
+  constructor(
+    session: DshSession,
+    log: (line: string) => void = () => {},
+    announceStore: AnnounceStore | null = null,
+  ) {
     this.session = session;
     this.log = log;
+    // ⚠️ 不能写成构造函数参数属性：Node 22 的类型擦除不支持，tsc 通过、跑起来
+    // 直接 ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX（`dialog-fsm.ts` 里也记过这条）。
+    this.announceStore = announceStore;
+
+    // 后台作业结算后 dsh 会自己开一轮；把那轮文本清洗成可朗读的句子交出去
+    this.session.onAnnounce = (text: string) => {
+      // 后台汇报也可能带情绪标签，同样处理
+      const { emotion, rest } = parseEmotion(text);
+      const speech = cleanForSpeech(rest);
+      if (!speech) {
+        return;
+      }
+      if (this.announcer === null) {
+        const pending = this.announceStore?.push(speech) ?? 0;
+        this.log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
+        return;
+      }
+      this.log(`  后台    任务完成 → 播报 ${JSON.stringify(speech.slice(0, 60))}`);
+      this.announcer(speech, emotion);
+    };
+  }
+
+  /**
+   * 设置播报出口。连接建立时设、断开时清 —— 后台任务属于**会话**，
+   * 但播报要落到当时在线的那个连接上。
+   */
+  setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
+    this.announcer = cb;
   }
 
   /** 当前会话 id（新会话时为 null，第一次 ask 之后才有值）。 */

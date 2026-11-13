@@ -138,6 +138,86 @@ node tools/fake-phone.ts --port 8768 --sbc ../tmp/voice.sbc --tls --ca cert.pem
 
 客户端把 CA 打进包再严格校验，就等价于证书 pinning —— 不需要自研应用层加密。
 
+## 后台任务与完成播报
+
+长任务**不需要我们自己在外面造任务队列** —— dsh 自带：
+
+```text
+模型调 bash {run_in_background: true}
+  → job/registered，工具立刻返回        （实测 2.8 s）
+  → 模型回一句「我让后台去办了」→ turn 结束（实测 3.6 s，主对话就自由了）
+  → 若干秒后 job/settled
+  → dsh **自己开一轮**把结果说出来        （没有 session/prompt）
+```
+
+我们的 SDK 封装以前会把这一轮**静默丢掉**（只在 prompt 期间挂 `onIdle`，自发轮次没有
+等待者）。现在 `session.ts` 用 `spontaneous.ts` 识别它，交给 `VoiceAgent.onAnnounce`
+清洗成可朗读文本，再由 `AliyunSession` 走旁白通道播出来。
+
+实测（2026-11-14，`POST /say`）：
+
+```text
+03:46:50  agent   "已经派到后台了，我这就回来，不等它跑完。"   2.12 s
+03:46:58  状态    speaking → listening
+03:47:19  [sdk]   后台任务结算 → agent 自发开了一轮（不是我们催的）
+03:47:21  后台    任务完成 → 播报 "后台那条已经跑完了，输出 bg30-done，一切正常。"
+03:47:23  旁白    ... 5.12 s
+```
+
+三个前提：
+
+- **提示词要点明**：不提醒的话模型会自己调 `job_output{wait:true}` 干等（实测等满 20 s）。
+  `agent.ts` 的 `VOICE_SYSTEM` 里已经写明「派出去、立刻回、不要等」。
+- **播报不占轮次**：走 `speakCanned` 的旁白通道，用户正在说话/听播报时排队，回到
+  `listening` 再放 —— 抢话比晚两秒更烦人。
+- **断线不丢**：任务完成时如果没连接，那句话会落到 `~/.voice-agent/announce.jsonl`
+  （`MIAI_ANNOUNCE_FILE` 可改，上限 `MIAI_ANNOUNCE_MAX` 默认 20 条），
+  下次连上第一条就补播。语义是**至少一次**：崩溃在播放中途会重复播一句，比丢一句好。
+
+离线补播实测（2026-11-14，用假手机模拟"派完就断、重连再听"）：
+
+```text
+03:53:03  agent   "派到后台了，我这就回来。"            4.38 s，turn 结束
+03:53:22  [sdk]   后台任务结算 → agent 自发开了一轮
+03:53:25  后台    没有连接，存入待补播（积压 1 条）        ← 连接 A 已断
+03:53:36  补播    离线期间攒了 1 条后台汇报               ← 连接 B 连上
+03:53:37  旁白    "二十秒那条也跑完了，输出 bg20-done。" 3.20 s
+```
+
+## 事后排障：原始档案
+
+出问题之后不能靠猜。`MIAI_ARCHIVE_DIR` 一开，**每条连接**都会留一份完整档案：
+
+```text
+<root>/20261114-031530-182.135.0.22_2421/
+  meta.json      当时的增益、门限、采样率、provider、模型（档案必须自解释）
+  events.jsonl   时间线，每条都带三条流当时的字节偏移
+  uplink.sbc     手机发来的原始 mSBC，未解码（可换增益重新解码）
+  uplink.pcm     解码后 PCM16 16 kHz，**放大前**（可任意重算增益/门限）
+  downlink.pcm   下行 TTS PCM16 24 kHz
+```
+
+```bash
+MIAI_ARCHIVE_DIR=/var/lib/miai/archive   # 空 = 关（默认）
+MIAI_ARCHIVE_MAX_MB=80                   # 单段上限，到顶另起 `…--2`
+MIAI_ARCHIVE_KEEP=20                     # 保留多少个会话目录
+```
+
+看一份档案：
+
+```bash
+python scripts/analyze_session.py ~/miai-archive/20261114-031530-182.135.0.22_2421
+```
+
+它给三样东西：事件时间线（门开关 / ASR 中间结果 / 成句 / 下发控制 / 唤醒）、
+**放大前**的上行电平曲线、以及自动诊断（"开了门但一句话都没定稿"这类结论）。
+
+为什么一定要留"放大前"的 PCM：像「小声说话识别不出来」这种问题，事后必须能在
+不同增益/门限下重放判断，而不是拿已经放大的波形去猜原始电平。
+
+旧的 `DUMP_DIR`（`up/down_<turn>.pcm`）已被它取代 —— 那套只覆盖**播放期**，恰好
+漏掉"用户说话但没成句"，而且同名文件会被下一条连接覆盖。
+
 ## 协议（最小实现见 `tools/fake-phone.ts`）
 
 ```

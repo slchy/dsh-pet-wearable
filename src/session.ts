@@ -26,6 +26,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { SpontaneousTurn } from './spontaneous.ts';
+
 /** 单轮超时。agent 可能跑工具，给得比纯对话宽。 */
 const DEFAULT_TIMEOUT_MS = 180_000;
 
@@ -162,6 +164,18 @@ export class DshSession {
   private onIdle: (() => void) | null = null;
   private sdkReady = false;
   /**
+   * 后台任务完成后**自发**产生的汇报文本（不属于任何一轮）。
+   *
+   * dsh 的后台作业结算后会自己开一轮说结果（没有 `session/prompt`），这条回调
+   * 就是接住它的唯一入口 —— 不接就是静默丢弃。
+   */
+  onAnnounce: ((text: string) => void) | null = null;
+  /**
+   * 自发轮次的判定：只在 prompt 期间挂 `onIdle`，所以那种轮次必须单独识别
+   * （见 `spontaneous.ts` 的实测记录）。
+   */
+  private readonly spontaneous = new SpontaneousTurn();
+  /**
    * 本进程内已经打开（resume 过或创建过）的会话 id。
    *
    * SDK 对已在当前进程打开的会话再发 `session/resume` 会报
@@ -285,6 +299,8 @@ export class DshSession {
     }
 
     this.assistantText = '';
+    // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
+    this.spontaneous.reset();
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
 
     await this.rpc('session/prompt', {
@@ -447,7 +463,24 @@ export class DshSession {
     }
 
     if (method === 'session.status') {
-      if (p['status'] === 'idle' && this.onIdle) {
+      const status = typeof p['status'] === 'string' ? p['status'] : '';
+      const waiting = this.onIdle !== null;
+      const verdict = this.spontaneous.onStatus(status, waiting);
+      if (verdict === 'begin') {
+        // 自发轮次开始：清掉上一轮的残留文本，否则会把旧回复当成本次结果播出去
+        this.assistantText = '';
+        this.log('[sdk] 后台任务结算 → agent 自发开了一轮（不是我们催的）');
+        return;
+      }
+      if (verdict === 'settle') {
+        const text = this.assistantText.trim();
+        this.assistantText = '';
+        if (text && this.onAnnounce) {
+          this.onAnnounce(text);
+        }
+        return;
+      }
+      if (status === 'idle' && this.onIdle) {
         const fire = this.onIdle;
         this.onIdle = null;
         fire();
