@@ -141,7 +141,7 @@ python scripts/deploy_cloud.py        # 同步 src/tools/tests → 跑单测 →
 | `~/miai-cloud/src` | 源码（Node 直接跑 `.ts`，无需构建） | `deploy_cloud.py` 推送 |
 | `~/miai-cloud/.env` | 阿里云 / MiMo / dsh 的真实凭据 | **只在服务器上**，不从本地覆盖 |
 | `~/miai-cloud/tls` | 证书 + 私钥 | `scripts/gen_local_ca.py` 后手工 scp |
-| `systemd miai-harness` | `--listen 63993 --host 0.0.0.0 --stt aliyun --tts mimo --agent dsh` | 一次性写好 |
+| `systemd miai-harness` | `--listen 63993 --host 0.0.0.0 --stt aliyun --tts mimo --agent dsh --dsh-sdk` | 一次性写好 |
 
 `.env` 刻意不进同步范围：本地那份是调试用的，推上去会盖掉服务器上的真实凭据。
 
@@ -163,6 +163,24 @@ python scripts/deploy_cloud.py        # 同步 src/tools/tests → 跑单测 →
 
 证书里带 `SAN=IP:203.0.113.10`，手机按 IP 直连也能过严格校验（`scripts/gen_local_ca.py --ip 203.0.113.10`）。
 换端口/换 IP 记得同时重发证书与 APK 里的 `assets/local-ca.pem`。
+
+### 换端口要一起改的三处
+
+控制口跟着 `--listen + 2` 走，但 `mcp/` 里那两个工具脚本是**写死 URL 的**，
+换了端口不改它们，模型就会说「挂断的工具现在不可用了」：
+
+```ini
+# cloud/.env（服务器上那份）
+PHOTO_CTL_PORT=63995                                    # harness 监听哪个控制口
+PHOTO_CTL_URL=http://127.0.0.1:63995/take_photo          # mcp-camera.mjs 读这个
+SESSION_CTL_URL=http://127.0.0.1:63995/end_session       # mcp-session.mjs 读这个
+```
+
+### agent 必须是 `--dsh-sdk`
+
+headless 模式（不带 `--dsh-sdk`）的 `dsh headless` 不接 `--patch`，MCP 工具根本
+没注册，模型只能回「工具不可用」。带 `--dsh-sdk` 才会用 `DSH_PATCH` 里的
+`mcp/camera.yml` 挂上 `take_photo` / `end_session`，顺带省掉每次重启进程的开销。
 
 ## 已知限制
 
