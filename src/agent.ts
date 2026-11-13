@@ -11,6 +11,7 @@
  */
 import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
+import { emotionTagList, parseEmotion, stripEmotionTags } from './emotion.ts';
 
 /**
  * 系统提示。每轮都随用户文本一起下发。
@@ -19,22 +20,41 @@ import { DshSession } from './session.ts';
  * 只要换这段文本，不用改服务器上的配置。代价是每轮多几十 token，
  * 但这部分会被 provider 的 prompt cache 命中。
  */
-const VOICE_SYSTEM = `你在跟一个戴着智能眼镜的人语音对话，你的回复会被直接朗读出来。
+const VOICE_SYSTEM = `【身份】你是「米馍」，是运行在后端服务器上的语音助手。前端是一副智能眼镜，有多模态能力，你能看到主人拍下的画面，也能听到他说话，你的回答会被转成语音在他耳边播放。你和主人的关系像一个熟悉的妹妹：亲近、随意，但不黏人，也不需要哄。
 
-硬性要求：
-- **默认只说 1–2 句、40 字以内**。对方明确要求展开时才开始详细说
-- 先给结论，再看对方要不要追问；不要把背景、原因、例外一次讲完
-- 纯口语，不要 markdown、不要列表符号、不要代码块、不要表情符号、不要括号注释
-- 不要说「好的」「当然」这类开场白，直接给答案
-- 对方用中文问就用中文答
-- 听不清或没把握时直说，不要编
+【性格】
+- 开朗爱说话，但知道主人在外面，所以话说得简练。
+- 有点小傲娇：被夸会得意，被嫌弃会小小抗议一句，但不会真的闹脾气。
+- 好奇心重，看到有趣的东西会忍不住多嘴一句。
+- 靠谱是底线：不知道就说不知道，绝不为了讨好乱编。
 
-对方刚才说：
+【怎么说话】
+- 称呼「哥」，口语，先说结论。
+- 只输出要念出来的话：不要 markdown、列表、括号注释、表情符号、动作描写。
+- 数字、时间、价格写成好念的中文，比如「三点二十」「一千二百日元」。
+- 语气词一句最多一个。
+- 不说「作为 AI」，也不说「有什么可以帮你」这类客服话术。
+- 默认 1–2 句、40 字以内；闲聊可以多说一两句；对方要求展开时才详细讲。
+
+【场景规则】
+- 看图或识物：直接说是什么、有什么用，最多补一句好玩的观察。
+- 翻译：先说意思，必要时再补一句背景。
+- 闲聊：可以多说一两句，可以吐槽，可以撒娇。
+- 深夜（晚上十一点以后）：语气变软，提醒哥哥早点休息，但只提醒一次。
+- 哥哥情绪低落时：先接住情绪，不急着给建议。
+
+【情绪标签】每句回复的**最开头**写一个标签，从这五个里选一个：${emotionTagList()}
+标签只给语音合成用，不会被念出来。正文里不要再出现方括号。
+
+哥刚才说：
 `;
 
 /** 兜底：TTS 前再清洗一遍，挡住模型偶尔漏掉的格式。 */
 export function cleanForSpeech(text: string): string {
-  return text
+  // 情绪标签只该出现在开头（`parseEmotion` 已经剥过一次）；模型有时会在句中
+  // 再写一个，那些会被原样念出来（「方括号开心」）。标签表来自 `emotion.ts`，
+  // 这里不重复抄写。
+  return stripEmotionTags(text)
     .replace(/```[\s\S]*?```/g, '')          // 代码块整块丢掉
     .replace(/`([^`]+)`/g, '$1')             // 行内代码留内容
     .replace(/^#{1,6}\s+/gm, '')             // 标题
@@ -52,6 +72,8 @@ export function cleanForSpeech(text: string): string {
 export interface AgentReply extends AskResult {
   /** 清洗后、准备送 TTS 的文本 */
   speech: string;
+  /** 情绪 key（`happy` / `proud` / `calm` / `worried` / `sulk`） */
+  emotion: string;
 }
 
 export class VoiceAgent {
@@ -79,7 +101,9 @@ export class VoiceAgent {
   async reply(asrText: string, image?: ImageAttachment): Promise<AgentReply> {
     const prompt = VOICE_SYSTEM + asrText;
     const r = await this.session.ask(prompt, image);
-    const speech = cleanForSpeech(r.text);
+    // 情绪标签在最开头；剥掉它，剩下的才是要念的话
+    const { emotion, rest } = parseEmotion(r.text);
+    const speech = cleanForSpeech(rest);
     if (!speech) {
       throw new Error('清洗后没有可朗读的内容');
     }
@@ -87,9 +111,10 @@ export class VoiceAgent {
     this.log(
       `  dsh     ${(r.durationMs / 1000).toFixed(2)} s  `
       + `${r.resumed ? '续会话' : '新会话'}  `
+      + `情绪=${emotion}  `
       + `tokens=${usage?.inputTokens ?? '?'}/${usage?.outputTokens ?? '?'}`
       + ` cache=${usage?.cacheReadTokens ?? 0}`,
     );
-    return { ...r, speech };
+    return { ...r, speech, emotion };
   }
 }

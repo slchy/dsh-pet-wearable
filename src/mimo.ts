@@ -8,6 +8,7 @@
  */
 
 import type { TtsProvider } from './providers.ts';
+import { BASE_STYLE, asEmotion, styleFor, type Emotion } from './emotion.ts';
 
 const API_URL = 'https://api.xiaomimimo.com/v1/chat/completions';
 const ASR_MODEL = 'mimo-v2.5-asr';
@@ -140,6 +141,8 @@ export async function asr(wav: Buffer, language = 'auto'): Promise<{ text: strin
  * 等整段收完再播，等于把"音频总时长"整个加到端到端延迟上
  * （12 s 的回复就要多等 3.8 s）；边收边播把这一项降到首块延迟。
  */
+export const DEFAULT_TTS_VOICE = 'Chloe';
+
 export async function* ttsStream(
   text: string,
   voice = 'Chloe',
@@ -178,14 +181,22 @@ export async function tts(
  *
  * 采样率由这里声明（24 kHz），宿主不再另配一份 —— 上行 16 kHz / 下行 24 kHz
  * 是两个不同的值，配错会 1.5 倍速升调。
+ *
+ * 语调由**情绪**决定：agent 每句开头给一个 `[开心]` 之类的标签，这里翻成风格提示词
+ * （见 `emotion.ts`）。不传情绪就按 `calm`。
  */
-export function mimoTts(
-  voice = 'Chloe',
-  style = 'Calm, natural, conversational.',
-): TtsProvider {
+export function mimoTts(options: {
+  readonly voice?: string;
+  readonly baseStyle?: string;
+  readonly overrides?: Partial<Record<Emotion, string>>;
+} = {}): TtsProvider {
+  const voice = options.voice ?? DEFAULT_TTS_VOICE;
+  const base = options.baseStyle ?? BASE_STYLE;
+  const overrides = options.overrides ?? {};
   return {
     name: `mimo:${voice}`,
     sampleRate: TTS_SAMPLE_RATE,
-    synthesize: (text: string) => ttsStream(text, voice, style),
+    synthesize: (text: string, emotion?: string) =>
+      ttsStream(text, voice, styleFor(asEmotion(emotion), base, overrides)),
   };
 }

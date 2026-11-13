@@ -88,7 +88,7 @@ export class TurnRunner {
       );
 
       const ttsStarted = Date.now();
-      for await (const chunk of this.options.tts.synthesize(reply.speech)) {
+      for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
         if (fsm.isStale(ticket)) {
           interrupted = true;
           break;

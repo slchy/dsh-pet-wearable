@@ -18,12 +18,19 @@ export interface AgentImage {
   readonly data: string;
 }
 
-/** Agent 回复。只保留编排层真正需要的两个字段。 */
+/** Agent 回复。只保留编排层真正需要的字段。 */
 export interface AgentReplyView {
   /** 原始文本（日志/调试用） */
   readonly text: string;
   /** 清洗后、准备送 TTS 的文本 */
   readonly speech: string;
+  /**
+   * 情绪（`happy` / `proud` / `calm` / `worried` / `sulk`）。
+   *
+   * agent 在回复开头写 `[开心]` 这类标签，这里给出规范化后的 key；TTS provider
+   * 据此换语调。缺省按 `calm` 处理。
+   */
+  readonly emotion?: string;
 }
 
 /**
@@ -36,6 +43,13 @@ export interface AgentReplyView {
 export interface AgentProvider {
   readonly name: string;
   reply(userText: string, image?: AgentImage): Promise<AgentReplyView>;
+  /**
+   * 可选：agent 在**没有任何一轮**的情况下主动要说的内容（后台任务完成汇报）。
+   *
+   * 传 `null` 表示当前没有连接可播报。实现方（`VoiceAgent`）负责把原始文本
+   * 清洗成可朗读的句子；编排层只管什么时候播、能不能播。
+   */
+  setAnnouncer?(cb: ((speech: string) => void) | null): void;
 }
 
 /** STT 会话：一次连接一个，流式喂 PCM。 */
@@ -67,7 +81,11 @@ export interface TtsProvider {
   readonly name: string;
   /** 输出采样率。**必须由 provider 声明**，不要在宿主里另配一份。 */
   readonly sampleRate: number;
-  synthesize(text: string): AsyncIterable<Buffer>;
+  /**
+   * @param emotion 情绪 key（见 `emotion.ts`）。provider 自己决定怎么用：MiMo 拿它
+   *   拼风格提示词。不认识/不传就按默认语气合成。
+   */
+  synthesize(text: string, emotion?: string): AsyncIterable<Buffer>;
 }
 
 // ------------------------------------------------------------------ 调试用实现
@@ -85,8 +103,7 @@ export function silentTts(sampleRate = 24_000, seconds = 0.5): TtsProvider {
   return {
     name: 'silent',
     sampleRate,
-    async* synthesize() {
-      const bytes = Math.round(sampleRate * 2 * seconds);
+    async* synthesize() {      const bytes = Math.round(sampleRate * 2 * seconds);
       yield Buffer.alloc(bytes);
     },
   };

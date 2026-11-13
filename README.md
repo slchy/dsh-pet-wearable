@@ -36,6 +36,27 @@ node src/main.ts --listen 8766      # 默认 --stt aliyun --tts mimo --agent dsh
 
 `<模块路径>` 指向一个导出工厂的文件，例如：
 
+### MiMo 的音色与**风格提示词**
+
+MiMo 的 TTS 是聊天式的：**风格提示词进 `user` 消息，要念的文本进 `assistant`**，
+模型按"这个助手该用什么语气说这句话"合成 —— 所以语调一半由提示词决定。
+
+```bash
+MIMO_TTS_VOICE=Chloe                    # 音色
+MIMO_TTS_STYLE='用自然的中文口语说话，像朋友聊天：语气温暖、有起伏，句末自然落下。'
+```
+
+同一句话、两种风格的实测（`ab-tts.mjs`，24 kHz PCM）：
+
+| 风格 | 时长 | 峰值 | 基频 σ |
+|---|---|---|---|
+| `Calm, natural, conversational.`（旧默认） | 3.20 s | −0.6 dBFS | 52.6 Hz |
+| 中文口语（新默认） | 3.84 s | −2.3 dBFS | 60.9 Hz |
+
+提示词确实在改变输出：语速慢了 20%、基频起伏大了 16%、峰值更低（给后续增益留了余量）。
+"听起来好不好"只能靠耳朵，但**它有可调项**这件事本身是确定的。
+
+
 ```ts
 // my-stt.ts
 import type { SttProvider } from '../src/providers.ts';
