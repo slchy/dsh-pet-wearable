@@ -295,6 +295,9 @@ class AliyunConnection {
         case 'stop':
           this.conn.sendControl('stop');
           break;
+        case 'stop_capture':
+          this.conn.sendControl('stop_capture');
+          break;
         case 'end':
           this.conn.end();
           break;

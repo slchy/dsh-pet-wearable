@@ -186,3 +186,16 @@ headless 模式（不带 `--dsh-sdk`）的 `dsh headless` 不接 `--patch`，MCP
 
 - 单设备：一条连接结束后进程退出；多设备要 `runTransport({singleConnection: false})`
 - 图片落盘默认关闭（`PHOTO_DIR` 为空），识图轮次仍可用
+
+### 下行控制串（`Control=2` 的 payload）
+
+| 串 | 什么时候发 | 客户端该做什么 |
+|---|---|---|
+| `stop` | 用户插话，云端判定这一轮作废 | 立刻停止播放并清空播放队列 |
+| `stop_capture` | 模型调了「退出」工具 | **立刻停止麦克风采集**（SDK：`endVoiceSession()`），但别断开蓝牙会话 —— 告别语还要靠它播完 |
+| `take_photo` | 模型调了拍照工具 | 让眼镜拍一张并回 `Image` 帧 |
+| `end_session` | 云端认为会话该结束了 | 收尾并断开 |
+| `auth_required` / `auth_failed` | 鉴权失败 | 检查 token，别重试同一份凭据 |
+
+`stop_capture` 是 2026-11-13 补的：之前模型一调退出工具，眼镜会继续采集到整段告别语
+播完（实测多采了 2–5 秒），既费电又容易把周围对话再喂进 ASR。

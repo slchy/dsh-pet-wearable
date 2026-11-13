@@ -36,6 +36,8 @@ export type CoreEffect =
   }
   /** 下发 `Control: stop`，停止播放 */
   | { readonly type: 'stop' }
+  /** 下发 `Control: stop_capture`，让眼镜立刻停止采集（模型调了退出工具） */
+  | { readonly type: 'stop_capture' }
   /** 挂断 */
   | { readonly type: 'end' }
   /** 有意丢弃（唤醒词 / 旁听反馈），只为可观测 */
@@ -83,6 +85,12 @@ export class SessionCore {
           this.options.log('  （旁听反馈，不单独成轮）');
           return [{ type: 'drop', why: 'backchannel' }];
         }
+        // 已经决定收尾（模型调了退出工具）：麦克风虽已停，但排队中的识别结果
+        // 还会到。此时再开一轮会和「告别语播完就挂断」打架。
+        if (this.fsm.endAfterSpeech) {
+          this.options.log('  （丢弃：已在收尾，不再开新一轮）');
+          return [{ type: 'drop', why: 'ending' }];
+        }
         return [{ type: 'turn', text: event.text, ticket: this.fsm.ticket() }];
 
       case 'partial': {
@@ -115,7 +123,12 @@ export class SessionCore {
 
       case 'endRequested':
         this.fsm.requestEnd();
-        return this.fsm.state === 'ending' ? [{ type: 'end' }] : [];
+        // 模型决定收尾的那一刻，眼镜就该停止采集 —— 不能等告别语播完。
+        // `endVoiceSession()`（Aivs 六字段全 0）实测能让设备立刻停流（§19.5）。
+        this.options.log('  采集    模型要求结束 → 通知设备停止采集');
+        return this.fsm.state === 'ending'
+          ? [{ type: 'stop_capture' }, { type: 'end' }]
+          : [{ type: 'stop_capture' }];
 
       case 'closed':
         this.fsm.close();

@@ -86,17 +86,29 @@ test('没人等的图：起一轮识图', () => {
 test('模型要求结束：告别语播完才挂断', () => {
   const { core } = newCore();
   toSpeaking(core);
-  assert.deepEqual(core.dispatch({ type: 'endRequested' }), []); // 还在播，先等
+  assert.deepEqual(core.dispatch({ type: 'endRequested' }), [{ type: 'stop_capture' }]); // 先停采集
   const ticket = core.fsm.ticket();
   core.fsm.audioDone(ticket);
   assert.equal(core.phase, 'ending');
   assert.deepEqual(core.dispatch({ type: 'turnFinished' }), [{ type: 'end' }]);
 });
 
-test('空闲时要求结束：立刻挂断', () => {
+test('空闲时要求结束：停采集 + 立刻挂断', () => {
   const { core } = newCore();
-  assert.deepEqual(core.dispatch({ type: 'endRequested' }), [{ type: 'end' }]);
+  assert.deepEqual(core.dispatch({ type: 'endRequested' }), [
+    { type: 'stop_capture' },
+    { type: 'end' },
+  ]);
   assert.equal(core.phase, 'ending');
+});
+
+test('收尾后到达的识别结果不再开新一轮', () => {
+  const { core } = newCore();
+  toSpeaking(core);
+  core.dispatch({ type: 'endRequested' });
+  assert.deepEqual(core.dispatch({ type: 'utterance', text: '等等我还有事' }), [
+    { type: 'drop', why: 'ending' },
+  ]);
 });
 
 test('连接结束是吸收态', () => {
