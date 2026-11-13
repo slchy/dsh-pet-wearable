@@ -53,24 +53,33 @@ node src/main.ts --stt ./my-stt.ts --agent ./my-agent.ts
 ## 数据流
 
 ```
-TCP ──transport.ts──┬─ Audio ──▶ ffmpeg(SBC→PCM) ──▶ EnergyGate ──▶ SttSession
-                    ├─ Image ──▶ 拍照等待 / 识图轮次                    │
-                    └─ Wake  ──▶ 诊断日志                              ▼
-                                                     UtteranceAssembler（判停）
-                                                                    │
-   工具控制口 ◀── take_photo / end_session      TurnRunner ◀── 一轮定稿
-        │                                            │
-        └──────────── Connection.sendControl ◀───────┴─ TtsProvider（流式）
+TCP ──transport──┬─ Audio ──▶ UplinkPipeline（ffmpeg→PCM→能量门）──▶ SttSession
+                 ├─ Image ──▶ PhotoInbox ──┬─ 有人在等：交图
+                 │                         └─ 没人等：当成一轮识图
+                 └─ Wake  ──▶ 诊断日志
+
+ SttSession.onSentence ──▶ SessionCore ──effects──▶ UtteranceAssembler（判停成句）
+                              ▲                          │
+                              │                    定稿一句话
+                    工具控制口 / 拍照                    ▼
+                                         SessionCore ──▶ TurnRunner ──▶ TtsProvider
+                                                              │
+                                                              └─▶ connection.sendAudio
 ```
 
 | 文件 | 只做一件事 |
 |---|---|
 | `src/transport.ts` | accept、帧编解码、Hello 鉴权、Ping/Pong、空闲看门狗、TLS |
 | `src/providers.ts` | STT / TTS / Agent 的接口与内置实现 |
-| `src/aliyun-session.ts` | 一条连接的编排（判停、成句、一轮执行、拍照、落盘） |
+| `src/uplink-pipeline.ts` | mSBC → PCM（ffmpeg）→ 能量门 → 有声段 |
+| `src/session-core.ts` | 对话决策：唤醒词/旁听反馈/插话/识图轮 → 产出动作（纯，可单测） |
+| `src/photo-inbox.ts` | 拍照请求的等待、超时与落盘 |
+| `src/aliyun-session.ts` | 一条连接的接线（不含判定逻辑） |
 | `src/turn-runner.ts` | 一轮对话：agent 流式出字 → TTS 流式出音 → 下发 |
 | `src/dialog-fsm.ts` | 对话状态机（listening/thinking/speaking/ending + 插话作废） |
 | `src/main.ts` | 只做装配与 CLI |
+
+改这些地方的判定不用碰网络：`npm test` 跑 `tests/session-core.test.ts`（纯事件 → 断言动作）。
 
 ## 接公网
 

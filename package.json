@@ -6,7 +6,8 @@
   "scripts": {
     "probe": "node src/probe-vad.ts",
     "start": "node src/main.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts"
   },
   "dependencies": {
     "onnxruntime-node": "^1.20.0"
