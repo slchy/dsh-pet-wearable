@@ -35,6 +35,33 @@ export function pcm16DurationMs(bytes: number, sampleRate: number): number {
 }
 
 /**
+ * 放大 PCM16（返回新 Buffer），带**软限幅**。
+ *
+ * 为什么需要：MiMo 出来的音量偏小，手机上要开到接近满格才听清。直接乘系数会在
+ * 峰值处硬削顶（爆音），所以过了拐点后改用 tanh 平滑压向 ±1 —— 听感是"压住"
+ * 而不是"削平"，且曲线在拐点处斜率连续（不会出现折角噪声）。
+ *
+ * @param gain 线性倍数，1.0 = 原样返回
+ */
+export function pcm16Gain(pcm: Buffer, gain: number): Buffer {
+  if (gain === 1 || pcm.length === 0) {
+    return pcm;
+  }
+  const knee = 0.85; // 低于此比例保持线性
+  const out = Buffer.allocUnsafe(pcm.length);
+  const samples = pcm.length >> 1;
+  for (let i = 0; i < samples; i += 1) {
+    const x = (pcm.readInt16LE(i << 1) / 32768) * gain;
+    const magnitude = Math.abs(x);
+    const shaped = magnitude <= knee
+      ? x
+      : Math.sign(x) * (knee + (1 - knee) * Math.tanh((magnitude - knee) / (1 - knee)));
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(shaped * 32767))), i << 1);
+  }
+  return out;
+}
+
+/**
  * 按**字节**定长的滑动预卷缓冲。
  *
  * 为什么不能按块数：ffmpeg 每次 `data` 事件的块大小不固定 —— 实测同一次会话里

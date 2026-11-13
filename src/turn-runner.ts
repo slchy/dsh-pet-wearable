@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 执行一轮完整对话：agent → TTS → 下发 → 等播放结束。
  *
  * <h2>职责边界</h2>
@@ -13,7 +13,7 @@
  */
 import { DialogFsm } from './dialog-fsm.ts';
 import type { DownlinkSink } from './transport.ts';
-import { pcm16DurationMs } from './pcm.ts';
+import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { sleep } from './util.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
@@ -26,6 +26,11 @@ export interface TurnRunnerOptions {
   readonly fsm: DialogFsm;
   /** 预估播放时长之外再多等的余量 */
   readonly playbackTailMs: number;
+  /**
+   * 下行语音增益（线性倍数，默认 1）。MiMo 输出偏小，实机听感要开到接近满格，
+   * 所以默认放大一档；压峰用软限幅（见 `pcm.ts` 的 `pcm16Gain`）。
+   */
+  readonly ttsGain?: number;
   /** 每块下行音频（AEC 分析落盘用） */
   readonly onDownlinkChunk?: (chunk: Buffer) => void;
   /** 一轮结束（落盘用），无论成功失败都会调用 */
@@ -95,7 +100,7 @@ export class TurnRunner {
         }
         audioBytes += chunk.length;
         this.options.onDownlinkChunk?.(chunk);
-        downlink.sendAudio(chunk);
+        downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       }
 
       interrupted = interrupted || fsm.isStale(ticket);

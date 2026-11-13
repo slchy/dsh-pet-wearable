@@ -66,6 +66,8 @@ export interface AliyunSessionOptions {
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
+  /** 下行语音增益（默认 1）；MiMo 输出偏小，实机用 2–3 更合适 */
+  readonly ttsGain?: number;
   /** 落盘目录，空串表示不落盘 */
   readonly dumpDir: string;
   /** 照片落盘目录；空串表示不落盘（默认） */
@@ -218,6 +220,7 @@ class AliyunConnection {
       downlink: conn,
       fsm: this.core.fsm,
       playbackTailMs: options.playbackTailMs,
+      ttsGain: options.ttsGain,
       onDownlinkChunk: (chunk) => {
         if (options.dumpDir) {
           this.downlinkChunks.push(Buffer.from(chunk));
