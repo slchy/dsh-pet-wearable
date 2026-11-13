@@ -34,6 +34,8 @@ export class UplinkPipeline {
   private readonly options: UplinkPipelineOptions;
   private readonly gate: EnergyGate;
   private readonly ffmpeg: ChildProcessWithoutNullStreams;
+  private received = false;
+  private closed = false;
 
   constructor(options: UplinkPipelineOptions) {
     this.options = options;
@@ -52,6 +54,9 @@ export class UplinkPipeline {
     ], { stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams;
 
     this.ffmpeg.stderr.on('data', (data: Buffer) => {
+      if (this.closed) {
+        return; // 收尾阶段的抱怨不值得看（见 end()）
+      }
       const text = data.toString().trim();
       if (text) {
         options.onError(text);
@@ -64,12 +69,24 @@ export class UplinkPipeline {
   /** 送一段 mSBC 压缩帧。 */
   push(sbc: Buffer): void {
     if (!this.ffmpeg.stdin.destroyed) {
+      this.received = true;
       this.ffmpeg.stdin.write(sbc);
     }
   }
 
   /** 关管道。ffmpeg 偶尔不肯立刻退，兜底一秒后 kill。 */
   end(): void {
+    this.closed = true;
+    if (!this.received) {
+      // 这段连接没收到任何音频：优雅关闭反而会让 ffmpeg 报
+      // 「Output file does not contain any stream」，直接杀掉更干净
+      try {
+        this.ffmpeg.kill();
+      } catch {
+        // 已退出
+      }
+      return;
+    }
     if (!this.ffmpeg.stdin.destroyed) {
       this.ffmpeg.stdin.end();
     }

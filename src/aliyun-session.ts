@@ -95,6 +95,14 @@ export interface AliyunSessionOptions {
 
   /** 心跳/空闲上限：这么久没收到任何字节就主动断开（默认 45 s）。 */
   readonly idleTimeoutMs?: number;
+
+  /**
+   * 常驻模式：一条连接结束后**继续等**下一条（默认 false = 单连接就退出）。
+   *
+   * 调试时客户端会反复重连（改端口、换证书、拉断重试），每次都要手动重启服务
+   * 很烦；`--serve` 就是给它准备的。
+   */
+  readonly serve?: boolean;
 }
 
 /**
@@ -109,6 +117,7 @@ export async function runAliyunServer(options: AliyunSessionOptions): Promise<nu
     tls: options.tls,
     authenticate: options.authenticate,
     idleTimeoutMs: options.idleTimeoutMs,
+    singleConnection: options.serve !== true,
     log: (line) => { console.log(line); },
     onConnection: (conn) => { new AliyunConnection(conn, options).start(); },
   });

@@ -403,6 +403,7 @@ async function main(): Promise<void> {
       tls: loadTls(),
       authenticate: loadAuthenticator(),
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
+      serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
     });
     dshSession?.stop();
     process.exit(code);
