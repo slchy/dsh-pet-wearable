@@ -189,7 +189,7 @@ node tools/fake-phone.ts --port 8768 --sbc ../tmp/voice.sbc --tls --ca cert.pem
 出问题之后不能靠猜。`MIAI_ARCHIVE_DIR` 一开，**每条连接**都会留一份完整档案：
 
 ```text
-<root>/20261114-031530-182.135.0.22_2421/
+<root>/20261114-031530-203.0.113.20_2421/
   meta.json      当时的增益、门限、采样率、provider、模型（档案必须自解释）
   events.jsonl   时间线，每条都带三条流当时的字节偏移
   uplink.sbc     手机发来的原始 mSBC，未解码（可换增益重新解码）
@@ -206,7 +206,7 @@ MIAI_ARCHIVE_KEEP=20                     # 保留多少个会话目录
 看一份档案：
 
 ```bash
-python scripts/analyze_session.py ~/miai-archive/20261114-031530-182.135.0.22_2421
+python scripts/analyze_session.py ~/miai-archive/20261114-031530-203.0.113.20_2421
 ```
 
 它给三样东西：事件时间线（门开关 / ASR 中间结果 / 成句 / 下发控制 / 唤醒）、
