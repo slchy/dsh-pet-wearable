@@ -81,6 +81,22 @@ TCP ──transport──┬─ Audio ──▶ UplinkPipeline（ffmpeg→PCM→
 
 改这些地方的判定不用碰网络：`npm test` 跑 `tests/session-core.test.ts`（纯事件 → 断言动作）。
 
+## 调试口（没有麦克风也能联调）
+
+连接建立后，云端在 `--listen + 2` 端口开一个本机控制口（`PHOTO_CTL_PORT` 可覆盖）：
+
+| 路由 | 作用 |
+|---|---|
+| `POST /say`（body = 一句话） | 当作「用户说了这句」，走正常轮次 → agent → TTS → 下发 |
+| `POST /take_photo` | 让设备拍一张，返回 JPEG |
+| `POST /end_session` | 按「说完这句就挂断」处理 |
+
+```bash
+curl -X POST --data '你好，介绍一下你自己' http://127.0.0.1:8770/say
+```
+
+这条口子只绑本机，是给联调与客户端作者用的；生产部署请别把它暴露出去。
+
 ## 接公网
 
 | 环境变量 | 作用 |
@@ -88,6 +104,7 @@ TCP ──transport──┬─ Audio ──▶ UplinkPipeline（ffmpeg→PCM→
 | `MIAI_TLS_KEY` / `MIAI_TLS_CERT` | 给了就走 TLS（另一条路径是明文 TCP，同一份代码） |
 | `MIAI_TOKENS` | 指向 `token` 或 `token:deviceId` 一行的文件；配了就要求首帧 `Hello` |
 | `--host` | 缺省 `127.0.0.1`，上公网由部署方显式给 `0.0.0.0` |
+| `DSH_BIN` | agent 可执行文件；Windows 上指向 npm 的 `dsh.cmd` 即可（内部用 `cmd /c` 启动 shim） |
 
 自签证书实测：
 

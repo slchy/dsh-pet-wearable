@@ -7,6 +7,8 @@
  *
  * - `POST /take_photo`  → 调 {@link ToolControlHandlers.takePhoto} 取 JPEG
  * - `POST /end_session` → 调 {@link ToolControlHandlers.endSession}
+ * - `POST /say`         → 当作「用户说了这句话」，起一轮（**调试/联调用**，
+ *   没有麦克风也能验证 agent→TTS→下发整条链）
  */
 import { createServer, type Server } from 'node:http';
 
@@ -15,6 +17,8 @@ export interface ToolControlHandlers {
   readonly takePhoto: () => Promise<Buffer | null>;
   /** 模型判定应当结束会话 */
   readonly endSession: () => void;
+  /** 注入一句话，按正常轮次处理（调试/联调） */
+  readonly say?: (text: string) => void;
   readonly log?: (line: string) => void;
 }
 
@@ -42,6 +46,22 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
   const server: Server = createServer((req, res) => {
     if (req.method !== 'POST') {
       res.writeHead(404).end();
+      return;
+    }
+
+    if (req.url === '/say') {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+      req.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        if (!text || !handlers.say) {
+          res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('need text');
+          return;
+        }
+        handlers.log?.(`  注入    ${JSON.stringify(text)}（调试口）`);
+        handlers.say(text);
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('ok');
+      });
       return;
     }
 

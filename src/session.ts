@@ -328,15 +328,10 @@ export class DshSession {
     if (this.proc && this.sdkReady) return;
     if (this.proc) this.stop();
 
-    const proc = spawn(this.program, [
+    const proc = this.spawnProgram([
       '--profile', 'sdk',
       ...(this.patch ? ['--patch', this.patch] : []),
-    ], {
-      cwd: this.workDir,
-      env: process.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
+    ]);
     this.proc = proc;
 
     proc.stdout?.on('data', (d: Buffer) => { this.handleData(d); });
@@ -513,16 +508,30 @@ export class DshSession {
     };
   }
 
+  /**
+   * `spawn` 一个可能是 npm shim 的 program。
+   *
+   * Windows 上 `.cmd` / `.bat` 不是可执行映像，直接 spawn 会 `EINVAL`；
+   * 用 `cmd.exe /c <shim> ...` 启动，比 `shell: true` 更可控
+   * （后者会把参数直接拼进命令行，Node 会报 DEP0190）。
+   */
+  private spawnProgram(args: string[]) {
+    const isShim = process.platform === 'win32' && /\.(cmd|bat)$/i.test(this.program);
+    const argv = isShim ? ['/c', this.program, ...args] : args;
+    const command = isShim ? (process.env['COMSPEC'] ?? 'cmd.exe') : this.program;
+    return spawn(command, argv, {
+      cwd: this.workDir,
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+  }
+
   private exec(args: string[], input: string): Promise<RunOutcome> {
     return new Promise<RunOutcome>((resolve, reject) => {
       let child;
       try {
-        child = spawn(this.program, args, {
-          cwd: this.workDir,
-          env: process.env,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        });
+        child = this.spawnProgram(args);
       } catch (e) {
         reject(new DshError(`无法启动 ${this.program}：${(e as Error).message}`));
         return;

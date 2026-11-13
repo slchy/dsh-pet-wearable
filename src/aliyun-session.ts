@@ -237,6 +237,10 @@ class AliyunConnection {
       handlers: {
         takePhoto: () => this.photos.request(),
         endSession: () => { this.execute(this.core.dispatch({ type: 'endRequested' })); },
+        say: (text) => {
+          // 调试口：和「用户说完一句」走同一条路，方便没有麦克风时联调
+          this.execute(this.core.dispatch({ type: 'utterance', text }));
+        },
         log: (line) => { console.log(line); },
       },
     });
