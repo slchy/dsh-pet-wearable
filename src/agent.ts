@@ -55,6 +55,9 @@ export interface AgentReply extends AskResult {
 }
 
 export class VoiceAgent {
+  /** 供日志/诊断显示 */
+  readonly name = 'dsh';
+
   private readonly session: DshSession;
   private readonly log: (line: string) => void;
 

@@ -16,6 +16,8 @@
  */
 import { createHmac, randomUUID } from 'node:crypto';
 
+import type { SttProvider } from './providers.ts';
+
 const SAMPLE_RATE = 16_000;
 /** token 提前这么多秒视为过期，避免边界上刚好失效 */
 const TOKEN_REFRESH_MARGIN_SEC = 300;
@@ -347,4 +349,33 @@ export class AliyunAsr {
       return;
     }
   }
+}
+
+/**
+ * 把阿里云 NLS 包成 {@link SttProvider}，供编排层注入。
+ *
+ * 凭据从这里进来（部署方负责，别写进源码）；换厂商时只需要另一个同接口的
+ * 工厂，编排层不动。
+ */
+export function aliyunStt(
+  creds: Omit<AliyunAsrOptions, 'onSentence' | 'onPartial' | 'onError' | 'log'>,
+  log?: (line: string) => void,
+): SttProvider {
+  return {
+    name: `aliyun:${creds.region}`,
+    open: (handlers) => {
+      const asr = new AliyunAsr({
+        ...creds,
+        onSentence: handlers.onSentence,
+        onPartial: handlers.onPartial,
+        onError: handlers.onError,
+        log,
+      });
+      return {
+        feed: (pcm) => { asr.feed(pcm); },
+        hangup: () => { asr.hangup(); },
+        close: () => { asr.close(); },
+      };
+    },
+  };
 }

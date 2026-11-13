@@ -11,14 +11,83 @@
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { VoiceAgent } from './agent.ts';
-import { ttsStream, TTS_SAMPLE_RATE } from './mimo.ts';
+import { aliyunStt } from './aliyun-asr.ts';
+import { mimoTts } from './mimo.ts';
+import { noopStt, silentTts, type SttProvider, type TtsProvider } from './providers.ts';
 import { DshSession } from './session.ts';
 import { runAliyunServer } from './aliyun-session.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
 import { sleep } from './util.ts';
+
+/**
+ * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` 工厂（或 default）。
+ *
+ * 这是 `cloud/` 唯一的扩展点 —— 换厂商不用改本文件，也不用 fork。将来开源时
+ * 别人照这个签名写自己的模块即可（见 `docs/BACKLOG.md` B-004）。
+ */
+async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
+  const isPath = /^[./]/.test(spec) || /^[A-Za-z]:[\\/]/.test(spec);
+  const url = isPath ? pathToFileURL(resolve(spec)).href : spec;
+  const mod = (await import(url)) as Record<string, unknown>;
+  const factory = (mod.default ?? mod[exportName]) as (() => T) | undefined;
+  if (typeof factory !== 'function') {
+    throw new Error(`${spec} 必须导出 ${exportName}() 工厂（或 default 导出工厂）`);
+  }
+  return factory();
+}
+
+/** `--stt aliyun|noop|<path>` */
+async function buildStt(
+  spec: string,
+  creds: { akId: string; akSecret: string; appkey: string; region: string; maxSentenceSilenceMs: number },
+): Promise<SttProvider> {
+  if (spec === 'noop') return noopStt();
+  if (spec === 'aliyun') {
+    return aliyunStt(creds, (line) => { console.log(`  [asr] ${line}`); });
+  }
+  return loadProvider<SttProvider>(spec, 'stt');
+}
+
+/** `--tts mimo|silent|<path>` */
+async function buildTts(spec: string): Promise<TtsProvider> {
+  if (spec === 'silent') return silentTts();
+  if (spec === 'mimo') return mimoTts(process.env['MIMO_TTS_VOICE'] ?? 'Chloe');
+  return loadProvider<TtsProvider>(spec, 'tts');
+}
+
+/** 证书从文件读，路径只走环境变量 —— 部署细节不进源码。 */
+function loadTls(): { key: Buffer; cert: Buffer } | undefined {
+  const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
+  const certPath = process.env['MIAI_TLS_CERT'] ?? '';
+  if (!keyPath || !certPath) return undefined;
+  return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+}
+
+/**
+ * 设备鉴权：`MIAI_TOKENS` 指向一个文件，每行 `token` 或 `token:deviceId`。
+ * 不配就**不鉴权**（本地开发）；配了就必须首帧 `Hello`。
+ */
+function loadAuthenticator(): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
+  const path = process.env['MIAI_TOKENS'] ?? '';
+  if (!path) return undefined;
+  const tokens = new Set(
+    readFileSync(path, 'utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '' && !line.startsWith('#'))
+      .map((line) => line.split(':')[0]!.trim()),
+  );
+  if (tokens.size === 0) {
+    console.error(`MIAI_TOKENS=${path} 里没有任何 token`);
+    process.exit(2);
+  }
+  console.log(`鉴权      ${tokens.size} 个设备 token（来自 ${path}）`);
+  return (hello) => typeof hello.token === 'string' && tokens.has(hello.token);
+}
 
 // ------------------------------------------------------------------ 入口
 async function runReplay(path: string, pipe: Pipeline, gapMs: number): Promise<number> {
@@ -221,6 +290,16 @@ async function main(): Promise<void> {
     );
     console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms\n`);
 
+    const stt = await buildStt(opt('--stt', 'aliyun'), {
+      akId,
+      akSecret,
+      appkey,
+      region,
+      maxSentenceSilenceMs: sentenceSilenceMs,
+    });
+    const tts = await buildTts(opt('--tts', 'mimo'));
+    console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
+
     const smartTurnPython = process.env['SMART_TURN_PYTHON'] ?? '';
     const smartTurnScript = process.env['SMART_TURN_SCRIPT'] ?? '';
     const smartTurnEnabled = process.env['SMART_TURN'] !== '0'
@@ -228,9 +307,11 @@ async function main(): Promise<void> {
 
     const code = await runAliyunServer({
       port: listen,
+      host: opt('--host', '127.0.0.1'),
       ffmpegPath: ffmpeg,
       agent,
-      asr: { akId, akSecret, appkey, region, maxSentenceSilenceMs: sentenceSilenceMs },
+      stt,
+      tts,
       smartTurn: smartTurnEnabled
         ? {
           pythonPath: smartTurnPython,
@@ -246,14 +327,15 @@ async function main(): Promise<void> {
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
         prerollMs: envNumber('VOICE_PREROLL_MS', 800),
       },
-      ttsSampleRate: TTS_SAMPLE_RATE,
       playbackTailMs: 600,
       dumpDir: process.env['DUMP_DIR'] ?? '',
-      photoDir: process.env['PHOTO_DIR'] ?? join(homedir(), 'miai-photos'),
+      photoDir: process.env['PHOTO_DIR'] ?? '',
       controlPort: envNumber('PHOTO_CTL_PORT', 8767),
       photoTimeoutMs: 20_000,
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
-      synthesize: (t: string) => ttsStream(t),
+      tls: loadTls(),
+      authenticate: loadAuthenticator(),
+      idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
     });
     dshSession?.stop();
     process.exit(code);

@@ -7,6 +7,8 @@
  * - TTS：输出 SSE base64 PCM16，**采样率 24 kHz**
  */
 
+import type { TtsProvider } from './providers.ts';
+
 const API_URL = 'https://api.xiaomimimo.com/v1/chat/completions';
 const ASR_MODEL = 'mimo-v2.5-asr';
 const TTS_MODEL = 'mimo-v2.5-tts';
@@ -169,4 +171,21 @@ export async function tts(
     parts.push(pcm);
   }
   return { pcm: Buffer.concat(parts), chunks: parts.length };
+}
+
+/**
+ * 把 MiMo 包成 {@link TtsProvider}，供编排层注入。
+ *
+ * 采样率由这里声明（24 kHz），宿主不再另配一份 —— 上行 16 kHz / 下行 24 kHz
+ * 是两个不同的值，配错会 1.5 倍速升调。
+ */
+export function mimoTts(
+  voice = 'Chloe',
+  style = 'Calm, natural, conversational.',
+): TtsProvider {
+  return {
+    name: `mimo:${voice}`,
+    sampleRate: TTS_SAMPLE_RATE,
+    synthesize: (text: string) => ttsStream(text, voice, style),
+  };
 }

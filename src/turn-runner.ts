@@ -15,16 +15,15 @@ import { DialogFsm } from './dialog-fsm.ts';
 import { DownstreamFrameType, FrameWriter } from './frame.ts';
 import { pcm16DurationMs } from './pcm.ts';
 import { sleep } from './util.ts';
-import type { VoiceAgent } from './agent.ts';
+import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
 export interface TurnRunnerOptions {
-  readonly agent: VoiceAgent;
-  /** 文本 → 音频块流 */
-  readonly synthesize: (text: string) => AsyncIterable<Buffer>;
+  readonly agent: AgentProvider;
+  /** TTS provider：采样率与合成都在里面，宿主不再各配一份 */
+  readonly tts: TtsProvider;
   readonly frames: FrameWriter;
   readonly fsm: DialogFsm;
-  readonly ttsSampleRate: number;
   /** 预估播放时长之外再多等的余量 */
   readonly playbackTailMs: number;
   /** 每块下行音频（AEC 分析落盘用） */
@@ -84,7 +83,7 @@ export class TurnRunner {
       );
 
       const ttsStarted = Date.now();
-      for await (const chunk of this.options.synthesize(reply.speech)) {
+      for await (const chunk of this.options.tts.synthesize(reply.speech)) {
         if (fsm.isStale(ticket)) {
           interrupted = true;
           break;
@@ -100,7 +99,7 @@ export class TurnRunner {
       }
 
       interrupted = interrupted || fsm.isStale(ticket);
-      const audioSeconds = pcm16DurationMs(audioBytes, this.options.ttsSampleRate) / 1000;
+      const audioSeconds = pcm16DurationMs(audioBytes, this.options.tts.sampleRate) / 1000;
       this.log(
         `  回放    ${audioBytes} 字节  ${audioSeconds.toFixed(2)} s`
         + (interrupted ? '（被中断）' : ''),

@@ -20,8 +20,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
+import { createServer as createTlsServer } from 'node:tls';
 
-import { AliyunAsr } from './aliyun-asr.ts';
 import { isBackchannelOnly } from './backchannel.ts';
 import { DialogFsm, type TurnTicket } from './dialog-fsm.ts';
 import { EnergyGate } from './energy-gate.ts';
@@ -37,24 +37,52 @@ import { startToolControl, type ToolControl } from './tool-control.ts';
 import { TurnRunner } from './turn-runner.ts';
 import { UtteranceAssembler } from './utterance-assembler.ts';
 import { isWakeWordOnly } from './wake-word.ts';
-import type { VoiceAgent } from './agent.ts';
+import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
 /** 上行采样率：mSBC 解码后固定 16 kHz */
 export const UPSTREAM_SAMPLE_RATE = 16_000;
 
+/** `Hello` 帧的内容。字段都可选，方便别人只报自己想报的。 */
+export interface HelloInfo {
+  readonly proto?: number;
+  readonly deviceId?: string;
+  readonly token?: string;
+}
+
+/** 解析 `Hello`；坏 JSON 返回 null（由调用方决定拒绝还是忽略）。 */
+export function parseHello(payload: Buffer): HelloInfo | null {
+  try {
+    const parsed: unknown = JSON.parse(payload.toString('utf8'));
+    if (parsed === null || typeof parsed !== 'object') {
+      return null;
+    }
+    const o = parsed as Record<string, unknown>;
+    return {
+      proto: typeof o.proto === 'number' ? o.proto : undefined,
+      deviceId: typeof o.deviceId === 'string' ? o.deviceId : undefined,
+      token: typeof o.token === 'string' ? o.token : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export interface AliyunSessionOptions {
   /** 监听端口 */
   readonly port: number;
+  /**
+   * 监听地址。缺省 `127.0.0.1` —— 本地开发默认不暴露；
+   * 上公网时由部署方显式给 `0.0.0.0`（或具体网卡地址）。
+   */
+  readonly host?: string;
   readonly ffmpegPath: string;
-  readonly agent: VoiceAgent;
-  readonly asr: {
-    readonly akId: string;
-    readonly akSecret: string;
-    readonly appkey: string;
-    readonly region: string;
-    readonly maxSentenceSilenceMs?: number;
-  };
+  /** Agent（LLM）。注入而不是 import 具体实现 —— 换模型不用动编排层。 */
+  readonly agent: AgentProvider;
+  /** STT。每次连接由 provider 开一个新会话；换厂商同理。 */
+  readonly stt: SttProvider;
+  /** TTS。采样率由 provider 自己声明，这里不再单独配。 */
+  readonly tts: TtsProvider;
   /** Smart Turn 判停器；缺任一项则不启用，退回固定合并窗口 */
   readonly smartTurn?: {
     readonly pythonPath: string;
@@ -70,21 +98,37 @@ export interface AliyunSessionOptions {
     readonly holdMs: number;
     readonly prerollMs: number;
   };
-  /** TTS 输出采样率（与上行不同，不得混用） */
-  readonly ttsSampleRate: number;
-  /** 文本 → 音频块流。注入而不是在内部 import，便于替换与测试。 */
-  readonly synthesize: (text: string) => AsyncIterable<Buffer>;
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
   /** 落盘目录，空串表示不落盘 */
   readonly dumpDir: string;
-  /** 照片落盘目录 */
+  /** 照片落盘目录；空串表示不落盘（默认） */
   readonly photoDir: string;
   /** 控制口端口与超时 */
   readonly controlPort: number;
   readonly photoTimeoutMs: number;
   /** 默认的识图提问 */
   readonly imageQuestion: string;
+
+  /**
+   * TLS。**不给就是明文** —— 本地开发不必先造证书；上公网时由部署方注入。
+   * 证书路径/内容属于部署细节，不进源码（见 `BACKLOG.md` B-004）。
+   */
+  readonly tls?: {
+    readonly key: Buffer;
+    readonly cert: Buffer;
+  };
+
+  /**
+   * 首帧鉴权。**不给就不要求 `Hello`**，任何客户端能直接发 Audio。
+   *
+   * 给了就必须先收到合法 `Hello` 才放行后续帧；返回 false 会回一条
+   * `Control: auth_failed` 再断开。
+   */
+  readonly authenticate?: (hello: HelloInfo) => boolean;
+
+  /** 心跳/空闲上限：这么久没收到任何字节就主动断开（默认 45 s）。 */
+  readonly idleTimeoutMs?: number;
 }
 
 interface PhotoWaiter {
@@ -99,17 +143,29 @@ interface PhotoWaiter {
  * 各个部件各自持有自己的状态，不再共用一个巨型闭包。
  */
 export async function runAliyunServer(options: AliyunSessionOptions): Promise<number> {
+  const host = options.host ?? '127.0.0.1';
+
   return await new Promise<number>((resolve) => {
-    const server: Server = createServer((socket) => {
+    const onConnection = (socket: Socket): void => {
+      socket.setNoDelay(true); // 小帧 + 实时语音：别让 Nagle 攒包
       new AliyunConnection(socket, options, () => {
         server.close();
         resolve(0);
       }).start();
-    });
+    };
 
-    server.listen(options.port, '127.0.0.1', () => {
-      console.log(`监听 127.0.0.1:${options.port}（阿里云流式识别）`);
-      console.log(`手机侧先执行： adb reverse tcp:${options.port} tcp:${options.port}\n`);
+    // TLS 只在部署方显式给了证书时才启用 —— 两条路径是同一份代码的两种配置
+    const server: Server = options.tls
+      ? createTlsServer({ key: options.tls.key, cert: options.tls.cert, minVersion: 'TLSv1.2' }, onConnection)
+      : createServer(onConnection);
+
+    server.listen(options.port, host, () => {
+      const scheme = options.tls ? 'tls' : 'tcp';
+      const auth = options.authenticate ? '需要 Hello 鉴权' : '不鉴权';
+      console.log(`监听 ${scheme}://${host}:${options.port}（${auth}）`);
+      if (host === '127.0.0.1') {
+        console.log(`手机侧先执行： adb reverse tcp:${options.port} tcp:${options.port}\n`);
+      }
     });
   });
 }
@@ -127,12 +183,18 @@ class AliyunConnection {
   private readonly smartTurn: SmartTurn | null;
   private readonly assembler: UtteranceAssembler;
   private readonly runner: TurnRunner;
-  private readonly asr: AliyunAsr;
+  private readonly stt: SttSession;
   private readonly ffmpeg: ChildProcessWithoutNullStreams;
 
   private control: ToolControl | null = null;
   private photoWaiter: PhotoWaiter | null = null;
   private serialChain: Promise<void> = Promise.resolve();
+
+  /** 没配 `authenticate` 就是已鉴权 —— 开发模式不该被迫先发 Hello。 */
+  private authed = true;
+  /** 最后一次收到字节的时刻，供空闲看门狗使用。 */
+  private lastRxAt = 0;
+  private idleTimer: NodeJS.Timeout | null = null;
 
   private downlinkChunks: Buffer[] = [];
   private uplinkDuringPlayback: Buffer[] = [];
@@ -193,13 +255,7 @@ class AliyunConnection {
       log: (line) => { console.log(line); },
     });
 
-    this.asr = new AliyunAsr({
-      akId: options.asr.akId,
-      akSecret: options.asr.akSecret,
-      appkey: options.asr.appkey,
-      region: options.asr.region,
-      maxSentenceSilenceMs: options.asr.maxSentenceSilenceMs,
-      log: (line) => { console.log(`  ${line}`); },
+    this.stt = options.stt.open({
       onPartial: (text) => { this.onPartial(text); },
       onSentence: (text, index) => { this.onSentence(text, index); },
       onError: (error) => { this.onAsrError(error); },
@@ -213,10 +269,9 @@ class AliyunConnection {
 
     this.runner = new TurnRunner({
       agent: options.agent,
-      synthesize: options.synthesize,
+      tts: options.tts,
       frames: this.frames,
       fsm: this.fsm,
-      ttsSampleRate: options.ttsSampleRate,
       playbackTailMs: options.playbackTailMs,
       onDownlinkChunk: (chunk) => {
         if (this.options.dumpDir) {
@@ -239,10 +294,31 @@ class AliyunConnection {
   start(): void {
     console.log(`已连接 ${this.socket.remoteAddress}:${this.socket.remotePort}\n`);
 
+    this.authed = !this.options.authenticate;
+    if (!this.authed) {
+      console.log('  鉴权    等待 Hello（首帧）');
+    }
+    this.lastRxAt = Date.now();
+    this.startIdleWatchdog();
+
     this.bindControl();
     this.bindUpstream();
     this.bindDecoderEvents();
     this.bindClose();
+  }
+
+  /**
+   * 空闲看门狗：NAT 会在几分钟后静默掐连接，两侧都不知道。
+   * 这里只负责「太久没收到字节就主动关」，心跳本身由客户端发 `Ping`。
+   */
+  private startIdleWatchdog(): void {
+    const limit = this.options.idleTimeoutMs ?? 45_000;
+    this.idleTimer = setInterval(() => {
+      if (Date.now() - this.lastRxAt > limit) {
+        console.log(`  连接    ${Math.round((Date.now() - this.lastRxAt) / 1000)} s 无数据，主动断开`);
+        this.socket.end();
+      }
+    }, 5_000);
   }
 
   // ------------------------------------------------------------------ 接线
@@ -282,21 +358,22 @@ class AliyunConnection {
           + `（补 ${decision.opened.preroll.length} 块 / ${decision.opened.prerollMs} ms）`,
         );
         for (const part of decision.opened.preroll) {
-          this.asr.feed(part);
+          this.stt.feed(part);
         }
       }
       if (decision.forward) {
-        this.asr.feed(chunk);
+        this.stt.feed(chunk);
       }
       if (decision.closed) {
         console.log('  上行    持续静音 → 停推并挂断（避免 IDLE_TIMEOUT）');
-        this.asr.hangup();
+        this.stt.hangup();
       }
     });
   }
 
   private bindDecoderEvents(): void {
     this.socket.on('data', (chunk: Buffer) => {
+      this.lastRxAt = Date.now();
       for (const frame of this.decoder.push(chunk)) {
         this.dispatch(frame.type, frame.payload);
       }
@@ -308,7 +385,20 @@ class AliyunConnection {
   }
 
   private dispatch(type: number, payload: Buffer): void {
+    // 未鉴权时只放行 Hello —— 其余帧一律拒绝，避免"还没证明身份就开始推音频"
+    if (!this.authed && type !== UpstreamFrameType.Hello) {
+      console.log(`  鉴权    未收到 Hello 就发帧（type=${type}），断开`);
+      this.rejectAuth('auth_required');
+      return;
+    }
+
     switch (type) {
+      case UpstreamFrameType.Hello:
+        this.onHello(payload);
+        return;
+      case UpstreamFrameType.Ping:
+        this.frames.write(DownstreamFrameType.Pong, Buffer.alloc(0));
+        return;
       case UpstreamFrameType.Audio:
         if (!this.ffmpeg.stdin.destroyed) {
           this.ffmpeg.stdin.write(payload);
@@ -325,6 +415,32 @@ class AliyunConnection {
     }
   }
 
+  private onHello(payload: Buffer): void {
+    if (this.authed) {
+      return; // 已经放行过，重复 Hello 直接忽略
+    }
+    const check = this.options.authenticate;
+    if (!check) {
+      this.authed = true;
+      return;
+    }
+    const hello = parseHello(payload);
+    if (!hello || !check(hello)) {
+      console.log(`  鉴权    拒绝（deviceId=${hello?.deviceId ?? '?'}）`);
+      this.rejectAuth('auth_failed');
+      return;
+    }
+    this.authed = true;
+    console.log(`  鉴权    通过（deviceId=${hello.deviceId ?? '?'} proto=${hello.proto ?? '?'}）`);
+  }
+
+  private rejectAuth(reason: string): void {
+    if (!this.socket.destroyed) {
+      this.frames.writeText(DownstreamFrameType.Control, reason);
+      this.socket.end();
+    }
+  }
+
   private bindClose(): void {
     this.socket.on('close', () => {
       console.log(`\n连接结束，${this.fsm.turn} 轮`);
@@ -333,7 +449,7 @@ class AliyunConnection {
       this.smartTurn?.stop();
       this.control?.close();
       this.flushDump();
-      this.asr.close();
+      this.stt.close();
       if (!this.ffmpeg.stdin.destroyed) {
         this.ffmpeg.stdin.end();
       }

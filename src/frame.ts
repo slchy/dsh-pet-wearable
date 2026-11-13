@@ -23,6 +23,20 @@ export const UpstreamFrameType = {
   Image: 2,
   /** 唤醒上下文：`transactionId\nrequestId` */
   Wake: 3,
+  /**
+   * 心跳。payload 忽略，服务端回 {@link DownstreamFrameType.Pong}。
+   *
+   * 可选：服务端不要求心跳也能工作，只是 NAT 会在几分钟后把静默连接掐掉。
+   */
+  Ping: 4,
+  /**
+   * 首帧身份。payload 是 UTF-8 JSON：
+   * `{"proto":1,"deviceId":"...","token":"..."}`
+   *
+   * **只有服务端配了 `authenticate` 时才必须**；没配就不必发，发了也忽略。
+   * 这样"只想跑起来看看"的人不用先造一套凭据。
+   */
+  Hello: 6,
 } as const;
 
 /** 下行帧类型（云端 → 手机） */
@@ -31,6 +45,8 @@ export const DownstreamFrameType = {
   Audio: 1,
   /** UTF-8 控制串：`take_photo` / `stop` */
   Control: 2,
+  /** 心跳应答，payload 为空 */
+  Pong: 5,
 } as const;
 
 export interface DecodedFrame {
