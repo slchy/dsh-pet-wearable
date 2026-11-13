@@ -7,12 +7,16 @@
  *
  * 用法：
  *   node tools/fake-phone.ts --port 8766 --sbc ../../tmp/voice_1793904904745.sbc \
- *     [--token <hex>] [--host 127.0.0.1] [--frames 400]
+ *     [--token <hex>] [--host 127.0.0.1] [--frames 400] [--tls [--ca cert.pem]]
+ *
+ * `--tls` 不给 `--ca` 时跳过证书校验（本地自签图省事）；给了 `--ca` 就严格校验 ——
+ * 这也是「自签 CA 打进客户端 = 天然 pinning」在测试里的样子。
  *
  * 退出码 0 表示：连上、发完、收到了下行 Audio（或至少 Pong/Control）。
  */
 import { readFileSync } from 'node:fs';
 import { connect, type Socket } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
 
 const FRAME_HEADER_BYTES = 5;
 const UP = { Audio: 1, Image: 2, Wake: 3, Ping: 4, Hello: 6 } as const;
@@ -36,6 +40,8 @@ const port = Number(opt(argv, '--port', '8766'));
 const sbcPath = opt(argv, '--sbc', '');
 const token = opt(argv, '--token', '');
 const frameLimit = Number(opt(argv, '--frames', '400'));
+const useTls = argv.includes('--tls');
+const caPath = opt(argv, '--ca', '');
 
 let gotAudio = 0;
 const gotControl: string[] = [];
@@ -62,8 +68,8 @@ function onData(chunk: Buffer): void {
   }
 }
 
-const socket: Socket = connect(port, host, async () => {
-  console.log(`✓ 已连接 ${host}:${port}`);
+async function onReady(): Promise<void> {
+  console.log(`✓ 已连接 ${useTls ? 'tls' : 'tcp'}://${host}:${port}`);
 
   if (token) {
     const hello = Buffer.from(JSON.stringify({ proto: 1, deviceId: 'fake-phone', token }), 'utf8');
@@ -93,7 +99,20 @@ const socket: Socket = connect(port, host, async () => {
     const ok = gotAudio > 0 || gotPong || gotControl.length > 0;
     process.exit(ok ? 0 : 1);
   }, 6000);
-});
+}
+
+const socket: Socket = useTls
+  ? tlsConnect(
+    {
+      host,
+      port,
+      rejectUnauthorized: caPath !== '',
+      servername: undefined, // 连的是 IP：证书里写 SAN=IP，别拿 IP 当域名比对
+      ...(caPath !== '' ? { ca: readFileSync(caPath) } : {}),
+    },
+    () => { void onReady(); },
+  ) as unknown as Socket
+  : connect(port, host, () => { void onReady(); });
 
 socket.on('data', onData);
 socket.on('error', (e: Error) => {

@@ -110,7 +110,6 @@ function loadTls(): { key: Buffer; cert: Buffer } | undefined {
   const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
   const certPath = process.env['MIAI_TLS_CERT'] ?? '';
   if (!keyPath || !certPath) return undefined;
-  console.log('⚠️  MIAI_TLS_* 已设置，但当前编排层仍用裸 TCP（transport.ts 尚未接线，见 B-004 第三步）');
   return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
 }
 
@@ -351,7 +350,11 @@ async function main(): Promise<void> {
     const sentenceSilenceMs = Number(
       opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS)),
     );
-    console.log(`STT      ${resolvedStt}  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms\n`);
+    // 只有阿里云实现关心 region/appkey；换成别的实现时别把无关信息印出来
+    const sttBanner = resolvedStt === 'aliyun'
+      ? `region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms`
+      : '(外部/内置实现，无需凭据)';
+    console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
     const stt = await buildStt(resolvedStt, {
       akId,
@@ -393,7 +396,8 @@ async function main(): Promise<void> {
       playbackTailMs: 600,
       dumpDir: process.env['DUMP_DIR'] ?? '',
       photoDir: process.env['PHOTO_DIR'] ?? '',
-      controlPort: envNumber('PHOTO_CTL_PORT', 8767),
+      // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
+      controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),
       photoTimeoutMs: 20_000,
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
       tls: loadTls(),

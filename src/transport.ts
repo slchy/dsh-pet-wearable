@@ -49,6 +49,12 @@ export interface ConnectionHandlers {
   onClose(reason: string): void;
 }
 
+/** 业务层往设备发东西只需要这两个动作；`Connection` 天然满足它。 */
+export interface DownlinkSink {
+  sendAudio(pcm: Buffer): void;
+  sendControl(text: string): void;
+}
+
 /** 一条已建立的连接。业务层只碰这个接口，不碰 socket。 */
 export class Connection {
   readonly remote: string;

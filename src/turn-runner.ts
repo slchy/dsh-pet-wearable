@@ -12,7 +12,7 @@
  * （`synthesize` 是函数，不是 TTS 客户端）。
  */
 import { DialogFsm } from './dialog-fsm.ts';
-import { DownstreamFrameType, FrameWriter } from './frame.ts';
+import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs } from './pcm.ts';
 import { sleep } from './util.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
@@ -22,7 +22,7 @@ export interface TurnRunnerOptions {
   readonly agent: AgentProvider;
   /** TTS provider：采样率与合成都在里面，宿主不再各配一份 */
   readonly tts: TtsProvider;
-  readonly frames: FrameWriter;
+  readonly downlink: DownlinkSink;
   readonly fsm: DialogFsm;
   /** 预估播放时长之外再多等的余量 */
   readonly playbackTailMs: number;
@@ -62,7 +62,7 @@ export class TurnRunner {
    * 返回时 `fsm` 已推进到下一状态；调用方据 `fsm.state` 决定是否挂断。
    */
   async run(text: string, image?: ImageAttachment): Promise<TurnResult | null> {
-    const { fsm, agent, frames } = this.options;
+    const { fsm, agent, downlink } = this.options;
     const ticket = fsm.beginTurn();
     if (!ticket) {
       return null;
@@ -95,7 +95,7 @@ export class TurnRunner {
         }
         audioBytes += chunk.length;
         this.options.onDownlinkChunk?.(chunk);
-        frames.write(DownstreamFrameType.Audio, chunk);
+        downlink.sendAudio(chunk);
       }
 
       interrupted = interrupted || fsm.isStale(ticket);

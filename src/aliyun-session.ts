@@ -18,22 +18,16 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
-import { createServer as createTlsServer } from 'node:tls';
 
 import { isBackchannelOnly } from './backchannel.ts';
 import { DialogFsm, type TurnTicket } from './dialog-fsm.ts';
 import { EnergyGate } from './energy-gate.ts';
-import {
-  DownstreamFrameType,
-  FrameDecoder,
-  FrameWriter,
-  UpstreamFrameType,
-} from './frame.ts';
+import { UpstreamFrameType } from './frame.ts';
 import { pcm16DurationMs } from './pcm.ts';
 import { SmartTurn } from './smart-turn.ts';
 import { startToolControl, type ToolControl } from './tool-control.ts';
+import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
 import { UtteranceAssembler } from './utterance-assembler.ts';
 import { isWakeWordOnly } from './wake-word.ts';
@@ -42,31 +36,6 @@ import type { ImageAttachment } from './session.ts';
 
 /** 上行采样率：mSBC 解码后固定 16 kHz */
 export const UPSTREAM_SAMPLE_RATE = 16_000;
-
-/** `Hello` 帧的内容。字段都可选，方便别人只报自己想报的。 */
-export interface HelloInfo {
-  readonly proto?: number;
-  readonly deviceId?: string;
-  readonly token?: string;
-}
-
-/** 解析 `Hello`；坏 JSON 返回 null（由调用方决定拒绝还是忽略）。 */
-export function parseHello(payload: Buffer): HelloInfo | null {
-  try {
-    const parsed: unknown = JSON.parse(payload.toString('utf8'));
-    if (parsed === null || typeof parsed !== 'object') {
-      return null;
-    }
-    const o = parsed as Record<string, unknown>;
-    return {
-      proto: typeof o.proto === 'number' ? o.proto : undefined,
-      deviceId: typeof o.deviceId === 'string' ? o.deviceId : undefined,
-      token: typeof o.token === 'string' ? o.token : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
 
 export interface AliyunSessionOptions {
   /** 监听端口 */
@@ -143,41 +112,22 @@ interface PhotoWaiter {
  * 各个部件各自持有自己的状态，不再共用一个巨型闭包。
  */
 export async function runAliyunServer(options: AliyunSessionOptions): Promise<number> {
-  const host = options.host ?? '127.0.0.1';
-
-  return await new Promise<number>((resolve) => {
-    const onConnection = (socket: Socket): void => {
-      socket.setNoDelay(true); // 小帧 + 实时语音：别让 Nagle 攒包
-      new AliyunConnection(socket, options, () => {
-        server.close();
-        resolve(0);
-      }).start();
-    };
-
-    // TLS 只在部署方显式给了证书时才启用 —— 两条路径是同一份代码的两种配置
-    const server: Server = options.tls
-      ? createTlsServer({ key: options.tls.key, cert: options.tls.cert, minVersion: 'TLSv1.2' }, onConnection)
-      : createServer(onConnection);
-
-    server.listen(options.port, host, () => {
-      const scheme = options.tls ? 'tls' : 'tcp';
-      const auth = options.authenticate ? '需要 Hello 鉴权' : '不鉴权';
-      console.log(`监听 ${scheme}://${host}:${options.port}（${auth}）`);
-      if (host === '127.0.0.1') {
-        console.log(`手机侧先执行： adb reverse tcp:${options.port} tcp:${options.port}\n`);
-      }
-    });
+  return await runTransport({
+    port: options.port,
+    host: options.host,
+    tls: options.tls,
+    authenticate: options.authenticate,
+    idleTimeoutMs: options.idleTimeoutMs,
+    log: (line) => { console.log(line); },
+    onConnection: (conn) => { new AliyunConnection(conn, options).start(); },
   });
 }
 
 /** 一条连接的完整状态。 */
 class AliyunConnection {
-  private readonly socket: Socket;
+  private readonly conn: Connection;
   private readonly options: AliyunSessionOptions;
-  private readonly onFinished: () => void;
 
-  private readonly frames: FrameWriter;
-  private readonly decoder: FrameDecoder;
   private readonly fsm: DialogFsm;
   private readonly gate: EnergyGate;
   private readonly smartTurn: SmartTurn | null;
@@ -190,25 +140,14 @@ class AliyunConnection {
   private photoWaiter: PhotoWaiter | null = null;
   private serialChain: Promise<void> = Promise.resolve();
 
-  /** 没配 `authenticate` 就是已鉴权 —— 开发模式不该被迫先发 Hello。 */
-  private authed = true;
-  /** 最后一次收到字节的时刻，供空闲看门狗使用。 */
-  private lastRxAt = 0;
-  private idleTimer: NodeJS.Timeout | null = null;
-
   private downlinkChunks: Buffer[] = [];
   private uplinkDuringPlayback: Buffer[] = [];
   private dumpedTurn = 0;
 
-  constructor(socket: Socket, options: AliyunSessionOptions, onFinished: () => void) {
-    this.socket = socket;
+  constructor(conn: Connection, options: AliyunSessionOptions) {
+    this.conn = conn;
     this.options = options;
-    this.onFinished = onFinished;
 
-    this.frames = new FrameWriter(socket);
-    this.decoder = new FrameDecoder((message) => {
-      console.error(`  ✗ ${message}`);
-    });
     this.fsm = new DialogFsm((line) => { console.log(line); });
 
     const prerollBytes = Math.round((options.gate.prerollMs / 1000)
@@ -270,7 +209,7 @@ class AliyunConnection {
     this.runner = new TurnRunner({
       agent: options.agent,
       tts: options.tts,
-      frames: this.frames,
+      downlink: this.conn,
       fsm: this.fsm,
       playbackTailMs: options.playbackTailMs,
       onDownlinkChunk: (chunk) => {
@@ -282,9 +221,7 @@ class AliyunConnection {
         this.flushDump();
         if (this.fsm.state === 'ending') {
           console.log('\n--- 会话结束（模型判定）---');
-          if (!this.socket.destroyed) {
-            this.socket.end();
-          }
+          this.conn.end();
         }
       },
       log: (line) => { console.log(line); },
@@ -292,33 +229,16 @@ class AliyunConnection {
   }
 
   start(): void {
-    console.log(`已连接 ${this.socket.remoteAddress}:${this.socket.remotePort}\n`);
+    console.log(`已连接 ${this.conn.remote}\n`);
 
-    this.authed = !this.options.authenticate;
-    if (!this.authed) {
-      console.log('  鉴权    等待 Hello（首帧）');
-    }
-    this.lastRxAt = Date.now();
-    this.startIdleWatchdog();
+    // 业务只认「帧」和「关闭」：Hello、Ping/Pong、空闲看门狗都在连接层
+    this.conn.bind({
+      onFrame: (type, payload) => { this.dispatch(type, payload); },
+      onClose: () => { this.onClose(); },
+    });
 
     this.bindControl();
     this.bindUpstream();
-    this.bindDecoderEvents();
-    this.bindClose();
-  }
-
-  /**
-   * 空闲看门狗：NAT 会在几分钟后静默掐连接，两侧都不知道。
-   * 这里只负责「太久没收到字节就主动关」，心跳本身由客户端发 `Ping`。
-   */
-  private startIdleWatchdog(): void {
-    const limit = this.options.idleTimeoutMs ?? 45_000;
-    this.idleTimer = setInterval(() => {
-      if (Date.now() - this.lastRxAt > limit) {
-        console.log(`  连接    ${Math.round((Date.now() - this.lastRxAt) / 1000)} s 无数据，主动断开`);
-        this.socket.end();
-      }
-    }, 5_000);
   }
 
   // ------------------------------------------------------------------ 接线
@@ -371,34 +291,8 @@ class AliyunConnection {
     });
   }
 
-  private bindDecoderEvents(): void {
-    this.socket.on('data', (chunk: Buffer) => {
-      this.lastRxAt = Date.now();
-      for (const frame of this.decoder.push(chunk)) {
-        this.dispatch(frame.type, frame.payload);
-      }
-    });
-
-    this.socket.on('error', (error: Error) => {
-      console.error(`socket 错误: ${error.message}`);
-    });
-  }
-
   private dispatch(type: number, payload: Buffer): void {
-    // 未鉴权时只放行 Hello —— 其余帧一律拒绝，避免"还没证明身份就开始推音频"
-    if (!this.authed && type !== UpstreamFrameType.Hello) {
-      console.log(`  鉴权    未收到 Hello 就发帧（type=${type}），断开`);
-      this.rejectAuth('auth_required');
-      return;
-    }
-
     switch (type) {
-      case UpstreamFrameType.Hello:
-        this.onHello(payload);
-        return;
-      case UpstreamFrameType.Ping:
-        this.frames.write(DownstreamFrameType.Pong, Buffer.alloc(0));
-        return;
       case UpstreamFrameType.Audio:
         if (!this.ffmpeg.stdin.destroyed) {
           this.ffmpeg.stdin.write(payload);
@@ -415,53 +309,24 @@ class AliyunConnection {
     }
   }
 
-  private onHello(payload: Buffer): void {
-    if (this.authed) {
-      return; // 已经放行过，重复 Hello 直接忽略
+  private onClose(): void {
+    console.log(`\n连接结束，${this.fsm.turn} 轮`);
+    this.fsm.close();
+    this.assembler.dispose();
+    this.smartTurn?.stop();
+    this.control?.close();
+    this.flushDump();
+    this.stt.close();
+    if (!this.ffmpeg.stdin.destroyed) {
+      this.ffmpeg.stdin.end();
     }
-    const check = this.options.authenticate;
-    if (!check) {
-      this.authed = true;
-      return;
-    }
-    const hello = parseHello(payload);
-    if (!hello || !check(hello)) {
-      console.log(`  鉴权    拒绝（deviceId=${hello?.deviceId ?? '?'}）`);
-      this.rejectAuth('auth_failed');
-      return;
-    }
-    this.authed = true;
-    console.log(`  鉴权    通过（deviceId=${hello.deviceId ?? '?'} proto=${hello.proto ?? '?'}）`);
-  }
-
-  private rejectAuth(reason: string): void {
-    if (!this.socket.destroyed) {
-      this.frames.writeText(DownstreamFrameType.Control, reason);
-      this.socket.end();
-    }
-  }
-
-  private bindClose(): void {
-    this.socket.on('close', () => {
-      console.log(`\n连接结束，${this.fsm.turn} 轮`);
-      this.fsm.close();
-      this.assembler.dispose();
-      this.smartTurn?.stop();
-      this.control?.close();
-      this.flushDump();
-      this.stt.close();
-      if (!this.ffmpeg.stdin.destroyed) {
-        this.ffmpeg.stdin.end();
+    setTimeout(() => {
+      try {
+        this.ffmpeg.kill();
+      } catch {
+        // 已退出
       }
-      setTimeout(() => {
-        try {
-          this.ffmpeg.kill();
-        } catch {
-          // 已退出
-        }
-      }, 1000).unref?.();
-      this.onFinished();
-    });
+    }, 1000).unref?.();
   }
 
   // ------------------------------------------------------------------ 事件
@@ -478,7 +343,7 @@ class AliyunConnection {
       return;
     }
     console.log(`  打断    听到「${text}」→ 停止播放，已排队的轮次作废`);
-    this.frames.writeText(DownstreamFrameType.Control, 'stop');
+    this.conn.sendControl('stop');
   }
 
   private onSentence(text: string, index: number): void {
@@ -555,7 +420,7 @@ class AliyunConnection {
       }, this.options.photoTimeoutMs);
 
       this.photoWaiter = { resolve, timer };
-      this.frames.writeText(DownstreamFrameType.Control, 'take_photo');
+      this.conn.sendControl('take_photo');
       console.log('  拍照    已下发指令，等设备回图…');
     });
   }
