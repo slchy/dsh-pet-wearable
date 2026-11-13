@@ -66,6 +66,8 @@ export class Connection {
   private authed: boolean;
   private lastRxAt = Date.now();
   private idleTimer: NodeJS.Timeout | null = null;
+  /** `end()` 已调用但 'close' 还没来 —— 这期间必须停止收发。 */
+  private closing = false;
   private closed = false;
 
   constructor(
@@ -119,14 +121,14 @@ export class Connection {
 
   /** 下行音频（PCM16）。 */
   sendAudio(pcm: Buffer): void {
-    if (!this.closed) {
+    if (!this.closed && !this.closing) {
       this.frames.write(DownstreamFrameType.Audio, pcm);
     }
   }
 
   /** 下行控制串：`take_photo` / `stop` / `end_session` / `auth_*`。 */
   sendControl(text: string): void {
-    if (!this.closed) {
+    if (!this.closed && !this.closing) {
       this.frames.writeText(DownstreamFrameType.Control, text);
     }
   }
@@ -138,6 +140,7 @@ export class Connection {
   }
 
   end(): void {
+    this.closing = true;
     if (!this.socket.destroyed) {
       this.socket.end();
     }
@@ -159,6 +162,9 @@ export class Connection {
   }
 
   private handle(type: number, payload: Buffer): void {
+    if (this.closed || this.closing) {
+      return; // 已决定关闭：同一次读里剩下的帧不再处理
+    }
     if (type === UpstreamFrameType.Hello) {
       this.onHello(payload);
       return;

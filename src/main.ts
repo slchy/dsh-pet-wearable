@@ -17,7 +17,15 @@ import { pathToFileURL } from 'node:url';
 import { VoiceAgent } from './agent.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
-import { noopStt, silentTts, type SttProvider, type TtsProvider } from './providers.ts';
+import {
+  cannedStt,
+  echoAgent,
+  noopStt,
+  silentTts,
+  type AgentProvider,
+  type SttProvider,
+  type TtsProvider,
+} from './providers.ts';
 import { DshSession } from './session.ts';
 import { runAliyunServer } from './aliyun-session.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
@@ -40,12 +48,13 @@ async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
   return factory();
 }
 
-/** `--stt aliyun|noop|<path>` */
+/** `--stt aliyun|noop|canned|<path>` */
 async function buildStt(
   spec: string,
   creds: { akId: string; akSecret: string; appkey: string; region: string; maxSentenceSilenceMs: number },
 ): Promise<SttProvider> {
   if (spec === 'noop') return noopStt();
+  if (spec === 'canned') return cannedStt();
   if (spec === 'aliyun') {
     return aliyunStt(creds, (line) => { console.log(`  [asr] ${line}`); });
   }
@@ -55,8 +64,45 @@ async function buildStt(
 /** `--tts mimo|silent|<path>` */
 async function buildTts(spec: string): Promise<TtsProvider> {
   if (spec === 'silent') return silentTts();
-  if (spec === 'mimo') return mimoTts(process.env['MIMO_TTS_VOICE'] ?? 'Chloe');
+  if (spec === 'mimo') {
+    if (!process.env['MIMO_API_KEY']) {
+      throw new Error('MIMO_API_KEY 未设置（用 --tts silent 可跳过 TTS）');
+    }
+    return mimoTts(process.env['MIMO_TTS_VOICE'] ?? 'Chloe');
+  }
   return loadProvider<TtsProvider>(spec, 'tts');
+}
+
+interface AgentBundle {
+  readonly agent: AgentProvider | null;
+  /** dsh 专用：进程句柄要留着，退出时 stop() */
+  readonly dsh: DshSession | null;
+}
+
+/** `--agent dsh|echo|none|<path>` */
+async function buildAgent(
+  spec: string,
+  dsh: { workDir: string; useSdk: boolean; provider: string; model: string; log: (line: string) => void },
+): Promise<AgentBundle> {
+  if (spec === 'none' || spec === '') {
+    return { agent: null, dsh: null };
+  }
+  if (spec === 'echo') {
+    return { agent: echoAgent(), dsh: null };
+  }
+  if (spec === 'dsh') {
+    const session = new DshSession({
+      workDir: dsh.workDir,
+      program: process.env['DSH_BIN'],
+      mode: dsh.useSdk ? 'sdk' : 'headless',
+      patch: process.env['DSH_PATCH'],
+      provider: dsh.provider,
+      model: dsh.model,
+      log: (l: string) => { console.log(`  [session] ${l}`); },
+    });
+    return { agent: new VoiceAgent(session, dsh.log), dsh: session };
+  }
+  return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
 }
 
 /** 证书从文件读，路径只走环境变量 —— 部署细节不进源码。 */
@@ -64,6 +110,7 @@ function loadTls(): { key: Buffer; cert: Buffer } | undefined {
   const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
   const certPath = process.env['MIAI_TLS_CERT'] ?? '';
   if (!keyPath || !certPath) return undefined;
+  console.log('⚠️  MIAI_TLS_* 已设置，但当前编排层仍用裸 TCP（transport.ts 尚未接线，见 B-004 第三步）');
   return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
 }
 
@@ -208,38 +255,52 @@ async function main(): Promise<void> {
   /** 冒烟用：把一张本地图片交给 dsh，打印它的描述后退出 */
   const askImage = opt('--ask-image', '');
 
-  const mode: ReplyMode = argv.includes('--agent')
+  // ---- 三个可替换件：都能按名字选内置实现，或给一个模块路径
+  const sttSpec = opt('--stt', process.env['MIAI_STT'] ?? '');
+  const ttsSpec = opt('--tts', process.env['MIAI_TTS'] ?? '');
+  /**
+   * Agent 选型：`--agent dsh|echo|none|<path>`。
+   * 裸 `--agent`（后面不跟值）等价 `dsh`，`--echo` 是旧写法，继续支持。
+   */
+  const agentSpec = ((): string => {
+    if (argv.includes('--echo')) return 'echo';
+    const i = argv.indexOf('--agent');
+    if (i < 0) return process.env['MIAI_AGENT'] ?? 'none';
+    const next = argv[i + 1];
+    return next !== undefined && !next.startsWith('--') ? next : 'dsh';
+  })();
+
+  const mode: ReplyMode = agentSpec === 'dsh'
     ? 'agent'
-    : argv.includes('--echo') ? 'echo' : 'none';
+    : agentSpec === 'echo' ? 'echo' : 'none';
 
   if (!replay && !listen && !askImage) {
-    console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>')
-    console.error('      [--agent | --echo] [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
-    process.exit(2);
-  }
-  if (!process.env.MIMO_API_KEY) {
-    console.error('未设置 MIMO_API_KEY');
+    console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
+    console.error('  可替换件: --stt aliyun|noop|canned|<path>  --tts mimo|silent|<path>');
+    console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
+    console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
     process.exit(2);
   }
 
-  let agent: VoiceAgent | null = null;
+  let agent: AgentProvider | null = null;
   let dshSession: DshSession | null = null;
-  if (mode === 'agent') {
-    // SDK 模式：一个常驻进程跑多轮，省掉每轮的进程启动与会话重加载。
-    // 实测 headless 每轮 5–7 s，其中 2–3 s 是冷启动。
-    const useSdk = argv.includes('--dsh-sdk');
-    dshSession = new DshSession({
+  try {
+    ({ agent, dsh: dshSession } = await buildAgent(agentSpec, {
       workDir,
-      program: process.env['DSH_BIN'],
-      mode: useSdk ? 'sdk' : 'headless',
-      patch: process.env['DSH_PATCH'],
+      useSdk: argv.includes('--dsh-sdk'),
       provider: opt('--provider', 'deepseek-official'),
       model: opt('--model', 'deepseek-flash'),
-      log: (l: string) => { console.log(`  [session] ${l}`); },
-    });
-    agent = new VoiceAgent(dshSession, (l: string) => { console.log(l); });
-    console.log(`agent 已就绪  workDir=${workDir}  dsh=${process.env['DSH_BIN'] ?? 'dsh'}  mode=${useSdk ? 'sdk' : 'headless'}`);
+      log: (line) => { console.log(line); },
+    }));
+  } catch (error) {
+    console.error(`agent 装配失败: ${(error as Error).message}`);
+    process.exit(2);
+  }
+  if (dshSession) {
+    console.log(`agent     dsh  workDir=${workDir}  dsh=${process.env['DSH_BIN'] ?? 'dsh'}  mode=${argv.includes('--dsh-sdk') ? 'sdk' : 'headless'}`);
     console.log(`会话      ${dshSession.currentSessionId ?? '（新会话）'}\n`);
+  } else if (agent) {
+    console.log(`agent     ${agent.name}\n`);
   }
 
   // ---------------------------------------------------------------- 图片 -> dsh 冒烟
@@ -266,38 +327,40 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // ---------------------------------------------------------------- 阿里云分支
+  // ---------------------------------------------------------------- 流式分支
+  // `--stt` 显式给了就走流式路径；`--asr aliyun` 是旧写法，继续认。
   const asrBackend = opt('--asr', 'mimo');
-  if (asrBackend === 'aliyun') {
+  const resolvedStt = sttSpec === '' ? (asrBackend === 'aliyun' ? 'aliyun' : '') : sttSpec;
+  if (resolvedStt !== '') {
+    if (!listen) {
+      console.error('流式识别只支持 --listen（没有 --replay 语义）');
+      process.exit(2);
+    }
+    if (!agent) {
+      console.error('流式识别需要一个 agent（收到 SentenceEnd 就要接一轮对话）');
+      process.exit(2);
+    }
     const akId = process.env['ALIYUN_AK_ID'] ?? '';
     const akSecret = process.env['ALIYUN_AK_SECRET'] ?? '';
     const appkey = process.env['ALIYUN_APPKEY'] ?? '';
     const region = process.env['ALIYUN_NLS_REGION'] ?? 'cn-shanghai';
-    if (!akId || !akSecret || !appkey) {
-      console.error('阿里云模式需要 ALIYUN_AK_ID / ALIYUN_AK_SECRET / ALIYUN_APPKEY');
-      process.exit(2);
-    }
-    if (!listen) {
-      console.error('阿里云模式只支持 --listen（流式识别没有 --replay 语义）');
-      process.exit(2);
-    }
-    if (!agent) {
-      console.error('阿里云模式需要 --agent（收到 SentenceEnd 就要接一轮对话）');
+    if (resolvedStt === 'aliyun' && (!akId || !akSecret || !appkey)) {
+      console.error('STT=aliyun 需要 ALIYUN_AK_ID / ALIYUN_AK_SECRET / ALIYUN_APPKEY');
       process.exit(2);
     }
     const sentenceSilenceMs = Number(
       opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS)),
     );
-    console.log(`ASR      阿里云实时识别  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms\n`);
+    console.log(`STT      ${resolvedStt}  region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms\n`);
 
-    const stt = await buildStt(opt('--stt', 'aliyun'), {
+    const stt = await buildStt(resolvedStt, {
       akId,
       akSecret,
       appkey,
       region,
       maxSentenceSilenceMs: sentenceSilenceMs,
     });
-    const tts = await buildTts(opt('--tts', 'mimo'));
+    const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
 
     const smartTurnPython = process.env['SMART_TURN_PYTHON'] ?? '';

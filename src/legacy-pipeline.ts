@@ -9,7 +9,7 @@ import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:c
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { VoiceAgent } from './agent.ts';
+import type { AgentProvider } from './providers.ts';
 import { asr, pcmToWav, ttsStream, TTS_SAMPLE_RATE } from './mimo.ts';
 import { sleep, peakDbfs } from './util.ts';
 import { SileroVad, sliceFrames, SAMPLE_RATE, WINDOW } from './vad.ts';
@@ -156,10 +156,10 @@ export class Pipeline {
   private replyBytes = 0;
   private readonly startedAt = Date.now();
   private readonly mode: ReplyMode;
-  private readonly agent: VoiceAgent | null;
+  private readonly agent: AgentProvider | null;
   private sink: AudioSink;
 
-  constructor(ffmpeg: string, mode: ReplyMode, agent: VoiceAgent | null = null, sink?: AudioSink) {
+  constructor(ffmpeg: string, mode: ReplyMode, agent: AgentProvider | null = null, sink?: AudioSink) {
     this.mode = mode;
     this.agent = agent;
     this.sink = sink ?? adbSink();
@@ -426,7 +426,7 @@ export class Pipeline {
             const r = await this.agent.reply(text);
             speech = r.speech;
             console.log(`  agent   ${((Date.now() - t0a) / 1000).toFixed(2)} s  `
-              + `${r.resumed ? '续会话' : '新会话'}  ${JSON.stringify(r.text.slice(0, 160))}`);
+              + `${JSON.stringify(r.text.slice(0, 160))}`);
           } catch (e) {
             // agent 挂了不该吞掉本轮：退回原样念回去，至少链路是通的
             console.log(`  ✗ agent 失败: ${(e as Error).message}（退回回声）`);

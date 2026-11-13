@@ -91,3 +91,48 @@ export function silentTts(sampleRate = 24_000, seconds = 0.5): TtsProvider {
     },
   };
 }
+
+/**
+ * 回显 Agent：把用户说的话原样念回去。
+ *
+ * 用途：不接任何 LLM 就能验「STT 出文本 → 一轮 → TTS → 下发」整条链路。
+ */
+export function echoAgent(): AgentProvider {
+  return {
+    name: 'echo',
+    reply: async (userText) => ({ text: userText, speech: userText }),
+  };
+}
+
+/**
+ * 罐头 STT：不收真实音频，累计到 `afterBytes` 就吐一句固定话。
+ *
+ * 用途：不动嘴、不接厂商，也能把一轮对话跑完（配合 `silentTts` + `echoAgent`）。
+ * **只用于开发/冒烟**，别拿它当默认值。
+ */
+export function cannedStt(
+  sentence = '你好，这是一句测试。',
+  afterBytes = 32 * 1024,
+): SttProvider {
+  return {
+    name: 'canned',
+    open: (handlers) => {
+      let seen = 0;
+      let fired = false;
+      return {
+        feed: (pcm) => {
+          if (fired) {
+            return;
+          }
+          seen += pcm.length;
+          if (seen >= afterBytes) {
+            fired = true;
+            handlers.onSentence(sentence, 1);
+          }
+        },
+        hangup: () => {},
+        close: () => {},
+      };
+    },
+  };
+}
