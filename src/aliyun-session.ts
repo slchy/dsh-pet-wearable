@@ -191,7 +191,9 @@ class AliyunConnection {
       dir: options.photoDir,
       timeoutMs: options.photoTimeoutMs,
       log,
-      sendTakePhoto: () => { this.conn.sendControl('take_photo'); },
+      sendTakePhoto: (kind) => {
+        this.conn.sendControl(kind === 'hq' ? 'take_photo_hq' : 'take_photo');
+      },
     });
 
     this.uplink = new UplinkPipeline({
@@ -250,7 +252,8 @@ class AliyunConnection {
       port: this.options.controlPort,
       photoTimeoutMs: this.options.photoTimeoutMs,
       handlers: {
-        takePhoto: () => this.photos.request(),
+        takePhoto: () => this.photos.request('spp'),
+        takePhotoHq: () => this.photos.request('hq'),
         endSession: () => { this.execute(this.core.dispatch({ type: 'endRequested' })); },
         say: (text) => {
           // 调试口：和「用户说完一句」走同一条路，方便没有麦克风时联调

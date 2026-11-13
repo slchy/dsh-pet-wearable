@@ -8,13 +8,16 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+export type PhotoKind = 'spp' | 'hq';
+
 export interface PhotoInboxOptions {
   /** 落盘目录；空串不落盘（默认） */
   readonly dir: string;
   readonly timeoutMs: number;
   readonly log: (line: string) => void;
   /** 真正下发 `take_photo` 的地方（连接层动作） */
-  readonly sendTakePhoto: () => void;
+  /** spp = 低清直出（快）；hq = P2P 拉原图再缩（慢但看得清） */
+  readonly sendTakePhoto: (kind: PhotoKind) => void;
 }
 
 interface Waiter {
@@ -34,13 +37,17 @@ export class PhotoInbox {
     return this.waiter !== null;
   }
 
-  /** 等一张图；已经有请求在等时直接给 null（不排队，避免两次请求抢一张图）。 */
-  request(): Promise<Buffer | null> {
+  /**
+   * 等一张图；已经有请求在等时直接给 null（不排队，避免两次请求抢一张图）。
+   *
+   * @param kind 走哪条采集路径；hq 时手机侧会开一次 P2P 拉原图，通常 3–8 s
+   */
+  request(kind: PhotoKind = 'spp'): Promise<Buffer | null> {
     if (this.waiter) {
       return Promise.resolve(null);
     }
-    this.options.sendTakePhoto();
-    this.options.log('  拍照    已下发指令，等设备回图…');
+    this.options.sendTakePhoto(kind);
+    this.options.log(`  拍照    已下发指令（${kind}），等设备回图…`);
 
     return new Promise<Buffer | null>((resolve) => {
       const timer = setTimeout(() => {

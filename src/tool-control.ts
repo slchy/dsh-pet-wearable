@@ -5,7 +5,8 @@
  * 独立进程，只能通过一个 URL 与 harness 通信。本模块只负责 HTTP 层：
  * 路由、并发保护、超时、响应码；真正的硬件动作由调用方注入。
  *
- * - `POST /take_photo`  → 调 {@link ToolControlHandlers.takePhoto} 取 JPEG
+ * - `POST /take_photo`  → 调 {@link ToolControlHandlers.takePhoto} 取 JPEG（低清，快）
+ * - `POST /take_photo_hq` → 高清版，见 {@link ToolControlHandlers.takePhotoHq}
  * - `POST /end_session` → 调 {@link ToolControlHandlers.endSession}
  * - `POST /say`         → 当作「用户说了这句话」，起一轮（**调试/联调用**，
  *   没有麦克风也能验证 agent→TTS→下发整条链）
@@ -15,6 +16,8 @@ import { createServer, type Server } from 'node:http';
 export interface ToolControlHandlers {
   /** 取一张照片；返回 null 表示超时/失败 */
   readonly takePhoto: () => Promise<Buffer | null>;
+  /** 取一张**高清**照片（手机侧开一次 P2P 拉原图再缩），无此能力时回落到 [takePhoto] */
+  readonly takePhotoHq?: () => Promise<Buffer | null>;
   /** 模型判定应当结束会话 */
   readonly endSession: () => void;
   /** 注入一句话，按正常轮次处理（调试/联调） */
@@ -72,10 +75,13 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
       return;
     }
 
-    if (req.url !== '/take_photo') {
+    if (req.url !== '/take_photo' && req.url !== '/take_photo_hq') {
       res.writeHead(404).end();
       return;
     }
+
+    const wantHq = req.url === '/take_photo_hq';
+    const shooter = wantHq && handlers.takePhotoHq !== undefined ? handlers.takePhotoHq : handlers.takePhoto;
 
     if (photoInFlight) {
       res.writeHead(409, { 'content-type': 'text/plain; charset=utf-8' })
@@ -91,7 +97,7 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
       }
     }, options.photoTimeoutMs);
 
-    void handlers.takePhoto().then((jpeg) => {
+    void shooter().then((jpeg) => {
       clearTimeout(timer);
       photoInFlight = false;
       if (res.writableEnded) {
