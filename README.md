@@ -21,7 +21,7 @@ node tools/fake-phone.ts --port 8766 --sbc ../tmp/voice.sbc
 # 3) 生产
 export ALIYUN_APPKEY=...            # 阿里云 NLS 实时识别（另有 ALIYUN_AK_ID / ALIYUN_AK_SECRET）
 export MIMO_API_KEY=...             # MiMo TTS
-node src/main.ts --listen 8765      # 默认 --stt aliyun --tts mimo --agent dsh
+node src/main.ts --listen 8766      # 默认 --stt aliyun --tts mimo --agent dsh
 ```
 
 手机侧先 `adb reverse tcp:8766 tcp:8766`（只监听 `127.0.0.1` 时日志会提示这一行）。
@@ -141,29 +141,28 @@ python scripts/deploy_cloud.py        # 同步 src/tools/tests → 跑单测 →
 | `~/miai-cloud/src` | 源码（Node 直接跑 `.ts`，无需构建） | `deploy_cloud.py` 推送 |
 | `~/miai-cloud/.env` | 阿里云 / MiMo / dsh 的真实凭据 | **只在服务器上**，不从本地覆盖 |
 | `~/miai-cloud/tls` | 证书 + 私钥 | `scripts/gen_local_ca.py` 后手工 scp |
-| `systemd miai-harness` | `--listen 8765 --host 0.0.0.0 --stt aliyun --tts mimo --agent dsh` | 一次性写好 |
+| `systemd miai-harness` | `--listen 63993 --host 0.0.0.0 --stt aliyun --tts mimo --agent dsh` | 一次性写好 |
 
 `.env` 刻意不进同步范围：本地那份是调试用的，推上去会盖掉服务器上的真实凭据。
 
-### 端口为什么还是连不上
+### 为什么是 63993，不是 8765
 
-服务已经监听 `0.0.0.0:8765`，但**从公网连不通**：TCP 能建立，TLS 一发数据就被断开，
-服务器上 `tcpdump` 抓不到任何到达的包 —— 说明卡在云厂商的安全组，不在主机
-（`iptables` 全 ACCEPT，`ufw` inactive）。
+`8765` 从公网连不通：TCP 能建立，TLS 一发数据就被断开，服务器上 `tcpdump`
+抓不到任何到达的包 —— 卡在云厂商的安全组，不在主机（`iptables` 全 ACCEPT、
+`ufw` inactive）。实测 63993 可直达，于是改用它。
 
-在华为云控制台放行 8765/tcp 之前，只能走隧道：
+| 项 | 值 |
+|---|---|
+| 监听 | `0.0.0.0:63993`（TLS） |
+| 手机填的地址 | `203.0.113.10:63993`，勾 TLS，token 与 `tokens.txt` 一致 |
+| 控制口 | `63995`（= listen + 2，只绑 127.0.0.1） |
+| 鉴权 | `MIAI_TOKENS=<部署路径>/miai-cloud/tokens.txt`，每行 `token` 或 `token:deviceId` |
 
-```bash
-ssh -i ~/.ssh/id_ed25519 -N -L 8765:127.0.0.1:8765 slchy@203.0.113.10
-adb reverse tcp:8765 tcp:8765
-```
+**公网可及就必须要鉴权**：没有 `MIAI_TOKENS` 等于谁都能往云上推音频。加了之后
+客户端 `Hello` 里不带 token 会收到 `Control: auth_required` 并被断开。
 
-手机连 `127.0.0.1:8765`（勾 TLS）。放行之后把手机地址改成 `203.0.113.10:8765`
-即可，证书里已经带了 `SAN=IP:203.0.113.10`。
-
-**放行前先加鉴权**：公网可及之后没有 `MIAI_TOKENS` 就等于谁都能推音频上来。
-写一行 `MIAI_TOKENS=<部署路径>/miai-cloud/tokens.txt`，文件里每行一个
-`token` 或 `token:deviceId`，手机侧 `Hello` 里带同一个 token 即通过。
+证书里带 `SAN=IP:203.0.113.10`，手机按 IP 直连也能过严格校验（`scripts/gen_local_ca.py --ip 203.0.113.10`）。
+换端口/换 IP 记得同时重发证书与 APK 里的 `assets/local-ca.pem`。
 
 ## 已知限制
 
