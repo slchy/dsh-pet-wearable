@@ -7,6 +7,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import { EnergyGate } from './energy-gate.ts';
+import { pcm16Gain } from './pcm.ts';
 
 export interface UplinkGateConfig {
   readonly thresholdDbfs: number;
@@ -19,6 +20,11 @@ export interface UplinkPipelineOptions {
   /** 解码后的采样率（mSBC 固定 16 kHz） */
   readonly sampleRate: number;
   readonly gate: UplinkGateConfig;
+  /**
+   * 上行增益（线性倍数，默认 1）。眼镜 mic 采进来的电平偏低，实测 ASR 识别率
+   * 明显受它影响；放大后再喂 STT。判停门限会按同样的 dB 抬高，保持选择性不变。
+   */
+  readonly gain?: number;
   readonly log: (line: string) => void;
   readonly onError: (line: string) => void;
   /** 每块解码后的 PCM：判停器、落盘都要它 */
@@ -40,8 +46,11 @@ export class UplinkPipeline {
   constructor(options: UplinkPipelineOptions) {
     this.options = options;
 
+    const gain = options.gain ?? 1;
+    // 放大后噪声底也一起抬高，门限同步 +20log10(gain) 才不会变得更容易被噪声推开
+    const effectiveThreshold = options.gate.thresholdDbfs + 20 * Math.log10(gain);
     this.gate = new EnergyGate({
-      thresholdDbfs: options.gate.thresholdDbfs,
+      thresholdDbfs: effectiveThreshold,
       holdMs: options.gate.holdMs,
       prerollBytes: Math.round((options.gate.prerollMs / 1000) * options.sampleRate * 2),
       sampleRate: options.sampleRate,
@@ -99,9 +108,10 @@ export class UplinkPipeline {
     }, 1000).unref?.();
   }
 
-  private onPcm(pcm: Buffer): void {
+  private onPcm(raw: Buffer): void {
     const { onPcm, onSpeechOpen, onSpeech, onSpeechClose, log } = this.options;
 
+    const pcm = pcm16Gain(raw, this.options.gain ?? 1);
     onPcm(pcm);
 
     const decision = this.gate.process(pcm);

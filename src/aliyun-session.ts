@@ -58,6 +58,8 @@ export interface AliyunSessionOptions {
     readonly maxExtensions: number;
     readonly threshold: number;
   };
+  /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
+  readonly micGain?: number;
   /** 能量门 */
   readonly gate: {
     readonly thresholdDbfs: number;
@@ -196,6 +198,7 @@ class AliyunConnection {
       ffmpegPath: options.ffmpegPath,
       sampleRate: UPSTREAM_SAMPLE_RATE,
       gate: options.gate,
+      gain: options.micGain,
       log,
       onError: (line) => { console.error(`[ffmpeg] ${line}`); },
       onPcm: (pcm) => {

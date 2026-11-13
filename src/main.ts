@@ -435,6 +435,7 @@ async function main(): Promise<void> {
       },
       playbackTailMs: 600,
       ttsGain: envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1)),
+      micGain: envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1)),
       dumpDir: process.env['DUMP_DIR'] ?? '',
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
