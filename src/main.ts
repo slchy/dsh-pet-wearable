@@ -15,8 +15,12 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { VoiceAgent } from './agent.ts';
+import { AnnounceStore } from './announce-store.ts';
+import { DEFAULT_HQ_ARM_TIMEOUT_MS, DEFAULT_HQ_SHUTTER_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
+import { BASE_STYLE, EMOTIONS } from './emotion.ts';
+import { DEFAULT_TTS_VOICE } from './mimo.ts';
 import {
   cannedStt,
   echoAgent,
@@ -68,7 +72,19 @@ async function buildTts(spec: string): Promise<TtsProvider> {
     if (!process.env['MIMO_API_KEY']) {
       throw new Error('MIMO_API_KEY 未设置（用 --tts silent 可跳过 TTS）');
     }
-    return mimoTts(process.env['MIMO_TTS_VOICE'] ?? 'Chloe');
+    // 风格提示词：MiMo 的 TTS 是「聊天式」的 —— 风格放进 user 消息，要念的文本放进
+    // assistant 消息。基础音色 + 五种情绪的变体都由 `emotion.ts` 提供，可用环境变量覆盖。
+    return mimoTts({
+      voice: process.env['MIMO_TTS_VOICE'] ?? DEFAULT_TTS_VOICE,
+      baseStyle: process.env['MIMO_TTS_STYLE'] ?? BASE_STYLE,
+      // 每个情绪一个可选覆盖；key 从单一事实来源来，加情绪不用改这里
+      overrides: Object.fromEntries(
+        Object.keys(EMOTIONS).map((key) => [
+          key,
+          process.env[`MIMO_TTS_STYLE_${key.toUpperCase()}`],
+        ]),
+      ),
+    });
   }
   return loadProvider<TtsProvider>(spec, 'tts');
 }
@@ -83,6 +99,7 @@ interface AgentBundle {
 async function buildAgent(
   spec: string,
   dsh: { workDir: string; useSdk: boolean; provider: string; model: string; log: (line: string) => void },
+  announceStore: AnnounceStore | null,
 ): Promise<AgentBundle> {
   if (spec === 'none' || spec === '') {
     return { agent: null, dsh: null };
@@ -100,7 +117,7 @@ async function buildAgent(
       model: dsh.model,
       log: (l: string) => { console.log(`  [session] ${l}`); },
     });
-    return { agent: new VoiceAgent(session, dsh.log), dsh: session };
+    return { agent: new VoiceAgent(session, dsh.log, announceStore), dsh: session };
   }
   return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
 }
@@ -323,6 +340,15 @@ async function main(): Promise<void> {
 
   let agent: AgentProvider | null = null;
   let dshSession: DshSession | null = null;
+  /**
+   * 离线时的后台汇报队列。放 `~/.voice-agent/` 旁边（和会话 id 一个目录），
+   * 路径可用 `MIAI_ANNOUNCE_FILE` 覆盖；空串 = 不持久化。
+   */
+  const announceStore = AnnounceStore.open({
+    file: process.env['MIAI_ANNOUNCE_FILE'] ?? join(homedir(), '.voice-agent', 'announce.jsonl'),
+    maxItems: envNumber('MIAI_ANNOUNCE_MAX', 20),
+    log: (line) => { console.log(line); },
+  });
   try {
     ({ agent, dsh: dshSession } = await buildAgent(agentSpec, {
       workDir,
@@ -330,7 +356,7 @@ async function main(): Promise<void> {
       provider: opt('--provider', 'deepseek-official'),
       model: opt('--model', 'deepseek-flash'),
       log: (line) => { console.log(line); },
-    }));
+    }, announceStore));
   } catch (error) {
     console.error(`agent 装配失败: ${(error as Error).message}`);
     process.exit(2);
@@ -411,6 +437,14 @@ async function main(): Promise<void> {
     const smartTurnEnabled = process.env['SMART_TURN'] !== '0'
       && smartTurnPython !== '' && smartTurnScript !== '';
 
+    // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」
+    const ttsGain = envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1));
+    const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1));
+    const peakDbfs = envNumber('VOICE_PEAK_DBFS', -58);
+    console.log(
+      `增益    上行 ${micGain}×（能量门 ${peakDbfs} dBFS，按放大后算）  下行 ${ttsGain}×\n`,
+    );
+
     const code = await runAliyunServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
@@ -429,19 +463,42 @@ async function main(): Promise<void> {
         }
         : undefined,
       gate: {
-        thresholdDbfs: envNumber('VOICE_PEAK_DBFS', -58),
+        thresholdDbfs: peakDbfs,
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
         prerollMs: envNumber('VOICE_PREROLL_MS', 800),
       },
       playbackTailMs: 600,
-      ttsGain: envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1)),
-      micGain: envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1)),
-      dumpDir: process.env['DUMP_DIR'] ?? '',
+      /**
+       * 下行增益。**默认应当是 1.0**：MiMo 的输出已经是满刻度（实测峰值 −0.5 dBFS），
+       * 任何 >1 的增益都会把元音峰值压进软限幅 —— ×3 时波峰因数从 14.7 dB 掉到
+       * 7.3 dB，听感是"扁、闷、语调怪"。要更响请调手机媒体音量，不要加这里。
+       */
+      ttsGain,
+      /**
+       * 上行增益。眼镜 mic 电平低，4.0 时小声说话才能推开能量门
+       * （门限 `VOICE_PEAK_DBFS` 按**放大后**的电平算，见 `uplink-pipeline.ts`）。
+       */
+      micGain,
+      // 调音用：`MIAI_LEVEL_LOG=2000` 每 2 s 打一行上行峰值（0 = 关）
+      levelLogMs: envNumber('MIAI_LEVEL_LOG', 0),
+      /**
+       * 原始档案目录（空 = 不存）。一条连接一个目录，存原始 mSBC、放大前的 PCM、
+       * 下行 PCM 和事件时间线 —— 出问题后能完整重放，见 `archive.ts`。
+       * 旧的 `DUMP_DIR`（按轮次存、只覆盖播放期）已被它取代。
+       */
+      archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
+      archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
+      archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),
-      photoTimeoutMs: 20_000,
+      // 高清链路要等手机建 P2P + 设备写相册，20 s 可能不够（`MIAI_PHOTO_TIMEOUT_MS` 可调）
+      photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 20_000),
+      // 高清照要人按快门，两段分开计：等手机就绪 / 等用户按下去
+      hqArmTimeoutMs: envNumber('MIAI_HQ_ARM_TIMEOUT_MS', DEFAULT_HQ_ARM_TIMEOUT_MS),
+      hqShutterTimeoutMs: envNumber('MIAI_HQ_SHUTTER_TIMEOUT_MS', DEFAULT_HQ_SHUTTER_TIMEOUT_MS),
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
+      announceStore,
       tls: loadTls(),
       authenticate: loadAuthenticator(),
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
@@ -464,4 +521,3 @@ async function main(): Promise<void> {
 }
 
 void main();
-
