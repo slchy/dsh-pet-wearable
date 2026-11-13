@@ -1,9 +1,8 @@
 /**
  * 三个可替换件的契约：**STT / TTS / Agent**。
  *
- * 为什么单独一个文件：`cloud/` 将来要开源（见 `docs/BACKLOG.md` B-004），
- * 别人得能换掉其中任意一个而不动编排代码。这里只放**接口**，不 import 任何
- * 厂商 SDK —— 具体实现在 `aliyun-asr.ts` / `mimo.ts` / `agent.ts` 里。
+ * 为什么单独一个文件：别人得能换掉其中任意一个而不动编排代码。这里只放**接口**，
+ * 不 import 任何具体实现的 SDK —— 具体实现在 `aliyun-asr.ts` / `mimo.ts` / `agent.ts` 里。
  *
  * 三者的边界：
  * - STT：PCM16 **16 kHz 单声道** → 文本（流式，边喂边出中间结果）

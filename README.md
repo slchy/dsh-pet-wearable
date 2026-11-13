@@ -3,7 +3,7 @@
 一部手机一条 TCP 连接，上行 mSBC 语音、下行 PCM 语音 + 控制串。STT / TTS / Agent
 三件都是**可替换件**，换厂商不用改这里任何代码。
 
-> 状态：私有仓开发中，暂未开源（原因见 `docs/BACKLOG.md` B-004）。
+> 状态：可独立运行。分层、状态机与扩展点见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 跑起来
 
