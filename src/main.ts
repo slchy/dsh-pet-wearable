@@ -238,7 +238,47 @@ function envNumber(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * 读 `cloud/.env`（KEY=VALUE，忽略 # 注释与空行）。
+ *
+ * 不引依赖：格式就这么点。**已存在的环境变量优先**，所以命令行临时覆盖仍然有效。
+ */
+function loadDotEnv(): void {
+  const path = join(process.cwd(), '.env');
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return;
+  }
+  let count = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const eq = line.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+      count += 1;
+    }
+  }
+  if (count > 0) {
+    console.log(`凭据    ${path}（${count} 项）`);
+  }
+}
+
 async function main(): Promise<void> {
+  loadDotEnv();
   const argv = process.argv.slice(2);
 
   const opt = (flag: string, def: string): string => {
