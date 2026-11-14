@@ -207,7 +207,12 @@ export class UplinkPipeline {
       onSpeech(pcm);
     }
     if (decision.closed) {
-      log('  上行    持续静音 → 停推并挂断（避免 IDLE_TIMEOUT）');
+      // 带上「距上次有声多久」：holdMs 只有 2 s，如果 gap 远大于它，
+      // 说明不是"用户没说话"，而是**上行断流**（播放期间采集中断/被设备暂停）。
+      log(
+        '  上行    持续静音 → 停推并挂断（避免 IDLE_TIMEOUT）'
+        + (decision.closedGapMs === undefined ? '' : `，距上次有声 ${Math.round(decision.closedGapMs)} ms`),
+      );
       onSpeechClose();
     }
   }

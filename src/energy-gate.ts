@@ -42,6 +42,8 @@ export interface EnergyGateDecision {
   };
   /** 刚关门（持续静音），调用方应当主动挂断以免 IDLE_TIMEOUT */
   readonly closed: boolean;
+  /** 关门时距上次「有声」过去了多久 —— 用来区分「真的安静」和「上行断流」 */
+  readonly closedGapMs?: number;
 }
 
 const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false };
@@ -97,9 +99,10 @@ export class EnergyGate {
 
     // 门开着但这块没有语音：仍在保持窗口内就继续推（尾巴不能截），
     // 超过保持窗口就关门；关门这一块本身仍然推出去，与历史行为一致。
-    if (this.now() - this.lastVoiceAtMs > this.options.holdMs) {
+    const gapMs = this.now() - this.lastVoiceAtMs;
+    if (gapMs > this.options.holdMs) {
       this.open = false;
-      return { forward: true, closed: true };
+      return { forward: true, closed: true, closedGapMs: gapMs };
     }
     return { forward: true, closed: false };
   }
