@@ -12,6 +12,7 @@
  * （`synthesize` 是函数，不是 TTS 客户端）。
  */
 import { DialogFsm } from './dialog-fsm.ts';
+import { fillerLine } from './filler.ts';
 import type { Clock, Cancel } from './app/clock.ts';
 import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
@@ -53,12 +54,18 @@ export interface TurnRunnerOptions {
   /** 一轮结束（落盘用），无论成功失败都会调用 */
   readonly onTurnFinished: () => void;
   /**
-   * 长思考回执：从「开始跑」到「首块音频下发」之间，若超过 `afterMs` 还没出声，
-   * 先用旁白通道说一句 `text`（「嗯，我看看。」）。
+   * 长任务填充（filler scheduler，见 ADR-004 §7 / SELF-CLIENT-DESIGN §2.11）。
    *
-   * 不给就不回执。`afterMs <= 0` 也等于关掉。
+   * 从「开始跑」到「首块音频下发」之间：先等 `firstAfterMs`，之后每 `intervalMs`
+   * 说 `lines` 里的下一句（说满就彻底安静）。用户一开口、模型一回来都立刻停。
+   *
+   * 不给就不填充；`firstAfterMs <= 0` 也等于关掉。
    */
-  readonly ack?: { readonly afterMs: number; readonly text: string };
+  readonly filler?: {
+    readonly firstAfterMs: number;
+    readonly intervalMs: number;
+    readonly lines: readonly string[];
+  };
   readonly log: (line: string) => void;
 }
 
@@ -92,12 +99,14 @@ export class TurnRunner {
   private speechChain: Promise<void> = Promise.resolve();
   /** 用户在旁白播到一半改主意：停止下发，也别让下一轮排在它后面 */
   private cannedCancelled = false;
-  /** 回执用的定时器（到点前收回音就该取消） */
-  private ackTimer: Cancel | null = null;
+  /** 填充用的定时器（到点前收回音就该取消） */
+  private fillerTimer: Cancel | null = null;
   /** 用户一开口就别再"嗯"了 */
-  private ackCancelled = false;
-  /** 「此刻正在念的那段旁白就是回执」—— 收回执时只掐它，别误伤别的旁白 */
-  private ackSpeaking = false;
+  private fillerCancelled = false;
+  /** 已经说到第几句（说满 `lines` 就不再开口） */
+  private fillerIndex = 0;
+  /** 「此刻正在念的那段旁白就是填充」—— 收回时只掐它，别误伤别的旁白 */
+  private fillerSpeaking = false;
   /** 本轮的回答已经开始出声 —— 回执不再有意义 */
   private replyStarted = false;
 
@@ -179,13 +188,13 @@ export class TurnRunner {
 
     try {
       this.replyStarted = false;
-      this.ackCancelled = false;
-      this.scheduleAck();
+      this.fillerCancelled = false;
+      this.scheduleFiller();
       const agentStartedAt = this.options.clock.now();
       const reply = await agent.reply(text, image, note);
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
       // 模型已经回来了：剩下的只是 TTS 首块，那点等待不值得再插一句
-      this.cancelAck();
+      this.cancelFiller();
       speech = reply.speech;
       this.log(
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `
@@ -196,7 +205,7 @@ export class TurnRunner {
       await this.speechChain;
 
       this.replyStarted = true;
-      this.cancelAck();
+      this.cancelFiller();
       const ttsStarted = this.options.clock.now();
       let firstAudioAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
@@ -268,41 +277,53 @@ export class TurnRunner {
       this.log(`  ✗ 本轮失败: ${(error as Error).message}`);
       return null;
     } finally {
-      this.cancelAck();
+      this.cancelFiller();
       fsm.audioDone(ticket);
       this.options.onTurnFinished();
     }
   }
 
   /**
-   * 排一次「长思考回执」。
+   * 排下一次填充。
    *
    * 只在**回答还没开始出声**时才有意义：到点时若已经开口，什么也不做。
-   * 回执走旁白通道（不改状态机），所以用户此时说话不会被当成插话 ——
-   * 而是一开口就把这句回执掐掉（{@link cancelAck}）。
+   * 填充走旁白通道（不改状态机），所以用户此时说话不会被当成插话 ——
+   * 而是一开口就把这句掐掉（{@link cancelFiller}）。
    */
-  private scheduleAck(): void {
-    const ack = this.options.ack;
-    if (ack === undefined || ack.afterMs <= 0 || ack.text.trim() === '') return;
-    this.ackTimer = this.options.clock.after(ack.afterMs, () => {
-      this.ackTimer = null;
-      if (this.ackCancelled || this.replyStarted) return;
-      this.log(`  回执    ${(ack.afterMs / 1000).toFixed(1)} s 还没出声 → 先说一句「${ack.text}」`);
-      this.ackSpeaking = true;
-      void this.speakCanned(ack.text)
+  private scheduleFiller(): void {
+    const filler = this.options.filler;
+    if (filler === undefined || filler.firstAfterMs <= 0 || filler.lines.length === 0) return;
+    this.fillerIndex = 0;
+    this.armFiller(filler.firstAfterMs);
+  }
+
+  private armFiller(delayMs: number): void {
+    const filler = this.options.filler;
+    if (filler === undefined) return;
+    this.fillerTimer = this.options.clock.after(delayMs, () => {
+      this.fillerTimer = null;
+      if (this.fillerCancelled || this.replyStarted) return;
+      const line = fillerLine(this.fillerIndex, filler.lines);
+      this.fillerIndex += 1;
+      // 说满了就彻底安静：一直唠比安静更烦人
+      if (line === null) return;
+      this.log(`  填补    ${(delayMs / 1000).toFixed(1)} s 还没出声 → 「${line}」`);
+      this.fillerSpeaking = true;
+      void this.speakCanned(line)
         .catch(() => undefined)
-        .finally(() => { this.ackSpeaking = false; });
+        .finally(() => { this.fillerSpeaking = false; });
+      this.armFiller(filler.intervalMs);
     });
   }
 
-  /** 收回执：回答要开始了，或者用户已经开口 */
-  cancelAck(): void {
-    this.ackCancelled = true;
-    if (this.ackTimer !== null) {
-      this.ackTimer();
-      this.ackTimer = null;
+  /** 收回填充：回答要开始了，或者用户已经开口 */
+  cancelFiller(): void {
+    this.fillerCancelled = true;
+    if (this.fillerTimer !== null) {
+      this.fillerTimer();
+      this.fillerTimer = null;
     }
-    // 正在念的那半句也得断：否则用户开口了「嗯，我看看」还在耳朵边上响
-    if (this.ackSpeaking) this.cannedCancelled = true;
+    // 正在念的那半句也得断：否则用户开口了「嗯…」还在耳朵边上响
+    if (this.fillerSpeaking) this.cannedCancelled = true;
   }
 }

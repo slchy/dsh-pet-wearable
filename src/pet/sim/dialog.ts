@@ -46,7 +46,7 @@ export interface DialogSimOptions {
    */
   readonly micOpenAfterMs?: number | null;
   /** 长思考回执（不给自己不加，既有场景的时间线保持不变） */
-  readonly ack?: { readonly afterMs: number; readonly text: string };
+  readonly filler?: { readonly firstAfterMs: number; readonly intervalMs: number; readonly lines: readonly string[] };
 }
 
 /** 只发不播的下行：记录字节数与时刻。 */
@@ -133,7 +133,7 @@ export class DialogSim {
       photoTimeoutMs: options.photoTimeoutMs ?? 4_000,
       confirmTimeoutMs: options.photoTimeoutMs ?? 4_000,
       playbackTailMs: 0,
-      ...(options.ack === undefined ? {} : { ack: options.ack }),
+      ...(options.filler === undefined ? {} : { filler: options.filler }),
       env: {
         call: (call) => {
           this.calls.push(call);

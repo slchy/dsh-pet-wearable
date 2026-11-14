@@ -20,6 +20,7 @@ import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
 import { BASE_STYLE, EMOTIONS } from './emotion.ts';
+import { FILLER_LINES } from './filler.ts';
 import { DEFAULT_TTS_VOICE } from './mimo.ts';
 import {
   cannedStt,
@@ -538,17 +539,20 @@ async function main(): Promise<void> {
       },
       playbackTailMs: 600,
       /**
-       * 长思考回执。真机上 dsh 跑工具常 5–8 s，这期间完全没有声音：
-       * 用户会以为「它没听见」，于是重复说、或者喊「你还在吗」。
-       * 超过 `MIAI_ACK_AFTER_MS` 还没开始出声就先说一句；0 = 关。
+       * 兜底确认（ADR-004 §5.3 两段式响应的第一段）。
+       *
+       * 正常由模型自己说「我查一下」（提示词要求它派后台后立刻确认），
+       * 这里只在它迟迟不开口时补一句，避免耳朵里一片死寂。
+       * `MIAI_ACK_AFTER_MS` 设 0 关掉；`MIAI_ACK_INTERVAL_MS` 是之后每隔多久再催一句。
        */
       ...(envNumber('MIAI_ACK_AFTER_MS', 1200) > 0
         ? {
-          ack: {
-            afterMs: envNumber('MIAI_ACK_AFTER_MS', 1200),
-            // 短是刻意的：它只是"我听见了"的回执。念长了既耽误正式回答，
-            // 又容易和用户接下来的话撞在一起（真机 1.76 s 的「嗯，我看看。」）。
-            text: process.env['MIAI_ACK_TEXT'] ?? '嗯。',
+          filler: {
+            firstAfterMs: envNumber('MIAI_ACK_AFTER_MS', 1200),
+            intervalMs: envNumber('MIAI_ACK_INTERVAL_MS', 8000),
+            lines: (process.env['MIAI_ACK_TEXT'] ?? '').trim() === ''
+              ? FILLER_LINES
+              : [process.env['MIAI_ACK_TEXT'] ?? ''],
           },
         }
         : {}),

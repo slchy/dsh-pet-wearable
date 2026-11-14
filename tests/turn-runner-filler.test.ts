@@ -1,17 +1,20 @@
 /**
- * 长思考回执：什么时候说、什么时候必须立刻闭嘴。
+ * 长思考兜底确认：什么时候说、什么时候必须立刻闭嘴。
  *
  * 真机现场（05:17:23–05:17:26）：
  *
  * ```text
  * 句 1  "退一下。"                ← thinking 开始
  * 句 2  "退休。"                  ← 用户又说了一句
- * 回执    1.2 s 还没出声 → 先说一句「嗯，我看看。」
+ * 确认    1.2 s 还没出声 → 先说一句「嗯，我看看。」
  * 旁白    "嗯，我看看。" 1.76 s   ← 用户正在说话，它还在念
  * ```
  *
- * 两件事都得钉住：回执到点才说（不能抢在模型前面），用户一开口就必须停
+ * 两件事都得钉住：确认到点才说（不能抢在模型前面），用户一开口就必须停
  * （不能盖着用户说）。这里用真实的 `TurnRunner` + 虚拟时钟跑，不靠人工推算。
+ *
+ * 注意这里测的是**兜底**：正常情况下第一段由模型自己说（ADR-004 §5.3 两段式，
+ * 提示词要求它派后台后立刻确认）。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -80,44 +83,44 @@ function harness(options: { agentLatencyMs: number }): Harness {
     downlink,
     fsm: new DialogFsm(() => {}),
     playbackTailMs: 0,
-    ack: { afterMs: 1_000, text: '嗯，我看看。' },
+    filler: { firstAfterMs: 1_000, intervalMs: 8_000, lines: ['我查一下。'] },
     onTurnFinished: () => {},
     log: () => {},
   });
   return { clock, runner, downlink, askedAt };
 }
 
-test('模型慢：到点先给回执', async () => {
+test('模型慢：到点先给确认', async () => {
   const { clock, runner, downlink } = harness({ agentLatencyMs: 5_000 });
   void runner.run('跑个长任务');
   await clock.runUntil(1_500);
 
-  assert.ok(downlink.chunks > 0, '1.5 s 时应当已经有回执音频');
-  assert.equal(downlink.at[0], 1_000, `回执该在 1 s 到点就发，实际 ${downlink.at[0]}`);
+  assert.ok(downlink.chunks > 0, '1.5 s 时应当已经有确认音频');
+  assert.equal(downlink.at[0], 1_000, `确认该在 1 s 到点就发，实际 ${downlink.at[0]}`);
 });
 
-test('用户开口：回执立刻停，剩下的不再下发', async () => {
+test('用户开口：确认立刻停，剩下的不再下发', async () => {
   const { clock, runner, downlink } = harness({ agentLatencyMs: 5_000 });
   void runner.run('跑个长任务');
   await clock.runUntil(1_500);
   const before = downlink.chunks;
-  assert.ok(before >= 1 && before < 4, `回执应当只念了一部分（共 4 块），实际 ${before} 块`);
+  assert.ok(before >= 1 && before < 4, `确认应当只念了一部分（共 4 块），实际 ${before} 块`);
 
-  runner.cancelAck();
+  runner.cancelFiller();
   await clock.runUntil(3_000);
-  assert.equal(downlink.chunks, before, '收回执之后不该再有回执音频');
+  assert.equal(downlink.chunks, before, '收确认之后不该再有确认音频');
 });
 
-test('模型很快：不说回执（不耽误正式回答）', async () => {
+test('模型很快：不说确认（不耽误正式回答）', async () => {
   const { clock, runner, downlink } = harness({ agentLatencyMs: 400 });
   void runner.run('你好');
   await clock.runUntil(4_000);
 
-  // 第一个块应当是正式回答（在 1 s 之前就开始），而不是 1 s 到点的回执
+  // 第一个块应当是正式回答（在 1 s 之前就开始），而不是 1 s 到点的确认
   assert.ok(downlink.chunks > 0, '应当有正式回答的音频');
   assert.equal(
     downlink.at.some((at) => at === 1_000),
     false,
-    `不该有 1 s 到点的回执，实际下发时刻：${JSON.stringify(downlink.at)}`,
+    `不该有 1 s 到点的确认，实际下发时刻：${JSON.stringify(downlink.at)}`,
   );
 });

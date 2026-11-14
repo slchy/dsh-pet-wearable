@@ -93,7 +93,7 @@ export interface DialogOptions {
    * 长思考回执：一句话在 `afterMs` 内还没开始出声，就先用旁白说 `text`。
    * 不给就不回执。
    */
-  readonly ack?: { readonly afterMs: number; readonly text: string };
+  readonly filler?: { readonly firstAfterMs: number; readonly intervalMs: number; readonly lines: readonly string[] };
   readonly env: DialogEnv;
   readonly log: (line: string) => void;
 }
@@ -148,7 +148,7 @@ export class DialogRuntime {
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       ...(options.onDownlinkChunk === undefined ? {} : { onDownlinkChunk: options.onDownlinkChunk }),
       ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
-      ...(options.ack === undefined ? {} : { ack: options.ack }),
+      ...(options.filler === undefined ? {} : { filler: options.filler }),
       onTurnFinished: () => {
         this.execute(this.core.dispatch({ type: 'turnFinished' }));
         // 本轮结束，后台任务的播报可以接着放
@@ -169,7 +169,7 @@ export class DialogRuntime {
     // 用户只要开口（中间结果 / 定稿 / 成句），任何正在念的「回执」都要停。
     // 只在 `onPartial` 上收回执是不够的：短促的插话常常只出定稿（真机 05:17:24）。
     if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
-      this.runner.cancelAck();
+      this.runner.cancelFiller();
     }
     const effects = this.core.dispatch(event);
     this.execute(effects);
@@ -208,6 +208,10 @@ export class DialogRuntime {
           break;
         case 'end':
           env.end();
+          break;
+        case 'say':
+          // 旁白通道：不改状态机、不占轮次，用户一开口就被 `cancelFiller` 收走
+          void this.runner.speakCanned(effect.text).catch(() => undefined);
           break;
         case 'drop':
           break;

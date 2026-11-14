@@ -121,12 +121,12 @@ export const DIALOG_SCENARIOS: readonly DialogScenario[] = [
     name: '对话：长思考 → 先给一句回执，再出正式回答',
     sim: {
       reply: { latencyMs: 5_000, text: '跑完了，一共三条。' },
-      ack: { afterMs: 1_000, text: '嗯，我看看。' },
+      filler: { firstAfterMs: 1_000, intervalMs: 8_000, lines: ['我查一下。'] },
     },
     async run(sim) {
       await sim.utterance('去跑三条命令');
       await sim.until(1_400);
-      // 1.4 s 时 dsh 还没回来：应当已经有一句回执播出去了
+      // 1.4 s 时 dsh 还没回来：应当已经有一句确认播出去了
       assert.ok(
         sim.downlink.sent.some((chunk) => chunk.at >= 1_000 && chunk.at <= 1_400),
         `1 s 时该有回执音频，实际下发时刻：${JSON.stringify(sim.downlink.sent.map((c) => c.at))}`,

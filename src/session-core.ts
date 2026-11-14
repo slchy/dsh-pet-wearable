@@ -14,6 +14,7 @@ import {
 } from './devices/primitives.ts';
 import { V1_BASELINE } from './devices/wire-v1.ts';
 import { DialogFsm, type DialogState, type TurnTicket } from './dialog-fsm.ts';
+import { STATUS_REPLY, isStatusQuery } from './filler.ts';
 import { wantsHighRes } from './hq-intent.ts';
 import type { CaptureRequest } from './photo-inbox.ts';
 import type { ImageAttachment } from './session.ts';
@@ -85,6 +86,13 @@ export type CoreEffect =
   }
   /** 挂断 */
   | { readonly type: 'end' }
+  /**
+   * 用旁白通道说一句（**不改状态机、不占轮次**）。
+   *
+   * 目前只有一个来源：`thinking` 期间的状态查询（「好了吗」）。
+   * ADR-004 §7 规定这类要**本地应答、不占 CLI** —— 所以它不是 `turn`。
+   */
+  | { readonly type: 'say'; readonly text: string }
   /** 有意丢弃（唤醒词 / 旁听反馈），只为可观测 */
   | { readonly type: 'drop'; readonly why: string };
 
@@ -174,6 +182,17 @@ export class SessionCore {
         if (isBackchannelOnly(event.text)) {
           this.options.log('  （旁听反馈，不单独成轮）');
           return [...effects, { type: 'drop', why: 'backchannel' }];
+        }
+        /**
+         * `thinking` 期间问「好了吗」= 状态查询：**本地应答，不占 CLI**（ADR-004 §7）。
+         *
+         * 不能走排队：排队要等这一轮跑完，用户问"好了吗"却在几分钟后才被回答，
+         * 那正是他重复问、重复打断的起点。也不能真去开一轮：dsh 同一会话同时只能
+         * 跑一个 turn（§8 也否决了多 CLI 并行）。
+         */
+        if (this.fsm.state === 'thinking' && isStatusQuery(event.text)) {
+          this.options.log('  （状态查询 → 本地应答，不占 CLI）');
+          return [...effects, { type: 'say', text: STATUS_REPLY }];
         }
         // 已经决定收尾（模型调了退出工具）：麦克风虽已停，但排队中的识别结果
         // 还会到。此时再开一轮会和「告别语播完就挂断」打架。
