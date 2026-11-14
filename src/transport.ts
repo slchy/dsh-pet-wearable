@@ -173,6 +173,12 @@ export class Connection {
 
   end(): void {
     this.closing = true;
+    // 立刻停掉空闲看门狗：半关之后 `finish()` 要等对端真的关，
+    // 那段时间里定时器还会继续判「无数据」，日志和 `socket.end()` 都会重复。
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
     if (!this.socket.destroyed) {
       this.socket.end();
     }
@@ -246,7 +252,9 @@ export class Connection {
   }
 
   private checkIdle(): void {
-    if (this.closed) {
+    // `closing` 也要挡：`end()` 只是半关，等对端真的关掉才走 `finish()`。
+    // 不挡的话定时器每 5 s 继续触发，日志会从「45 s 无数据」一路刷到「70 s 无数据」。
+    if (this.closed || this.closing) {
       return;
     }
     const quietMs = Date.now() - this.lastRxAt;
