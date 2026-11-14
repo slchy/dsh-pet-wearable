@@ -39,9 +39,7 @@
   "types": "./src/driver.ts",
   "files": [
     "src",
-    "README.md",
-    "README.cloud.md",
-    "HANDOFF.md"
+    "README.md"
   ],
   "scripts": {
     "start": "node src/main.ts",
