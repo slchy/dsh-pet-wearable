@@ -54,6 +54,41 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 | **文件变化自动重读** | 吊销不必重启。`TokenGate` 按 mtime 判，读不到就拒绝一切（fail closed） |
 | **`token:deviceId` 真绑定** | `Hello.deviceId` 对不上也拒。否则那一列只是注释 |
 
+### 宠物环（主动开口）
+
+**默认关。** 不设 `PET_PROACTIVE=1` 时 `aliyun-session.ts` 里 `this.app` 是 `null`，
+`AppSession` / `PetBrain` **根本不会构造** —— 只剩下对话环。启动日志会明说：
+
+```
+宠物环   开（主动开口）：心跳每 30000 ms，离场 300000 ms 后重戴会打招呼
+宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口
+```
+
+开着的时候，每次输入/意图都会打一行，**「它为什么不出声」要能当场读出来**：
+
+```
+宠物 ← 心跳  [闲置]
+宠物 ·  心跳后仍不出声  [闲置]
+宠物 ← 佩戴=戴上  [闲置]
+宠物 → 进入 look（计划 look→compose→speak，截止 4000 ms，不占话筒）
+宠物 → 收尾：greet / spoke
+```
+
+`[闲置]` / `[look #1]` 是当前 `engagement` 的阶段。心跳即便什么都不做也留一行 ——
+它是唯一"没反应也照跑"的输入，不写就又回到"分不清没跑还是没想说"。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `PET_PROACTIVE` | 未设（关） | `1` = 装宠物环 |
+| `PET_TICK_MS` | `30000` | 心跳间隔 |
+| `PET_GREET_AWAY_MS` | `300000` | 离场多久后重戴会打招呼 |
+| `PET_CHATTER_IDLE_MS` | `1200000` | 安静多久后可以主动搭话 |
+| `PET_LISTEN_MS` | 见 `DEFAULT_PROACTIVE` | 说完后开麦听回应多久 |
+| `PET_MIC_OPEN_TIMEOUT_MS` | `1500` | 开麦到首帧上行的截止 |
+
+> 注意 `presence`（佩戴）不是所有设备都报。v1 基线没有佩戴源，`greet` 这条触发不了，
+> 能观察到的第一条通常是 `chatter`（安静够久）。
+
 **已建立的连接不会因吊销而断开** —— 吊销影响新连接；要立刻清场就重启进程。
 
 ### 独立进程形态的环境变量
