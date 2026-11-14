@@ -46,7 +46,7 @@ patch 的语义要记住：裸条目是**按 id 覆盖**已有节点，**新增*
 | `port` | `8766` | 手机连上来的 TCP 端口 |
 | `host` | `127.0.0.1` | 监听地址。**非本机地址要求 `tls` 与 `auth` 同时配齐**，否则拒绝加载 |
 | `tls.keyPath` / `tls.certPath` | `''` | TLS 证书（PEM）。要么两个都给，要么都不给 |
-| `auth.tokenFile` | `''` | 设备 token 文件（每行 `token` 或 `token:deviceId`，`#` 开头是注释）。留空 = 不鉴权 |
+| `auth.tokenFile` | `''` | 设备 token 文件（每行 `token` 或 `token:deviceId`）。留空 = 不鉴权。**用 `npm run pair new` 生成，别自己想字符串** |
 | `device` | `''` | v1 手机的型号提示（如 `xiaomi-glasses`）。新协议设备在握手时自报能力，不用填；留空 = v1 基线 |
 | `voice` | `Chloe` | TTS 音色 |
 | `turnThreshold` | `0.5` | 判停阈值。调高更不容易被判为"说完了" |
@@ -77,6 +77,37 @@ patch 的语义要记住：裸条目是**按 id 覆盖**已有节点，**新增*
 不是"打一条警告然后照绑"—— 拒绝的路径一根 socket 都不开，退出码 2。
 两条正当出路：保持 `127.0.0.1` 走 `adb reverse`；或让反向代理终结 TLS、把 `--host` 写回
 `127.0.0.1`。
+
+### 配对：谁来生成 token
+
+**谁初始化，谁生成。** 不用自己想字符串，也不该把眼镜的 token 拿来用：
+
+```bash
+npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
+```
+
+输出一条配对串，直接贴进手机 App：
+
+```
+dshpet://pair?host=203.0.113.10&port=8766&tls=1&token=<64 位 hex>&device=pixel-9
+```
+
+规则：
+
+| 子命令 | 作用 |
+|---|---|
+| `npm run pair -- new` | 生成 32 字节随机 token，**追加**进文件（不覆盖已有设备），打印配对串 |
+| `npm run pair -- list` | 列设备 + 打码的 token。完整值只在生成时出现一次 |
+| `npm run pair -- revoke --device <id>` | 吊销。服务端**按文件变化热读**，不必重启 |
+| `npm run pair -- check <配对串>` | 不碰服务端，验一条串合不合格 |
+
+四件事是刻意的：
+
+1. **追加不覆盖** —— 重新生成不会把所有已配对设备一起踢下线
+2. **强度不达标就拒启动** —— `< 32 字节` 直接报错。顺带把 `^[0-9a-f]{32}$` 判成
+   "这看起来是眼镜的 token"：那是 16 字节 UUID，是 SPP 会话密钥的根，不该出现在这里
+3. **吊销立即生效** —— 新连接按新表判；已建立的连接不踢（那要重启）
+4. **`token:deviceId` 是真绑定** —— `Hello.deviceId` 对不上同样拒绝。以前这一列只是注释
 
 ## 外部依赖
 

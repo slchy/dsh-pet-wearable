@@ -36,6 +36,12 @@ import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
+import {
+  describeTokenProblem,
+  readTokenFile,
+  tokenFilePath,
+  TokenGate,
+} from './tokens.ts';
 import { sleep } from './util.ts';
 
 /**
@@ -153,24 +159,32 @@ function fail(message: string): never {
 
 /**
  * 设备鉴权：`MIAI_TOKENS` 指向一个文件，每行 `token` 或 `token:deviceId`。
- * 不配就**不鉴权**（本地开发）；配了就必须首帧 `Hello`。
+ *
+ * - 不配就**不鉴权**（只可能用于本机地址 —— 由 `bind-policy.ts` 把关）
+ * - 配了就必须首帧 `Hello`，且 token 要过强度校验（见 `tokens.ts`）
+ * - 文件变了自动重读，**吊销不必重启进程**
+ * - 写了 `token:deviceId` 就是真绑定：`Hello.deviceId` 对不上同样拒绝
  */
-function loadAuthenticator(): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
+function loadAuthenticator(log: (line: string) => void): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
   const path = process.env['MIAI_TOKENS'] ?? '';
-  if (!path) return undefined;
-  const tokens = new Set(
-    readFileSync(path, 'utf8')
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line !== '' && !line.startsWith('#'))
-      .map((line) => line.split(':')[0]!.trim()),
-  );
-  if (tokens.size === 0) {
-    console.error(`MIAI_TOKENS=${path} 里没有任何 token`);
-    process.exit(2);
+  if (!path.trim()) return undefined;
+
+  const resolved = tokenFilePath(path);
+  // 启动时就报出弱/错 token，别等到设备连上来才发现「配了等于没配」
+  const { entries, bad } = readTokenFile(resolved);
+  for (const item of bad) {
+    fail(
+      `${resolved} 第 ${item.line} 行不合格：${describeTokenProblem(item.raw, item.problem)}\n`
+      + '（要重新发一个：node src/pair.ts new --device <id>）',
+    );
   }
-  console.log(`鉴权      ${tokens.size} 个设备 token（来自 ${path}）`);
-  return (hello) => typeof hello.token === 'string' && tokens.has(hello.token);
+  if (entries.length === 0) {
+    fail(`${resolved} 里没有任何可用的 token`);
+  }
+
+  const gate = new TokenGate(resolved, log);
+  console.log(`鉴权      ${entries.length} 个设备 token（来自 ${resolved}，改动会自动重读）`);
+  return (hello) => typeof hello.token === 'string' && gate.match(hello.token, hello.deviceId) !== null;
 }
 
 // ------------------------------------------------------------------ 入口
@@ -538,7 +552,7 @@ async function main(): Promise<void> {
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
       announceStore,
       tls: loadTls(),
-      authenticate: loadAuthenticator(),
+      authenticate: loadAuthenticator((line) => { console.log(line); }),
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
       serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
       // 主动开口默认关：开着它会自己说话，得人明确要

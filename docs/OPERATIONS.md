@@ -35,7 +35,28 @@ node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
 判据在 [`src/bind-policy.ts`](../src/bind-policy.ts)，`transport.ts` 与 `driver.ts` 共用；
 `tests/bind-policy.test.ts` 钉矩阵，`tests/transport-bind.test.ts` 断言拒绝时端口没被占。
 
-独立进程形态下这几项走环境变量：
+### token 从哪来
+
+**不来自任何外部系统，也不该复用眼镜的 token。** 由部署方在初始化时现场生成：
+
+```bash
+npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
+# → 写入 tokens.txt，并打印 dshpet://pair?... 配对串
+```
+
+实现见 [`src/tokens.ts`](../src/tokens.ts)（生成 / 强度 / 文件 / 比对）与
+[`src/pair.ts`](../src/pair.ts)（CLI）。四条要记住的行为：
+
+| 行为 | 为什么 |
+|---|---|
+| **追加不覆盖** | 重新生成只影响新设备，不会把已配对的全部踢下线 |
+| **弱 token 拒绝启动** | `< 32 字节` 报错并指向 `pair new`。`^[0-9a-f]{32}$` 额外判成「这是眼镜的 token」 |
+| **文件变化自动重读** | 吊销不必重启。`TokenGate` 按 mtime 判，读不到就拒绝一切（fail closed） |
+| **`token:deviceId` 真绑定** | `Hello.deviceId` 对不上也拒。否则那一列只是注释 |
+
+**已建立的连接不会因吊销而断开** —— 吊销影响新连接；要立刻清场就重启进程。
+
+### 独立进程形态的环境变量
 
 | 环境变量 | 作用 |
 |---|---|
