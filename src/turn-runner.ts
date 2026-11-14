@@ -96,6 +96,8 @@ export class TurnRunner {
   private ackTimer: Cancel | null = null;
   /** 用户一开口就别再"嗯"了 */
   private ackCancelled = false;
+  /** 「此刻正在念的那段旁白就是回执」—— 收回执时只掐它，别误伤别的旁白 */
+  private ackSpeaking = false;
   /** 本轮的回答已经开始出声 —— 回执不再有意义 */
   private replyStarted = false;
 
@@ -286,7 +288,10 @@ export class TurnRunner {
       this.ackTimer = null;
       if (this.ackCancelled || this.replyStarted) return;
       this.log(`  回执    ${(ack.afterMs / 1000).toFixed(1)} s 还没出声 → 先说一句「${ack.text}」`);
-      void this.speakCanned(ack.text).catch(() => undefined);
+      this.ackSpeaking = true;
+      void this.speakCanned(ack.text)
+        .catch(() => undefined)
+        .finally(() => { this.ackSpeaking = false; });
     });
   }
 
@@ -297,5 +302,7 @@ export class TurnRunner {
       this.ackTimer();
       this.ackTimer = null;
     }
+    // 正在念的那半句也得断：否则用户开口了「嗯，我看看」还在耳朵边上响
+    if (this.ackSpeaking) this.cannedCancelled = true;
   }
 }

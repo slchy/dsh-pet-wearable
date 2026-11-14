@@ -546,7 +546,9 @@ async function main(): Promise<void> {
         ? {
           ack: {
             afterMs: envNumber('MIAI_ACK_AFTER_MS', 1200),
-            text: process.env['MIAI_ACK_TEXT'] ?? '嗯，我看看。',
+            // 短是刻意的：它只是"我听见了"的回执。念长了既耽误正式回答，
+            // 又容易和用户接下来的话撞在一起（真机 1.76 s 的「嗯，我看看。」）。
+            text: process.env['MIAI_ACK_TEXT'] ?? '嗯。',
           },
         }
         : {}),

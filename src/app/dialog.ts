@@ -166,6 +166,11 @@ export class DialogRuntime {
    * @returns 这一批效果（调用方偶尔要先看一眼，比如"是不是要求停播"）
    */
   dispatch(event: CoreEvent): readonly CoreEffect[] {
+    // 用户只要开口（中间结果 / 定稿 / 成句），任何正在念的「回执」都要停。
+    // 只在 `onPartial` 上收回执是不够的：短促的插话常常只出定稿（真机 05:17:24）。
+    if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
+      this.runner.cancelAck();
+    }
     const effects = this.core.dispatch(event);
     this.execute(effects);
     return effects;
