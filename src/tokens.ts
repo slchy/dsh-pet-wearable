@@ -20,10 +20,8 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
-  statSync,
   writeFileSync,
-} from 'node:fs';
-import { dirname, resolve } from 'node:path';
+} from 'node:fs';import { dirname, resolve } from 'node:path';
 
 /** 生成的长度：32 字节 → 64 位 hex。 */
 export const TOKEN_BYTES = 32;
@@ -106,10 +104,9 @@ export function parseTokenFile(text: string): { entries: TokenEntry[]; bad: Arra
   return { entries, bad };
 }
 
-export function readTokenFile(path: string): { entries: TokenEntry[]; bad: ReturnType<typeof parseTokenFile>['bad']; mtimeMs: number } {
+export function readTokenFile(path: string): { entries: TokenEntry[]; bad: ReturnType<typeof parseTokenFile>['bad'] } {
   const text = readFileSync(path, 'utf8');
-  const parsed = parseTokenFile(text);
-  return { ...parsed, mtimeMs: statSync(path).mtimeMs };
+  return parseTokenFile(text);
 }
 
 /** 原子写 + 0600（POSIX 上才有意义，Windows 会忽略）。 */
@@ -186,39 +183,46 @@ export interface AuthenticatedDevice {
 }
 
 /**
- * 连接上的比对器。**文件一变就重新读** —— 吊销不该要求重启进程，
- * 否则"先重启再断"的窗口里那把旧 token 还是有效的。
+ * 连接上的比对器。**每次比对都重读文件**。
+ *
+ * 试过按 `mtime` 缓存，在 Linux 上翻车：吊销（写空）后紧接着发新 token，
+ * 两次写在同一个时间戳刻度内，`mtimeMs` 一样 → 缓存不刷新 → 新 token 不生效。
+ * 这个文件只有几行、鉴权一次连接才做一次，省这点 IO 不值得换一类陈旧缓存 bug。
+ *
+ * 文件读不了时**拒绝一切**（fail closed），只抱怨一次。
  */
 export class TokenGate {
   private readonly path: string;
   private readonly log: (line: string) => void;
   private entries: TokenEntry[] = [];
-  private mtimeMs = -1;
   private warnedMissing = false;
+  /** 上一次打过的「已加载」/「坏行」签名，用来避免每条连接都刷屏 */
+  private lastSignature = '';
 
   constructor(path: string, log: (line: string) => void) {
     this.path = path;
     this.log = log;
   }
 
-  /** 文件读不了时**拒绝一切**（fail closed），只抱怨一次。 */
   private refresh(): void {
     try {
-      const mtimeMs = statSync(this.path).mtimeMs;
-      if (mtimeMs === this.mtimeMs) {
-        return;
-      }
       const { entries, bad } = readTokenFile(this.path);
       this.entries = entries;
-      this.mtimeMs = mtimeMs;
       this.warnedMissing = false;
-      for (const item of bad) {
-        this.log(`  鉴权    tokens 文件第 ${item.line} 行被忽略：${describeTokenProblem(item.raw, item.problem)}`);
+
+      const signature = `${entries.map((e) => `${e.token}:${e.deviceId ?? ''}`).join('|')}#${bad
+        .map((b) => `${b.line}:${b.problem}`)
+        .join(',')}`;
+      if (signature !== this.lastSignature) {
+        this.lastSignature = signature;
+        for (const item of bad) {
+          this.log(`  鉴权    tokens 文件第 ${item.line} 行被忽略：${describeTokenProblem(item.raw, item.problem)}`);
+        }
+        this.log(`  鉴权    已加载 ${entries.length} 个设备 token（${this.path}）`);
       }
-      this.log(`  鉴权    已加载 ${entries.length} 个设备 token（${this.path}）`);
     } catch (error) {
       this.entries = [];
-      this.mtimeMs = -1;
+      this.lastSignature = '';
       if (!this.warnedMissing) {
         this.warnedMissing = true;
         this.log(`  鉴权    读不到 ${this.path}（${(error as Error).message}）→ 拒绝所有连接`);

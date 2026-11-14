@@ -9,11 +9,22 @@
  * 图属于哪个请求由线协议层给出 id（v1 的判法见 `wire-v1.test.ts`）。
  */
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 
 import type { DeviceCall, DeviceEvent } from '../src/devices/index.ts';
 import { SystemClock } from '../src/app/clock.ts';
 import { PhotoInbox, type CaptureRequest, type PhotoOutcome } from '../src/photo-inbox.ts';
+
+/**
+ * `SystemClock` 的定时器是**故意 `unref` 的**（生产上不该被心跳拖着不退出）。
+ * 单测里如果除了那个定时器没有别的活儿，事件循环会先结束，待定的 promise 就被判
+ * `Promise resolution is still pending but the event loop has already resolved`
+ * —— Node 22 上会这样，Node 24 上只是碰巧没触发。
+ *
+ * 这里显式持有一个 ref 的定时器兜住，让「等真实超时」的用例有事件循环可用。
+ */
+const keepAlive = setInterval(() => {}, 1_000);
+after(() => { clearInterval(keepAlive); });
 
 interface Harness {
   readonly inbox: PhotoInbox;

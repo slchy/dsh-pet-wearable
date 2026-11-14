@@ -158,9 +158,10 @@ test('TokenGate：文件变了就重读 —— 吊销不必重启进程', () => 
   writeTokenFile(file, []);
   assert.equal(gate.match(token, 'pixel-9'), null, '吊销后旧 token 必须立即失效');
 
-  // 再发一个，同一个 gate 也要认
+  // 紧接着发一个新的 —— 这一步曾在 Linux 上翻车：按 mtime 缓存会把同一时间戳内的
+  // 两次写当成"没变"，于是新 token 不生效。现在每次比对都重读，不依赖时间戳。
   const fresh = appendToken(file, 'pixel-9');
-  assert.notEqual(gate.match(fresh.token, 'pixel-9'), null);
+  assert.notEqual(gate.match(fresh.token, 'pixel-9'), null, '新发的 token 必须立刻可用');
 });
 
 test('TokenGate：文件读不到就拒绝一切（fail closed）', () => {
