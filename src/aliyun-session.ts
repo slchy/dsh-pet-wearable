@@ -907,7 +907,10 @@ class AliyunConnection {
         // 敲击关播报：清掉队列并停掉正在播的那条
         this.dialog.clearAnnounce();
       },
-      log: (line) => { console.log(`  ${line}`); },
+      // **带上连接标签**：一副眼镜一条宠物，日志里必须能分辨是谁在说话。
+      // 不加的话两条连接的心跳会互相穿插成 `[闲置]` / `[compose #1]` 来回跳，
+      // 看着像状态机错乱，其实是两个独立实例。
+      log: (line) => { console.log(`  [${this.link.label}] ${line}`); },
     });
   }
 
