@@ -99,6 +99,22 @@ test('太短的中间结果不触发插话', () => {
   assert.equal(core.phase, 'speaking');
 });
 
+test('播报中的定稿也要打断 —— 短促插话常常只有定稿、没有中间结果', () => {
+  const { core } = newCore();
+  toSpeaking(core);
+  // 真机日志：「句 3 "退休。"」在 speaking 里到达，只派发 assemble 不打断，
+  // 于是要等到下一句的部分结果才停 —— 表现为"有时候打断要等好几秒"。
+  const effects = core.dispatch({ type: 'sentence', text: '退下' });
+  assert.deepEqual(callOps(effects), ['call:audio.stop', 'assemble']);
+  assert.equal(core.phase, 'listening');
+});
+
+test('不在播报时，定稿照常只是攒进一轮（不要多打一枪停止）', () => {
+  const { core } = newCore();
+  // listening 状态：没有音频在放，"停播"是空动作
+  assert.deepEqual(callOps(core.dispatch({ type: 'sentence', text: '帮我看看这个' })), ['assemble']);
+});
+
 test('没人等的图：起一轮识图', () => {
   const { core } = newCore();
   const effects = core.dispatch({ type: 'image', jpeg: Buffer.from([1, 2, 3]) });

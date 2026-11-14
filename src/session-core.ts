@@ -144,12 +144,21 @@ export class SessionCore {
 
   dispatch(event: CoreEvent): CoreEffect[] {
     switch (event.type) {
-      case 'sentence':
+      case 'sentence': {
         if (isWakeWordOnly(event.text, this.caps.ignorePhrases)) {
           this.options.log('  → 唤醒词，丢弃（不算一轮）');
           return [{ type: 'drop', why: 'wake-word' }];
         }
-        return [{ type: 'assemble', text: event.text }];
+        // **定稿也要打断**。短促的插话（「退下」「好了」）常常只出定稿、不出中间结果，
+        // 只听 `partial` 就会漏掉 —— 真机上表现为「有时候打断立刻生效、有时候要等
+        // 下一句才停」。`bargeIn` 只在 `speaking` 成立，所以不会误伤别的状态。
+        const effects: CoreEffect[] = [];
+        if (this.fsm.bargeIn(event.text)) {
+          effects.push({ type: 'call', call: { op: 'audio.stop' } });
+        }
+        effects.push({ type: 'assemble', text: event.text });
+        return effects;
+      }
 
       case 'utterance': {
         /** 等快门期间用户又说话 = 改主意：先取消拍照，再按新句子重新判 */
