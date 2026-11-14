@@ -30,11 +30,16 @@
  * 理由不是洁癖 —— AR1 跑不动本地推理，245 mAh 更跑不动，而且每台设备各写一套判停
  * 会让"什么算说完了"分裂成 N 个版本。
  *
+ * 协议层的原语已经收在 `src/devices/primitives.ts`（`DeviceCall` / `DeviceEvent`：
+ * `presence` / `power` / `summon` / `capture` …）。宠物侧应当消费 `DeviceEvent`，
+ * **不要在这里并行长出第三套宿主接口**；这组端口只是宠物核心的最小依赖面。
+ *
  * <h2>`null` 不是 `false`</h2>
  *
  * 设备拿不到某个状态时返回 `null`，**绝不返回一个默认值**。拿不到佩戴状态不等于没戴，
  * 拿不到电量不等于没电。核心据此走降级分支，而不是把未知当已知。
  */
+import type { TapInfo } from './pet-timing.ts';
 
 /** 佩戴状态来源。设备不提供时整个字段缺省。 */
 export interface PresencePort {
@@ -49,11 +54,13 @@ export interface PresencePort {
    * 订阅状态变化。
    *
    * 适配器必须自己去重：只在真正翻转时调用，不要把轮询结果原样转发。
+   * **`null` 也是一次翻转**：设备丢失 / 读不到时必须报 `null`，
+   * 不能报 `false`（那会把「不知道」当成「摘下了」）。
    *
-   * @param fn - 变化回调
+   * @param fn - 变化回调，参数是 `true` / `false` / `null`
    * @returns 退订函数；重复调用无副作用
    */
-  onChange(fn: (wearing: boolean) => void): () => void;
+  onChange(fn: (wearing: boolean | null) => void): () => void;
 }
 
 /** 电量来源。 */
@@ -61,25 +68,31 @@ export interface BatteryPort {
   /**
    * 电量百分比。
    *
+   * 这是**异步**接口；`PetSnapshot.battery` 是同步值 —— 中间的轮询与缓存
+   * 由 `BatteryCache` 负责（见 `battery-cache.ts`），核心不做异步。
+   *
    * @returns 0..100；读不到时给 `null`
    */
   level(): Promise<number | null>;
 }
 
-/** 一个「招呼」手势：触摸、长按、双击之类，由适配器归一成一次敲击。 */
+/**
+ * 一个「招呼」手势：触摸、长按、双击之类，由适配器归一成一次敲击。
+ */
 export interface TouchPort {
   /**
    * 订阅敲击。
    *
    * 各设备的可用手势不一样，适配器负责归一：
-   * - 小米：长按触控板 → `Aivs` id=10 → `AivsEvent.OpenDevice`
-   *   （注意它**同时会打开语音会话**，别当成纯手势用）
-   * - 雷鸟：镜腿触摸
+   * - 小米：长按触控板 → `Aivs` id=10 → `AivsEvent.OpenDevice`。
+   *   **必须报 `opensSession: true`**：它同时会打开语音会话，核心收到后
+   *   不会把这次敲击当成「用户说了话」，也不播反射音。
+   * - 雷鸟：`TempleAction` 的离散手势（`tap` / `double-tap` / 滑动…）。
    *
-   * @param fn - 每次敲击调用一次
+   * @param fn - 每次敲击调用一次，带 `opensSession` 语义
    * @returns 退订函数
    */
-  onTap(fn: () => void): () => void;
+  onTap(fn: (tap: TapInfo) => void): () => void;
 }
 
 /** 直接下发音频的通道，供**预合成的短音**使用。 */
@@ -91,6 +104,7 @@ export interface AudioOutPort {
    * 播一段 PCM16 单声道。
    *
    * 用于快反射（「嗯？」「在呢」这类预合成短音）：不走 TTS、不等 agent。
+   * 触发点是 `PetMove.kind === 'reflect'`（`cue` 选片段），由调用方执行；
    * 需要走 TTS 的完整回复**不走这里**，那是 `TtsProvider` 的事。
    *
    * @param pcm - PCM16 单声道样本
@@ -113,7 +127,7 @@ export interface AudioOutPort {
 export interface PetHost {
   /** 佩戴来源；缺省时用"连接是否存活"近似 */
   readonly presence?: PresencePort;
-  /** 电量来源；缺省时按"永不疲劳"处理 */
+  /** 电量来源；缺省时按"永不疲劳"处理。快照里的同步值由 `BatteryCache` 提供。 */
   readonly battery?: BatteryPort;
   /** 敲击来源；缺省时只剩语音入口 */
   readonly touch?: TouchPort;

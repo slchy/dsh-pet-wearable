@@ -74,10 +74,36 @@ test('摘下期间永远 idle', () => {
   assert.equal(p.tick(snap(60 * MIN, { wearing: false })).kind, 'idle');
 });
 
-test('读不到佩戴（null）按在场处理，不当成离场', () => {
+test('摘不下 → 读不到（null）按在场处理，不当成离场', () => {
   const p = new PetTiming();
   p.onPresence(null, 0);
   assert.equal(p.tick(snap(20 * MIN, { wearing: null })).kind, 'chatter');
+});
+
+test('没戴 → 读不到 → 又读到戴着：不补打招呼', () => {
+  const p = new PetTiming();
+  p.onPresence(true, 0);
+  p.onPresence(false, 10 * MIN);   // 已知离场
+  p.onPresence(null, 11 * MIN);    // 读不到：离场计时作废
+  p.onPresence(true, 20 * MIN);    // 重新读到戴着
+  assert.equal(p.tick(snap(20 * MIN)).kind, 'idle');
+});
+
+test('没戴 → 读不到：离场计时清掉，之后不会冒出 greet', () => {
+  const p = new PetTiming();
+  p.onPresence(true, 0);
+  p.onPresence(false, 10 * MIN);
+  p.onPresence(null, 11 * MIN);
+  assert.equal(p.tick(snap(12 * MIN, { wearing: null })).kind, 'idle');
+  // 未知按在场处理，闲置从 11 分钟起算 → 20 分钟后是搭话，不是打招呼
+  assert.equal(p.tick(snap(31 * MIN, { wearing: null })).kind, 'chatter');
+});
+
+test('读不到之后直接读到戴着：不打招呼', () => {
+  const p = new PetTiming();
+  p.onPresence(null, 0);
+  p.onPresence(true, 20 * MIN);
+  assert.equal(p.tick(snap(20 * MIN)).kind, 'idle');
 });
 
 test('深夜不搭话，但离场回来照旧打招呼', () => {
@@ -132,6 +158,22 @@ test('敲击等同用户说话：刷新闲置与最小间隔', () => {
   p.onTap(19 * MIN);
   assert.equal(p.tick(snap(20 * MIN)).kind, 'idle');
   assert.equal(p.tick(snap(19 * MIN + 20 * MIN)).kind, 'chatter');
+});
+
+test('普通敲击给一个快反射动作，同时刷新闲置', () => {
+  const p = new PetTiming();
+  p.onPresence(true, 0);
+  assert.deepEqual(p.onTap(19 * MIN), { kind: 'reflect', cue: 'tap-ack' });
+  // 反射不算主动开口：最小间隔不刷新，但闲置已重置
+  assert.equal(p.tick(snap(20 * MIN)).kind, 'idle');
+});
+
+test('会打开语音会话的敲击不当作说话，也不给反射', () => {
+  const p = new PetTiming();
+  p.onPresence(true, 0);
+  assert.deepEqual(p.onTap(19 * MIN, { opensSession: true }), { kind: 'idle' });
+  // 闲置没有被重置：20 分钟门槛到了就搭话（随后的发言会由 onUserSpoke 报告）
+  assert.equal(p.tick(snap(20 * MIN)).kind, 'chatter');
 });
 
 test('只喂快照也能工作（不调 onPresence）', () => {

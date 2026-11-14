@@ -63,7 +63,12 @@ export interface PetSnapshot {
    * 当成「摘下了」，白白丢掉打招呼的机会。
    */
   readonly wearing: boolean | null;
-  /** 电量百分比；`null` = 读不到（按「不累」处理，不编造疲劳） */
+  /**
+   * 电量百分比；`null` = 读不到（按「不累」处理，不编造疲劳）。
+   *
+   * 这是**同步快照**：宿主用 `BatteryCache` 把异步的 `BatteryPort.level()`
+   * 缓存成这个值（默认 60 s 一轮），核心自己不做异步。
+   */
   readonly battery: number | null;
   /** 单调时钟（ms）。不要用 `Date.now()`，改系统时间会让闲置时长跳变 */
   readonly nowMs: number;
@@ -78,7 +83,23 @@ export type PetMove =
   /** 离场归来：值得说一句 */
   | { readonly kind: 'greet'; readonly awayMs: number }
   /** 闲置太久：可以搭一句话 */
-  | { readonly kind: 'chatter'; readonly idleMs: number };
+  | { readonly kind: 'chatter'; readonly idleMs: number }
+  /** 快反射：播一段**预合成**的短音（「嗯？」「在呢」），不走 TTS */
+  | { readonly kind: 'reflect'; readonly cue: ReflexCue };
+
+/** 预合成短音的编号。具体音频由宿主按 `AudioOutPort` 提供。 */
+export type ReflexCue = 'tap-ack';
+
+/**
+ * 一次敲击的语义。
+ *
+ * 有些设备把「敲一下」和「开语音会话」绑在同一个手势上（小米长按触控板），
+ * 这时敲击本身**不能**当成用户说了话，否则会话和时机机会各记一次。
+ */
+export interface TapInfo {
+  /** 这次敲击在设备上同时打开了语音会话 */
+  readonly opensSession: boolean;
+}
 
 /** 深夜判定：支持跨零点区间（`from > to`）。 */
 function inQuietHours(hour: number, from: number, to: number): boolean {
@@ -120,6 +141,10 @@ export class PetTiming {
   /**
    * 佩戴状态变化。只在**真正翻转**时产生效果，重复喂同一个值无副作用。
    *
+   * `null`（读不到）是第三种状态，不是 `false` 的别名：
+   * - 已知没戴 → 读不到：**清掉离场计时**，之后即使读到戴着也不补打招呼
+   * - 读不到 → 戴着：没有已知离场，不打招呼
+   *
    * @param wearing - `true` / `false` / `null`
    * @param nowMs - 同一时刻的单调时钟
    */
@@ -127,17 +152,40 @@ export class PetTiming {
     const prev = this.wearing;
     this.wearing = wearing;
 
-    if (wearing === false && prev !== false) {
-      // 进入离场：开始计时，并允许回来时打招呼
-      this.awaySinceMs = nowMs;
+    if (wearing === false) {
+      if (prev !== false) {
+        // 进入已知离场：开始计时，并允许回来时打招呼
+        this.awaySinceMs = nowMs;
+        this.returnHandled = false;
+      }
+      return;
+    }
+
+    if (wearing === null) {
+      // 未知不等于已知：任何未消费的「离场归来」都必须作废 ——
+      // 否则接下来读到 true 时，会拿一段不知道发生了什么的时间当「离开够久」。
+      if (prev === false) {
+        // 未知按在场处理：闲置从此刻重新计
+        this.idleSinceMs = nowMs;
+      }
+      this.awaySinceMs = null;
+      this.returnHandled = true;
+      return;
+    }
+
+    // wearing === true
+    if (prev === true) {
+      return;
+    }
+    this.idleSinceMs = nowMs;
+    if (prev === false) {
+      // 已知离场后回来：awaySinceMs 保留，交给 tick 判断够不够久
       this.returnHandled = false;
       return;
     }
-    if (wearing === true && prev !== true) {
-      // 回到在场：闲置从现在重新计
-      this.idleSinceMs = nowMs;
-      this.returnHandled = false;
-    }
+    // prev === null：上一段是「不知道」，不能当成离开过
+    this.awaySinceMs = null;
+    this.returnHandled = true;
   }
 
   /** 用户刚说过话：重置闲置，并刷新主动开口的最小间隔（刚聊完别急着搭话）。 */
@@ -146,9 +194,20 @@ export class PetTiming {
     this.lastProactiveMs = nowMs;
   }
 
-  /** 敲击 = 用户主动找它，等同 {@link onUserSpoke}。 */
-  onTap(nowMs: number): void {
+  /**
+   * 一次敲击。
+   *
+   * - 普通敲击 = 用户主动找它：刷新闲置，并给一个快反射动作
+   * - `opensSession` 的敲击（小米长按触控板）= 设备正在开麦，
+   *   **不当作说话、也不给反射** —— 真正的发言随后由 {@link onUserSpoke} 报告，
+   *   会话自己的应答也不该被宠物的短音盖住
+   */
+  onTap(nowMs: number, tap: TapInfo = { opensSession: false }): PetMove {
+    if (tap.opensSession) {
+      return { kind: 'idle' };
+    }
     this.onUserSpoke(nowMs);
+    return { kind: 'reflect', cue: 'tap-ack' };
   }
 
   /** 记录一次主动开口已被采纳，避免同一条件反复触发。 */
