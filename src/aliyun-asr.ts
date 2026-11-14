@@ -41,6 +41,14 @@ export interface AliyunAsrOptions {
   appkey: string;
   /** cn-shanghai / ap-southeast-1 等 */
   region: string;
+  /**
+   * 换 token 的实现。默认走阿里云 `CreateToken`。
+   *
+   * 单独抽出来是为了让连接状态机可测：默认实现要在测试里发一次真实
+   * HTTPS 请求，那样「旧连接迟到的 close 会不会清掉新连接」这种
+   * 纯时序问题就没法写单测。
+   */
+  tokenProvider?: () => Promise<AliyunToken>;
   /** 一句结束后判定「说完了」所需的静音时长（毫秒） */
   maxSentenceSilenceMs?: number;
   /** 中间结果（边说边出字），可选 */
@@ -142,7 +150,9 @@ export class AliyunAsr {
     const now = Math.floor(Date.now() / 1000);
     const cur = this.cache.token;
     if (cur && cur.expireAtSec - now > TOKEN_REFRESH_MARGIN_SEC) return cur;
-    const fresh = await createToken(this.opts.akId, this.opts.akSecret, this.opts.region);
+    const provider = this.opts.tokenProvider
+      ?? ((): Promise<AliyunToken> => createToken(this.opts.akId, this.opts.akSecret, this.opts.region));
+    const fresh = await provider();
     this.cache.token = fresh;
     return fresh;
   }
@@ -156,36 +166,71 @@ export class AliyunAsr {
       // 解 dropping 的时机只有两个：初始值，以及显式 resume()。
       this.backlog = [];
       const token = await this.token();
-    const url = `wss://nls-gateway-${this.opts.region}.aliyuncs.com/ws/v1`
-      + `?token=${encodeURIComponent(token.id)}`;
+      const url = `wss://nls-gateway-${this.opts.region}.aliyuncs.com/ws/v1`
+        + `?token=${encodeURIComponent(token.id)}`;
 
-    const ws = new WebSocket(url);
-    this.ws = ws;
-
-    await new Promise<void>((resolve, reject) => {
-      const onOpen = (): void => { resolve(); };
-      const onError = (e: Event): void => {
-        reject(new AliyunAsrError(`WebSocket 连接失败: ${String(e)}`));
-      };
-      ws.addEventListener('open', onOpen, { once: true });
-      ws.addEventListener('error', onError, { once: true });
-    });
-
-    ws.addEventListener('message', (ev) => { this.onMessage(ev); });
-    ws.addEventListener('error', (e) => {
-      this.opts.onError?.(new AliyunAsrError(`WebSocket error: ${String(e)}`));
-    });
-    ws.addEventListener('close', (ev) => {
+      const ws = new WebSocket(url);
+      this.ws = ws;
       this.ready = false;
-      this.ws = null;
       this.taskId = null;
-      this.log(`[asr] 连接关闭 code=${ev.code} reason=${ev.reason || '无'}`);
-    });
 
-    this.startTranscription();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onOpen = (): void => { resolve(); };
+          const onError = (e: Event): void => {
+            reject(new AliyunAsrError(`WebSocket 连接失败: ${String(e)}`));
+          };
+          ws.addEventListener('open', onOpen, { once: true });
+          ws.addEventListener('error', onError, { once: true });
+        });
+      } catch (e) {
+        // 连不上就把自己摘干净：`feed()` 靠「`this.ws` 为空」判断该不该重连，
+        // 留着这条半死的连接会一直往 backlog 里攒音频，永远不再重建。
+        this.drop(ws);
+        try {
+          ws.close();
+        } catch {
+          // 已断
+        }
+        throw e;
+      }
+
+      ws.addEventListener('message', (ev) => {
+        // 只认**当前**这条连接的消息。旧连接是钩子上没摘干净的孤儿，
+        // 它的中间结果会和当前连接打架。
+        if (this.ws === ws) this.onMessage(ev);
+      });
+      ws.addEventListener('error', (e) => {
+        if (this.ws !== ws) return;
+        this.opts.onError?.(new AliyunAsrError(`WebSocket error: ${String(e)}`));
+      });
+      ws.addEventListener('close', (ev) => {
+        this.log(`[asr] 连接关闭 code=${ev.code} reason=${ev.reason || '无'}`);
+        // 关键：只有「这条就是当前连接」时才清状态。
+        // `hangup()` 会先把 `this.ws` 摘空、500 ms 后才真正 close，这中间
+        // 可能已经建了新连接；那时这条迟到的 close 若无条件清 `this.ws`，
+        // 新连接就变成没人认领的孤儿（实测同时存活 4 条，结果互相打架）。
+        this.drop(ws);
+      });
+
+      this.startTranscription();
     } finally {
       this.connecting = false;
     }
+  }
+
+  /**
+   * 摘掉**指定**这条连接的状态。
+   *
+   * 不是当前连接就什么都不做 —— 迟到的 close 不能影响后来者。
+   */
+  private drop(ws: WebSocket | null): boolean {
+    if (ws === null || this.ws !== ws) return false;
+    this.ws = null;
+    this.ready = false;
+    this.taskId = null;
+    this.backlog = [];
+    return true;
   }
 
   private startTranscription(): void {
@@ -220,6 +265,8 @@ export class AliyunAsr {
   /** 推音频。16 kHz / 单声道 / PCM16 小端。未 ready 时先缓存。 */
   feed(pcm: Buffer): void {
     if (this.dropping) return;
+    // 已经关掉、但 close 事件还没派发的连接不算「还连着」
+    if (this.ws && this.ws.readyState === WebSocket.CLOSED) this.drop(this.ws);
     // 懒连接：只有真有待推音频时才建连。
     // 空连接会被服务端判 IDLE_TIMEOUT（实测 `Gateway:IDLE_TIMEOUT`）。
     if (!this.ws && !this.connecting) {
@@ -303,8 +350,9 @@ export class AliyunAsr {
         // 已断
       }
     }, 500).unref?.();
-    this.ws = null;
-    this.ready = false;
+    // 立刻摘空：这 500 ms 里若有音频进来会建新连接，
+    // 老连接的 close 靠 `drop()` 的身份判定自动忽略。
+    this.drop(ws);
   }
 
   private onMessage(ev: MessageEvent): void {
@@ -339,14 +387,33 @@ export class AliyunAsr {
     }
     if (name === 'TranscriptionCompleted') {
       this.log('[asr] 识别任务已结束');
-      this.ready = false;
+      this.endTask();
       return;
     }
     if (name === 'TaskFailed') {
       const st = msg.header?.status_text ?? `status=${msg.header?.status}`;
       this.opts.onError?.(new AliyunAsrError(`TaskFailed: ${st}`));
-      this.ready = false;
+      this.endTask();
       return;
+    }
+  }
+
+  /**
+   * 任务结束 → 关掉这条连接。
+   *
+   * 只置 `ready = false` 是不够的：`feed()` 看到 `this.ws` 还在就以为
+   * 「连接好着，只是还没就绪」，于是把音频全攒进 backlog（上限 200 块，
+   * 满了就丢）。**用户说什么都不会再被识别**，直到上行静音触发
+   * `hangup()` 才恢复 —— 表现为"跑一阵子就听不见了"。
+   */
+  private endTask(): void {
+    const ws = this.ws;
+    if (ws === null) return;
+    this.drop(ws);
+    try {
+      ws.close();
+    } catch {
+      // 已断
     }
   }
 }

@@ -483,7 +483,18 @@ async function main(): Promise<void> {
     // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」
     const ttsGain = envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1));
     const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1));
-    const peakDbfs = envNumber('VOICE_PEAK_DBFS', -58);
+    /**
+     * 能量门限（按**放大后**算）。
+     *
+     * 实测（M2004J7AC、增益 4×、家里安静房间，84 个 2 s 窗口）：
+     * 底噪峰值集中在 −60…−51 dBFS（p10 −58.3、p50 −53.7），
+     * 说话时在 −20…0 dBFS，中间几乎空着。
+     *
+     * 原来取 −58：**低于底噪**，门一直开着 → 噪声当语音推给 ASR →
+     * 服务端判「无有效语音」踢连接 → 6 分钟里建连 45 次、同时存活 4 条。
+     * 取 −40：比最响的底噪高 10 dB，比最轻的说话低 10 dB。
+     */
+    const peakDbfs = envNumber('VOICE_PEAK_DBFS', -40);
     console.log(
       `增益    上行 ${micGain}×（能量门 ${peakDbfs} dBFS，按放大后算）  下行 ${ttsGain}×\n`,
     );
