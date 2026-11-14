@@ -13,6 +13,32 @@
 #   take_photo  → harness 经常驻 TCP 让手机复用 WakeUpEvent 的
 #                 transactionId/requestId 发 multiModel，再把 JPEG 回给它
 #   end_session → harness 挂「本轮说完就结束」的旗子，播完断开连接
+
+# ---- 主对话常驻：bash 前台最多等 3 s，超时自动转后台 job ----
+#
+# 这是全双工能成立的前提：前台跑命令会把主对话整个占住，这几秒里用户说什么都
+# 进不来（真机 05:40:37 那次网上搜索占了 10.19 s，用户问「你查好了吗」排到了
+# 这一轮之后）。dsh 的 bash 工具本身带 promoteOnTimeout：跑过 timeoutMs 之后
+# **不杀**命令，而是继续当 job 跑，调用返回
+# `[still running after <ms>; moved to background job <id>]`，主对话立刻自由。
+#
+# 所以不需要在应用层猜用户在问什么（关键词匹配既是漏判也是误伤），
+# 也不需要提示词逼模型"一律派后台"——调短等待就够了，一个主对话能同时挂多个 job。
+- id: bash-sandbox
+  config:
+    timeoutMs: 3000
+    # 模型自己传 timeoutMs 也不能把它拉长，否则它一问就又把主对话堵回去
+    maxTimeoutMs: 3000
+
+# 同上，`job_output wait:true` 默认会等 **30 秒**（dsh-tool-jobs 的
+# `waitTimeoutMs ?? 3e4`）—— 模型刚被踢到后台，转头又用 job_output 干等，
+# 主对话照样被堵（实测：sleep 8 转后台后，它又等 5 秒把结果取回来）。
+# 压到 1 秒：拿不到就结束这一轮，job 结算时系统会主动叫它（completionDelivery）。
+- id: tool-jobs
+  config:
+    waitTimeoutMs: 1000
+    maxWaitTimeoutMs: 1000
+
 - insert:
     - id: mcp-camera
       name: '@deepseek-ai/dsh-mcp-client'

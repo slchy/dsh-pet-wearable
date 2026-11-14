@@ -20,7 +20,6 @@ import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
 import { BASE_STYLE, EMOTIONS } from './emotion.ts';
-import { FILLER_LINES } from './filler.ts';
 import { DEFAULT_TTS_VOICE } from './mimo.ts';
 import {
   cannedStt,
@@ -538,27 +537,6 @@ async function main(): Promise<void> {
         prerollMs: envNumber('VOICE_PREROLL_MS', 800),
       },
       playbackTailMs: 600,
-      /**
-       * 兜底确认（ADR-004 §5.3 两段式响应的第一段）。
-       *
-       * **默认关**（`MIAI_ACK_AFTER_MS=0`）。真机实测（05:41）：服务端不知道模型在
-       * 干什么，只能说一句通用的话 —— 用户说「退一下」，它却回「我查一下。」
-       * （见日志 05:41:00 / 05:41:11）。说错话比沉默更糟：沉默只是慢，说错是不听话。
-       *
-       * 第一段本来就该由模型自己说（提示词要求：派后台后立刻告诉哥你去办）。
-       * 这里只留作**可选兜底**：确实需要"别装死"的部署再打开。
-       */
-      ...(envNumber('MIAI_ACK_AFTER_MS', 0) > 0
-        ? {
-          filler: {
-            firstAfterMs: envNumber('MIAI_ACK_AFTER_MS', 0),
-            intervalMs: envNumber('MIAI_ACK_INTERVAL_MS', 8000),
-            lines: (process.env['MIAI_ACK_TEXT'] ?? '').trim() === ''
-              ? FILLER_LINES
-              : [process.env['MIAI_ACK_TEXT'] ?? ''],
-          },
-        }
-        : {}),
       /**
        * 下行增益。**默认应当是 1.0**：MiMo 的输出已经是满刻度（实测峰值 −0.5 dBFS），
        * 任何 >1 的增益都会把元音峰值压进软限幅 —— ×3 时波峰因数从 14.7 dB 掉到

@@ -118,30 +118,6 @@ export const DIALOG_SCENARIOS: readonly DialogScenario[] = [
     },
   },
   {
-    name: '对话：长思考 → 先给一句回执，再出正式回答',
-    sim: {
-      reply: { latencyMs: 5_000, text: '跑完了，一共三条。' },
-      filler: { firstAfterMs: 1_000, intervalMs: 8_000, lines: ['我查一下。'] },
-    },
-    async run(sim) {
-      await sim.utterance('去跑三条命令');
-      await sim.until(1_400);
-      // 1.4 s 时 dsh 还没回来：应当已经有一句确认播出去了
-      assert.ok(
-        sim.downlink.sent.some((chunk) => chunk.at >= 1_000 && chunk.at <= 1_400),
-        `1 s 时该有回执音频，实际下发时刻：${JSON.stringify(sim.downlink.sent.map((c) => c.at))}`,
-      );
-      assert.equal(sim.core.phase, 'thinking', '回执照旁白走，不该改动状态机');
-
-      await sim.until(12_000);
-      assert.ok(
-        sim.downlink.sent.some((chunk) => chunk.at >= 5_000),
-        '正式回答应当在 dsh 返回后下发（回执不能把它顶掉）',
-      );
-      assert.equal(sim.core.turn, 1, '一轮就是一问一答，回执不算新的一轮');
-    },
-  },
-  {
     name: '对话：回答被打断 → 下一轮带上「没说完的那段」',
     sim: {
       reply: { text: '这件事我分成三点来说，第一点是先看清楚需求，第二点是确认边界条件。' },

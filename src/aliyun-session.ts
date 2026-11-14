@@ -125,7 +125,6 @@ export interface AliyunSessionOptions {
    *
    * 真机上 dsh 跑工具常常 5–8 s，这期间一片安静，用户会以为它没听见。
    */
-  readonly filler?: { readonly firstAfterMs: number; readonly intervalMs: number; readonly lines: readonly string[] };
   /** 下行语音增益（默认 1）；MiMo 输出偏小，实机用 2–3 更合适 */
   readonly ttsGain?: number;
   /** 落盘目录，空串表示不落盘 */
@@ -323,7 +322,6 @@ class AliyunConnection {
       photoTimeoutMs: options.photoTimeoutMs,
       confirmTimeoutMs: options.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS,
       playbackTailMs: options.playbackTailMs,
-      ...(options.filler === undefined ? {} : { filler: options.filler }),
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       onDownlinkChunk: (chunk) => { this.archive?.downlink(chunk); },
       onEvent: (name, fields) => { this.archive?.event(name, fields); },
@@ -789,7 +787,6 @@ class AliyunConnection {
     console.log(`  … ${text}`);
     this.archive?.event('asr.partial', { text });
     // 用户已经开口了，「嗯，我看看」这种回执就没必要了
-    this.runner.cancelFiller();
     // 宠物要在**用户刚开口**就收手，不能等到这句话定稿
     this.app?.userPartial();
     const effects = this.dialog.dispatch({ type: 'partial', text });
