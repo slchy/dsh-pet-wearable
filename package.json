@@ -1,10 +1,30 @@
 {
-  "name": "miai-cloud-harness",
-  "private": true,
+  "name": "dsh-pet-wearable",
+  "version": "0.0.1",
+  "description": "Pet for DeepSeek Harness (dsh) that lives on smart glasses — it speaks up on its own and shares your view. Early development; no stable API yet.",
   "type": "module",
-  "description": "云端 harness：mSBC 流 -> ffmpeg 解码 -> silero-vad 判停 -> MiMo ASR/TTS",
+  "license": "UNLICENSED",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "smart-glasses",
+    "ar-glasses",
+    "wearable",
+    "pet",
+    "voice",
+    "proactive",
+    "full-duplex"
+  ],
+  "exports": {
+    ".": "./src/driver.ts",
+    "./src/*": "./src/*"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
   "scripts": {
-    "probe": "node src/probe-vad.ts",
     "start": "node src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.ts"
@@ -17,3 +37,4 @@
     "typescript": "^5.7.0"
   }
 }
+
