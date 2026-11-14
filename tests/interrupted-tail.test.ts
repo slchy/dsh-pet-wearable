@@ -51,13 +51,18 @@ test('空文本 / 负时长不炸', () => {
   assert.equal(remainingSpeech(SPEECH, -5), SPEECH);
 });
 
-test('注记里说得清「没说出口」而不是「说到一半」', () => {
+test('注记里说的是"他真的没听到"，不是"你可以忽略"', () => {
   const note = interruptionNote('第二点是确认边界条件。');
   assert.ok(note.includes('打断'));
-  assert.ok(note.includes('没说出口'));
+  // 真机 05:40:51：模型收到注记却答「说完了，就这些」——措辞必须堵死这条路
+  assert.ok(note.includes('没听到'), `要说明用户没听到，实际：${note}`);
+  assert.ok(note.includes('如实'), '要明确要求"问就说没说完"');
   assert.ok(note.includes('第二点是确认边界条件。'));
-  // 要给它「可以不理」的出口，否则用户只是不想听了它还在硬接
-  assert.ok(note.includes('否则'));
+});
+
+test('注记给了"换话题就别翻旧账"的出口', () => {
+  const note = interruptionNote('第一点是先看清楚需求。');
+  assert.ok(note.includes('换了话题'), '不能逼模型每次都硬接');
 });
 
 test('注记有上限，长回答不会把下一轮 prompt 塞爆', () => {
