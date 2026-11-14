@@ -23,6 +23,8 @@ export interface HelloInfo {
   readonly proto?: number;
   readonly deviceId?: string;
   readonly token?: string;
+  /** v2 自报的能力，**原样**交给设备层解析（这一层不认识它） */
+  readonly capabilities?: unknown;
 }
 
 /** 解析 `Hello`；坏 JSON 返回 null（由调用方决定拒绝还是忽略）。 */
@@ -37,14 +39,21 @@ export function parseHello(payload: Buffer): HelloInfo | null {
       proto: typeof o.proto === 'number' ? o.proto : undefined,
       deviceId: typeof o.deviceId === 'string' ? o.deviceId : undefined,
       token: typeof o.token === 'string' ? o.token : undefined,
+      capabilities: o.capabilities,
     };
   } catch {
     return null;
   }
 }
 
-/** 业务层只实现这两个回调。 */
+/** 业务层实现的回调。 */
 export interface ConnectionHandlers {
+  /**
+   * 收到（并通过鉴权的）`Hello`，每条连接至多一次。
+   *
+   * 没配鉴权时 `Hello` 不是必需的，但发了照样交上来 —— v2 的能力自报在里面。
+   */
+  onHello?(hello: HelloInfo): void;
   onFrame(type: number, payload: Buffer): void;
   onClose(reason: string): void;
 }
@@ -70,6 +79,8 @@ export class Connection {
   private handlers: ConnectionHandlers | null = null;
   private readonly onClosed?: () => void;
   private authed: boolean;
+  /** 已经处理过一次 `Hello`（重复的忽略） */
+  private helloSeen = false;
   private lastRxAt = Date.now();
   private idleTimer: NodeJS.Timeout | null = null;
   /** `end()` 已调用但 'close' 还没来 —— 这期间必须停止收发。 */
@@ -139,6 +150,20 @@ export class Connection {
     }
   }
 
+  /** v2：下行一个原语操作（UTF-8 JSON）。只该在发过 `Welcome` 之后用。 */
+  sendCall(json: string): void {
+    if (!this.closed && !this.closing) {
+      this.frames.writeText(DownstreamFrameType.Call, json);
+    }
+  }
+
+  /** v2：接受 v2 的回执。 */
+  sendWelcome(json: string): void {
+    if (!this.closed && !this.closing) {
+      this.frames.writeText(DownstreamFrameType.Welcome, json);
+    }
+  }
+
   /** 回一条控制串再关（鉴权失败等）。 */
   closeWith(reason: string): void {
     this.sendControl(reason);
@@ -191,11 +216,24 @@ export class Connection {
   }
 
   private onHello(payload: Buffer): void {
-    if (this.authed) {
-      return; // 已经放行过，重复 Hello 忽略
+    if (this.helloSeen) {
+      return; // 重复 Hello 忽略
     }
+    this.helloSeen = true;
     const hello = parseHello(payload);
-    if (!hello || !this.authenticate || !this.authenticate(hello)) {
+
+    if (this.authenticate === undefined) {
+      // 没配鉴权：Hello 只是自我介绍，坏 JSON 也不断开（v1 时代发了也忽略）
+      if (hello !== null) {
+        this.handlers?.onHello?.(hello);
+      }
+      return;
+    }
+
+    if (this.authed) {
+      return;
+    }
+    if (!hello || !this.authenticate(hello)) {
       this.log(`  鉴权    拒绝（deviceId=${hello?.deviceId ?? '?'}）`);
       this.closeWith('auth_failed');
       return;
@@ -203,6 +241,7 @@ export class Connection {
     this.authed = true;
     this.authDeviceId = hello.deviceId;
     this.log(`  鉴权    通过（deviceId=${hello.deviceId ?? '?'} proto=${hello.proto ?? '?'}）`);
+    this.handlers?.onHello?.(hello);
   }
 
   private checkIdle(): void {

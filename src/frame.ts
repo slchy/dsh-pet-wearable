@@ -44,10 +44,21 @@ export const UpstreamFrameType = {
    * 首帧身份。payload 是 UTF-8 JSON：
    * `{"proto":1,"deviceId":"...","token":"..."}`
    *
-   * **只有服务端配了 `authenticate` 时才必须**；没配就不必发，发了也忽略。
+   * v2 设备再带 `"proto":2` 与 `"capabilities":{...}`（见 `src/devices/primitives.ts`
+   * 的 `parseCapabilities`），服务端认了会回 {@link DownstreamFrameType.Welcome}。
+   *
+   * **只有服务端配了 `authenticate` 时才必须**；没配时 v1 手机可以不发。
    * 这样"只想跑起来看看"的人不用先造一套凭据。
    */
   Hello: 6,
+  /** v2：一条原语事件，UTF-8 JSON `DeviceEvent`（`{"kind":"presence","wearing":true}`） */
+  Event: 7,
+  /**
+   * v2：拍照请求的回图，`[idLen:u8][id:UTF-8][JPEG]`。
+   *
+   * 用户自己拍的图（不属于任何请求）仍走 {@link Image}。
+   */
+  CaptureImage: 8,
 } as const;
 
 /** 下行帧类型（云端 → 手机） */
@@ -56,6 +67,14 @@ export const DownstreamFrameType = {
   Audio: 1,
   /** UTF-8 控制串：`take_photo` / `take_photo_hq` / `stop_capture` / `hq_cancel` / `stop` */
   Control: 2,
+  /** v2：一个原语操作，UTF-8 JSON `DeviceCall`（`{"op":"audio.stop"}`） */
+  Call: 3,
+  /**
+   * v2：接受 v2 的回执，UTF-8 JSON `{"proto":2}`。
+   *
+   * 老服务端不会发它 —— 设备据此退回 v1，这就是向下兼容的握手。
+   */
+  Welcome: 4,
   /** 心跳应答，payload 为空 */
   Pong: 5,
 } as const;

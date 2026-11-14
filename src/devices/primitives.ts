@@ -113,7 +113,11 @@ export interface CaptureFailure {
 export type DeviceEvent =
   | { readonly kind: 'presence'; readonly wearing: boolean | null }
   | { readonly kind: 'power'; readonly percent: number | null; readonly charging: boolean | null }
-  | { readonly kind: 'summon' }
+  /**
+   * 「招呼」手势。`opensSession`：这个手势在设备上同时打开了语音会话
+   * （小米长按触控板）—— 宠物不把它当招呼，也不播反射音。
+   */
+  | { readonly kind: 'summon'; readonly opensSession?: boolean }
   /** 下行音频的播放队列已经播空 */
   | { readonly kind: 'played' }
   /** 这次拍照在等用户动手；`say` 是设备给的一句提示，插件照念 */

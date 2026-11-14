@@ -13,13 +13,17 @@
 | 上行 | 3 | `Wake` | 唤醒事件 |
 | 上行 | 4 | `Ping` | — |
 | 上行 | 5 | `Status` | UTF-8 JSON，见下 |
-| 上行 | 6 | `Hello` | UTF-8 JSON `{proto, deviceId, token}` |
+| 上行 | 6 | `Hello` | UTF-8 JSON `{proto, deviceId, token, capabilities?}` |
+| 上行 | 7 | `Event` | v2：UTF-8 JSON `DeviceEvent` |
+| 上行 | 8 | `CaptureImage` | v2：`[idLen:u8][id:UTF-8][JPEG]` |
 | 下行 | 1 | `Audio` | PCM16 单声道小端 |
 | 下行 | 2 | `Control` | UTF-8 ASCII 控制串，见下 |
+| 下行 | 3 | `Call` | v2：UTF-8 JSON `DeviceCall` |
+| 下行 | 4 | `Welcome` | v2：UTF-8 JSON `{"proto":2}` |
 | 下行 | 5 | `Pong` | — |
 
 `Hello` 只在配了鉴权时必需；没配时客户端可以不发。最小实现见
-[`tools/fake-phone.ts`](../tools/fake-phone.ts)。
+[`tools/fake-phone.ts`](../tools/fake-phone.ts)。v2 的新增帧见下方「v2」一节。
 
 ## 下行控制串（`Control=2`）
 
@@ -84,6 +88,32 @@
 失败码只有 5 个：`unsupported` `busy` `timeout` `cancelled` `failed`。
 设备的原因（如没按快门、P2P 没建起来）放在 `say` 里，是给用户听的一句人话，不参与判定。
 v1 手机不会说 `say`，由垫片按 `reason` 代说（见 [`src/devices/xiaomi.ts`](../src/devices/xiaomi.ts)）。
+
+## v2（向下兼容）
+
+v2 只**新增**帧类型，不改任何旧帧的含义。谁说哪个版本由握手定：
+
+```text
+设备 ── Hello{proto:2, capabilities} ──▶ 服务端
+     ◀── Welcome{"proto":2} ────────── 认了：之后用 Call / Event / CaptureImage
+     （没有 Welcome）                   老服务端，或能力不合法：设备照 v1 说话
+```
+
+- 老手机（不发 `Hello`，或 `proto:1`）→ 服务端走 v1 垫片，行为不变
+- v2 设备连老服务端 → 老服务端不回 `Welcome`，设备退回 v1
+- 服务端只在发过 `Welcome` 之后才发 `Call`，所以 v1 手机永远收不到不认识的帧
+- `proto` 更高也按 2 说：`Welcome` 里回 2，设备据此降到 2
+
+`capabilities` 的字段见下方原语表与
+[`devices/RAYNEO-X3-PRO.md`](devices/RAYNEO-X3-PRO.md) 的示例。
+
+| 帧 | payload |
+|---|---|
+| `Call` | 一个原语操作，如 `{"op":"listen.start","maxMs":8000}` |
+| `Event` | 一条原语事件，如 `{"kind":"presence","wearing":true}` |
+| `CaptureImage` | 带请求 id 的图：`[idLen:u8][id][JPEG]` |
+
+用户自己拍的图（不属于任何请求）仍走 v1 的 `Image`。
 
 ## 鉴权
 
