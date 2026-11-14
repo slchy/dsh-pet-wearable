@@ -751,7 +751,7 @@ class AliyunConnection {
   /**
    * 后台任务完成 → 播报。
    *
-   * 排队、让位、开麦的顺序都在 pp/dialog.ts（与模拟器同一份实现），
+   * 排队、让位、开麦的顺序都在 `app/dialog.ts`（与模拟器同一份实现），
    * 这里只记档并把话交进去。
    */
   private onAnnounce(speech: string): void {
@@ -846,7 +846,10 @@ class AliyunConnection {
               .catch((error: Error) => {
                 console.error(`  ✗ 宠物拍照失败: ${error.message}`);
                 this.app?.image(call.id, null);
-              });
+              })
+              // 这一趟结束了（成功也算）：v1 垫片里它是"在途 glance"，
+              // 不清掉的话之后用户自己拍的图都会被当成它的迟到图吃掉
+              .finally(() => { this.v1?.forget(call.id); });
             return;
           }
           if (call.op === 'capture.cancel') {

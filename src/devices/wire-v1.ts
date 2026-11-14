@@ -11,6 +11,10 @@
  *   顺手回的低清图不属于任何请求（实测把 17 KB 的糊图当原图交付过）
  * - **取消没有回执**：取消之后迟到的那一帧图要吃掉，不能当成「看一眼」
  * - **没有开麦动词**：`listen.start` 表达不了
+ *
+ * 因为拿不到 id，归属只能靠「上一趟请求的图一定先于下一趟到达」这条顺序假设：
+ * 公告过的、取消掉的图都排在在途请求之前认领（见 {@link V1Session.image}）。
+ * 一句话：**宁可让新请求超时，也不把旧图当新图交出去。**
  */
 import type {
   CaptureErrorCode,
@@ -93,27 +97,31 @@ export class V1Session {
         return null;
       case 'capture':
         this.inflight = { id: call.id, intent: call.intent };
-        this.announcedId = null;
-        this.cancelledId = null;
+        // 上一次的公告与取消残留**不清**：那两帧可能还在链路上，清掉就会把旧图
+        // 认给这个新请求。顺序假设见类注释。
         return call.intent === 'detail' ? 'take_photo_hq' : 'take_photo';
       case 'capture.cancel':
-        if (this.inflight?.id === call.id) {
-          if (this.inflight.intent === 'detail') {
-            this.cancelledId = call.id;
-          }
-          this.inflight = null;
+        // id 对不上就是作废的取消：不能下发 —— 否则设备侧取消的是**新**请求
+        if (this.inflight?.id !== call.id) {
+          return null;
         }
+        if (this.inflight.intent === 'detail') {
+          this.cancelledId = call.id;
+        }
+        this.inflight = null;
         return 'hq_cancel';
     }
   }
 
-  /** 请求已经有了结局（成功 / 超时 / 失败），之后的图不再归它。 */
+  /**
+   * 请求已经有了结局（成功 / 超时 / 失败），它不再等在途。
+   *
+   * **只清 `inflight`**：公告过或取消掉的图可能还在链路上，那一帧仍旧要归旧 id
+   * （让收件箱吃掉），清掉残留就会把它认给下一个请求。
+   */
   forget(id: string): void {
     if (this.inflight?.id === id) {
       this.inflight = null;
-    }
-    if (this.announcedId === id) {
-      this.announcedId = null;
     }
   }
 
@@ -144,6 +152,10 @@ export class V1Session {
         if (id === null) {
           return { known: true, event: null };
         }
+        // 设备给了结局：这一趟不会再有迟到的图，取消残留到此为止
+        if (this.cancelledId === id) {
+          this.cancelledId = null;
+        }
         const reason = typeof json['reason'] === 'string' ? json['reason'] : 'timeout';
         const say = this.phrases.failureSay?.(reason);
         return {
@@ -164,6 +176,9 @@ export class V1Session {
   /**
    * 一帧图属于哪个请求。
    *
+   * 认领顺序固定：**公告的高清 → 取消后的迟到图 → 在途 glance 的第一帧**。
+   * v1 按序处理命令，旧请求的回图一定先于新请求到达，所以先认领旧请求的。
+   *
    * @returns 请求 id；`null` = 不属于任何请求（用户自己拍的，或等快门时的低清回图）
    */
   image(): string | null {
@@ -172,15 +187,18 @@ export class V1Session {
       this.announcedId = null;
       return id;
     }
-    const inflight = this.inflight;
-    if (inflight !== null) {
-      // 低清直出没有公告，到的第一帧就是它；高清没公告的图是顺手回的低清图
-      return inflight.intent === 'glance' ? inflight.id : null;
-    }
     if (this.cancelledId !== null) {
       const id = this.cancelledId;
       this.cancelledId = null;
       return id;
+    }
+    const inflight = this.inflight;
+    if (inflight !== null && inflight.intent === 'glance') {
+      // 低清直出没有公告，到的第一帧就是它。
+      // **一趟 glance 只回一帧**：认领即结束 —— 留着它，这次请求结束（成功、超时
+      // 或取消）之后用户自己拍的图都会被当成它的迟到图吃掉，再也起不了识图轮。
+      this.inflight = null;
+      return inflight.id;
     }
     return null;
   }
