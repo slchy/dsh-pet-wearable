@@ -15,6 +15,7 @@
  * `uplink-pipeline.ts`，协议在 `transport.ts`，这里只剩接线。
  */
 import type { TurnTicket } from './dialog-fsm.ts';
+import { SystemClock } from './app/clock.ts';
 import { SessionArchive } from './archive.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { performance } from 'node:perf_hooks';
@@ -284,6 +285,8 @@ class AliyunConnection {
   /** 上行编码由能力集决定；档案与解码都要它 */
   private readonly uplinkCodec: 'msbc' | 'pcm16';
 
+  /** 本连接唯一的时钟：拍照兜底超时与一轮的等待都走它 */
+  private readonly clock = new SystemClock();
   private readonly core: SessionCore;
   private readonly uplink: UplinkPipeline;
   private readonly photos: PhotoInbox;
@@ -388,6 +391,7 @@ class AliyunConnection {
     });
 
     this.photos = new PhotoInbox({
+      clock: this.clock,
       dir: options.photoDir,
       timeoutMs: options.photoTimeoutMs,
       confirmTimeoutMs: options.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS,
@@ -424,6 +428,7 @@ class AliyunConnection {
     });
 
     this.runner = new TurnRunner({
+      clock: this.clock,
       agent: options.agent,
       tts: options.tts,
       downlink: conn,

@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import type { DeviceCall, DeviceEvent } from '../src/devices/index.ts';
+import { SystemClock } from '../src/app/clock.ts';
 import { PhotoInbox, type CaptureRequest, type PhotoOutcome } from '../src/photo-inbox.ts';
 
 interface Harness {
@@ -28,6 +29,7 @@ function newInbox(overrides: {
   const sent: DeviceCall[] = [];
   const logs: string[] = [];
   const inbox = new PhotoInbox({
+    clock: new SystemClock(),
     dir: '',
     timeoutMs: overrides.timeoutMs ?? 200,
     confirmTimeoutMs: overrides.confirmTimeoutMs ?? 200,

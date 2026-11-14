@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 执行一轮完整对话：agent → TTS → 下发 → 等播放结束。
  *
  * <h2>职责边界</h2>
@@ -14,7 +14,7 @@
 import { DialogFsm } from './dialog-fsm.ts';
 import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
-import { sleep } from './util.ts';
+import type { Clock } from './app/clock.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
@@ -27,6 +27,8 @@ import type { ImageAttachment } from './session.ts';
 const PLAYBACK_POLL_MS = 100;
 
 export interface TurnRunnerOptions {
+  /** 时钟端口：一轮里的所有等待与计时都走它（模拟器要用虚拟时间） */
+  readonly clock: Clock;
   readonly agent: AgentProvider;
   /** TTS provider：采样率与合成都在里面，宿主不再各配一份 */
   readonly tts: TtsProvider;
@@ -80,6 +82,13 @@ export class TurnRunner {
     this.log = options.log;
   }
 
+  /** 等 ms：走 Clock，虚拟时钟下就是推进虚拟时间。 */
+  private wait(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.options.clock.after(ms, resolve);
+    });
+  }
+
   /**
    * 播一句**系统旁白**（不是模型的回答）。
    *
@@ -90,7 +99,7 @@ export class TurnRunner {
   speakCanned(text: string, emotion?: string): Promise<void> {
     this.cannedCancelled = false;
     const run = async (): Promise<void> => {
-      const startedAt = Date.now();
+      const startedAt = this.options.clock.now();
       let bytes = 0;
       let firstChunkAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(text, emotion)) {
@@ -99,7 +108,7 @@ export class TurnRunner {
           return;
         }
         if (firstChunkAtMs < 0) {
-          firstChunkAtMs = Date.now() - startedAt;
+          firstChunkAtMs = this.options.clock.now() - startedAt;
         }
         bytes += chunk.length;
         this.options.onDownlinkChunk?.(chunk);
@@ -111,9 +120,9 @@ export class TurnRunner {
         + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
       );
       // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
-      const until = Date.now() + seconds * 1000 + this.options.playbackTailMs;
-      while (Date.now() < until && !this.cannedCancelled) {
-        await sleep(PLAYBACK_POLL_MS);
+      const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
+      while (this.options.clock.now() < until && !this.cannedCancelled) {
+        await this.wait(PLAYBACK_POLL_MS);
       }
     };
     const next = this.speechChain.then(run, run);
@@ -144,9 +153,9 @@ export class TurnRunner {
     let agentLatencyMs = 0;
 
     try {
-      const agentStartedAt = Date.now();
+      const agentStartedAt = this.options.clock.now();
       const reply = await agent.reply(text, image);
-      agentLatencyMs = Date.now() - agentStartedAt;
+      agentLatencyMs = this.options.clock.now() - agentStartedAt;
       this.log(
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `
         + JSON.stringify(reply.text.slice(0, 120)),
@@ -155,14 +164,14 @@ export class TurnRunner {
       // 旁白还没播完就先让路：否则「请按快门」和回答会叠在一起
       await this.speechChain;
 
-      const ttsStarted = Date.now();
+      const ttsStarted = this.options.clock.now();
       for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
         if (fsm.isStale(ticket)) {
           interrupted = true;
           break;
         }
         if (firstChunkAtMs === 0) {
-          firstChunkAtMs = Date.now() - ttsStarted;
+          firstChunkAtMs = this.options.clock.now() - ttsStarted;
           fsm.audioStarted(ticket);
           this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
           this.options.onEvent?.('tts.first', { ms: firstChunkAtMs });
@@ -188,9 +197,9 @@ export class TurnRunner {
 
       // 状态机在整个等待期间保持 speaking；插话会让票据作废从而提前结束等待。
       if (!interrupted) {
-        const until = Date.now() + audioSeconds * 1000 + this.options.playbackTailMs;
-        while (!fsm.isStale(ticket) && Date.now() < until) {
-          await sleep(PLAYBACK_POLL_MS);
+        const until = this.options.clock.now() + audioSeconds * 1000 + this.options.playbackTailMs;
+        while (!fsm.isStale(ticket) && this.options.clock.now() < until) {
+          await this.wait(PLAYBACK_POLL_MS);
         }
         interrupted = fsm.isStale(ticket);
       }

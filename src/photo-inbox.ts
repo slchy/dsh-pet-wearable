@@ -20,6 +20,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { CaptureFailure, CaptureIntent, DeviceCall, DeviceEvent } from './devices/primitives.ts';
+import type { Clock } from './app/clock.ts';
 
 export type PhotoOutcome =
   | { readonly ok: true; readonly jpeg: Buffer }
@@ -44,6 +45,8 @@ export const DEFAULT_CAPTURE_TIMEOUT_MS = 20_000;
 export const DEFAULT_CONFIRM_TIMEOUT_MS = 40_000;
 
 export interface PhotoInboxOptions {
+  /** 时钟端口：超时走它（模拟器要用虚拟时间） */
+  readonly clock: Clock;
   /** 落盘目录；空串不落盘（默认） */
   readonly dir: string;
   /** 不用人动手时的兜底总时长 */
@@ -58,7 +61,8 @@ export interface PhotoInboxOptions {
 interface Waiter {
   readonly request: CaptureRequest;
   resolve: (outcome: PhotoOutcome) => void;
-  timer: NodeJS.Timeout;
+  /** 取消兜底计时 */
+  cancelTimer: () => void;
   /** 设备的提示已经念过 */
   prompted: boolean;
 }
@@ -98,8 +102,8 @@ export class PhotoInbox {
 
     const deadlineMs = this.timeoutFor(request.needsUser);
     return new Promise<PhotoOutcome>((resolve) => {
-      const timer = setTimeout(() => { this.expire(); }, deadlineMs);
-      this.waiter = { request, resolve, timer, prompted: false };
+      const cancelTimer = this.options.clock.after(deadlineMs, () => { this.expire(); });
+      this.waiter = { request, resolve, cancelTimer, prompted: false };
 
       const sent = this.options.send({
         op: 'capture',
@@ -205,7 +209,7 @@ export class PhotoInbox {
       return false;
     }
     this.waiter = null;
-    clearTimeout(waiter.timer);
+    waiter.cancelTimer();
     waiter.resolve(outcome);
     return true;
   }
@@ -217,7 +221,7 @@ export class PhotoInbox {
     }
     try {
       mkdirSync(dir, { recursive: true });
-      const file = join(dir, `photo_${tag}_${Date.now()}.jpg`);
+      const file = join(dir, `photo_${tag}_${this.options.clock.now()}.jpg`);
       writeFileSync(file, jpeg);
       log(`  图片    ${jpeg.length} B  ${file}`);
     } catch (error) {
