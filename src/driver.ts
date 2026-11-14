@@ -11,6 +11,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
+import { checkBindSafety } from './bind-policy.ts'
 import { DEFAULT_TTS_VOICE } from './mimo.ts'
 import { DEFAULT_PET_TIMING, type PetTimingOptions } from './pet/pet-timing.ts'
 
@@ -22,6 +23,17 @@ export const inject = ['agents', 'sessions', 'sessionPersistence']
 export interface PetConfig {
   /** 手机连上来的 TCP 监听端口 */
   port: number
+  /**
+   * 监听地址。默认只通本机（`127.0.0.1`），手机侧用 `adb reverse` 接进来。
+   *
+   * 写成非本机地址（如 `0.0.0.0`）时，`tls` 与 `auth` **必须同时配齐**，
+   * 否则插件拒绝加载 —— 判据在 `src/bind-policy.ts`，与独立进程形态共用同一份。
+   */
+  host: string
+  /** TLS 证书。两个路径要么都给，要么都不给 */
+  tls: TlsConfig
+  /** 设备鉴权。`tokenFile` 为空 = 不鉴权（只允许用于本机地址） */
+  auth: AuthConfig
   /**
    * v1 手机的型号提示（见 `src/devices/`）。
    *
@@ -35,6 +47,22 @@ export interface PetConfig {
   turnThreshold: number
   /** 主动开口的时机参数，默认值一律偏向「宁可少说」 */
   proactive: PetTimingOptions
+}
+
+export interface TlsConfig {
+  /** 私钥文件路径（PEM）。和 `certPath` 必须成对 */
+  keyPath: string
+  /** 证书文件路径（PEM） */
+  certPath: string
+}
+
+export interface AuthConfig {
+  /**
+   * 每行 `token` 或 `token:deviceId` 的文件路径（`#` 开头是注释）。
+   *
+   * 留空 = 不鉴权。此时只能监听本机地址，绑非本机地址会被 `checkBindSafety` 拒绝。
+   */
+  tokenFile: string
 }
 
 /**
@@ -52,8 +80,20 @@ const ProactiveConfig: Schema<PetTimingOptions> = Schema.object({
   lowBatteryPercent: Schema.natural().max(100).default(DEFAULT_PET_TIMING.lowBatteryPercent).description('低于此电量就不主动开口'),
 })
 
+const TlsConfigSchema: Schema<TlsConfig> = Schema.object({
+  keyPath: Schema.string().default('').description('TLS 私钥文件路径（PEM）；与 certPath 必须成对'),
+  certPath: Schema.string().default('').description('TLS 证书文件路径（PEM）'),
+})
+
+const AuthConfigSchema: Schema<AuthConfig> = Schema.object({
+  tokenFile: Schema.string().default('').description('设备 token 文件（每行 token 或 token:deviceId）；留空 = 不鉴权'),
+})
+
 export const Config: Schema<PetConfig> = Schema.object({
   port: Schema.natural().max(65535).default(8766).description('手机连上来的 TCP 端口'),
+  host: Schema.string().default('127.0.0.1').description('监听地址；非本机地址要求 tls 与 auth 同时配齐'),
+  tls: TlsConfigSchema,
+  auth: AuthConfigSchema,
   device: Schema.string().default('').description('v1 手机的型号提示（如 xiaomi-glasses）；自报能力的设备不用填'),
   voice: Schema.string().default(DEFAULT_TTS_VOICE).description('TTS 音色'),
   turnThreshold: Schema.percent().default(0.5).description('判停阈值，调高更不容易被判为说完'),
@@ -62,6 +102,22 @@ export const Config: Schema<PetConfig> = Schema.object({
 
 export function apply(ctx: Context, config: PetConfig): void {
   const logger = ctx.logger('pet-wearable')
+
+  // 配置一写错就在这里报，不必等接上设备、真去 bind 了才发现。
+  // 判据与 `transport.ts` 共用 `src/bind-policy.ts`，不会漂。
+  const hasTls = config.tls.keyPath !== '' && config.tls.certPath !== '';
+  if (!hasTls && (config.tls.keyPath !== '' || config.tls.certPath !== '')) {
+    throw new Error('pet-wearable: tls.keyPath 与 tls.certPath 必须成对给，只给一半等于把连接降级成明文')
+  }
+  const safety = checkBindSafety({
+    host: config.host,
+    hasTls,
+    hasAuth: config.auth.tokenFile !== '',
+  })
+  if (!safety.ok) {
+    throw new Error(`pet-wearable: ${safety.message}`)
+  }
+
   logger.info('骨架就位：语音栈尚未接线')
-  logger.info(`port=${config.port} device=${config.device || 'generic'} voice=${config.voice} turnThreshold=${config.turnThreshold}`)
+  logger.info(`port=${config.port} host=${config.host} device=${config.device || 'generic'} voice=${config.voice} turnThreshold=${config.turnThreshold}`)
 }

@@ -129,8 +129,26 @@ async function buildAgent(
 function loadTls(): { key: Buffer; cert: Buffer } | undefined {
   const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
   const certPath = process.env['MIAI_TLS_CERT'] ?? '';
-  if (!keyPath || !certPath) return undefined;
-  return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+  if (!keyPath || !certPath) {
+    // 只给一半是配错了，不是「没配」—— 静默降级成明文会让人以为已经加密了
+    if (keyPath || certPath) {
+      const given = keyPath ? 'MIAI_TLS_KEY' : 'MIAI_TLS_CERT';
+      const absent = keyPath ? 'MIAI_TLS_CERT' : 'MIAI_TLS_KEY';
+      fail(`只给了 ${given}，缺 ${absent}：TLS 要么两个都给，要么都不给`);
+    }
+    return undefined;
+  }
+  try {
+    return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+  } catch (error) {
+    fail(`TLS 证书读不到：${(error as Error).message}`);
+  }
+}
+
+/** 启动期配置错误：说清楚是哪一项、该怎么改，然后退出。 */
+function fail(message: string): never {
+  console.error(`\n启动失败：${message}\n`);
+  process.exit(2);
 }
 
 /**
@@ -340,6 +358,8 @@ async function main(): Promise<void> {
 
   if (!replay && !listen && !askImage) {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
+    console.error('  --host <addr>   监听地址（默认 127.0.0.1）。非本机地址必须同时配');
+    console.error('                  MIAI_TOKENS 与 MIAI_TLS_KEY/MIAI_TLS_CERT，否则拒绝启动');
     console.error('  可替换件: --stt aliyun|noop|canned|<path>  --tts mimo|silent|<path>');
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
     console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);

@@ -31,11 +31,17 @@ node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
 
 ## 鉴权与 TLS
 
+**先看判据**：非本机地址必须同时具备 token 与 TLS，否则不监听（退出码 2）。
+判据在 [`src/bind-policy.ts`](../src/bind-policy.ts)，`transport.ts` 与 `driver.ts` 共用；
+`tests/bind-policy.test.ts` 钉矩阵，`tests/transport-bind.test.ts` 断言拒绝时端口没被占。
+
+独立进程形态下这几项走环境变量：
+
 | 环境变量 | 作用 |
 |---|---|
-| `MIAI_TLS_KEY` / `MIAI_TLS_CERT` | 给了就走 TLS（另一条路径是明文 TCP，同一份代码） |
+| `MIAI_TLS_KEY` / `MIAI_TLS_CERT` | 给了就走 TLS（另一条路径是明文 TCP，同一份代码）。**只给一个会启动即失败** —— 静默降级成明文会让人以为已经加密了 |
 | `MIAI_TOKENS` | 指向 `token` 或 `token:deviceId` 一行的文件；配了就要求首帧 `Hello` |
-| `--host` | 缺省 `127.0.0.1`；上公网由部署方显式给 `0.0.0.0` |
+| `--host` | 缺省 `127.0.0.1`；上公网由部署方显式给 `0.0.0.0`（**且必须配齐上面两项**） |
 
 自签证书：
 

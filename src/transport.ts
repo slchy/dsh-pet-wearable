@@ -11,6 +11,7 @@
 import { createServer, type Server, type Socket } from 'node:net';
 import { createServer as createTlsServer } from 'node:tls';
 
+import { checkBindSafety } from './bind-policy.ts';
 import {
   DownstreamFrameType,
   FrameDecoder,
@@ -271,7 +272,12 @@ export class Connection {
 
 export interface TransportOptions {
   readonly port: number;
-  /** 缺省 `127.0.0.1`：本地开发默认不暴露；上公网由部署方显式给。 */
+  /**
+   * 缺省 `127.0.0.1`：本地开发默认不暴露。
+   *
+   * 非本机地址由 {@link checkBindSafety} 把关 —— 必须同时有 token 和 TLS，
+   * 否则**不监听**并返回退出码 2。这条判据不在这里重复。
+   */
   readonly host?: string;
   readonly tls?: { readonly key: Buffer; readonly cert: Buffer };
   readonly authenticate?: (hello: HelloInfo) => boolean;
@@ -293,6 +299,17 @@ export async function runTransport(options: TransportOptions): Promise<number> {
   const host = options.host ?? '127.0.0.1';
   const idleTimeoutMs = options.idleTimeoutMs ?? 45_000;
   const single = options.singleConnection !== false;
+
+  // 闸在 bind 之前：非本机地址缺 token 或 TLS 就**不监听**，而不是绑上去再打一行提示。
+  const safety = checkBindSafety({
+    host,
+    hasTls: options.tls !== undefined,
+    hasAuth: options.authenticate !== undefined,
+  });
+  if (!safety.ok) {
+    options.log(safety.message);
+    return 2;
+  }
 
   return await new Promise<number>((resolve) => {
     let server: Server;
