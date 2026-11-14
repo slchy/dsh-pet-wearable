@@ -70,6 +70,15 @@ export const UPSTREAM_SAMPLE_RATE = 16_000;
 const ASSEMBLER_FALLBACK_WINDOW_MS = 600;
 
 /**
+ * 连接就绪时那次 `listen.start` 的时长。
+ *
+ * 它只是**把设备从待机叫回来**（`EXPERIMENTS §42`：0.62 s 内开始推流），
+ * 之后由设备自己的会话管理接管。60 s 足够覆盖「连上了、想一下、再开口」，
+ * 又不会在用户摘下眼镜后长时间占着麦克风。
+ */
+const INITIAL_LISTEN_MS = 60_000;
+
+/**
  * 送给判停器的「最近音频」上限（秒）。
  *
  * 判停器要听到整句话的尾巴才能判「说完了」，8 s 足够覆盖常见的一句话，
@@ -489,6 +498,20 @@ class AliyunConnection {
       this.onFrame(first.type, first.payload);
     }
     // 心跳由 AppSession 自己开（clock.every），这里不再 setInterval
+
+    // 连接就绪就把麦拉起来。
+    //
+    // 为什么必须做：设备侧的 Aivs 会话会被**它自己**结束 —— 真机 05:57 那次，
+    // 云端正在重连（断了 35 s），设备上报 `state=3` 并停采；等云端连上，
+    // 用户再说一帧都上不来，表现就是「未响应」（云端日志里上行帧数为 0）。
+    //
+    // 采集只能由设备发起，或由手机发 WakeUpEvent 拉起（`EXPERIMENTS §42`，
+    // 实测 0.62 s 内就来流）。v2 的 `listen.start` 正是这条路径，App 侧走
+    // `requestWakeUp`。等有东西要播时，播报会自己再开一次（幂等）。
+    if (this.caps.listenStart && backlog.length === 0) {
+      this.sendCall({ op: 'listen.start', maxMs: INITIAL_LISTEN_MS });
+      console.log('  开麦    连接就绪 → 请设备推流（采集只能由设备或手机拉起，见 §42）');
+    }
 
     const detail = captureMode(this.caps, 'detail');
     this.control = startToolControl({
