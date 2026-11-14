@@ -25,9 +25,18 @@
 - 语音栈（STT/TTS/判停/打断/档案）已在真机上跑通
 - 手机**能主动拉起**眼镜的语音会话（0.62 s，已验证）
 - 宠物时机状态机已写（`src/pet/pet-timing.ts`），**尚未接线**
-- **还没变成 dsh 插件** —— 现在是独立进程形态，下一步是写 `src/driver.ts`
+- **`src/driver.ts` 只有骨架**：`name` / `inject` / `Config` / `apply` 就位，
+  `Config` 覆盖端口、音色、判停阈值和时机参数；TCP 监听和 agent 桥还没接
 
-## 跑起来
+## 装上它
+
+```bash
+npm install dsh-pet-wearable
+```
+
+`0.0.x` 期间 API 不稳定，装了就只是个能加载的空壳 —— 等 driver 接线完成再用。
+
+## 跑起来（仓库内开发）
 
 ```bash
 npm install
@@ -54,7 +63,7 @@ src/
   session-core.ts / dialog-fsm.ts          对话决策（纯逻辑）
   agent.ts                                 人设 + 情绪标签 + cleanForSpeech
   pet/                                     宠物核心（时机 / 宿主端口）
-  driver.ts                                ← 待写：dsh 插件入口
+  driver.ts                                dsh 插件入口（骨架：Config 已就位）
 smart_turn/                                Python 判停 sidecar
 tests/                                     node --test tests/*.test.ts
 ```

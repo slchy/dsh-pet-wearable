@@ -3,7 +3,22 @@
   "version": "0.0.1",
   "description": "Pet for DeepSeek Harness (dsh) that lives on smart glasses — it speaks up on its own and shares your view. Early development; no stable API yet.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "author": "slchy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slchy/dsh-pet-wearable.git"
+  },
+  "homepage": "https://github.com/slchy/dsh-pet-wearable#readme",
+  "bugs": {
+    "url": "https://github.com/slchy/dsh-pet-wearable/issues"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -20,21 +35,30 @@
     ".": "./src/driver.ts",
     "./src/*": "./src/*"
   },
+  "main": "./src/driver.ts",
+  "types": "./src/driver.ts",
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "README.cloud.md",
+    "HANDOFF.md"
   ],
   "scripts": {
     "start": "node src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/*.test.ts"
+    "test": "node --test tests/*.test.ts",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0",
     "onnxruntime-node": "^1.20.0"
   },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
   "devDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
   }
 }
-
