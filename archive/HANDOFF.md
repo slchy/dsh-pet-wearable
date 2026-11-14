@@ -198,8 +198,8 @@ export function apply(ctx: Context, config: PetConfig): void {
 `C:\Miaiglassses2grokbot` 是**研究线**，本仓库是从它的 `cloud/` 用 `git subtree split`
 提取出来的（51 个 commit 的历史都在）。那边保留：
 
-- `sdk/` —— 小米眼镜 Kotlin SDK（SPP 逆向、握手、门面）
-- `docs/` —— A–AW 逆向笔记（mSBC 帧率、能量门阈值、判停策略的来源）
+- `sdk/` —— 小米眼镜 Kotlin SDK（SPP 解析、握手、门面）
+- `docs/` —— A–AW 解析笔记（mSBC 帧率、能量门阈值、判停策略的来源）
 - 手机端调试 App（`sdk/sample`，即上面那个 `io.github.slchy.glasses2grok.sample`）
 
 **两侧零代码依赖，只通过线协议通信。** 手机端推音频，本仓库是云端 + 插件。
