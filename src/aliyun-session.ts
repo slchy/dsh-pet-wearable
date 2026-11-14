@@ -15,7 +15,6 @@
  * `uplink-pipeline.ts`，协议在 `transport.ts`，这里只剩接线。
  */
 import type { TurnTicket } from './dialog-fsm.ts';
-import { SystemClock } from './app/clock.ts';
 import { SessionArchive } from './archive.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { performance } from 'node:perf_hooks';
@@ -36,15 +35,13 @@ import {
   type DeviceLink,
   type V1Session,
 } from './devices/index.ts';
-import { BatteryCache } from './pet/battery-cache.ts';
-import { DeviceEventHost } from './pet/device-host.ts';
-import { PetTiming, type PetMove, type PetTimingOptions } from './pet/pet-timing.ts';
-import {
-  DEFAULT_PROACTIVE,
-  planProactive,
-  proactivePrompt,
-  type ProactivePlan,
-} from './pet/proactive.ts';
+import { AppSession } from './app/session.ts';
+import { DialogRuntime } from './app/dialog.ts';
+import { SystemClock, type Clock } from './app/clock.ts';
+import { DEFAULT_PET_PARAMS, type PetParams } from './pet/brain/registry.ts';
+import { summarizePetEvent } from './pet/brain/session.ts';
+import type { PetReply } from './pet/brain/types.ts';
+import { petPrompt } from './pet/proactive.ts';
 import { UpstreamFrameType } from './frame.ts';
 import {
   DEFAULT_CONFIRM_TIMEOUT_MS,
@@ -53,7 +50,7 @@ import {
   type PhotoOutcome,
 } from './photo-inbox.ts';
 import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './providers.ts';
-import { SessionCore, type CoreEffect } from './session-core.ts';
+import type { SessionCore } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { SmartTurn } from './smart-turn.ts';
 import { startToolControl, type ToolControl } from './tool-control.ts';
@@ -155,7 +152,8 @@ export interface AliyunSessionOptions {
    * 深夜判定用进程本地时区 —— VPS 上记得设 `TZ`（如 `Asia/Shanghai`）。
    */
   readonly proactive?: {
-    readonly timing?: Partial<PetTimingOptions>;
+    /** 宠物层参数（见 `pet/brain/registry.ts` 的 `PetParams`），全部可覆盖 */
+    readonly params?: Partial<PetParams>;
     /** 主动开口后开麦听回应多久（设备支持 `listen.start` 才生效） */
     readonly listenMs?: number;
     /** 多久判一次时机（默认 30 s） */
@@ -268,37 +266,27 @@ class AliyunConnection {
   /** v1 线协议垫片：原语 ↔ 控制串 / 状态帧，图像帧归属；v2 连接为 `null` */
   private readonly v1: V1Session | null;
 
-  /** 宠物环（没开主动开口时全为 null） */
-  private readonly pet: {
-    readonly timing: PetTiming;
-    readonly host: DeviceEventHost;
-    readonly battery: BatteryCache | null;
-    readonly listenMs: number;
-    readonly tickMs: number;
-  } | null;
-  private petTimer: NodeJS.Timeout | null = null;
-  /** 一次主动开口还没结束（拍照 / 排队 / 播放中） */
-  private proactiveBusy = false;
-  /** 用户每说完一句 +1：主动开口拍照期间用户开口了，就放弃这次 */
-  private utteranceSeq = 0;
-  private petSeq = 0;
+  /** 应用层（宠物环 + 心跳）；没开主动开口时为 null */
+  private readonly app: AppSession | null;
+  /** 等首帧上行的兜底时长；宠物与播报共用 */
+  private readonly micOpenTimeoutMs: number;
+  /**
+   * 本连接唯一的时钟。
+   *
+   * 一轮对话的等待、拍照的兜底超时、宠物心跳全走它 —— 生产是 `SystemClock`，
+   * 模拟器换成 `VirtualClock`。**不要在这里再直接 `Date.now()`**。
+   */
+  private readonly clock: Clock = new SystemClock();
   /** 上行编码由能力集决定；档案与解码都要它 */
   private readonly uplinkCodec: 'msbc' | 'pcm16';
 
-  /** 本连接唯一的时钟：拍照兜底超时与一轮的等待都走它 */
-  private readonly clock = new SystemClock();
-  private readonly core: SessionCore;
+  private readonly dialog: DialogRuntime;
   private readonly uplink: UplinkPipeline;
-  private readonly photos: PhotoInbox;
   private readonly smartTurn: SmartTurn | null;
   private readonly assembler: UtteranceAssembler;
-  private readonly runner: TurnRunner;
   private readonly stt: SttSession;
 
   private control: ToolControl | null = null;
-  private serialChain: Promise<void> = Promise.resolve();
-  /** 串行队列里还没跑完的任务数（主动开口只在队列空时才判时机） */
-  private queued = 0;
 
   /** 原始档案（`MIAI_ARCHIVE_DIR` 为空时是 null） */
   private readonly archive: SessionArchive | null;
@@ -315,19 +303,52 @@ class AliyunConnection {
     this.uplinkCodec = this.caps.audioIn;
 
     const proactive = options.proactive;
-    if (proactive === undefined || proactive === null) {
-      this.pet = null;
-    } else {
-      const host = new DeviceEventHost(this.caps, () => performance.now());
-      this.pet = {
-        timing: new PetTiming(proactive.timing),
-        host,
-        battery: host.battery === undefined ? null : new BatteryCache(host.battery, { log }),
-        listenMs: proactive.listenMs ?? DEFAULT_PROACTIVE.listenMs,
-        tickMs: proactive.tickMs ?? 30_000,
-      };
-    }
-    this.core = new SessionCore({ imageQuestion: options.imageQuestion, log, capabilities: this.caps });
+    this.micOpenTimeoutMs = proactive?.params?.micOpenTimeoutMs ?? DEFAULT_PET_PARAMS.micOpenTimeoutMs;
+    // 对话层（状态机 + 拍照 + 一轮的串行队列 + 播报排队）只有一份实现，
+    // 在 `app/dialog.ts`；这里只把环境接上（ADR-0002 §3.1）
+    this.dialog = new DialogRuntime({
+      clock: this.clock,
+      caps: this.caps,
+      agent: options.agent,
+      tts: options.tts,
+      downlink: conn,
+      imageQuestion: options.imageQuestion,
+      photoDir: options.photoDir,
+      photoTimeoutMs: options.photoTimeoutMs,
+      confirmTimeoutMs: options.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS,
+      playbackTailMs: options.playbackTailMs,
+      ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
+      onDownlinkChunk: (chunk) => { this.archive?.downlink(chunk); },
+      onEvent: (name, fields) => { this.archive?.event(name, fields); },
+      env: {
+        call: (call) => this.sendCall(call),
+        assemble: (text) => { this.assembler.addSentence(text); },
+        end: () => { this.conn.end(); },
+        forget: (id) => { this.v1?.forget(id); },
+        ...(this.caps.listenStart
+          ? {
+            announceMic: {
+              listenStart: true,
+              micOpenTimeoutMs: this.micOpenTimeoutMs,
+              listenMs: DEFAULT_PET_PARAMS.listenMs,
+              call: (call: DeviceCall) => { this.sendCall(call); },
+              awaitMicOpen: (timeoutMs: number) => this.awaitMicOpen(timeoutMs),
+            },
+          }
+          : {}),
+        onAnnounce: (pending, spoken) => { this.app?.announce(pending, spoken); },
+        onTurnStart: (text, hasImage) => {
+          this.archive?.event('turn.start', { text_len: text.length, image: hasImage });
+          this.app?.turnStart();
+        },
+        onTurnEnd: () => { this.app?.turnEnd(); },
+      },
+      log,
+    });
+    // 应用层（宠物环）建好之后，对话层的话筒与播报都交给它
+    this.app = proactive === undefined || proactive === null
+      ? null
+      : this.createAppSession(proactive, this.dialog);
 
     // 档案先开：后面每一段音频/每个事件都要往里写
     this.archive = SessionArchive.open(
@@ -375,11 +396,10 @@ class AliyunConnection {
         ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
         : undefined,
       onUtterance: (text) => {
-        this.utteranceSeq += 1;
-        this.pet?.timing.onUserSpoke(performance.now());
+        this.app?.userFinal(text);
         console.log('\n--- 本轮 ---');
         console.log(`  文本    ${JSON.stringify(text)}`);
-        this.execute(this.core.dispatch({ type: 'utterance', text }));
+        this.dialog.dispatch({ type: 'utterance', text });
       },
       log,
     });
@@ -388,15 +408,6 @@ class AliyunConnection {
       onPartial: (text) => { this.onPartial(text); },
       onSentence: (text, index) => { this.onSentence(text, index); },
       onError: (error) => { this.onAsrError(error); },
-    });
-
-    this.photos = new PhotoInbox({
-      clock: this.clock,
-      dir: options.photoDir,
-      timeoutMs: options.photoTimeoutMs,
-      confirmTimeoutMs: options.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS,
-      log,
-      send: (call) => this.sendCall(call),
     });
 
     this.uplink = new UplinkPipeline({
@@ -426,24 +437,19 @@ class AliyunConnection {
         this.stt.hangup();
       },
     });
+  }
 
-    this.runner = new TurnRunner({
-      clock: this.clock,
-      agent: options.agent,
-      tts: options.tts,
-      downlink: conn,
-      fsm: this.core.fsm,
-      playbackTailMs: options.playbackTailMs,
-      ttsGain: options.ttsGain,
-      onDownlinkChunk: (chunk) => { this.archive?.downlink(chunk); },
-      onEvent: (name, fields) => { this.archive?.event(name, fields); },
-      onTurnFinished: () => {
-        this.execute(this.core.dispatch({ type: 'turnFinished' }));
-        // 本轮结束，后台任务的播报可以接着放
-        void this.flushAnnounce();
-      },
-      log,
-    });
+  /** 状态机（在 `DialogRuntime` 里；本类只读它的阶段与轮次） */
+  private get core(): SessionCore {
+    return this.dialog.core;
+  }
+
+  private get photos(): PhotoInbox {
+    return this.dialog.photos;
+  }
+
+  private get runner(): TurnRunner {
+    return this.dialog.runner;
   }
 
   /**
@@ -465,9 +471,8 @@ class AliyunConnection {
       this.archive?.event('announce.replay', { count: backlog.length });
       console.log(`  补播    离线期间攒了 ${backlog.length} 条后台汇报`);
       for (const speech of backlog) {
-        this.announceQueue.push(speech);
+        this.dialog.enqueueAnnounce(speech);
       }
-      void this.flushAnnounce();
     }
 
     // 业务只认「帧」和「关闭」：Hello、Ping/Pong、空闲看门狗、TLS 都在连接层
@@ -478,7 +483,7 @@ class AliyunConnection {
     if (first !== undefined) {
       this.onFrame(first.type, first.payload);
     }
-    this.startPet();
+    // 心跳由 AppSession 自己开（clock.every），这里不再 setInterval
 
     const detail = captureMode(this.caps, 'detail');
     this.control = startToolControl({
@@ -490,10 +495,10 @@ class AliyunConnection {
         takePhoto: () => this.requestToolCapture('glance'),
         // 没有 `detail` 意图时不传 `takePhotoHq`：`tool-control` 会回落到 `takePhoto`
         takePhotoHq: detail === null ? undefined : () => this.requestToolCapture('detail'),
-        endSession: () => { this.execute(this.core.dispatch({ type: 'endRequested' })); },
+        endSession: () => { this.dialog.dispatch({ type: 'endRequested' }); },
         say: (text) => {
           // 调试口：和「用户说完一句」走同一条路，方便没有麦克风时联调
-          this.execute(this.core.dispatch({ type: 'utterance', text }));
+          this.dialog.dispatch({ type: 'utterance', text });
         },
         control: (text) => { this.conn.sendControl(text); },
         log: (line) => { console.log(line); },
@@ -506,6 +511,8 @@ class AliyunConnection {
   private onFrame(type: number, payload: Buffer): void {
     switch (type) {
       case UpstreamFrameType.Audio:
+        // 首帧上行 = 麦真的开了（不用手机回执：ACK 只证明命令进了队列）
+        this.onMicOpened();
         // `uplink.sbc` 只存压缩帧；PCM 上行由 pipeline 的 onRawPcm 写 `uplink.pcm`
         if (this.uplinkCodec === 'msbc') {
           this.archive?.sbc(payload);
@@ -517,7 +524,7 @@ class AliyunConnection {
         // v2：带 id 的图走 CaptureImage，走 Image 的一律是用户自己拍的。
         // 没人认领就是「看一眼」，起一轮识图
         if (!this.photos.deliver(this.v1?.image() ?? null, payload)) {
-          this.execute(this.core.dispatch({ type: 'image', jpeg: payload }));
+          this.dialog.dispatch({ type: 'image', jpeg: payload });
         }
         return;
       }
@@ -613,42 +620,13 @@ class AliyunConnection {
       case 'presence':
       case 'power':
       case 'summon':
-        this.pet?.host.feed(event);
+        // 「事件后补 tick」在 AppSession 里（ADR-0002 §3.1）
+        this.app?.deviceEvent(event);
         return;
       case 'played':
         // 播放进度目前由 TurnRunner 按时长估算；收到也只记档，留给以后替换估算
         this.archive?.event('device.played');
         return;
-    }
-  }
-
-  /** 执行 core 给出的动作。**所有副作用只在这里发生。** */
-  private execute(effects: readonly CoreEffect[]): void {
-    for (const effect of effects) {
-      switch (effect.type) {
-        case 'assemble':
-          this.assembler.addSentence(effect.text);
-          break;
-        case 'turn':
-          this.enqueueTurn(effect.text, effect.image, effect.ticket);
-          break;
-        case 'capture':
-          this.enqueueCapture(effect.request, effect.ticket);
-          break;
-        case 'call':
-          if (effect.call.op === 'capture.cancel') {
-            this.runner.cancelCanned();
-            this.photos.cancel('用户改主意或收尾');
-          } else {
-            this.sendCall(effect.call);
-          }
-          break;
-        case 'end':
-          this.conn.end();
-          break;
-        case 'drop':
-          break;
-      }
     }
   }
 
@@ -660,6 +638,13 @@ class AliyunConnection {
    * - v1 连接经垫片翻成控制串；v1 表达不了的（如 `listen.start`）明确记日志跳过
    */
   private sendCall(call: DeviceCall): boolean {
+    // 开麦之后要等首帧上行才算"麦真的开了"（ADR-0001 §5.4）
+    if (call.op === 'listen.start') {
+      this.micPending = true;
+    } else if (call.op === 'listen.stop') {
+      this.micPending = false;
+      this.resolveMicWaiters();
+    }
     if (!supportsCall(this.caps, call)) {
       this.archive?.event('ctl.skip', { op: call.op, why: 'unsupported' });
       console.log(`  控制    ✗ 设备未声明 ${call.op}，已跳过`);
@@ -687,6 +672,62 @@ class AliyunConnection {
     this.conn.sendControl(text);
   }
 
+  // ------------------------------------------------------------------ 开麦
+
+  /** 已经发过 `listen.start`，还没收到首帧上行音频 */
+  private micPending = false;
+  /** 等首帧上行的人（播报用；宠物走 `AppSession.micOpened()`） */
+  private micWaiters: Array<() => void> = [];
+
+  private resolveMicWaiters(): void {
+    const waiters = this.micWaiters;
+    this.micWaiters = [];
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+
+  /**
+   * 麦开的证据到了。
+   *
+   * 只在 `micPending` 时算一次：`listen.stop` 之后再来的音频属于对话层，
+   * 不该再被当成"宠物这一轮开麦成功"。
+   */
+  private onMicOpened(): void {
+    if (!this.micPending) {
+      return;
+    }
+    this.micPending = false;
+    this.archive?.event('mic.opened');
+    this.resolveMicWaiters();
+    this.app?.micOpened();
+  }
+
+  /**
+   * 等麦开，最多 `timeoutMs`。
+   *
+   * 播报用（ADR-0001 §6）：设备支持 `listen.start` 时，播报也先开麦再开口，
+   * 这样播报一开口就能被插话；超时照播。
+   */
+  private awaitMicOpen(timeoutMs: number): Promise<boolean> {
+    if (!this.micPending) {
+      return Promise.resolve(false);
+    }
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (opened: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cancel();
+        resolve(opened);
+      };
+      const cancel = this.clock.after(timeoutMs, () => { finish(false); });
+      this.micWaiters.push(() => { finish(true); });
+    });
+  }
+
   /** 工具口拍照用的序号，保证 `id` 在一条连接内唯一 */
   private toolSeq = 0;
 
@@ -707,61 +748,26 @@ class AliyunConnection {
     }
   }
 
-  /** 后台任务完成后的播报排队：用户正在说/正在听的时候不插嘴 */
-  private readonly announceQueue: string[] = [];
-  private announcing = false;
-
   /**
    * 后台任务完成 → 播报。
    *
-   * 这条**不属于任何一轮**（`speakCanned` 的旁白通道），所以不占轮次票据、不改状态机。
-   * 用户正在说话或正在播报时排队，等回到 `listening` 再放出来 —— 抢话比晚两秒更烦人。
+   * 排队、让位、开麦的顺序都在 pp/dialog.ts（与模拟器同一份实现），
+   * 这里只记档并把话交进去。
    */
   private onAnnounce(speech: string): void {
     this.archive?.event('announce', { len: speech.length });
-    this.announceQueue.push(speech);
-    void this.flushAnnounce();
+    this.dialog.enqueueAnnounce(speech);
   }
-
-  private async flushAnnounce(): Promise<void> {
-    if (this.announcing || this.announceQueue.length === 0) {
-      return;
-    }
-    if (this.core.phase !== 'listening') {
-      // 等本轮结束（`onTurnFinished` 会再叫一次）
-      return;
-    }
-    this.announcing = true;
-    try {
-      while (this.announceQueue.length > 0) {
-        const speech = this.announceQueue.shift();
-        if (speech === undefined) {
-          break;
-        }
-        await this.runner.speakCanned(speech);
-        if (this.core.phase !== 'listening') {
-          // 播报期间用户说话了，剩下的一条留到下一轮结束
-          break;
-        }
-      }
-    } finally {
-      this.announcing = false;
-    }
-  }
-
   private onClose(): void {
-    if (this.petTimer !== null) {
-      clearInterval(this.petTimer);
-      this.petTimer = null;
-    }
-    this.pet?.battery?.dispose();
+    // 有在途开口就记 aborted，然后丢掉执行器手里的计时器
+    this.app?.close();
+    this.app?.dispose();
     console.log(`\n连接结束，${this.core.turn} 轮`);
     // 连接没了，后台任务的播报就没有出口了（结果仍会在 dsh 会话里，下次连上可追问）
     this.options.agent.setAnnouncer?.(null);
-    this.announceQueue.length = 0;
-    this.execute(this.core.dispatch({ type: 'closed' }));
+    this.dialog.dispatch({ type: 'closed' });
     // 收件箱里还有等待者的话，定时器会拖住进程（不必再下发 hq_cancel：连接都断了）
-    this.photos.dispose();
+    this.dialog.dispose();
     this.assembler.dispose();
     this.smartTurn?.stop();
     this.control?.close();
@@ -775,17 +781,18 @@ class AliyunConnection {
   private onPartial(text: string): void {
     console.log(`  … ${text}`);
     this.archive?.event('asr.partial', { text });
-    const effects = this.core.dispatch({ type: 'partial', text });
+    // 宠物要在**用户刚开口**就收手，不能等到这句话定稿
+    this.app?.userPartial();
+    const effects = this.dialog.dispatch({ type: 'partial', text });
     if (effects.some((effect) => effect.type === 'call' && effect.call.op === 'audio.stop')) {
       console.log('  打断    听到识别结果 → 停止播放，已排队的轮次作废');
     }
-    this.execute(effects);
   }
 
   private onSentence(text: string, index: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
     this.archive?.event('asr.sentence', { text, index });
-    this.execute(this.core.dispatch({ type: 'sentence', text }));
+    this.dialog.dispatch({ type: 'sentence', text });
   }
 
   private onAsrError(error: Error): void {
@@ -807,152 +814,101 @@ class AliyunConnection {
     );
   }
 
-  // ------------------------------------------------------------------ 一轮
-
-  private enqueueTurn(
-    text: string,
-    image: ImageAttachment | undefined,
-    ticket: TurnTicket,
-  ): Promise<void> {
-    this.queued += 1;
-    this.serialChain = this.serialChain.then(async () => {
-      if (this.core.fsm.isStale(ticket)) {
-        console.log('  （丢弃：用户已插话，这一轮过时了）');
-        return;
-      }
-      this.archive?.event('turn.start', { text_len: text.length, image: image !== undefined });
-      // 图由 `capture` 那一步拿好并挂在 text/image 里，这里不再自己拍
-      return this.runner.run(text, image).then(() => undefined);
-    }).catch((error: Error) => {
-      console.error(`  ✗ 队列任务失败（不影响后续）: ${error.message}`);
-    }).finally(() => {
-      this.queued -= 1;
-    });
-    return this.serialChain;
-  }
-
-  /**
-   * 执行一次 `capture`，拿到结果再交给状态机。
-   *
-   * 走串行队列：等图的这几十秒里不能开别的一轮（用户改主意时会先下发
-   * `capture.cancel` 让这里立刻返回，所以不会把后面的句子卡住）。
-   */
-  private enqueueCapture(request: CaptureRequest, ticket: TurnTicket): void {
-    this.queued += 1;
-    this.serialChain = this.serialChain.then(async () => {
-      if (this.core.fsm.isStale(ticket)) {
-        console.log('  （丢弃：拍照请求已过时）');
-        return;
-      }
-      const outcome = await this.photos.request(request);
-      this.v1?.forget(request.id);
-      this.execute(this.core.dispatch(
-        outcome.ok
-          ? { type: 'shotResult', ok: true, jpeg: outcome.jpeg }
-          : { type: 'shotResult', ok: false, failure: outcome.failure },
-      ));
-    }).catch((error: Error) => {
-      console.error(`  ✗ 拍照任务失败（不影响后续）: ${error.message}`);
-    }).finally(() => {
-      this.queued -= 1;
-    });
-  }
-
-
   // ------------------------------------------------------------------ 宠物环
 
   /**
-   * 主动开口的接线：时机在 `pet-timing.ts`，做法在 `proactive.ts`，这里只执行。
+   * 把应用层装到本连接上。**这里只有接线，没有判断**。
    *
-   * 定时器**不占着进程**：`unref`，没别的事时照常退出。
+   * 四个端口各对应一件已经存在的事：
+   * - `Clock`：`SystemClock`（心跳也在 `AppSession` 里，这里不再自己开定时器）
+   * - `Device`：`capture` 走收件箱（要等图），其余直接下发原语
+   * - `Agent`：措辞由 `petPrompt` 拼，模型只负责说
+   * - `Voice`：旁白通道（`speakCanned`），`stop` 就是 `cancelCanned`
    */
-  private startPet(): void {
-    const pet = this.pet;
-    if (pet === null) {
-      return;
-    }
-    pet.host.presence?.onChange((wearing) => {
-      pet.timing.onPresence(wearing, performance.now());
+  private createAppSession(
+    proactive: NonNullable<AliyunSessionOptions['proactive']>,
+    dialog: DialogRuntime,
+  ): AppSession {
+    return new AppSession({
+      clock: this.clock,
+      caps: this.caps,
+      dialog,
+      ...(proactive.tickMs === undefined ? {} : { tickMs: proactive.tickMs }),
+      device: {
+        call: (call) => {
+          if (call.op === 'capture') {
+            void this.photos.request({ id: call.id, intent: call.intent, needsUser: false })
+              .then((outcome) => {
+                this.app?.image(call.id, outcome.ok
+                  ? { mimeType: 'image/jpeg', data: outcome.jpeg.toString('base64') }
+                  : null);
+              })
+              .catch((error: Error) => {
+                console.error(`  ✗ 宠物拍照失败: ${error.message}`);
+                this.app?.image(call.id, null);
+              });
+            return;
+          }
+          if (call.op === 'capture.cancel') {
+            this.photos.cancel('宠物不再需要这张图');
+            return;
+          }
+          this.sendCall(call);
+        },
+      },
+      agent: {
+        ask: async (context, image): Promise<PetReply> => {
+          const attachment: ImageAttachment | undefined = image === null
+            ? undefined
+            : { mimeType: image.mimeType as ImageAttachment['mimeType'], data: image.data };
+          const view = await this.options.agent.reply(petPrompt(context, image !== null), attachment);
+          const text = view.speech.trim();
+          return text === ''
+            ? { text: '' }
+            : { text, emotion: view.emotion as PetReply['emotion'] };
+        },
+      },
+      voice: {
+        speak: async (text, emotion, signal) => {
+          let aborted = false;
+          const onAbort = (): void => {
+            aborted = true;
+            this.runner.cancelCanned();
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          try {
+            await this.runner.speakCanned(text, emotion ?? undefined);
+          } catch (error) {
+            console.error(`  ✗ 宠物朗读失败: ${(error as Error).message}`);
+            return 'cut';
+          } finally {
+            signal.removeEventListener('abort', onAbort);
+          }
+          return aborted ? 'cut' : 'done';
+        },
+        stop: () => { this.runner.cancelCanned(); },
+      },
+      ...(proactive.params === undefined && proactive.listenMs === undefined
+        ? {}
+        : {
+          params: {
+            ...proactive.params,
+            ...(proactive.listenMs === undefined ? {} : { listenMs: proactive.listenMs }),
+          },
+        }),
+      onEvent: (name, fields) => {
+        // 输入/意图里可能带 JPEG（base64），落盘前压成字节数
+        this.archive?.event(name, summarizePetEvent(name, fields));
+      },
+      dismissAnnounce: () => {
+        // 敲击关播报：清掉队列并停掉正在播的那条
+        this.dialog.clearAnnounce();
+      },
+      log: (line) => { console.log(`  ${line}`); },
     });
-    pet.host.touch?.onTap((tap) => {
-      const move = pet.timing.onTap(performance.now(), tap);
-      if (move.kind === 'reflect') {
-        // 快反射要预合成的短音（「嗯？」「在呢」），还没有素材，先只记日志
-        this.archive?.event('pet.reflect', { cue: move.cue });
-        console.log(`  宠物    敲击（${move.cue}），没有短音素材，略过`);
-      }
-    });
-    pet.battery?.start();
-    this.petTimer = setInterval(() => { this.tickPet(); }, pet.tickMs);
-    this.petTimer.unref?.();
   }
 
-  /** 判一次时机：只在没人说话、没人在播、队列也空的时候才执行。 */
-  private tickPet(): void {
-    const pet = this.pet;
-    if (pet === null || this.proactiveBusy) {
-      return;
-    }
-    if (this.core.phase !== 'listening' || this.queued > 0 || this.announcing) {
-      return;
-    }
-    const move = pet.timing.tick({
-      wearing: pet.host.presence?.wearing() ?? null,
-      battery: pet.battery?.current() ?? null,
-      nowMs: performance.now(),
-      localHour: new Date().getHours(),
-    });
-    const plan = planProactive(move, this.caps, { listenMs: pet.listenMs });
-    if (plan === null) {
-      return;
-    }
-    this.proactiveBusy = true;
-    void this.runProactive(move, plan).finally(() => {
-      this.proactiveBusy = false;
-    });
-  }
-
-  /**
-   * 一次主动开口：先看一眼（设备能不用人动手拍 `glance` 才拍），再开口。
-   *
-   * 拍照期间用户开口了（`utteranceSeq` 变了）就放弃 —— 主动找你说话不该
-   * 抢用户正在说的话。说完之后按计划开麦，设备不支持就不开。
-   */
-  private async runProactive(move: PetMove, plan: ProactivePlan): Promise<void> {
-    const seq = this.utteranceSeq;
-    this.archive?.event('pet.proactive', { kind: plan.kind, look: plan.look });
-    console.log(`  宠物    主动开口（${plan.kind}）`);
-
-    let image: ImageAttachment | undefined;
-    if (plan.look !== null) {
-      this.petSeq += 1;
-      const outcome = await this.photos.request({
-        id: `pet-${this.petSeq}`,
-        intent: plan.look,
-        needsUser: false,
-      });
-      if (this.utteranceSeq !== seq || this.core.phase !== 'listening') {
-        console.log('  宠物    拍照期间用户开口了，这次主动开口作废');
-        return;
-      }
-      if (outcome.ok) {
-        image = { mimeType: 'image/jpeg', data: outcome.jpeg.toString('base64') };
-      } else {
-        // 没拍到就当没画面：开口时明确告诉模型别假装看见了
-        console.log(`  宠物    主动拍照没拍到（${outcome.failure.code}），改成不带画面开口`);
-      }
-    }
-
-    const text = proactivePrompt(move, image !== undefined);
-    if (text === '') {
-      return;
-    }
-    await this.enqueueTurn(text, image, this.core.fsm.ticket());
-
-    if (plan.listenMs !== null && this.utteranceSeq === seq && this.core.phase === 'listening') {
-      this.sendCall({ op: 'listen.start', maxMs: plan.listenMs });
-    }
-  }
+  // ------------------------------------------------------------------ 档案
   // ------------------------------------------------------------------ 档案
 
   /**

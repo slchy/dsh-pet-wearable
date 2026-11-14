@@ -524,9 +524,11 @@ async function main(): Promise<void> {
       // 主动开口默认关：开着它会自己说话，得人明确要
       proactive: process.env['PET_PROACTIVE'] === '1'
         ? {
-          timing: {
+          params: {
             greetAfterAwayMs: envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs),
             chatterAfterIdleMs: envNumber('PET_CHATTER_IDLE_MS', DEFAULT_PET_TIMING.chatterAfterIdleMs),
+            // 开麦到首帧上行音频的截止。小米实测 0.62 s，给到 1.5 s
+            micOpenTimeoutMs: envNumber('PET_MIC_OPEN_TIMEOUT_MS', 1500),
           },
           listenMs: envNumber('PET_LISTEN_MS', DEFAULT_PROACTIVE.listenMs),
           tickMs: envNumber('PET_TICK_MS', 30_000),

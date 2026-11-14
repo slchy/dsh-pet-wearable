@@ -8,6 +8,7 @@
  * - 说完开麦：设备支持 `listen.start` 才开，否则用户得自己唤醒
  */
 import { canCaptureUnprompted, type CaptureIntent, type DeviceCapabilities } from '../devices/primitives.ts';
+import type { PetContext } from './brain/types.ts';
 import type { PetMove } from './pet-timing.ts';
 
 export interface ProactivePlan {
@@ -66,4 +67,20 @@ export function proactivePrompt(move: PetMove, withImage: boolean): string {
       + `主动搭一句话，一两句，口语；对方没兴趣就别追问。${look}）`;
   }
   return '';
+}
+
+/**
+ * 由**状态机的结构化上下文**拼出那一句提示词。
+ *
+ * 措辞归这一层（agent 适配器），不归状态机：状态机只传 `reason` / `elapsedMs` /
+ * `hasImage`（ADR-0001 §9）。
+ *
+ * @param context 触发上下文
+ * @param withImage 这次真的带了画面吗（`look` 失败时为 `false`）
+ */
+export function petPrompt(context: PetContext, withImage: boolean): string {
+  const move: PetMove = context.reason === 'greet'
+    ? { kind: 'greet', awayMs: context.elapsedMs }
+    : { kind: 'chatter', idleMs: context.elapsedMs };
+  return proactivePrompt(move, withImage);
 }

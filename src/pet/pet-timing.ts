@@ -111,6 +111,10 @@ function inQuietHours(hour: number, from: number, to: number): boolean {
 /**
  * 时机状态机。
  *
+ * > **已被 `pet/brain/` 取代**（ADR-0001）。保留它是为了给 `PetBrain` 的重放测试
+ * > 当行为基准（`tests/pet-brain.test.ts` 逐条对照本模块的用例），以及给不走
+ * > 完整宠物环的宿主当轻量替代。生产连接用的是 `PetSession`。
+ *
  * 外部事件（佩戴变化、用户说完话、敲击）调对应 `on*`；心跳调 {@link tick} 取动作。
  *
  * **佩戴变化请用 {@link onPresence} 报告。** {@link tick} 里的自动同步只为
