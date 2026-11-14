@@ -103,7 +103,8 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | `primitives.ts` | 原语类型、`captureMode()` / `canCaptureUnprompted()` / `supportsCall()`、`parseCapabilities()`（`Hello.capabilities`） |
 | `wire-v1.ts` | v1 垫片：`V1_BASELINE` + `V1Session`（原语 ↔ 控制串 / 状态帧，并判「这帧图属于哪个请求」） |
 | `xiaomi.ts` | 小米 v1 手机的默认能力与代说的话（真机验证） |
-| `index.ts` | 出口；`resolveV1Device()`：v1 型号提示 → 能力（空 / 未知回落 v1 基线，**不报错**） |
+| `wire-v2.ts` | v2 线协议：`negotiateV2()`、`Call` / `Event` / `CaptureImage` 的编解码 |
+| `index.ts` | 出口；`resolveDeviceLink()`：`Hello` 自报合法能力就走 v2，否则按型号提示走 v1 |
 
 判定核只读能力，不认型号：「能不能自动拍细节」= `captureMode(caps, 'detail') !== null`，
 要不要等人 = 它的 `needsUser`。执行层每次下发前用 `supportsCall()` 挡一次，
@@ -114,8 +115,10 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 [`devices/RAYNEO-X3-PRO.md`](devices/RAYNEO-X3-PRO.md)）；插件不加文件，**协议动词不增加**。
 `--device` 型号提示只为不会自报的 v1 手机存在，手机端改说新协议后随 `wire-v1.ts` / `xiaomi.ts` 一起删。
 
-> 现状：`Hello.capabilities` 已能解析，但还没接进连接 —— 连接仍按 `--device` 走 v1 垫片；
-> v2 帧的序列化尚未实现。
+连接时先握手再干活（`aliyun-session.ts` 的 `handshake()`）：配了鉴权就等 `Hello`；
+没配时等 1 秒，`Hello` 先到用它，别的帧先到或等满就按 v1 走，那一帧原样补交不丢。
+`resolveDeviceLink()` 判版本：v2 就回 `Welcome` 并用 `Call` / `Event` 帧，否则走 v1 垫片。
+`proto:2` 但能力不合法 → **不回 `Welcome`**，设备退回 v1，不拒绝连接。
 
 ### 2.4 识别与合成（可替换实现）
 

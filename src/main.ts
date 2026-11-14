@@ -33,6 +33,8 @@ import {
 import { DshSession } from './session.ts';
 import { runAliyunServer } from './aliyun-session.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
+import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
+import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
 import { sleep } from './util.ts';
 
@@ -452,8 +454,9 @@ async function main(): Promise<void> {
       `增益    上行 ${micGain}×（能量门 ${peakDbfs} dBFS，按放大后算）  下行 ${ttsGain}×\n`,
     );
 
+    // 横幅只能先打 v1 的默认能力：真正走哪个版本要等连接时的 `Hello` 自报
     const device = resolveV1Device(deviceSpec);
-    console.log(`设备     ${device.label}（v1）：${describeCapabilities(device.capabilities)}\n`);
+    console.log(`设备     ${device.label}（v1 默认，v2 设备在 Hello 里自报能力）：${describeCapabilities(device.capabilities)}\n`);
 
     const code = await runAliyunServer({
       port: listen,
@@ -518,6 +521,17 @@ async function main(): Promise<void> {
       authenticate: loadAuthenticator(),
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
       serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
+      // 主动开口默认关：开着它会自己说话，得人明确要
+      proactive: process.env['PET_PROACTIVE'] === '1'
+        ? {
+          timing: {
+            greetAfterAwayMs: envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs),
+            chatterAfterIdleMs: envNumber('PET_CHATTER_IDLE_MS', DEFAULT_PET_TIMING.chatterAfterIdleMs),
+          },
+          listenMs: envNumber('PET_LISTEN_MS', DEFAULT_PROACTIVE.listenMs),
+          tickMs: envNumber('PET_TICK_MS', 30_000),
+        }
+        : null,
     });
     dshSession?.stop();
     process.exit(code);
