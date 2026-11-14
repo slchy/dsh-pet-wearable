@@ -27,6 +27,7 @@ import type {
   FloorOwner,
   PetImage,
   PetInput,
+  PetIntent,
   PetOutcomeRecord,
   PetState,
   Voice,
@@ -61,6 +62,64 @@ export function summarizePetEvent(name: string, fields: Record<string, unknown>)
     out['image'] = { bytes: typeof data === 'string' ? data.length : 0 };
   }
   return out;
+}
+
+/** 长文本进日志要截断，不然一行能刷满屏。 */
+function clip(text: string, max = 24): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/**
+ * 一行说得清「谁戳了它」。
+ *
+ * 心跳每 30 s 一条，所以这行必须短。它存在的意义：**「它为什么不出声」要能当场读出来**，
+ * 而不是去翻 `events.jsonl` 才知道宠物到底收没收到佩戴/电量/话筒变化。
+ */
+export function describePetInput(input: PetInput): string {
+  switch (input.kind) {
+    case 'tick':
+      return '心跳';
+    case 'userPartial':
+      return '用户开口（中间结果）';
+    case 'userFinal':
+      return `用户说完「${clip(input.text)}」`;
+    case 'presence':
+      return `佩戴=${input.wearing === null ? '未知' : input.wearing ? '戴上' : '摘下'}`;
+    case 'power':
+      return `电量=${input.percent === null ? '未知' : `${input.percent}%`}`;
+    case 'summon':
+      return input.opensSession ? '招呼（同时开语音会话）' : '招呼';
+    case 'floor':
+      return `话筒=${input.busy ? `被占(${input.owner ?? '?'})` : '空闲'}`;
+    case 'announce':
+      return `待播报=${input.pending ? '有' : '无'}${input.spoken ? '，刚播完' : ''}`;
+    case 'image':
+      return input.image === null
+        ? '看图结果：没拍到'
+        : `看图结果：${Math.round(input.image.data.length * 0.75)} B`;
+    case 'phaseResult':
+      return `阶段结果 ${input.phase}#${input.step}=${input.result}`;
+    case 'micOpened':
+      return '首帧上行到了（麦真的在采集）';
+    case 'closed':
+      return '连接关闭';
+  }
+}
+
+/** 一行说得清「它决定了什么」。 */
+export function describePetIntent(intent: PetIntent): string {
+  switch (intent.kind) {
+    case 'phase.enter':
+      return `进入 ${intent.phase}（计划 ${intent.plan.join('→')}，截止 ${
+        intent.deadlineMs === null ? '无' : `${intent.deadlineMs} ms`
+      }，${intent.holdsFloor ? '占话筒' : '不占话筒'})`;
+    case 'end':
+      return `收尾：${intent.record.reason} / ${intent.record.outcome}`;
+    case 'reflex':
+      return `快反射 ${intent.cue}`;
+    case 'announce.dismiss':
+      return '撤掉待播报';
+  }
 }
 
 export class PetSession {
@@ -221,6 +280,16 @@ export class PetSession {
     return { now: this.options.clock.now(), localHour: this.options.clock.localHour() };
   }
 
+  /** 当前处在哪个阶段，或「闲置」。日志里带上它，才知道这句话是在什么状态下判的。 */
+  private phaseNote(): string {
+    const engagement = this.state.engagement;
+    if (engagement === null) {
+      return '  [闲置]';
+    }
+    const phase = engagement.plan[engagement.at] ?? '?';
+    return `  [${phase} #${engagement.step}]`;
+  }
+
   private enqueue(input: PetInput): void {
     // 连接关了就不再接受任何新输入；否则心跳还会把宠物叫起来说话
     if (this.closed && input.kind !== 'closed') {
@@ -242,10 +311,17 @@ export class PetSession {
           break;
         }
         this.options.onEvent?.('pet.in', input as unknown as Record<string, unknown>);
+        this.options.log?.(`宠物 ← ${describePetInput(input)}${this.phaseNote()}`);
         const result = this.brain.step(this.state, input);
         this.state = result.state;
+        if (result.intents.length === 0 && input.kind === 'tick') {
+          // 心跳是唯一"什么都不做"也会发生的输入：它不出声时必须留下一行，
+          // 否则分不清"没在跑"和"判断了但决定不说"
+          this.options.log?.(`宠物 ·  心跳后仍不出声${this.phaseNote()}`);
+        }
         for (const intent of result.intents) {
           this.options.onEvent?.('pet.out', intent as unknown as Record<string, unknown>);
+          this.options.log?.(`宠物 → ${describePetIntent(intent)}`);
           this.inFlight += 1;
           // 推到微任务里执行：执行器绝不能重入 pump，否则它会在同一条输入里
           // 把下一阶段的副作用全跑完（打断就只能等它们做完才生效）

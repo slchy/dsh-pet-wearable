@@ -492,6 +492,16 @@ async function main(): Promise<void> {
     const device = resolveV1Device(deviceSpec);
     console.log(`设备     ${device.label}（v1 默认，v2 设备在 Hello 里自报能力）：${describeCapabilities(device.capabilities)}\n`);
 
+    // 宠物环开没开必须说出来。不说的话，「它一直不说话」分不清是
+    // 「判断了但决定不说」还是「这一层根本没装」（见 archive/HANDOFF.md 的教训）
+    const proactiveOn = process.env['PET_PROACTIVE'] === '1';
+    console.log(
+      proactiveOn
+        ? '宠物环   开（主动开口）：心跳每 '
+          + `${envNumber('PET_TICK_MS', 30_000)} ms，离场 ${envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs)} ms 后重戴会打招呼\n`
+        : '宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口\n',
+    );
+
     const code = await runAliyunServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
@@ -556,7 +566,7 @@ async function main(): Promise<void> {
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
       serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
       // 主动开口默认关：开着它会自己说话，得人明确要
-      proactive: process.env['PET_PROACTIVE'] === '1'
+      proactive: proactiveOn
         ? {
           params: {
             greetAfterAwayMs: envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs),
