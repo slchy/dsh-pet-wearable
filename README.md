@@ -17,7 +17,7 @@
 | 配置项 | 可用，见下 |
 | 语音链路（mSBC → STT → 判停 → TTS → 打断） | 代码齐全，目前只通过独立进程形态跑（`src/main.ts`） |
 | 设备会话（拉起眼镜语音、拍照、佩戴 / 电量） | 手机端已跑通，插件侧未接线 |
-| 主动开口 | 时机状态机已实现（`src/pet/pet-timing.ts`），未接进对话循环 |
+| 主动开口（时机 / 阶段 / 打断 / 结局） | 已按 [ADR-0001](./docs/adr/0001-app-layer-and-pet.md) 实现并接进对话连接，`npm run sim` 可离线跑全套场景 |
 
 ## 装进 dsh
 
@@ -77,6 +77,9 @@ patch 的语义要记住：裸条目是**按 id 覆盖**已有节点，**新增*
 npm install
 npm run typecheck
 npm test                            # node --test tests/*.test.ts
+npm run sim                         # 宠物主动开口的离线场景（零网络 / 零密钥 / 零 ffmpeg）
+npm run sim -- --explore --runs 500 # 随机探索：找不变量违反并收缩成最小复现
+npm run sim -- --trace out/         # 把每个场景的时间线写成 JSONL
 
 # 不需要任何密钥：canned 识别 + 静音合成 + echo agent
 node src/main.ts --listen 8766 --stt canned --tts silent --agent echo
@@ -119,6 +122,8 @@ export function stt(): SttProvider {
 
 | 文件 | 内容 |
 |---|---|
+| [docs/adr/0001-app-layer-and-pet.md](./docs/adr/0001-app-layer-and-pet.md) | **应用层与宠物层**：端口、状态机、三张登记表、模拟器、实施顺序 |
+| [docs/adr/0002-virtual-time-simulator.md](./docs/adr/0002-virtual-time-simulator.md) | **虚拟时间模拟器**：单一调度器、假件、声明式场景、三层判定、随机探索 |
 | [docs/CLOUD-ARCHITECTURE.md](./docs/CLOUD-ARCHITECTURE.md) | 分层、类职责、并发模型、状态机、扩展点 |
 | [docs/device-protocol.md](./docs/device-protocol.md) | 线协议：帧格式、控制串、状态帧、拍照时间预算（写手机端的人看） |
 | [docs/OPERATIONS.md](./docs/OPERATIONS.md) | 部署形态、鉴权与 TLS、原始档案、延迟报告、待补播 |

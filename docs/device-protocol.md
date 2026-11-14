@@ -77,7 +77,7 @@
 |---|---|---|
 | `audio.stop` | `stop` | 立即停播并清空队列（插话） |
 | `listen.stop` | `stop_capture` | 停采集，不断会话 |
-| `listen.start{maxMs}` | —（v1 表达不了） | 主动开麦听回应 |
+| `listen.start{maxMs}` | —（v1 表达不了） | 主动开麦听回应，见下方「开麦」 |
 | `capture{id,intent}` | `take_photo` / `take_photo_hq` | 按 `id` 关联、at-most-once、可取消 |
 | `capture.cancel{id}` | `hq_cancel` | 幂等 |
 | `session.end` | `end_session` | 幂等终态 |
@@ -88,6 +88,28 @@
 失败码只有 5 个：`unsupported` `busy` `timeout` `cancelled` `failed`。
 设备的原因（如没按快门、P2P 没建起来）放在 `say` 里，是给用户听的一句人话，不参与判定。
 v1 手机不会说 `say`，由垫片按 `reason` 代说（见 [`src/devices/xiaomi.ts`](../src/devices/xiaomi.ts)）。
+
+## 开麦（`listen.start`）
+
+`listen.start` 只在 v2 里有，而且**只负责把麦克风打开**，不负责出声。小米没有语音会话时
+下行 PCM 照样能播（`AudioTrack` 走 A2DP，与会话无关），所以"能不能说"不依赖这条命令。
+
+"麦开了"的信号是**命令发出之后到达的第一帧上行 `Audio`**，服务端自己就能看到，
+设备不用另报事件。手机侧的回执（排队成功、SAR ACK）只证明命令进了队列或到了传输层，
+不证明设备在采集，不能拿来当这个信号。
+
+小米手机端把 `listen.start` 翻成 `Aivs` id=10（容器字段是 `f11`，不是 `f1`）。
+实测从发出到第一帧上行约 0.62 s。`listen.stop` 只停采集、不结束会话（与 v1 的 `stop_capture` 同义），
+会话留给下一次开口复用；结束会话是 `session.end`，小米侧对应 `Aivs` id=5（六字段全零，只写 f1 无效）。
+这段时间里麦克风没开，用户插话听不到，所以服务端先等首帧再开口；1.5 s 还等不到就照样开口，
+宁可听不见插话，也不能沉默。
+
+`maxMs` 是兜底，不是窗口：服务端在回应窗口过期时会主动发 `listen.stop`。
+眼镜自己的空闲超时如果比 `maxMs` 更短，会把还没结束的回应窗口截断，所以手机端应把
+设备侧的空闲超时设得不短于 `maxMs`。
+
+能力位 `listenStart: false` 的设备（雷鸟能装自己的 APK，麦克风随开随用）不会收到这条命令，
+服务端直接开口。
 
 ## v2（向下兼容）
 
