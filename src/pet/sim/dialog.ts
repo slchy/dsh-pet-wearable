@@ -45,6 +45,8 @@ export interface DialogSimOptions {
    * 数字 = 这么多毫秒后出首帧。默认 300。
    */
   readonly micOpenAfterMs?: number | null;
+  /** 长思考回执（不给自己不加，既有场景的时间线保持不变） */
+  readonly ack?: { readonly afterMs: number; readonly text: string };
 }
 
 /** 只发不播的下行：记录字节数与时刻。 */
@@ -77,7 +79,7 @@ export class DialogSim {
   /** 下发给设备的操作 */
   readonly calls: DeviceCall[] = [];
   /** agent 收到的提问 */
-  readonly asked: Array<{ text: string; image: boolean; at: number }> = [];
+  readonly asked: Array<{ text: string; image: boolean; at: number; note?: string }> = [];
   /** 执行过的效果（调试用） */
   readonly effects: CoreEffect[] = [];
   /** 一轮的开始 / 结束次数（生产用它们占话筒，必须成对） */
@@ -90,8 +92,8 @@ export class DialogSim {
 
     const agent: AgentProvider = {
       name: 'sim',
-      reply: (text, image) => {
-        this.asked.push({ text, image: image !== undefined, at: this.clock.now() });
+      reply: (text, image, note) => {
+        this.asked.push({ text, image: image !== undefined, at: this.clock.now(), note });
         const latency = options.reply?.latencyMs ?? 0;
         const answer: AgentReplyView = {
           text: options.reply?.text ?? '嗯，看到了。',
@@ -131,6 +133,7 @@ export class DialogSim {
       photoTimeoutMs: options.photoTimeoutMs ?? 4_000,
       confirmTimeoutMs: options.photoTimeoutMs ?? 4_000,
       playbackTailMs: 0,
+      ...(options.ack === undefined ? {} : { ack: options.ack }),
       env: {
         call: (call) => {
           this.calls.push(call);

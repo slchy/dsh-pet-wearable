@@ -538,6 +538,19 @@ async function main(): Promise<void> {
       },
       playbackTailMs: 600,
       /**
+       * 长思考回执。真机上 dsh 跑工具常 5–8 s，这期间完全没有声音：
+       * 用户会以为「它没听见」，于是重复说、或者喊「你还在吗」。
+       * 超过 `MIAI_ACK_AFTER_MS` 还没开始出声就先说一句；0 = 关。
+       */
+      ...(envNumber('MIAI_ACK_AFTER_MS', 1200) > 0
+        ? {
+          ack: {
+            afterMs: envNumber('MIAI_ACK_AFTER_MS', 1200),
+            text: process.env['MIAI_ACK_TEXT'] ?? '嗯，我看看。',
+          },
+        }
+        : {}),
+      /**
        * 下行增益。**默认应当是 1.0**：MiMo 的输出已经是满刻度（实测峰值 −0.5 dBFS），
        * 任何 >1 的增益都会把元音峰值压进软限幅 —— ×3 时波峰因数从 14.7 dB 掉到
        * 7.3 dB，听感是"扁、闷、语调怪"。要更响请调手机媒体音量，不要加这里。

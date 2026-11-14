@@ -12,9 +12,9 @@
  * （`synthesize` 是函数，不是 TTS 客户端）。
  */
 import { DialogFsm } from './dialog-fsm.ts';
+import type { Clock, Cancel } from './app/clock.ts';
 import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
-import type { Clock } from './app/clock.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
@@ -52,6 +52,13 @@ export interface TurnRunnerOptions {
   readonly onEvent?: (name: string, fields?: Record<string, unknown>) => void;
   /** 一轮结束（落盘用），无论成功失败都会调用 */
   readonly onTurnFinished: () => void;
+  /**
+   * 长思考回执：从「开始跑」到「首块音频下发」之间，若超过 `afterMs` 还没出声，
+   * 先用旁白通道说一句 `text`（「嗯，我看看。」）。
+   *
+   * 不给就不回执。`afterMs <= 0` 也等于关掉。
+   */
+  readonly ack?: { readonly afterMs: number; readonly text: string };
   readonly log: (line: string) => void;
 }
 
@@ -59,10 +66,19 @@ export interface TurnRunnerOptions {
 export interface TurnResult {
   /** 是否被用户插话中断 */
   readonly interrupted: boolean;
+  /** 模型给的、准备念的全文（被打断时用来算"还剩哪段没说完"） */
+  readonly speech: string;
   /** 下发的字节数 */
   readonly audioBytes: number;
-  /** 音频时长（秒） */
+  /** 整段音频时长（秒） */
   readonly audioSeconds: number;
+  /**
+   * **用户实际听到的**时长（秒）。
+   *
+   * 不等于 `audioSeconds`：回答是先整段合成再等的，用户插话那会儿音频早就
+   * 全发出去了 —— 所以只能按"首块发出去之后过了多久"算。
+   */
+  readonly playedSeconds: number;
   /** TTS 首块耗时（毫秒），-1 表示没拿到音频 */
   readonly firstChunkLatencyMs: number;
   /** agent 耗时（毫秒） */
@@ -76,6 +92,12 @@ export class TurnRunner {
   private speechChain: Promise<void> = Promise.resolve();
   /** 用户在旁白播到一半改主意：停止下发，也别让下一轮排在它后面 */
   private cannedCancelled = false;
+  /** 回执用的定时器（到点前收回音就该取消） */
+  private ackTimer: Cancel | null = null;
+  /** 用户一开口就别再"嗯"了 */
+  private ackCancelled = false;
+  /** 本轮的回答已经开始出声 —— 回执不再有意义 */
+  private replyStarted = false;
 
   constructor(options: TurnRunnerOptions) {
     this.options = options;
@@ -140,7 +162,7 @@ export class TurnRunner {
    *
    * 返回时 `fsm` 已推进到下一状态；调用方据 `fsm.state` 决定是否挂断。
    */
-  async run(text: string, image?: ImageAttachment): Promise<TurnResult | null> {
+  async run(text: string, image?: ImageAttachment, note?: string): Promise<TurnResult | null> {
     const { fsm, agent, downlink } = this.options;
     const ticket = fsm.beginTurn();
     if (!ticket) {
@@ -151,11 +173,18 @@ export class TurnRunner {
     let audioBytes = 0;
     let firstChunkAtMs = 0;
     let agentLatencyMs = 0;
+    let speech = '';
 
     try {
+      this.replyStarted = false;
+      this.ackCancelled = false;
+      this.scheduleAck();
       const agentStartedAt = this.options.clock.now();
-      const reply = await agent.reply(text, image);
+      const reply = await agent.reply(text, image, note);
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
+      // 模型已经回来了：剩下的只是 TTS 首块，那点等待不值得再插一句
+      this.cancelAck();
+      speech = reply.speech;
       this.log(
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `
         + JSON.stringify(reply.text.slice(0, 120)),
@@ -164,7 +193,10 @@ export class TurnRunner {
       // 旁白还没播完就先让路：否则「请按快门」和回答会叠在一起
       await this.speechChain;
 
+      this.replyStarted = true;
+      this.cancelAck();
       const ttsStarted = this.options.clock.now();
+      let firstAudioAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
         if (fsm.isStale(ticket)) {
           interrupted = true;
@@ -172,6 +204,7 @@ export class TurnRunner {
         }
         if (firstChunkAtMs === 0) {
           firstChunkAtMs = this.options.clock.now() - ttsStarted;
+          firstAudioAtMs = this.options.clock.now();
           fsm.audioStarted(ticket);
           this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
           this.options.onEvent?.('tts.first', { ms: firstChunkAtMs });
@@ -204,17 +237,26 @@ export class TurnRunner {
         interrupted = fsm.isStale(ticket);
       }
 
+      // 用户听到的时长按「首块发出之后过了多久」算，不按字节算：
+      // 回答是整段先合成完再等的，插话那会儿音频早就全发出去了。
+      const heardSeconds = firstAudioAtMs < 0
+        ? 0
+        : Math.min(audioSeconds, (this.options.clock.now() - firstAudioAtMs) / 1000);
+
       this.options.onEvent?.('turn.end', {
         interrupted,
         audio_s: Number(audioSeconds.toFixed(2)),
+        heard_s: Number(heardSeconds.toFixed(2)),
         dsh_ms: agentLatencyMs,
         tts_first_ms: firstChunkAtMs === 0 ? -1 : firstChunkAtMs,
       });
 
       return {
         interrupted,
+        speech,
         audioBytes,
         audioSeconds,
+        playedSeconds: heardSeconds,
         firstChunkLatencyMs: firstChunkAtMs === 0 ? -1 : firstChunkAtMs,
         agentLatencyMs,
       };
@@ -224,8 +266,36 @@ export class TurnRunner {
       this.log(`  ✗ 本轮失败: ${(error as Error).message}`);
       return null;
     } finally {
+      this.cancelAck();
       fsm.audioDone(ticket);
       this.options.onTurnFinished();
+    }
+  }
+
+  /**
+   * 排一次「长思考回执」。
+   *
+   * 只在**回答还没开始出声**时才有意义：到点时若已经开口，什么也不做。
+   * 回执走旁白通道（不改状态机），所以用户此时说话不会被当成插话 ——
+   * 而是一开口就把这句回执掐掉（{@link cancelAck}）。
+   */
+  private scheduleAck(): void {
+    const ack = this.options.ack;
+    if (ack === undefined || ack.afterMs <= 0 || ack.text.trim() === '') return;
+    this.ackTimer = this.options.clock.after(ack.afterMs, () => {
+      this.ackTimer = null;
+      if (this.ackCancelled || this.replyStarted) return;
+      this.log(`  回执    ${(ack.afterMs / 1000).toFixed(1)} s 还没出声 → 先说一句「${ack.text}」`);
+      void this.speakCanned(ack.text).catch(() => undefined);
+    });
+  }
+
+  /** 收回执：回答要开始了，或者用户已经开口 */
+  cancelAck(): void {
+    this.ackCancelled = true;
+    if (this.ackTimer !== null) {
+      this.ackTimer();
+      this.ackTimer = null;
     }
   }
 }

@@ -6,10 +6,12 @@
 import assert from 'node:assert/strict';
 
 import { XIAOMI_GLASSES_CAPABILITIES } from '../../devices/xiaomi.ts';
-import { DialogSim } from '../sim/dialog.ts';
+import { DialogSim, type DialogSimOptions } from '../sim/dialog.ts';
 
 export interface DialogScenario {
   readonly name: string;
+  /** 这个场景要用特别的 sim 配置时给（不给自己用默认的） */
+  readonly sim?: Partial<DialogSimOptions>;
   readonly run: (sim: DialogSim) => Promise<void>;
 }
 
@@ -115,6 +117,57 @@ export const DIALOG_SCENARIOS: readonly DialogScenario[] = [
       assert.ok(stopAt > openAt, '播完之后应当关麦');
     },
   },
+  {
+    name: '对话：长思考 → 先给一句回执，再出正式回答',
+    sim: {
+      reply: { latencyMs: 5_000, text: '跑完了，一共三条。' },
+      ack: { afterMs: 1_000, text: '嗯，我看看。' },
+    },
+    async run(sim) {
+      await sim.utterance('去跑三条命令');
+      await sim.until(1_400);
+      // 1.4 s 时 dsh 还没回来：应当已经有一句回执播出去了
+      assert.ok(
+        sim.downlink.sent.some((chunk) => chunk.at >= 1_000 && chunk.at <= 1_400),
+        `1 s 时该有回执音频，实际下发时刻：${JSON.stringify(sim.downlink.sent.map((c) => c.at))}`,
+      );
+      assert.equal(sim.core.phase, 'thinking', '回执照旁白走，不该改动状态机');
+
+      await sim.until(12_000);
+      assert.ok(
+        sim.downlink.sent.some((chunk) => chunk.at >= 5_000),
+        '正式回答应当在 dsh 返回后下发（回执不能把它顶掉）',
+      );
+      assert.equal(sim.core.turn, 1, '一轮就是一问一答，回执不算新的一轮');
+    },
+  },
+  {
+    name: '对话：回答被打断 → 下一轮带上「没说完的那段」',
+    sim: {
+      reply: { text: '这件事我分成三点来说，第一点是先看清楚需求，第二点是确认边界条件。' },
+    },
+    async run(sim) {
+      await sim.utterance('你解释一下');
+      // 播到一半插话（这句约 6 s 音频，2.5 s 处打断：前面两点已经念出来了）
+      await sim.until(2_500);
+      await sim.partial('等等');
+      await sim.until(4_000);
+
+      await sim.utterance('你刚才想说什么');
+      await sim.until(12_000);
+
+      const last = sim.asked.at(-1);
+      assert.ok(last !== undefined, '应当问过 agent');
+      assert.ok(
+        last.note !== undefined && last.note.includes('打断'),
+        `第二轮应当带上被打断的注记，实际：${JSON.stringify(last.note ?? null)}`,
+      );
+      assert.ok(
+        last.note?.includes('第二点') === true,
+        `注记里该有没念出口的部分（第二点），实际：${last.note ?? ''}`,
+      );
+    },
+  },
 ];
 
 /** 找一个比兜底超时更晚的时刻。 */
@@ -126,7 +179,11 @@ function sooner(sim: DialogSim): number {
 export async function runDialogScenarios(): Promise<Array<{ name: string; ok: boolean; error?: string }>> {
   const results: Array<{ name: string; ok: boolean; error?: string }> = [];
   for (const scenario of DIALOG_SCENARIOS) {
-    const sim = new DialogSim({ caps: CAPS, reply: { text: '嗯，看到了。' } });
+    const sim = new DialogSim({
+      caps: CAPS,
+      reply: { text: '嗯，看到了。' },
+      ...scenario.sim,
+    });
     try {
       await scenario.run(sim);
       results.push({ name: scenario.name, ok: true });

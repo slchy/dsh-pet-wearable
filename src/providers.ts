@@ -41,7 +41,11 @@ export interface AgentReplyView {
  */
 export interface AgentProvider {
   readonly name: string;
-  reply(userText: string, image?: AgentImage): Promise<AgentReplyView>;
+  /**
+   * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
+   *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
+   */
+  reply(userText: string, image?: AgentImage, note?: string): Promise<AgentReplyView>;
   /**
    * 可选：agent 在**没有任何一轮**的情况下主动要说的内容（后台任务完成汇报）。
    *

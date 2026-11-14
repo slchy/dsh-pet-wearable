@@ -53,7 +53,6 @@ const VOICE_SYSTEM = `【身份】你是「米馍」，是运行在后端服务�
 哥说「算了 / 别跑了 / 停一下」而你有后台任务还在跑时，真的把它停掉（job_list 查、job_kill 停），
 不要只是嘴上说停了。
 
-哥刚才说：
 `;
 
 /** 兜底：TTS 前再清洗一遍，挡住模型偶尔漏掉的格式。 */
@@ -160,8 +159,11 @@ export class VoiceAgent {
     this.session.reset();
   }
 
-  async reply(asrText: string, image?: ImageAttachment): Promise<AgentReply> {
-    const prompt = VOICE_SYSTEM + asrText;
+  async reply(asrText: string, image?: ImageAttachment, note?: string): Promise<AgentReply> {
+    // 注记放在人设之后、用户话术之前：既改了上下文，又不动 `VOICE_SYSTEM`
+    // 这段前缀（provider 的 prompt cache 是按前缀命中的）。
+    const context = note === undefined ? '' : `\n（系统注记：${note}）\n`;
+    const prompt = `${VOICE_SYSTEM}${context}\n哥刚才说：\n${asrText}`;
     const r = await this.session.ask(prompt, image);
     // 情绪标签在最开头；剥掉它，剩下的才是要念的话
     const { emotion, rest } = parseEmotion(r.text);

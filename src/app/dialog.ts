@@ -26,11 +26,15 @@ import type { Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { TurnTicket } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
+import { interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
 import type { AgentProvider, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
 import type { ImageAttachment } from '../session.ts';
 import type { DownlinkSink } from '../transport.ts';
-import { TurnRunner } from '../turn-runner.ts';
+import { TurnRunner, type TurnResult } from '../turn-runner.ts';
+
+/** 被打断的那半句最多留这么久：再久就是另一段对话了。 */
+const TAIL_TTL_MS = 120_000;
 
 /** 播报时怎么开麦。设备没有 `listen.start` 就不给这个。 */
 export interface AnnounceMic {
@@ -85,6 +89,11 @@ export interface DialogOptions {
   readonly onDownlinkChunk?: (chunk: Buffer) => void;
   /** 时间线事件（进会话档案） */
   readonly onEvent?: (name: string, fields?: Record<string, unknown>) => void;
+  /**
+   * 长思考回执：一句话在 `afterMs` 内还没开始出声，就先用旁白说 `text`。
+   * 不给就不回执。
+   */
+  readonly ack?: { readonly afterMs: number; readonly text: string };
   readonly env: DialogEnv;
   readonly log: (line: string) => void;
 }
@@ -103,6 +112,13 @@ export class DialogRuntime {
   private readonly announceQueue: string[] = [];
   private announcing = false;
   private disposed = false;
+  /**
+   * 上一轮被打断、**没念出口**的那一段（一次性）。
+   *
+   * 只活到下一轮：用户接着问「你刚才想说什么」时，模型得知道自己断在哪。
+   * 顺序反过来（用户没再问）就丢掉 —— 隔了几句话还翻旧账更烦人。
+   */
+  private tail: { readonly text: string; readonly at: number } | null = null;
 
   constructor(options: DialogOptions) {
     this.options = options;
@@ -132,6 +148,7 @@ export class DialogRuntime {
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       ...(options.onDownlinkChunk === undefined ? {} : { onDownlinkChunk: options.onDownlinkChunk }),
       ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
+      ...(options.ack === undefined ? {} : { ack: options.ack }),
       onTurnFinished: () => {
         this.execute(this.core.dispatch({ type: 'turnFinished' }));
         // 本轮结束，后台任务的播报可以接着放
@@ -206,8 +223,12 @@ export class DialogRuntime {
       }
       // 图由 `capture` 那一步拿好并挂在 text/image 里，这里不再自己拍
       this.options.env.onTurnStart?.(text, image !== undefined);
+      const note = this.takeTailNote();
       try {
-        await this.runner.run(text, image);
+        const result = await this.runner.run(text, image, note);
+        if (result !== null && result.interrupted) {
+          this.rememberTail(result);
+        }
       } finally {
         this.options.env.onTurnEnd?.();
       }
@@ -217,6 +238,27 @@ export class DialogRuntime {
       this.queued -= 1;
     });
     return this.serialChain;
+  }
+
+  /** 取走「上一轮被打断的那段」并拼成给模型的注记（一次性）。 */
+  private takeTailNote(): string | undefined {
+    const tail = this.tail;
+    this.tail = null;
+    if (tail === null) return undefined;
+    if (this.options.clock.now() - tail.at > TAIL_TTL_MS) return undefined;
+    this.options.log(`  续话    上一轮被打断，剩 ${[...tail.text].length} 字没说完 → 交给这一轮`);
+    return interruptionNote(tail.text);
+  }
+
+  /** 记下这一轮被打断后**没念出口**的部分。 */
+  private rememberTail(result: TurnResult): void {
+    const rest = remainingSpeech(result.speech, result.playedSeconds);
+    if (rest === '') {
+      this.tail = null;
+      return;
+    }
+    this.tail = { text: rest, at: this.options.clock.now() };
+    this.options.log(`  续话    被打断，剩 ${[...rest].length} 字没说完`);
   }
 
   /**
