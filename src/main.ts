@@ -16,7 +16,7 @@ import { pathToFileURL } from 'node:url';
 
 import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
-import { DEFAULT_HQ_ARM_TIMEOUT_MS, DEFAULT_HQ_SHUTTER_TIMEOUT_MS } from './photo-inbox.ts';
+import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
 import { BASE_STYLE, EMOTIONS } from './emotion.ts';
@@ -32,6 +32,7 @@ import {
 } from './providers.ts';
 import { DshSession } from './session.ts';
 import { runAliyunServer } from './aliyun-session.ts';
+import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
 import { sleep } from './util.ts';
 
@@ -310,6 +311,11 @@ async function main(): Promise<void> {
   const workDir = opt('--work-dir', join(homedir(), 'voice-workspace'));
   /** 冒烟用：把一张本地图片交给 dsh，打印它的描述后退出 */
   const askImage = opt('--ask-image', '');
+  /**
+   * 设备型号。**入参激活**：给了才启用该设备的专属优化，空串走通用路径
+   * （见 `src/devices/`）。`MIAI_DEVICE` 是旧名字，继续认。
+   */
+  const deviceSpec = opt('--device', process.env['PET_DEVICE'] ?? process.env['MIAI_DEVICE'] ?? '');
 
   // ---- 三个可替换件：都能按名字选内置实现，或给一个模块路径
   const sttSpec = opt('--stt', process.env['MIAI_STT'] ?? '');
@@ -334,6 +340,7 @@ async function main(): Promise<void> {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
     console.error('  可替换件: --stt aliyun|noop|canned|<path>  --tts mimo|silent|<path>');
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
+    console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);
     console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
     process.exit(2);
   }
@@ -445,9 +452,13 @@ async function main(): Promise<void> {
       `增益    上行 ${micGain}×（能量门 ${peakDbfs} dBFS，按放大后算）  下行 ${ttsGain}×\n`,
     );
 
+    const device = resolveV1Device(deviceSpec);
+    console.log(`设备     ${device.label}（v1）：${describeCapabilities(device.capabilities)}\n`);
+
     const code = await runAliyunServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
+      device: deviceSpec,
       ffmpegPath: ffmpeg,
       agent,
       stt,
@@ -494,9 +505,13 @@ async function main(): Promise<void> {
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),
       // 高清链路要等手机建 P2P + 设备写相册，20 s 可能不够（`MIAI_PHOTO_TIMEOUT_MS` 可调）
       photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 20_000),
-      // 高清照要人按快门，两段分开计：等手机就绪 / 等用户按下去
-      hqArmTimeoutMs: envNumber('MIAI_HQ_ARM_TIMEOUT_MS', DEFAULT_HQ_ARM_TIMEOUT_MS),
-      hqShutterTimeoutMs: envNumber('MIAI_HQ_SHUTTER_TIMEOUT_MS', DEFAULT_HQ_SHUTTER_TIMEOUT_MS),
+      // 要人动手的拍照只设一个兜底总时长（分段计时归设备）。
+      // 兼容旧的两段变量：给了就相加
+      confirmTimeoutMs: process.env['MIAI_CONFIRM_TIMEOUT_MS'] !== undefined
+        || (process.env['MIAI_HQ_ARM_TIMEOUT_MS'] === undefined
+          && process.env['MIAI_HQ_SHUTTER_TIMEOUT_MS'] === undefined)
+        ? envNumber('MIAI_CONFIRM_TIMEOUT_MS', DEFAULT_CONFIRM_TIMEOUT_MS)
+        : envNumber('MIAI_HQ_ARM_TIMEOUT_MS', 15_000) + envNumber('MIAI_HQ_SHUTTER_TIMEOUT_MS', 25_000),
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
       announceStore,
       tls: loadTls(),

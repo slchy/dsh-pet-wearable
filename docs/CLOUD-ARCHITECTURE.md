@@ -77,9 +77,47 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | `utterance-assembler.ts` | 句子 → 一轮话语：按 Smart Turn 概率或固定窗口判停 | ASR 的句号是**句子**边界，不是**轮次**边界；问号结尾不等于说完了 |
 | `smart-turn.ts` | 常驻 Python 侧车的客户端：`[u32 len][int16 PCM]` 问、`[f64 概率]` 答 | 进程常驻、模型只加载一次；不可用时退回固定窗口 |
 | `vad.ts` | silero-vad v5 封装（可选判停后端） | 输入是 `[1,576]`（512 + 64 点上下文）、值域 `[-1,1]`，阈值 0.4 |
-| `wake-word.ts` · `backchannel.ts` · `hq-intent.ts` | 三条**领域规则**：唤醒词 / 纯应答噪声 / 要看细节的措辞 | 都是"已知的机械事实"，交给模型判断反而更贵更不准 |
+| `wake-word.ts` · `backchannel.ts` · `hq-intent.ts` | 三条**领域规则**：唤醒词 / 纯应答噪声 / 要看细节的措辞 | 唤醒词词表（`ignorePhrases`）与「要不要自动拍细节」（`detail` 意图）都来自设备能力（见 §2.3）；v1 基线下前者空表、后者不启用，三条规则都只是"已知的机械事实"，交给模型判断反而更贵更不准 |
 
-### 2.3 识别与合成（可替换实现）
+### 2.3 设备原语（`src/devices/`）
+
+原语只收插件**两个环真正消费**的东西：对话环（上行音频 → 判停 → agent → 下行音频 → 插话即停）
+和宠物环（佩戴 / 电量 / 招呼 → 时机 → 主动开口与「看你所看」→ 开麦听回应）。
+设备怎么做到（P2P、相册、快门、蓝牙会话、显示屏、更多手势）归手机端或用户自己的适配器。
+回声消除不是原语：主流智能眼镜都在端侧做 AEC。
+
+| 方向 | 内容 |
+|---|---|
+| 下行操作 `DeviceCall` | `audio.stop` `listen.start{maxMs}` `listen.stop` `capture{id,intent,deadlineMs}` `capture.cancel{id}` `session.end` |
+| 上行事件 `DeviceEvent` | `presence` `power` `summon` `played` `capture.waiting{id,say?}` `capture.failed{id,code,say?}` |
+| 能力 `DeviceCapabilities` | `audioIn`、各拍照意图的 `needsUser`、五个上报 / 开麦开关、`ignorePhrases`；设备在 `Hello` 里自报 |
+
+拍照按**用途**分意图：`glance`（看一眼）/ `detail`（看清细节），不按分辨率分。
+每个意图只带一个 `needsUser`：要不要用户在设备上动手。它决定兜底时长，也决定
+能不能**主动**拍 —— 要人按快门的档不能用于主动拍照。失败码 5 个
+（`unsupported` `busy` `timeout` `cancelled` `failed`）；只有设备知道的原因
+（没按快门、相册通道没建起来）放在 `say` 里，插件照念，不必认识每台设备的失败原因。
+
+| 文件 | 职责 |
+|---|---|
+| `primitives.ts` | 原语类型、`captureMode()` / `canCaptureUnprompted()` / `supportsCall()`、`parseCapabilities()`（`Hello.capabilities`） |
+| `wire-v1.ts` | v1 垫片：`V1_BASELINE` + `V1Session`（原语 ↔ 控制串 / 状态帧，并判「这帧图属于哪个请求」） |
+| `xiaomi.ts` | 小米 v1 手机的默认能力与代说的话（真机验证） |
+| `index.ts` | 出口；`resolveV1Device()`：v1 型号提示 → 能力（空 / 未知回落 v1 基线，**不报错**） |
+
+判定核只读能力，不认型号：「能不能自动拍细节」= `captureMode(caps, 'detail') !== null`，
+要不要等人 = 它的 `needsUser`。执行层每次下发前用 `supportsCall()` 挡一次，
+序列化交给 `V1Session.encode()`；`Control` / `Status` 的字面量不出现在业务代码里。
+上行编码来自 `caps.audioIn`。
+
+加一台设备 = 设备侧在 `Hello` 里自报能力（雷鸟 X3 Pro 的写法见
+[`devices/RAYNEO-X3-PRO.md`](devices/RAYNEO-X3-PRO.md)）；插件不加文件，**协议动词不增加**。
+`--device` 型号提示只为不会自报的 v1 手机存在，手机端改说新协议后随 `wire-v1.ts` / `xiaomi.ts` 一起删。
+
+> 现状：`Hello.capabilities` 已能解析，但还没接进连接 —— 连接仍按 `--device` 走 v1 垫片；
+> v2 帧的序列化尚未实现。
+
+### 2.4 识别与合成（可替换实现）
 
 | 文件 | 职责 | 约束 |
 |---|---|---|
@@ -88,7 +126,7 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | `agent.ts` | `VoiceAgent`：人设提示词 → 模型 → 剥情绪标签 → 清洗成可朗读文本 → 播报出口 | 清洗是必须的：TTS 会把 markdown 原样念出来。`cleanForSpeech` 还负责两类**看不见**的脏东西：零宽字符及其 HTML 实体（`&#8203;` 字面送进去会被念成符号）、以及两个中日韩字符之间的空格（那不是停顿标记，只会让合成器塞一个假停顿；英文 / 数字 / 代码段两侧的空格有语义，不动） |
 | `session.ts` | `DshSession`：把文本交给 agent 进程（NDJSON），续会话、取 usage、接住**自发轮次** | 单轮等待上限 180 s；超出必须抛错**并说出来**，不许静默 |
 
-### 2.4 决策层（纯逻辑）
+### 2.5 决策层（纯逻辑）
 
 | 文件 | 职责 | 关键导出 |
 |---|---|---|
@@ -97,21 +135,22 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | `emotion.ts` | 情绪标签 → 规范化 key → TTS 风格串 | `EMOTION_LABELS` 是单一事实来源 |
 | `providers.ts` | `SttProvider` / `TtsProvider` / `AgentProvider` 三个契约 + 测试替身 | `cannedStt` / `silentTts` / `echoAgent` |
 
-`SessionCore` 的 16 种输入事件产出 9 种效果，效果由编排层执行：
+`SessionCore` 的输入事件产出 **6 种效果**，效果由编排层执行：
 
 ```text
 效果            含义
 assemble        把文本交给一轮（含旁听反馈 / 唤醒词过滤之后）
 turn            开跑一轮（携带票据）
-awaitShot       进"等快门"相位并播一句旁白
-cancel_shot     取消等快门
-stop            立刻停播（打断）并让本轮作废
-stop_capture    下发"停采集"（Aivs id=5 六字段全 0）
+capture         要一张图（CaptureRequest: id + intent + needsUser），进"等图"相位
+call            一个设备操作（audio.stop / listen.stop / capture.cancel …）
 end             说完了就挂断
 drop            丢弃这句话（纯噪声）
 ```
 
-### 2.5 执行层
+判定核只产出 `DeviceCall`；`stop` / `stop_capture` / `take_photo_hq` 这些
+**v1 字符串只存在于 `wire-v1.ts` 的翻译里**，业务层不再直接拼控制串。
+
+### 2.6 执行层
 
 | 文件 | 职责 | 关键点 |
 |---|---|---|
@@ -119,7 +158,7 @@ drop            丢弃这句话（纯噪声）
 | `photo-inbox.ts` | 「请设备拍一张」变成可等待 / 可超时 / 可取消的请求（见 §4.3） | 两种使用者：工具口等人取图；设备自己按快门时没人等就转成一轮识图 |
 | `spontaneous.ts` | 判定**没人催的轮次**（后台作业结算后自己开的一轮） | 有等待者的轮次不算；只认 `running → idle` 且没有 prompt 在飞 |
 
-### 2.6 旁路与运维
+### 2.7 旁路与运维
 
 | 文件 | 职责 | 语义 |
 |---|---|---|
@@ -213,20 +252,23 @@ closed ──峰值越门──▶ open（推流 + 预卷补发 + hold 计时）
 ### 4.3 拍照（`PhotoInbox`）
 
 ```text
-                request('spp')                      deliver(image) / 超时
-   idle ─────────────────────▶ WAITING ◀──────────────────────▶ settle
-                                  ▲
-        request('hq') ──发 take_photo_hq──▶ ARMING ──hq_armed──┘
-                                            │
-                                    15 s 没就绪 / hq_failed
-                                            ▼
-                                         fail(no_arm | reason)
+request({id, intent, needsUser}) ── capture ──▶ WAIT ◀── deliver(id, jpeg)：id 对上就交付
+                                                  │
+        capture.waiting{say} ── 照念提示（只一次） ┤
+        capture.failed{code,say} ── 立刻收尾 ─────┤
+        cancel() ── needsUser 时下发 capture.cancel ┤
+        兜底超时（20 s / needsUser 40 s）── timeout ┘
 ```
 
-两段超时的由来：高清照多了「人」这一环 —— 程序化快门**不写相册**，只能请用户按一下。
-于是「等手机建好 P2P 并打开相册」和「等用户按下快门」各有各的失败语义
-（`no_arm` vs `no_shutter`），手机自己先放弃并上报 `hq_failed` 时云端**立刻返回**，
-不必干等到自己的总超时。
+收件箱只认原语和图的归属 id。分段计时（等设备建好通道 / 等用户按快门）是**设备侧**的事：
+设备自己先超时并在 `capture.failed.say` 里说原因，插件只有一个兜底总时长。
+**分叉点是意图上的 `needsUser`，不是第二个动词**：小米的 `detail` 为 true，
+自报能力的雷鸟为 false；执行层看到的都只是一次 `capture`。
+
+图属于哪个请求由线协议层判。v1 没有请求 id，`V1Session.image()` 按规则补：
+`hq_image` 公告之后那一帧归 `detail`；在途的 `glance` 认领第一帧；等快门期间
+相机顺手回的低清图不属于任何请求（收件箱吃掉）；取消 `detail` 后迟到的那一帧
+归已作废的 id（同样吃掉，不回落成识图轮）。
 
 ---
 

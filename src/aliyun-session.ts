@@ -17,14 +17,29 @@
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
 import type { AnnounceStore } from './announce-store.ts';
+import {
+  captureMode,
+  describeCapabilities,
+  resolveV1Device,
+  supportsCall,
+  V1Session,
+  type CaptureIntent,
+  type DeviceCall,
+  type DeviceCapabilities,
+  type V1Device,
+} from './devices/index.ts';
 import { UpstreamFrameType } from './frame.ts';
-import { DEFAULT_HQ_ARM_TIMEOUT_MS, DEFAULT_HQ_SHUTTER_TIMEOUT_MS, PhotoInbox } from './photo-inbox.ts';
+import {
+  DEFAULT_CONFIRM_TIMEOUT_MS,
+  PhotoInbox,
+  type CaptureRequest,
+  type PhotoOutcome,
+} from './photo-inbox.ts';
 import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './providers.ts';
 import { SessionCore, type CoreEffect } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { SmartTurn } from './smart-turn.ts';
 import { startToolControl, type ToolControl } from './tool-control.ts';
-import type { PhotoFailReason } from './photo-inbox.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
 import { UplinkPipeline } from './uplink-pipeline.ts';
@@ -51,6 +66,13 @@ const ASSEMBLER_RECENT_SECONDS = 8;
 export interface AliyunSessionOptions {
   /** 监听端口 */
   readonly port: number;
+  /**
+   * v1 手机的型号提示（见 `src/devices/`）。
+   *
+   * v1 手机不在 `Hello` 里自报能力，这个入参给它补默认能力；空串 / 未知型号 = v1 基线。
+   * 判定核只读能力，不认型号字符串。
+   */
+  readonly device?: string;
   /**
    * 监听地址。缺省 `127.0.0.1` —— 本地开发默认不暴露；
    * 上公网时由部署方显式给 `0.0.0.0`（或具体网卡地址）。
@@ -96,16 +118,15 @@ export interface AliyunSessionOptions {
   readonly photoDir: string;
   /** 控制口端口与超时 */
   readonly controlPort: number;
-  /** `spp` 低清照的总超时 */
+  /** 不用人动手的拍照（`needsUser=false`）的兜底总时长 */
   readonly photoTimeoutMs: number;
   /**
-   * `hq` 高清照的两段超时（默认 15 s / 25 s）。
+   * 要人在设备上动手的拍照（`needsUser=true`）的兜底总时长（默认 40 s）。
    *
-   * 高清照需要用户按快门（程序化快门不写相册），所以「等手机就绪」和
-   * 「等用户按下去」必须分开计 —— 见 `photo-inbox.ts` 的说明。
+   * 分段计时（等设备就绪 / 等人按快门）是设备侧的事，设备会先超时并上报原因；
+   * 这里只是「设备也没消息」的兜底 —— 见 `photo-inbox.ts`。
    */
-  readonly hqArmTimeoutMs?: number;
-  readonly hqShutterTimeoutMs?: number;
+  readonly confirmTimeoutMs?: number;
   /** 默认的识图提问 */
   readonly imageQuestion: string;
   /** 离线时的后台汇报队列（null / 不给 = 不持久化） */
@@ -162,6 +183,12 @@ export async function runAliyunServer(options: AliyunSessionOptions): Promise<nu
 class AliyunConnection {
   private readonly conn: Connection;
   private readonly options: AliyunSessionOptions;
+  private readonly device: V1Device;
+  private readonly caps: DeviceCapabilities;
+  /** v1 线协议垫片：原语 ↔ 控制串 / 状态帧，图像帧归属 */
+  private readonly v1: V1Session;
+  /** 上行编码由能力集决定；档案与解码都要它 */
+  private readonly uplinkCodec: 'msbc' | 'pcm16';
 
   private readonly core: SessionCore;
   private readonly uplink: UplinkPipeline;
@@ -177,15 +204,17 @@ class AliyunConnection {
   /** 原始档案（`MIAI_ARCHIVE_DIR` 为空时是 null） */
   private readonly archive: SessionArchive | null;
 
-  /** 收到 `hq_image` 公告：下一个 Image 帧算高清图 */
-  private expectHqImage = false;
-
   constructor(conn: Connection, options: AliyunSessionOptions) {
     this.conn = conn;
     this.options = options;
 
     const log = (line: string): void => { console.log(line); };
-    this.core = new SessionCore({ imageQuestion: options.imageQuestion, log });
+    // 型号提示只在这里被解析一次；往下全是能力
+    this.device = resolveV1Device(options.device);
+    this.caps = this.device.capabilities;
+    this.v1 = new V1Session(this.device.phrases);
+    this.uplinkCodec = this.caps.audioIn;
+    this.core = new SessionCore({ imageQuestion: options.imageQuestion, log, capabilities: this.caps });
 
     // 档案先开：后面每一段音频/每个事件都要往里写
     this.archive = SessionArchive.open(
@@ -204,6 +233,7 @@ class AliyunConnection {
         gateHoldMs: options.gate.holdMs,
         gatePrerollMs: options.gate.prerollMs,
         uplinkRate: UPSTREAM_SAMPLE_RATE,
+        uplinkCodec: this.uplinkCodec,
         downlinkRate: options.tts.sampleRate,
         stt: options.stt.name,
         tts: options.tts.name,
@@ -248,17 +278,15 @@ class AliyunConnection {
     this.photos = new PhotoInbox({
       dir: options.photoDir,
       timeoutMs: options.photoTimeoutMs,
-      armTimeoutMs: options.hqArmTimeoutMs ?? DEFAULT_HQ_ARM_TIMEOUT_MS,
-      shutterTimeoutMs: options.hqShutterTimeoutMs ?? DEFAULT_HQ_SHUTTER_TIMEOUT_MS,
+      confirmTimeoutMs: options.confirmTimeoutMs ?? DEFAULT_CONFIRM_TIMEOUT_MS,
       log,
-      sendTakePhoto: (kind) => {
-        this.sendControl(kind === 'hq' ? 'take_photo_hq' : 'take_photo');
-      },
-      sendCancel: () => { this.sendControl('hq_cancel'); },
+      send: (call) => this.sendCall(call),
     });
 
     this.uplink = new UplinkPipeline({
       ffmpegPath: options.ffmpegPath,
+      // 上行编码由能力决定：v1 是 mSBC，自报 pcm16 的设备直接进增益/能量门
+      codec: this.uplinkCodec,
       sampleRate: UPSTREAM_SAMPLE_RATE,
       gate: options.gate,
       gain: options.micGain,
@@ -303,6 +331,7 @@ class AliyunConnection {
 
   start(): void {
     console.log(`已连接 ${this.conn.remote}\n`);
+    console.log(`  设备    ${this.device.label}（v1）：${describeCapabilities(this.caps)}`);
 
     // 后台任务完成后的播报落在这条连接上
     this.options.agent.setAnnouncer?.((speech) => { this.onAnnounce(speech); });
@@ -324,16 +353,16 @@ class AliyunConnection {
       onClose: () => { this.onClose(); },
     });
 
+    const detail = captureMode(this.caps, 'detail');
     this.control = startToolControl({
       port: this.options.controlPort,
       photoTimeoutMs: this.options.photoTimeoutMs,
-      // 高清要等手机建 P2P 再等用户按快门，20 s 远远不够
-      hqTimeoutMs: (this.options.hqArmTimeoutMs ?? DEFAULT_HQ_ARM_TIMEOUT_MS)
-        + (this.options.hqShutterTimeoutMs ?? DEFAULT_HQ_SHUTTER_TIMEOUT_MS)
-        + 5_000,
+      // HTTP 超时比收件箱的兜底再宽 5 s：让设备上报的失败原因先回来
+      hqTimeoutMs: detail === null ? undefined : this.photos.timeoutFor(detail.needsUser) + 5_000,
       handlers: {
-        takePhoto: () => this.photos.request('spp'),
-        takePhotoHq: () => this.photos.request('hq'),
+        takePhoto: () => this.requestToolCapture('glance'),
+        // 没有 `detail` 意图时不传 `takePhotoHq`：`tool-control` 会回落到 `takePhoto`
+        takePhotoHq: detail === null ? undefined : () => this.requestToolCapture('detail'),
         endSession: () => { this.execute(this.core.dispatch({ type: 'endRequested' })); },
         say: (text) => {
           // 调试口：和「用户说完一句」走同一条路，方便没有麦克风时联调
@@ -350,15 +379,16 @@ class AliyunConnection {
   private onFrame(type: number, payload: Buffer): void {
     switch (type) {
       case UpstreamFrameType.Audio:
-        this.archive?.sbc(payload);
+        // `uplink.sbc` 只存压缩帧；PCM 上行由 pipeline 的 onRawPcm 写 `uplink.pcm`
+        if (this.uplinkCodec === 'msbc') {
+          this.archive?.sbc(payload);
+        }
         this.uplink.push(payload);
         return;
       case UpstreamFrameType.Image: {
-        // 高清图会在 `hq_image` 公告之后到来；没有公告的就是 SPP 低清直出
-        const kind = this.expectHqImage ? 'hq' : 'spp';
-        this.expectHqImage = false;
-        // 有拍照请求在等就交付；否则当成「看一眼」，起一轮识图
-        if (!this.photos.deliver(kind, payload)) {
+        // 图属于哪个请求由 v1 垫片判（`hq_image` 公告 / 在途的 glance）；
+        // 没人认领就是「看一眼」，起一轮识图
+        if (!this.photos.deliver(this.v1.image(), payload)) {
           this.execute(this.core.dispatch({ type: 'image', jpeg: payload }));
         }
         return;
@@ -375,42 +405,34 @@ class AliyunConnection {
   }
 
   /**
-   * 手机上报的状态事件（高清照流程）。
+   * 设备上报的状态事件。
    *
-   * 以前没有这条通道：手机 30 s 后早就放弃了，云端却要自己干等到总超时才知道
-   * 「用户没按快门」。现在两端各自说得清楚。
+   * v1 的 `hq_armed` / `hq_image` / `hq_failed` 由垫片翻译成原语事件；
+   * 收件箱只认 `DeviceEvent`。
    */
   private onStatus(payload: Buffer): void {
-    let event: Record<string, unknown>;
+    let json: Record<string, unknown>;
     try {
-      event = JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
+      json = JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
     } catch {
       console.error(`  ✗ 状态帧不是合法 JSON：${payload.toString('utf8').slice(0, 120)}`);
       return;
     }
-    const name = typeof event['ev'] === 'string' ? event['ev'] : '';
-    this.archive?.event('status.recv', { name, raw: JSON.stringify(event).slice(0, 200) });
-    switch (name) {
-      case 'hq_armed': {
-        const fresh = event['fresh'] === true || event['fresh'] === 'true';
-        const wantPrompt = this.photos.armed(fresh);
-        if (wantPrompt) {
-          // 手机已经连上相册，现在才轮到人干活 —— 这句旁白就是让他去按快门
-          void this.runner.speakCanned('好，请按一下眼镜上的快门，我等着。');
-        }
-        return;
+    const name = typeof json['ev'] === 'string' ? json['ev'] : '';
+    this.archive?.event('status.recv', { name, raw: JSON.stringify(json).slice(0, 200) });
+
+    // v1 的状态帧没有请求 id：垫片按它记着的在途请求补上
+    const result = this.v1.status(json);
+    if (!result.known) {
+      console.log(`  ✗ 未知状态事件 ${JSON.stringify(name)}，已忽略`);
+      return;
+    }
+    if (result.event !== null) {
+      const say = this.photos.onEvent(result.event);
+      if (say !== null) {
+        // 设备已就绪，现在轮到人动手 —— 照念设备给的提示
+        void this.runner.speakCanned(say);
       }
-      case 'hq_image':
-        // 下一个 Image 帧属于高清流程
-        this.expectHqImage = true;
-        return;
-      case 'hq_failed': {
-        const reason = typeof event['reason'] === 'string' ? event['reason'] : 'timeout';
-        this.photos.failed(reason as PhotoFailReason);
-        return;
-      }
-      default:
-        console.log(`  ✗ 未知状态事件 ${JSON.stringify(name)}，已忽略`);
     }
   }
 
@@ -424,18 +446,16 @@ class AliyunConnection {
         case 'turn':
           this.enqueueTurn(effect.text, effect.image, effect.ticket);
           break;
-        case 'awaitShot':
-          this.enqueueShot(effect.text, effect.ticket);
+        case 'capture':
+          this.enqueueCapture(effect.request, effect.ticket);
           break;
-        case 'cancel_shot':
-          this.runner.cancelCanned();
-          this.photos.cancel('用户改主意或收尾');
-          break;
-        case 'stop':
-          this.sendControl('stop');
-          break;
-        case 'stop_capture':
-          this.sendControl('stop_capture');
+        case 'call':
+          if (effect.call.op === 'capture.cancel') {
+            this.runner.cancelCanned();
+            this.photos.cancel('用户改主意或收尾');
+          } else {
+            this.sendCall(effect.call);
+          }
           break;
         case 'end':
           this.conn.end();
@@ -446,10 +466,52 @@ class AliyunConnection {
     }
   }
 
+  /**
+   * 把一次 `DeviceCall` 真正下发出去。
+   *
+   * - 能力先挡：设备没声明的操作不发（`supportsCall`）
+   * - 序列化目前只有 v1 垫片；v1 表达不了的（如 `listen.start`）明确记日志跳过
+   */
+  private sendCall(call: DeviceCall): boolean {
+    if (!supportsCall(this.caps, call)) {
+      this.archive?.event('ctl.skip', { op: call.op, why: 'unsupported' });
+      console.log(`  控制    ✗ 设备未声明 ${call.op}，已跳过`);
+      return false;
+    }
+    const text = this.v1.encode(call);
+    if (text === null) {
+      this.archive?.event('ctl.skip', { op: call.op, why: 'v1-cannot-express' });
+      console.log(`  控制    ✗ v1 无法表达 ${call.op}，已跳过`);
+      return false;
+    }
+    this.sendControl(text);
+    return true;
+  }
+
   /** 下发控制串并记进档案：每次下发都能在时间线上对到当时的音频位置 */
   private sendControl(text: string): void {
     this.archive?.event('ctl.send', { text });
     this.conn.sendControl(text);
+  }
+
+  /** 工具口拍照用的序号，保证 `id` 在一条连接内唯一 */
+  private toolSeq = 0;
+
+  /** 工具口的拍照请求：要的意图没有就退到另一档。 */
+  private async requestToolCapture(want: CaptureIntent): Promise<PhotoOutcome> {
+    const other: CaptureIntent = want === 'glance' ? 'detail' : 'glance';
+    const intent = captureMode(this.caps, want) !== null ? want : other;
+    const mode = captureMode(this.caps, intent);
+    if (mode === null) {
+      return { ok: false, failure: { code: 'unsupported' } };
+    }
+    this.toolSeq += 1;
+    const request: CaptureRequest = { id: `tool-${this.toolSeq}`, intent, needsUser: mode.needsUser };
+    try {
+      return await this.photos.request(request);
+    } finally {
+      this.v1.forget(request.id);
+    }
   }
 
   /** 后台任务完成后的播报排队：用户正在说/正在听的时候不插嘴 */
@@ -516,7 +578,7 @@ class AliyunConnection {
     console.log(`  … ${text}`);
     this.archive?.event('asr.partial', { text });
     const effects = this.core.dispatch({ type: 'partial', text });
-    if (effects.some((effect) => effect.type === 'stop')) {
+    if (effects.some((effect) => effect.type === 'call' && effect.call.op === 'audio.stop')) {
       console.log('  打断    听到识别结果 → 停止播放，已排队的轮次作废');
     }
     this.execute(effects);
@@ -556,7 +618,7 @@ class AliyunConnection {
         return;
       }
       this.archive?.event('turn.start', { text_len: text.length, image: image !== undefined });
-      // 高清图由 `awaitShot` 那一步拿好并挂在 text/image 里，这里不再自己拍
+      // 图由 `capture` 那一步拿好并挂在 text/image 里，这里不再自己拍
       return this.runner.run(text, image).then(() => undefined);
     }).catch((error: Error) => {
       console.error(`  ✗ 队列任务失败（不影响后续）: ${error.message}`);
@@ -564,22 +626,23 @@ class AliyunConnection {
   }
 
   /**
-   * 去要一张高清照，拿到结果再交给状态机。
+   * 执行一次 `capture`，拿到结果再交给状态机。
    *
-   * 走串行队列：等图的这几十秒里不能开别的一轮（用户改主意时会先 `cancel_shot`
-   * 让这里立刻返回，所以不会把后面的句子卡住）。
+   * 走串行队列：等图的这几十秒里不能开别的一轮（用户改主意时会先下发
+   * `capture.cancel` 让这里立刻返回，所以不会把后面的句子卡住）。
    */
-  private enqueueShot(text: string, ticket: TurnTicket): void {
+  private enqueueCapture(request: CaptureRequest, ticket: TurnTicket): void {
     this.serialChain = this.serialChain.then(async () => {
       if (this.core.fsm.isStale(ticket)) {
         console.log('  （丢弃：拍照请求已过时）');
         return;
       }
-      const outcome = await this.photos.request('hq');
+      const outcome = await this.photos.request(request);
+      this.v1.forget(request.id);
       this.execute(this.core.dispatch(
         outcome.ok
           ? { type: 'shotResult', ok: true, jpeg: outcome.jpeg }
-          : { type: 'shotResult', ok: false, reason: outcome.reason },
+          : { type: 'shotResult', ok: false, failure: outcome.failure },
       ));
     }).catch((error: Error) => {
       console.error(`  ✗ 拍照任务失败（不影响后续）: ${error.message}`);

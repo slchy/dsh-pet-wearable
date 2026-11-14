@@ -1,82 +1,66 @@
 /**
- * 拍照收件箱：把「请设备拍一张」变成一次可等待、可超时、可取消的请求。
+ * 拍照收件箱：把「请设备拍一张」变成一次可等待、可超时、可取消的 `capture` 调用。
  *
- * 两类使用者：
- * - 工具口 `POST /take_photo` / `POST /take_photo_hq`：等图，返回 {@link PhotoOutcome}
- * - 设备自己按快门（SPP 低清直出）：没人等就落到 {@link deliver} 返回 false，
- *   由调用方当成一轮识图
+ * 只认原语（`DeviceCall` / `DeviceEvent` / 带 id 的图像帧）。图属于哪个请求
+ * 由线协议层决定（v1 靠 `hq_image` 公告，新协议直接带 id），这里只按 id 认领。
  *
- * <h2>为什么要分两段超时</h2>
- *
- * 高清照多了「人」这一环：程序化快门不写相册（`EXPERIMENTS.md §38.5`），只能请用户
- * 按一下。于是时间分成两段，各有各的失败语义：
+ * <h2>流程</h2>
  *
  * ```text
- * request('hq') ──发 take_photo_hq──▶ ARMING（等 hq_armed，15 s）
- *   hq_armed ─────────────────────▶ WAITING（等用户按快门，25 s）
- *   hq_failed / 超时 ──────────────▶ 立刻失败，别让云端干等到自己的总超时
+ * needsUser=false ──发 capture──▶ 等图（timeoutMs）
+ * needsUser=true  ──发 capture──▶ 等图（confirmTimeoutMs）
+ *   capture.waiting ────────────▶ 照念设备给的提示（只念一次）
+ *   capture.failed ─────────────▶ 立刻收尾，不让调用方干等到超时
  * ```
  *
- * 手机自己在 20 s 就放弃并上报 `no_shutter`，这边的 25 s 只是「手机也没消息」的兜底。
+ * 分段计时（等设备就绪 / 等人按快门）是设备侧的事：设备自己会先超时并上报原因，
+ * 插件这里只有一个兜底总时长。
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-export type PhotoKind = 'spp' | 'hq';
-
-/** 失败原因。`cancelled` 表示用户自己取消了，调用方不该再说话。 */
-export type PhotoFailReason =
-  | 'busy'
-  | 'no_arm'
-  | 'no_shutter'
-  | 'p2p'
-  | 'join'
-  | 'connect'
-  | 'arm'
-  | 'download'
-  | 'decode'
-  | 'send'
-  | 'cancelled'
-  | 'timeout';
+import type { CaptureFailure, CaptureIntent, DeviceCall, DeviceEvent } from './devices/primitives.ts';
 
 export type PhotoOutcome =
   | { readonly ok: true; readonly jpeg: Buffer }
-  | { readonly ok: false; readonly reason: PhotoFailReason };
+  | { readonly ok: false; readonly failure: CaptureFailure };
 
+export interface CaptureRequest {
+  /** 关联 id；取消、事件、图像帧都按它匹配 */
+  readonly id: string;
+  readonly intent: CaptureIntent;
+  /** 这一档要不要用户在设备上动手 —— 决定兜底时长与要不要下发取消 */
+  readonly needsUser: boolean;
+}
+
+/** 不用人动手时的兜底总时长（低清直出 1–3 s 就有） */
+export const DEFAULT_CAPTURE_TIMEOUT_MS = 20_000;
 /**
- * 高清照两段超时的**默认值**（毫秒），单一来源。
+ * 要人动手时的兜底总时长。
  *
- * - 手机侧建组+入组+连相册实测 5.4 s，留三倍余量
- * - 就绪后等用户按快门：手机自己 20 s 就放弃，这里留 5 s 兜底
- *
- * `main.ts` 读环境变量时用它当默认值，`aliyun-session.ts` 兜底时也用它 ——
- * 以前这两处各写一个 `15_000` / `25_000`，改一个就会不一致。
+ * 小米实测：建组 + 入组 + 连相册 5.4 s，等按快门手机自己 20 s 放弃并上报；
+ * 正常情况下永远是设备的原因先到，这里只是「设备也没消息」的兜底。
  */
-export const DEFAULT_HQ_ARM_TIMEOUT_MS = 15_000;
-export const DEFAULT_HQ_SHUTTER_TIMEOUT_MS = 25_000;
+export const DEFAULT_CONFIRM_TIMEOUT_MS = 40_000;
 
 export interface PhotoInboxOptions {
   /** 落盘目录；空串不落盘（默认） */
   readonly dir: string;
-  /** `spp` 的总超时（低清直出，1–3 s 就有） */
+  /** 不用人动手时的兜底总时长 */
   readonly timeoutMs: number;
-  /** `hq`：发指令到手机回报「相册已通」的上限（实测建组+入组+连接约 5.4 s） */
-  readonly armTimeoutMs: number;
-  /** `hq`：就绪之后等用户按快门的上限（手机侧 20 s 放弃，这边留 5 s 余量） */
-  readonly shutterTimeoutMs: number;
+  /** 要人动手时的兜底总时长 */
+  readonly confirmTimeoutMs: number;
   readonly log: (line: string) => void;
-  /** 真正下发 `take_photo` / `take_photo_hq` 的地方（连接层动作） */
-  readonly sendTakePhoto: (kind: PhotoKind) => void;
-  /** 下发 `hq_cancel`：用户改主意了，别继续开着 P2P 等 */
-  readonly sendCancel?: () => void;
+  /** 下发一次操作。返回 false 表示设备 / 协议表达不了 */
+  readonly send: (call: DeviceCall) => boolean;
 }
 
 interface Waiter {
-  readonly kind: PhotoKind;
+  readonly request: CaptureRequest;
   resolve: (outcome: PhotoOutcome) => void;
   timer: NodeJS.Timeout;
-  /** `hq` 已经回报过就绪（第一段超时已换成第二段） */
-  armed: boolean;
+  /** 设备的提示已经念过 */
+  prompted: boolean;
 }
 
 export class PhotoInbox {
@@ -91,128 +75,133 @@ export class PhotoInbox {
     return this.waiter !== null;
   }
 
-  /** 正在等哪一类图；没人等返回 null */
-  get waitingKind(): PhotoKind | null {
-    return this.waiter?.kind ?? null;
+  /** 正在等哪个请求；没人等返回 null */
+  get waitingId(): string | null {
+    return this.waiter?.request.id ?? null;
+  }
+
+  /** 这类请求的兜底总时长（给工具口的 HTTP 超时对齐用） */
+  timeoutFor(needsUser: boolean): number {
+    return needsUser ? this.options.confirmTimeoutMs : this.options.timeoutMs;
   }
 
   /**
    * 等一张图。
    *
    * 已经有请求在等时立刻返回 `busy`（不排队，避免两次请求抢一张图）。
-   *
-   * @param kind 走哪条采集路径；`hq` 要手机开一次 P2P 拉原图，且需要用户按快门
    */
-  request(kind: PhotoKind = 'spp'): Promise<PhotoOutcome> {
-    if (this.waiter) {
+  request(request: CaptureRequest): Promise<PhotoOutcome> {
+    if (this.waiter !== null) {
       this.options.log('  拍照    ⚠ 已有请求在等图，本次拒绝（busy）');
-      return Promise.resolve({ ok: false, reason: 'busy' });
+      return Promise.resolve({ ok: false, failure: { code: 'busy' } });
     }
-    this.options.sendTakePhoto(kind);
-    this.options.log(
-      kind === 'hq'
-        ? '  拍照    已下发高清指令（P2P 拉原图），等手机回报就绪…'
-        : '  拍照    已下发指令（spp），等设备回图…',
-    );
 
+    const deadlineMs = this.timeoutFor(request.needsUser);
     return new Promise<PhotoOutcome>((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.waiter?.timer !== timer) {
-          return;
-        }
-        const waiting = this.waiter;
-        this.waiter = null;
-        const reason: PhotoFailReason = waiting.kind === 'hq'
-          ? (waiting.armed ? 'no_shutter' : 'no_arm')
-          : 'timeout';
-        this.options.log(`  拍照    ✗ ${reason}（本地超时）`);
-        resolve({ ok: false, reason });
-      }, kind === 'hq' ? this.options.armTimeoutMs : this.options.timeoutMs);
+      const timer = setTimeout(() => { this.expire(); }, deadlineMs);
+      this.waiter = { request, resolve, timer, prompted: false };
 
-      this.waiter = { kind, resolve, timer, armed: kind !== 'hq' };
+      const sent = this.options.send({
+        op: 'capture',
+        id: request.id,
+        intent: request.intent,
+        deadlineMs,
+      });
+      if (!sent) {
+        this.settle({ ok: false, failure: { code: 'unsupported' } });
+        return;
+      }
+      this.options.log(
+        `  拍照    已下发 ${request.intent}`
+        + (request.needsUser ? '（需要用户在设备上动手）' : '（直接拍，等图）'),
+      );
     });
   }
 
   /**
-   * 手机回报「P2P 与相册都通了」。
+   * 设备的拍照事件。
    *
-   * @param fresh 相机里此刻**已经**有一张基线外的新图（用户提前按了快门）
-   * @returns 是否有人正在等高清图 —— 调用方据此决定要不要播「请按快门」
+   * @returns 需要念给用户的一句提示（只在第一次 `capture.waiting` 时给）；否则 `null`
    */
-  armed(fresh: boolean): boolean {
+  onEvent(event: DeviceEvent): string | null {
     const waiter = this.waiter;
-    if (!waiter || waiter.kind !== 'hq') {
-      this.options.log(`  拍照    （无人等待，忽略 hq_armed fresh=${fresh}）`);
-      return false;
+    if (waiter === null) {
+      return null;
     }
-    if (!waiter.armed) {
-      clearTimeout(waiter.timer);
-      waiter.armed = true;
-      waiter.timer = setTimeout(() => {
-        if (this.waiter?.timer !== waiter.timer) {
-          return;
-        }
-        this.waiter = null;
-        this.options.log('  拍照    ✗ 就绪后一直没有新照片（本地超时）');
-        waiter.resolve({ ok: false, reason: 'no_shutter' });
-      }, this.options.shutterTimeoutMs);
+    if (event.kind === 'capture.waiting' && event.id === waiter.request.id) {
+      this.options.log('  拍照    设备在等用户动手');
+      if (waiter.prompted || event.say === undefined) {
+        return null;
+      }
+      waiter.prompted = true;
+      return event.say;
     }
-    this.options.log(`  拍照    手机就绪（fresh=${fresh}），等用户按快门…`);
-    return !fresh;
+    if (event.kind === 'capture.failed' && event.id === waiter.request.id) {
+      this.options.log(`  拍照    ✗ 设备上报失败：${event.code}${event.say === undefined ? '' : `（${event.say}）`}`);
+      this.settle({
+        ok: false,
+        failure: { code: event.code, ...(event.say === undefined ? {} : { say: event.say }) },
+      });
+    }
+    return null;
   }
 
-  /** 手机上报失败：立刻收尾，别让调用方干等到超时 */
-  failed(reason: PhotoFailReason): boolean {
-    this.options.log(`  拍照    ✗ 手机上报失败：${reason}`);
-    return this.settle({ ok: false, reason });
-  }
-
-  /** 取消（用户改主意 / 会话收尾）：下发 `hq_cancel`，让手机把 P2P 解散 */
+  /** 取消（用户改主意 / 会话收尾）：要人动手的流程才下发 `capture.cancel`。 */
   cancel(why: string): void {
-    if (this.waiter === null) {
+    const waiter = this.waiter;
+    if (waiter === null) {
       return;
     }
     this.options.log(`  拍照    取消（${why}）`);
-    this.options.sendCancel?.();
-    this.settle({ ok: false, reason: 'cancelled' });
+    if (waiter.request.needsUser) {
+      this.options.send({ op: 'capture.cancel', id: waiter.request.id });
+    }
+    this.settle({ ok: false, failure: { code: 'cancelled' } });
   }
 
   /**
    * 收到一张图。
    *
-   * @param kind 这张图从哪条路径来（手机在 `hq_image` 公告之后发的才算高清）
-   * @returns true 表示已消化（交付或有意丢弃）；false 表示没人等、也不是高清图，
+   * @param id - 线协议层给出的归属；`null` = 不属于任何请求
+   * @returns true 表示已消化（交付或有意丢弃）；false 表示是用户自己拍的，
    *          调用方可以当成「看一眼」起一轮
    */
-  deliver(kind: PhotoKind, jpeg: Buffer): boolean {
+  deliver(id: string | null, jpeg: Buffer): boolean {
     const waiter = this.waiter;
-    if (!waiter) {
-      if (kind === 'hq') {
-        // 迟到的清图：取消之后才到的原图，起一轮识图只会让用户莫名其妙
-        this.options.log('  拍照    （无人等待，丢弃迟到的高清图）');
-        return true;
-      }
-      this.persist(kind, jpeg);
-      return false;
-    }
-    if (waiter.kind !== kind) {
-      // 高清等待期里 SPP 的低清回图：交付它就等于用 17 KB 的糊图冒充原图（实测发生过）
-      this.options.log(`  拍照    （等 ${waiter.kind} 时收到 ${kind} 图 ${jpeg.length} B，丢弃）`);
+    if (waiter !== null && id === waiter.request.id) {
+      this.persist(waiter.request.intent, jpeg);
+      this.settle({ ok: true, jpeg });
       return true;
     }
-    this.persist(kind, jpeg);
-    this.settle({ ok: true, jpeg });
-    return true;
+    if (id !== null) {
+      this.options.log(`  拍照    （丢弃迟到的图 ${jpeg.length} B，请求 ${id} 已经结束）`);
+      return true;
+    }
+    if (waiter !== null) {
+      // 等图期间收到不属于请求的图（小米按快门时相机顺手回的低清图）：不交付，也不另起一轮
+      this.options.log(`  拍照    （等图时收到非预期图 ${jpeg.length} B，丢弃）`);
+      return true;
+    }
+    this.persist('unsolicited', jpeg);
+    return false;
   }
 
   /** 连接结束时清干净：否则定时器会拖住进程 */
   dispose(): void {
-    this.settle({ ok: false, reason: 'cancelled' });
+    this.settle({ ok: false, failure: { code: 'cancelled' } });
+  }
+
+  private expire(): void {
+    if (this.waiter === null) {
+      return;
+    }
+    this.options.log('  拍照    ✗ 设备一直没给结果（本地兜底超时）');
+    this.settle({ ok: false, failure: { code: 'timeout' } });
   }
 
   private settle(outcome: PhotoOutcome): boolean {
     const waiter = this.waiter;
-    if (!waiter) {
+    if (waiter === null) {
       return false;
     }
     this.waiter = null;
@@ -221,14 +210,14 @@ export class PhotoInbox {
     return true;
   }
 
-  private persist(kind: PhotoKind, jpeg: Buffer): void {
+  private persist(tag: string, jpeg: Buffer): void {
     const { dir, log } = this.options;
     if (!dir) {
       return;
     }
     try {
       mkdirSync(dir, { recursive: true });
-      const file = join(dir, `photo_${kind}_${Date.now()}.jpg`);
+      const file = join(dir, `photo_${tag}_${Date.now()}.jpg`);
       writeFileSync(file, jpeg);
       log(`  图片    ${jpeg.length} B  ${file}`);
     } catch (error) {

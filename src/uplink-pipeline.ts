@@ -17,6 +17,13 @@ export interface UplinkGateConfig {
 
 export interface UplinkPipelineOptions {
   readonly ffmpegPath: string;
+  /**
+   * 上行编码。`msbc` 走 ffmpeg 解码；`pcm16` 表示对端已经是 PCM16 16 kHz
+   * 单声道，直接进增益/能量门（雷鸟的 `AudioRecord` 就是这种）。
+   *
+   * 缺省 `msbc` —— v1 协议的历史行为。
+   */
+  readonly codec?: 'msbc' | 'pcm16';
   /** 解码后的采样率（mSBC 固定 16 kHz） */
   readonly sampleRate: number;
   /**
@@ -64,7 +71,7 @@ export interface UplinkPipelineOptions {
 export class UplinkPipeline {
   private readonly options: UplinkPipelineOptions;
   private readonly gate: EnergyGate;
-  private readonly ffmpeg: ChildProcessWithoutNullStreams;
+  private readonly ffmpeg: ChildProcessWithoutNullStreams | null;
   private received = false;
   private closed = false;
 
@@ -113,52 +120,65 @@ export class UplinkPipeline {
       sampleRate: options.sampleRate,
     });
 
-    this.ffmpeg = spawn(options.ffmpegPath, [
-      '-hide_banner', '-loglevel', 'error',
-      '-f', 'sbc', '-i', 'pipe:0',
-      '-f', 's16le', '-ar', String(options.sampleRate), '-ac', '1', 'pipe:1',
-    ], { stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams;
+    this.ffmpeg = options.codec === 'pcm16'
+      ? null
+      : spawn(options.ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'sbc', '-i', 'pipe:0',
+        '-f', 's16le', '-ar', String(options.sampleRate), '-ac', '1', 'pipe:1',
+      ], { stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams;
 
-    this.ffmpeg.stderr.on('data', (data: Buffer) => {
-      if (this.closed) {
-        return; // 收尾阶段的抱怨不值得看（见 end()）
-      }
-      const text = data.toString().trim();
-      if (text) {
-        options.onError(text);
-      }
-    });
+    if (this.ffmpeg !== null) {
+      this.ffmpeg.stderr.on('data', (data: Buffer) => {
+        if (this.closed) {
+          return; // 收尾阶段的抱怨不值得看（见 end()）
+        }
+        const text = data.toString().trim();
+        if (text) {
+          options.onError(text);
+        }
+      });
 
-    this.ffmpeg.stdout.on('data', (pcm: Buffer) => { this.onPcm(pcm); });
+      this.ffmpeg.stdout.on('data', (pcm: Buffer) => { this.onPcm(pcm); });
+    }
   }
 
-  /** 送一段 mSBC 压缩帧。 */
-  push(sbc: Buffer): void {
-    if (!this.ffmpeg.stdin.destroyed) {
+  /** 送一段上行音频。`msbc` 是压缩帧，`pcm16` 是已经解码好的字节。 */
+  push(chunk: Buffer): void {
+    if (this.options.codec === 'pcm16') {
       this.received = true;
-      this.ffmpeg.stdin.write(sbc);
+      this.onPcm(chunk);
+      return;
+    }
+    if (this.ffmpeg !== null && !this.ffmpeg.stdin.destroyed) {
+      this.received = true;
+      this.ffmpeg.stdin.write(chunk);
     }
   }
 
   /** 关管道。ffmpeg 偶尔不肯立刻退，兜底一秒后 kill。 */
   end(): void {
     this.closed = true;
+    const ffmpeg = this.ffmpeg;
+    if (ffmpeg === null) {
+      return;
+    }
     if (!this.received) {
       // 这段连接没收到任何音频：优雅关闭反而会让 ffmpeg 报
       // 「Output file does not contain any stream」，直接杀掉更干净
       try {
-        this.ffmpeg.kill();
+        ffmpeg.kill();
       } catch {
         // 已退出
       }
       return;
     }
-    if (!this.ffmpeg.stdin.destroyed) {
-      this.ffmpeg.stdin.end();
+    if (!ffmpeg.stdin.destroyed) {
+      ffmpeg.stdin.end();
     }
     setTimeout(() => {
       try {
-        this.ffmpeg.kill();
+        ffmpeg.kill();
       } catch {
         // 已退出
       }

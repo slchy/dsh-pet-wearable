@@ -129,9 +129,10 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
         return;
       }
       if (!outcome.ok) {
-        handlers.log?.(`  拍照    ✗ 失败（${outcome.reason}）`);
+        const label = outcome.failure.say ?? outcome.failure.code;
+        handlers.log?.(`  拍照    ✗ 失败（${label}）`);
         res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
-          .end(`拍照失败：${outcome.reason}`);
+          .end(`拍照失败：${label}`);
         return;
       }
       const jpeg = outcome.jpeg;

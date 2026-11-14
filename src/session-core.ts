@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 对话层的**决策**：给定事件，产出「接下来做什么」。
  *
  * 这里没有 socket、没有 ffmpeg、没有定时器 —— 副作用都以 `CoreEffect` 返回，
@@ -6,10 +6,29 @@
  * 插话算不算数、识图轮从哪来），而这些用单测就能钉住，不必起连接。
  */
 import { isBackchannelOnly } from './backchannel.ts';
+import {
+  captureMode,
+  type CaptureFailure,
+  type DeviceCall,
+  type DeviceCapabilities,
+} from './devices/primitives.ts';
+import { V1_BASELINE } from './devices/wire-v1.ts';
 import { DialogFsm, type DialogState, type TurnTicket } from './dialog-fsm.ts';
 import { wantsHighRes } from './hq-intent.ts';
+import type { CaptureRequest } from './photo-inbox.ts';
 import type { ImageAttachment } from './session.ts';
 import { isWakeWordOnly } from './wake-word.ts';
+
+/**
+ * 拍照失败 → 交给模型的一句话。
+ *
+ * 设备给了原因（`say`）就转述；没给就只说拿不到 —— 不猜是快门、P2P 还是传输。
+ */
+export function captureFailureHint(failure: CaptureFailure): string {
+  return failure.say === undefined
+    ? `没能拿到高清图（${failure.code}）。请如实说明拿不到照片，不要凭空描述。`
+    : `没能拿到高清图：${failure.say}。请把这个原因告诉用户，不要凭空描述画面。`;
+}
 
 export type CoreEvent =
   /** STT 出了一句（还没合并） */
@@ -21,12 +40,18 @@ export type CoreEvent =
   /** 设备回了一张图，且没有拍照请求在等它 */
   | { readonly type: 'image'; readonly jpeg: Buffer }
   /**
-   * 高清照有了结果（成功或失败都算）。
+   * 一次拍照有了结果（成功或失败都算）。
    *
-   * 由宿主在 `photos.request('hq')` resolve 之后派发 —— 状态机在 `awaiting_shot`
-   * 期间什么都做不了，必须靠这个事件才能回到 `thinking`。
+   * 由宿主在 `DeviceCall` 收尾后派发 —— 状态机在 `awaiting_shot` 期间什么都
+   * 做不了，必须靠这个事件才能回到 `thinking`。失败带 `code` + `say`：
+   * 判定看 `code`，措辞看 `say`（设备给的原因）。
    */
-  | { readonly type: 'shotResult'; readonly ok: boolean; readonly jpeg?: Buffer; readonly reason?: string }
+  | {
+    readonly type: 'shotResult';
+    readonly ok: boolean;
+    readonly jpeg?: Buffer;
+    readonly failure?: CaptureFailure;
+  }
   /** 一轮跑完（音频下发结束） */
   | { readonly type: 'turnFinished' }
   /** 外部（工具口 / 模型）要求收尾 */
@@ -43,53 +68,33 @@ export type CoreEffect =
     readonly ticket: TurnTicket;
   }
   /**
-   * 去要一张高清照：`listening → awaiting_shot`。
-   *
-   * 宿主该做的：`photos.request('hq')`，拿到结果后派发 `shotResult`。
+   * 一个**设备操作**。判定核只说做什么，怎么说（v1 控制串 / v2 操作帧）
+   * 由执行层决定。
    */
-  | { readonly type: 'awaitShot'; readonly text: string; readonly ticket: TurnTicket }
-  /** 取消正在等的高清照（下发 `Control: hq_cancel`，让手机把 P2P 解散） */
-  | { readonly type: 'cancel_shot' }
-  /** 下发 `Control: stop`，停止播放 */
-  | { readonly type: 'stop' }
-  /** 下发 `Control: stop_capture`，让眼镜立刻停止采集（模型调了退出工具） */
-  | { readonly type: 'stop_capture' }
+  | { readonly type: 'call'; readonly call: DeviceCall }
+  /**
+   * 要一张图：`listening → awaiting_shot`。
+   *
+   * 「要不要等用户动手」由 `request.needsUser` 决定，状态机只有这一条拍照流程。
+   */
+  | {
+    readonly type: 'capture';
+    readonly request: CaptureRequest;
+    readonly text: string;
+    readonly ticket: TurnTicket;
+  }
   /** 挂断 */
   | { readonly type: 'end' }
   /** 有意丢弃（唤醒词 / 旁听反馈），只为可观测 */
   | { readonly type: 'drop'; readonly why: string };
 
-/**
- * 没拿到高清照时追加给模型的话。
- *
- * `no_shutter` 是最常见的一种，而且**不是故障**：程序化快门不写相册，只能人按
- * （`EXPERIMENTS.md §38.5`）。所以不能让模型瞎猜画面内容，得明确告诉它去要。
- */
-function shotFailureHint(reason: string): string {
-  switch (reason) {
-    case 'no_shutter':
-      return '没能拿到高清图：相册里没有新照片。请让用户按一下眼镜上的快门，然后再说一次；'
-        + '不要凭空描述画质或内容。';
-    case 'no_arm':
-      return '没能拿到高清图：手机没有响应拍照请求（可能没连上云端）。'
-        + '请如实说明拿不到照片，不要凭空描述。';
-    case 'p2p':
-    case 'join':
-    case 'connect':
-    case 'arm':
-      return '没能拿到高清图：手机和眼镜的相册通道没建起来（P2P/入组/连接失败或超时）。'
-        + '请让用户稍后再试，不要凭空描述。';
-    case 'download':
-    case 'decode':
-      return '照片拿到了但读不出来（下载或解码失败）。请让用户再说一次，不要凭空描述。';
-    case 'send':
-      return '照片拍到了但没能传上来。请让用户再说一次，不要凭空描述。';
-    default:
-      return '没能拿到高清图。请如实说明，不要凭空描述画面内容。';
-  }
-}
-
 export interface SessionCoreOptions {
+  /**
+   * 设备能力：决定忽略哪些短语、「看清细节」能不能自动拍。
+   *
+   * 缺省 {@link V1_BASELINE}。判定核只读能力，不认型号。
+   */
+  readonly capabilities?: DeviceCapabilities;
   /** 没人等图时的默认提问 */
   readonly imageQuestion: string;
   readonly log: (line: string) => void;
@@ -100,6 +105,7 @@ export class SessionCore {
   readonly fsm: DialogFsm;
 
   private readonly options: SessionCoreOptions;
+  private readonly caps: DeviceCapabilities;
 
   /**
    * 正在等高清照的那句话。
@@ -107,11 +113,25 @@ export class SessionCore {
    * 放在这里而不是宿主里：它是**状态**（`awaiting_shot` 期间有效），要随
    * `abortAwaitShot` / `closed` 一起清掉，放宿主一定会漏。
    */
-  private pendingShot: { text: string; ticket: TurnTicket } | null = null;
+  private pendingShot: { text: string; ticket: TurnTicket; id: string } | null = null;
 
   constructor(options: SessionCoreOptions) {
     this.options = options;
+    this.caps = options.capabilities ?? V1_BASELINE;
     this.fsm = new DialogFsm(options.log);
+  }
+
+  /** 取消正在等的拍照：解散设备侧流程，并清掉已经在播的旁白。 */
+  private cancelCapture(): CoreEffect[] {
+    const pending = this.pendingShot;
+    if (pending === null) {
+      return [];
+    }
+    this.pendingShot = null;
+    return [
+      { type: 'call', call: { op: 'capture.cancel', id: pending.id } },
+      { type: 'call', call: { op: 'audio.stop' } },
+    ];
   }
 
   get phase(): DialogState {
@@ -125,7 +145,7 @@ export class SessionCore {
   dispatch(event: CoreEvent): CoreEffect[] {
     switch (event.type) {
       case 'sentence':
-        if (isWakeWordOnly(event.text)) {
+        if (isWakeWordOnly(event.text, this.caps.ignorePhrases)) {
           this.options.log('  → 唤醒词，丢弃（不算一轮）');
           return [{ type: 'drop', why: 'wake-word' }];
         }
@@ -136,10 +156,8 @@ export class SessionCore {
         const effects: CoreEffect[] = [];
         if (this.fsm.state === 'awaiting_shot') {
           this.options.log('  （等快门时用户又说话 → 取消拍照，新句子重新判）');
-          this.pendingShot = null;
+          effects.push(...this.cancelCapture());
           this.fsm.abortAwaitShot('用户改主意');
-          // `stop` 是把已经在播的旁白清掉（手机侧 flush）；`cancel_shot` 是解散 P2P
-          effects.push({ type: 'cancel_shot' }, { type: 'stop' });
         }
         // 旁听反馈不单独成轮。实测：「嗯嗯，我知道了我知道了。」曾触发一次完整
         // agent 调用，回了句「行，那有需要再喊我」—— 像逐客令，用户下一句就是
@@ -157,12 +175,22 @@ export class SessionCore {
         // 用户**说**要看清细节时，不等模型自己选工具：直接把高清图拍好塞给它。
         // 实测 deepseek-flash 不会稳定地按工具描述选 `take_photo_hq`（同一句话
         // 三次里两次挑了低清），所以「要不要高清」由**用户的话**决定。
-        if (wantsHighRes(event.text)) {
+        //
+        // 能不能自动拍由能力决定：设备没有 `detail` 意图（v1 基线）→ 照常开一轮交给 agent。
+        const mode = captureMode(this.caps, 'detail');
+        if (mode !== null && wantsHighRes(event.text)) {
           const shotTicket = this.fsm.beginAwaitShot();
           if (shotTicket !== null) {
-            this.pendingShot = { text: event.text, ticket: shotTicket };
-            this.options.log('  拍照    用户要求看清细节 → 先拍高清（P2P，需要按快门）');
-            return [...effects, { type: 'awaitShot', text: event.text, ticket: shotTicket }];
+            const request: CaptureRequest = {
+              id: `capture-${shotTicket.no}-${shotTicket.gen}`,
+              intent: 'detail',
+              needsUser: mode.needsUser,
+            };
+            this.pendingShot = { text: event.text, ticket: shotTicket, id: request.id };
+            this.options.log(
+              `  拍照    用户要求看清细节 → ${mode.needsUser ? '等用户在设备上动手' : '直接拍'}`,
+            );
+            return [...effects, { type: 'capture', request, text: event.text, ticket: shotTicket }];
           }
         }
         return [...effects, { type: 'turn', text: event.text, ticket: this.fsm.ticket() }];
@@ -183,15 +211,15 @@ export class SessionCore {
             ticket: this.fsm.ticket(),
           }];
         }
-        const reason = event.reason ?? 'timeout';
-        if (reason === 'cancelled') {
+        const failure: CaptureFailure = event.failure ?? { code: 'failed' };
+        if (failure.code === 'cancelled') {
           // 用户自己取消的：不要凭空生成一轮回答
           return [{ type: 'drop', why: 'shot-cancelled' }];
         }
-        this.options.log(`  拍照    ✗ 没拿到高清图（${reason}），本轮按文本继续`);
+        this.options.log(`  拍照    ✗ 没拿到高清图（${failure.code}），本轮按文本继续`);
         return [{
           type: 'turn',
-          text: `${pending.text}\n（${shotFailureHint(reason)}）`,
+          text: `${pending.text}\n（${captureFailureHint(failure)}）`,
           ticket: this.fsm.ticket(),
         }];
       }
@@ -206,7 +234,7 @@ export class SessionCore {
         if (!this.fsm.bargeIn(event.text)) {
           return [];
         }
-        return [{ type: 'stop' }];
+        return [{ type: 'call', call: { op: 'audio.stop' } }];
       }
 
       case 'image':
@@ -234,18 +262,16 @@ export class SessionCore {
         // 收尾时如果还在等快门，得把这个请求一起取消 —— 不然手机侧 P2P 会挂到
         // 自己的 20 s 超时才散，用户已经听过告别语了灯还亮着。
         const cancelling = this.fsm.state === 'awaiting_shot';
+        const effects: CoreEffect[] = [];
         if (cancelling) {
-          this.pendingShot = null;
           this.options.log('  拍照    收尾 → 取消还没到手的高清照');
+          effects.push(...this.cancelCapture());
         }
         this.fsm.requestEnd();
         // 模型决定收尾的那一刻，眼镜就该停止采集 —— 不能等告别语播完。
         // `endVoiceSession()`（Aivs 六字段全 0）实测能让设备立刻停流（§19.5）。
         this.options.log('  采集    模型要求结束 → 通知设备停止采集');
-        const effects: CoreEffect[] = cancelling
-          ? [{ type: 'cancel_shot' }, { type: 'stop' }]
-          : [];
-        effects.push({ type: 'stop_capture' });
+        effects.push({ type: 'call', call: { op: 'listen.stop' } });
         if (this.fsm.state === 'ending') {
           effects.push({ type: 'end' });
         }
