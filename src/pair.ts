@@ -104,6 +104,9 @@ switch (sub) {
         for (const item of bad) {
           console.log(`  第 ${item.line} 行 ${maskToken(item.raw)}：${describeTokenProblem(item.raw, item.problem)}`);
         }
+        // 有坏行就以非零退出：部署脚本与 CI 用这条命令当闸，
+        // 不能因为"文件存在"就放行 —— 新代码启动时会直接拒绝这些行。
+        process.exitCode = 2;
       }
     } catch (error) {
       fail(`读不到 ${file}：${(error as Error).message}\n先跑 node src/pair.ts new`);
