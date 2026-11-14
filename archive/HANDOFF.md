@@ -1,4 +1,22 @@
-# 交接文档 — dsh-pet-wearable
+# 交接文档 — dsh-pet-wearable（**已归档**）
+
+> ⚠️ **这是历史文件，不是现状。**
+>
+> 2026-11-14 起，设计现状由两份 ADR 定义：
+> - [`docs/adr/0001-app-layer-and-pet.md`](../docs/adr/0001-app-layer-and-pet.md) —— 应用层分层、宠物状态机、话筒仲裁
+> - [`docs/adr/0002-virtual-time-simulator.md`](../docs/adr/0002-virtual-time-simulator.md) —— 虚拟时间模拟器
+>
+> 当前状态与用法见 [`README.md`](../README.md)。
+>
+> 本文件仍有价值的只有三类内容，ADR 没有重复它们：
+> 1. **真机结论**（§2：手机能主动拉起语音会话、下行无需会话即可出声等）
+> 2. **已证伪的假设**（§2：`Aivs` 字段号、`f1=2` 不可用等）
+> 3. **环境与踩过的坑**（§6 / §8）
+>
+> 「已知缺口」与「建议的下一步」两节**已逐条标注现状**（已做 / 已被否决 / 仍成立），
+> 标注日期 2026-11-14。**仍成立的只有缺口 1（快反射无短音素材）和缺口 4（`played` 只记档）。**
+
+---
 
 写给接手这个仓库的 agent 或人。**先读完再动手**，里面有一批已经用真机验证过的结论和
 踩过的坑，重复验证它们纯粹是浪费。
@@ -218,3 +236,226 @@ export function apply(ctx: Context, config: PetConfig): void {
 | `session.ts` 的 180 s 上限 | 超时必须抛错**并说出来**，不许静默 |
 | TTS 会把 markdown 念出来 | 所有下行文本必须过 `cleanForSpeech` |
 | 播放时长是估算 | `turn-runner` 用 `audioSeconds + playbackTailMs` 之后 sleep 轮询，服务器不知道设备真正播到哪。"它什么时候觉得自己说完了"建在这个估算上 |
+
+# 交接：v2 线协议与宠物环接线（2026-11-14）
+
+接着 [archive/HANDOFF.md](../archive/HANDOFF.md) 往下写。那份里的真机结论（§2）、纪律（§5）、
+环境（§6）和已知的坑（§8）仍然有效，这里不重复。
+
+## 现状
+
+`main` 比 `origin/main` 多 5 个提交，**都没推送**：
+
+| 提交 | 内容 |
+|---|---|
+| `46abb00` | 旧交接文档与 harness.py 移入 `archive/` |
+| `c5de987` | 宠物环：快反射、电量缓存、presence 允许 `null` |
+| `a0ebe09` | 设备原语收成最小集，能力自报，v1 降为垫片 |
+| `3c3e317` | v2 线协议：只增帧，`Hello` 自报能力，`Welcome` 握手 |
+| `4805734` | v2 接进连接；宠物环主动开口 |
+
+`npx tsc --noEmit` 干净，`npm test` 150 个全过。工作区干净。
+
+## 这一轮做了什么
+
+**v2 线协议，向下兼容。** 只新增帧，旧帧含义不变。协议写给手机端的人看：
+[docs/device-protocol.md](../docs/device-protocol.md) 的「v2」一节。
+
+- 下行 `Call`(3) / `Welcome`(4)，上行 `Event`(7) / `CaptureImage`(8)
+- `Hello{proto:2, capabilities}` 合法 → 回 `Welcome`，之后走 v2
+- 不发 `Hello`、`proto:1`、或 `proto:2` 但能力不合法 → 不回 `Welcome`，走 v1 垫片，**不拒绝连接**
+- 服务端只在发过 `Welcome` 后才发 `Call`，v1 手机收不到不认识的帧
+
+**握手在建连接之前。** [src/aliyun-session.ts](../src/aliyun-session.ts) 的 `handshake()`：
+能力决定上行解码、判定核和收件箱，所以先定版本再构造 `AliyunConnection`。
+配了鉴权就等 `Hello`；没配时 `Hello` 先到用它，别的帧先到或等满 1 秒就按 v1 走，
+先到的那一帧原样补交。
+
+**宠物环接进对话循环。**
+
+- [src/pet/device-host.ts](../src/pet/device-host.ts)：`DeviceEvent` → 宠物端口的唯一适配器。
+  设备没声明的能力，对应端口缺省（不是永远 `null` 的假端口）
+- [src/pet/proactive.ts](../src/pet/proactive.ts)：`planProactive()` 决定怎么开口。
+  设备能不用人动手拍 `glance`（`canCaptureUnprompted`）才先拍一张；支持 `listen.start` 才在说完后开麦
+- `AliyunConnection.tickPet()`：只在 `listening`、串行队列空、没在播报时判时机
+- `runProactive()`：拍照期间用户开口了（`utteranceSeq` 变了）就作废这次
+
+## 怎么开
+
+主动开口**默认关**，`PET_PROACTIVE=1` 才开。
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `PET_TICK_MS` | 30000 | 多久判一次时机 |
+| `PET_LISTEN_MS` | 8000 | 说完后开麦多久（设备支持 `listen.start` 才生效） |
+| `PET_GREET_AWAY_MS` | 300000 | 摘下超过多久，戴回时打招呼 |
+| `PET_CHATTER_IDLE_MS` | 1200000 | 安静多久后搭话 |
+
+其余时机参数（两次开口最小间隔 10 分钟、23–7 点不搭话、电量 ≤20% 不搭话）只能改
+`DEFAULT_PET_TIMING`。深夜判定用进程本地时区，VPS 上要设 `TZ`。
+
+## 两台设备上会发生什么
+
+| | 小米（v1，型号提示 `xiaomi-glasses`） | 雷鸟 X3 Pro（v2 自报） |
+|---|---|---|
+| 戴回打招呼 | 没有：v1 手机不转发佩戴 | 有 |
+| 安静久了搭话 | 有 | 有 |
+| 开口前先拍一张 | 有：`glance` 不用人动手，走 `take_photo` | 有 |
+| 说完自动开麦 | 没有：v1 表达不了 `listen.start` | 有 |
+| 敲击 | 没有：v1 手机不转发 | 只记日志（见缺口 1） |
+
+两列都**没跑过完整的宠物流程**：小米那列受 v1 手机端能力所限，雷鸟那列只按官方文档推断、
+设备侧适配器还不存在。
+
+**但「小米能不能出声」已经真机验证：能。**
+
+2026-11-14 实测：**不唤醒、不建语音会话**，直接 `AudioTrack` 播一段 PCM → 眼镜有声。
+所以小米上主动开口**不需要先改手机端**。
+
+`A2DP` 是独立的蓝牙音频 profile，**与 SPP 语音会话无关** —— 手机和眼镜只要连着 A2DP（配对后
+一直连着），随时可以往它推 PCM，不需要 `Aivs` 会话、不需要唤醒、不需要 SPP 上任何一帧。
+三处互证（另一仓 `docs/application/product/ARCHITECTURE.md`）：
+
+```text
+L65   K2["A2DP<br/>下行音频唯一路径"]
+L84   P5 -->|"A2DP，绕过 SPP"| K2
+L305  | 下行音频 | — | — | — | — | A2DP，不经 SPP | — |
+```
+
+**上下行前置条件不同，但可以同时跑 —— 这条早就验证过。**
+
+| 方向 | 通道 | 前置条件 |
+|---|---|---|
+| 上行（听） | SPP 语音会话 | 必须被拉起（`Aivs` id=10，实测 0.62 s 后开始推流） |
+| 下行（说） | A2DP | 无 —— 连着就能播 |
+
+「开麦之后下行还从 A2DP 出声吗」= **会**。三层独立证据（老仓）：
+
+- **官方**：官方 App 完整会话 = 上行 SPP `MASS_VOICE` + 下行 TTS 走 A2DP，
+  **全程零 SCO 事件**（`ADR-001-AUDIO-CHANNEL-SPLIT.md` §1）
+- **机制**：SCO 由「通话」建立，唤醒词与 `Aivs` 会话都不会拉起它（同 ADR §4）
+- **自研**：`VoiceLink` 同一个类里两个方向同时跑（`UP_AUDIO` L103 / `DOWN_AUDIO → player.write()` L285）
+
+第三层就是日常——每次对话都是上行 mSBC + 下行 PCM 同时，会话全程开着。**不是推断，是在用。**
+
+由此定一条编排不变量：**要正式发言时，先 `requestWakeUp()` 再播** —— 这样"在说话但听不见"
+的状态不存在，用户随时可插话。唯一成本是电量（麦克风 + 7.6 kB/s 上行），不涉及链路风险。
+
+快反射短音（"嗯？""在呢"，<200 ms）**不开麦**，纯 A2DP：省电、少一步，而这么短的一句
+被插话没有意义。
+
+## 没验证的
+
+单元测试覆盖了 v2 编解码、`resolveDeviceLink`、`DeviceEventHost`、`planProactive`。
+**`aliyun-session.ts` 里的接线一行都没跑过**：握手、1 秒回落、补交首帧、`Welcome`、
+`Event` / `CaptureImage` 分发、定时判断、主动开口。
+
+[tools/fake-phone.ts](../tools/fake-phone.ts) 只会说 v1（`Hello` 写死 `proto:1`），测不了 v2。
+
+## 已知缺口
+
+1. **快反射没有短音素材。** `onTap` 给出 `reflect` 后只记日志，不出声
+2. **主动开口的提示走「用户消息」通道。** `proactivePrompt()` 那句「（系统提示，不是用户说的话：…）」
+   会作为用户消息进 dsh 会话历史 —— 这是用**内容**去补**元数据**的缺。
+
+   **答案（源码核对，`packages/llm/llm/src/message.ts:100-135`）**：
+
+   应用层已经落地了这个决定，且比这里的建议更进一步：
+   [ADR-0001 §3](../docs/adr/0001-app-layer-and-pet.md) 定义 `source` 取
+   `{kind:'user'}` 或 `{kind:'pet', reason}`，由 **agent 适配器**负责映射到 dsh
+   （现阶段 `pet` 映射成 `user`，正文保留"系统提示"那半句）。也就是说：应用层有了真正的
+   `pet` 来源，dsh 侧仍是安全的 `user`。下面这段保留作为该决定的依据。
+
+   ```ts
+   interface MessageSourceMap {
+     user: { kind: 'user' }
+     model: ModelMessageSource        // { kind: 'model', ...providerMetadata }
+     tool: ToolMessageSource          // { kind: 'tool', callId }
+     'system-prompt': { kind: 'system-prompt' }
+   }
+   ```
+
+   注释原文两句是关键：
+
+   > Merge-extensible sum type — **each producer declares its own `kind` in its own
+   > module; there is no shared catch-all `plugin` kind.**
+   > … user messages carry any producer's kind, and **consumers fall through unknown kinds.**
+
+   所以按风险排：
+
+   - **`source: { kind: 'user' }`** —— 官方唯一用过的写法（`packages/acp/acp/src/session.ts:268`）。
+     **先这样做**，零风险。
+   - **声明合并一个新 kind**（`{ kind: 'pet', reason: 'greet' \| 'chatter' }`）—— 类型上是设计意图，
+     语义最正。风险点：`known-event-types.ts` 的白名单只针对未知 **event type**（靠 `ignorable`
+     标记），对 `source.kind` 没有白名单，而注释明说 "fall through unknown kinds"，所以**应该**
+     安全。**留到 v0.1 之后再上**，现在别拿它冒险。
+   - **靠 content 里那句话区分** —— 就是现状，最差。
+
+   **落地动作（已被 ADR 覆盖，此处保留当时的推理）**：原建议是「填 `source: { kind: 'user' }`，
+   把括号里那半句删掉」。ADR-0001 §3 决定**不删那半句** —— 应用层发出 `{kind:'pet'}`，
+   到 dsh 边界才降成 `{kind:'user'}`，正文里那句话因此仍有信息量（它告诉模型这不是用户打的字）。
+3. ~~主动拍照最多等 20 秒才开口~~ **已做**。`PetParams.captureTimeoutMs = 4_000`，只作用于
+   `look` 阶段（`brain/registry.ts` 的 `deadlineMs: (p) => p.captureTimeoutMs`），
+   超时结果是 `none` → **不带图照常开口**（`onResult` 注释：「别假装看见了」）。
+   实测证据：`sim/scenarios.ts` 的「晚到的图不进 agent（look 超时后才回）」——
+   `captureLatencyMs: 6_000` 晚于 4 s 截止，图确实被挡在 agent 之外。
+
+   当时的建议是 3000–5000 ms，取 4 s 属于这个区间。
+4. **`played` 事件只记档。** `TurnRunner` 仍按音频时长估算播完时刻，`listen.start` 也是在估算的播完之后发
+5. ~~v2 设备必须先发 `Hello`~~ **已缓解**，但方式不是我建议的升级：`handshake()`
+   （`src/aliyun-session.ts`）在定版本前留了一个窗口 ——
+   - 配了鉴权：连接层保证 `Hello` 先到，直接等它
+   - 没配鉴权：先到的是别的帧、或等满 `HANDSHAKE_WAIT_MS = 1000` → 按 v1 走，
+     **那一帧原样转交，不丢**
+
+   所以"音频比 `Hello` 早到就永久降级"只在不鉴权 + 首帧比 `Hello` 早 1 s 以上时才成立。
+   剩下的 `proto:2` 但能力不合法 → **降级不拒绝**（`resolveDeviceLink` 注释明写
+   "向下兼容优先"），只打一行日志、不回 `Welcome`。
+6. ~~README「现在能不能用」一表过时~~ **已更新**：状态表现在写「语音链路仅独立进程可跑；
+   主动开口已按 ADR-0001 实现且 `npm run sim` 可离线跑」。
+
+## 建议的下一步
+
+> ⚠️ 本节写于 ADR 之前。**2/3 已答、4 已否决、5 已做；1 只剩工具侧。**
+> 保留只为记录当时的判断顺序。
+> 真正待办的清单见 [`README.md`](../README.md) 与 ADR-0001 §11。
+
+1. ~~给 `fake-phone.ts` 加 `--v2`~~ **协议侧已做，工具侧仍未做**：
+   - v2 线协议在 `src/devices/wire-v2.ts`（`negotiateV2` / `encodeV2Call` / `parseV2Event` /
+     `parseV2CaptureImage`），由 `src/devices/index.ts` 接入 `handshake()`；有单测
+   - **`v2-generic` 能力档在模拟器里是跑通的**（`sim/world.ts` 的 `capabilitiesOf`，
+     场景「v2 设备也能跑：能力集换成通用档」）。但它只替换**能力集**，
+     不经过 `wire-v2.ts` 的编解码 —— 模拟器在应用层之下，看不到线协议
+   - `tools/fake-phone.ts` **还在**，L116 仍写死 `proto: 1`，和进程内模拟器是两件
+     不同的东西（真 TCP + 真帧 vs 进程内虚拟时间）
+   - 所以真正缺的只有一件：**v2 线协议的端到端覆盖**（握手 → 编解码 → 事件往返）
+2. ~~问用户：小米在没有语音会话时能否下行播放~~ **已答**（见上「两台设备上会发生什么」）：
+   A2DP 与 SPP 语音会话无关，随时可播。剩下只有真机确认那一步。
+3. ~~主动开口改用 dsh 的 MessageSource（字段问用户）~~ **已答**（见缺口 2）：
+   应用层用 `{kind:'pet'}`，到 dsh 边界映射成 `{kind:'user'}`。
+4. ~~缺口 5 允许 v1→v2 升级~~ **已否决，且原问题已另行缓解**（见缺口 5）：
+   `handshake()` 有 1 s 的 `Hello` 等待窗口并转交首帧，代价远低于重建对象图。
+   升级本身被 [ADR-0001 §11](../docs/adr/0001-app-layer-and-pet.md) 否决 ——
+   上行解码、判定核、收件箱在建连接时按能力定死。
+5. ~~更新 README 状态表~~ **已更新**；推送仍按「和用户协作」等用户开口。
+
+## 和用户协作
+
+- 用中文沟通
+- 只在本仓库目录内读写，不读仓库外路径；需要外部信息直接问用户
+- 提交和推送都等用户开口
+- 中文提交信息用 `git commit -F`（旧交接 §8）
+
+## 补记的来源（2026-11-14）
+
+缺口 2 的 MessageSource 字段与本文件「小米能不能出声」一节，不是猜的，来自两处源码核对：
+
+| 结论 | 出处 |
+|---|---|
+| `MessageSourceMap` 的形状与「消费者会 fall through 未知 kind」 | `deepseek-ai/deepseek-harness` 的 `packages/llm/llm/src/message.ts:100-135` |
+| 官方先用 `{ kind: 'user' }` | `packages/acp/acp/src/session.ts:268` |
+| A2DP 是下行唯一路径且绕过 SPP | 老仓 `docs/application/product/ARCHITECTURE.md` L65 / L84 / L305 |
+| **下行无需语音会话即可出声** | **真机 2026-11-14**（`AudioTrack` 播 PCM → 有声，不唤醒、不建会话） |
+| **上下行可同时**（含开麦时下行仍走 A2DP） | 老仓 `ADR-001-AUDIO-CHANNEL-SPLIT.md` §1（官方全程零 SCO）、§4（SCO 不会被拉起）+ `VoiceLink.kt` 双向环 |
+
+前两条来自公开仓库，可随时复核；其余是另一仓的真机结论，均已落地成文档。
