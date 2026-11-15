@@ -36,6 +36,8 @@ export const DEFAULT_ANNOUNCE_MAX = 20;
 interface Entry {
   readonly t: number;
   readonly text: string;
+  /** 情绪 key。旧文件没有这个字段，读出来按「没有」处理 */
+  readonly emotion?: string;
 }
 
 export class AnnounceStore {
@@ -63,9 +65,9 @@ export class AnnounceStore {
   }
 
   /** 存一条；返回当前积压条数。写失败只记日志，不影响通话。 */
-  push(text: string): number {
+  push(text: string, emotion?: string): number {
     const items = this.read();
-    items.push({ t: Date.now(), text });
+    items.push(emotion === undefined ? { t: Date.now(), text } : { t: Date.now(), text, emotion });
     while (items.length > this.maxItems) {
       items.shift();
     }
@@ -79,7 +81,7 @@ export class AnnounceStore {
   }
 
   /** 取走全部并清空（至少一次：清不掉就下次再播一次）。 */
-  drain(): string[] {
+  drain(): Array<{ text: string; emotion?: string }> {
     const items = this.read();
     if (items.length === 0) {
       return [];
@@ -89,7 +91,11 @@ export class AnnounceStore {
     } catch (error) {
       this.log(`  ✗ 待补播清理失败（下次可能重复播）：${(error as Error).message}`);
     }
-    return items.map((e) => e.text);
+    // 情绪要跟着一起取走：只存文本的话，离线攒下的「[开心]跑完了」补播时
+    // 又变回平静语气 —— 和 provider 接口截断 emotion 是同一类漏接。
+    return items.map((e) => (e.emotion === undefined
+      ? { text: e.text }
+      : { text: e.text, emotion: e.emotion }));
   }
 
   /** 当前积压条数（只读） */
@@ -111,7 +117,11 @@ export class AnnounceStore {
         try {
           const e = JSON.parse(s) as Partial<Entry>;
           if (typeof e.text === 'string' && e.text) {
-            out.push({ t: typeof e.t === 'number' ? e.t : 0, text: e.text });
+            out.push({
+              t: typeof e.t === 'number' ? e.t : 0,
+              text: e.text,
+              ...(typeof e.emotion === 'string' && e.emotion ? { emotion: e.emotion } : {}),
+            });
           }
         } catch {
           // 坏行直接跳过：一句提示不值得让整个队列失效

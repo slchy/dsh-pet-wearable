@@ -97,7 +97,7 @@ export class VoiceAgent {
         return;
       }
       if (this.announcer === null) {
-        const pending = this.announceStore?.push(speech) ?? 0;
+        const pending = this.announceStore?.push(speech, emotion) ?? 0;
         this.log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
         return;
       }

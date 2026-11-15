@@ -527,8 +527,8 @@ class VoiceConnection {
     if (backlog.length > 0) {
       this.archive?.event(EVENTS.announceReplay, { count: backlog.length });
       console.log(`  补播    离线期间攒了 ${backlog.length} 条后台汇报`);
-      for (const speech of backlog) {
-        this.dialog.enqueueAnnounce(speech);
+      for (const item of backlog) {
+        this.dialog.enqueueAnnounce(item.text, item.emotion);
       }
     }
 
