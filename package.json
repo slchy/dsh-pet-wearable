@@ -46,6 +46,7 @@
   ],
   "scripts": {
     "start": "node src/main.ts",
+    "install-profile": "node scripts/install-profile-patch.mjs",
     "pair": "node src/pair.ts",
     "sim": "node src/pet/sim/run.ts",
     "typecheck": "tsc --noEmit",

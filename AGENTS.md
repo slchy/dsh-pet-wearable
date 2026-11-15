@@ -20,6 +20,20 @@
 这是**软限制** —— 具体情况具体分析。真正会静默出错、且无法手动补救的地方
 （比如"数据被覆盖了才知道"），该自动化还是要自动化，说清楚就行。
 
+## 人设提示词只有一份
+
+**改「米馍」的身份、性格、说话方式、干活策略 —— 去 [mcp/profile.cordis.yml](mcp/profile.cordis.yml)
+的 `personaPrefix`，不要在 `src/agent.ts` 里加。**
+
+理由：那份文件会被装成 `~/.dsh/profiles/sdk/cordis.patch.yml`，由 dsh 作为**系统提示词**
+注入。放系统层比每轮拼进用户消息服从度更高，内容不变时还能稳定命中前缀缓存。
+两份长文本迟早漂移，只留一份就没得漂。
+
+- 本地改完要 `npm run install-profile`，否则跑的是没人设的通用 agent；
+- 服务器由 `scripts/deploy_cloud.py` 自动安装；
+- 【情绪标签】那行的五个标签必须与 `src/emotion.ts` 的 `EMOTION_LABELS` 一致，
+  `tests/profile-prompt.test.ts` 会卡住不一致。
+
 ## 示例不要用真实地址
 
 **用法注释、文档示例、测试里不要出现真实的 IP / 主机名 / 服务器路径。**
