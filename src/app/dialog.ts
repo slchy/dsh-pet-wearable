@@ -65,8 +65,29 @@ export interface DialogEnv {
   /** 有没有一轮在跑（对话层占着话筒） */
   readonly onTurnStart?: (text: string, hasImage: boolean) => void;
   readonly onTurnEnd?: () => void;
+  /**
+   * 这一轮要附带给模型的**设备现状**（电量、佩戴…）。
+   *
+   * 模型看不见上行事件，不给它这行就会瞎答：真机问「眼镜还剩多少电」，
+   * agent 回「读不到，我手上没有拿电量的接口」——可设备每 30 s 就在报
+   * `{"kind":"power","percent":77}`，只是那数据只喂给了宠物环。
+   */
+  readonly deviceNote?: () => string | undefined;
   /** 每个效果执行前过一眼（档案、断言用） */
   readonly onEffect?: (effect: CoreEffect) => void;
+}
+
+/**
+ * 把「设备现状」和「续话尾巴」拼成这一轮的系统注记。
+ *
+ * 两段都是**可选**的，而且都只在当下有效（电量会变、尾巴只活一轮），
+ * 所以拼在用户消息前面而不是塞进系统提示词 —— 后者会被前缀缓存锁住。
+ *
+ * 导出是为了能单测：这里的顺序错了模型就会把「接着刚才」理解成「设备状态」。
+ */
+export function composeTurnNote(deviceNote?: string, tailNote?: string): string | undefined {
+  const parts = [deviceNote, tailNote].filter((part): part is string => part !== undefined && part !== '');
+  return parts.length === 0 ? undefined : parts.join('；');
 }
 
 export interface DialogOptions {
@@ -225,7 +246,9 @@ export class DialogRuntime {
       }
       // 图由 `capture` 那一步拿好并挂在 text/image 里，这里不再自己拍
       this.options.env.onTurnStart?.(text, image !== undefined);
-      const note = this.takeTailNote();
+      // 续话（上一轮被打断的尾巴）和设备现状一起作为系统注记，模型才答得上
+      // 「眼镜还剩多少电」「我刚才说到哪」这类只能靠上下文的问题。
+      const note = composeTurnNote(this.options.env.deviceNote?.(), this.takeTailNote());
       try {
         const result = await this.runner.run(text, image, note);
         if (result !== null && result.interrupted) {

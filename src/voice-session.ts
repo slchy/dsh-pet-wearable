@@ -295,6 +295,15 @@ class VoiceConnection {
   private readonly options: VoiceSessionOptions;
   private readonly link: DeviceLink;
   private readonly caps: DeviceCapabilities;
+  /**
+   * 设备最近一次上报的电量 / 充电 / 佩戴。
+   *
+   * 以前这些只喂给宠物环，agent 那条路上完全没有 —— 真机问「眼镜还剩多少电」，
+   * agent 回「读不到，我手上没有拿电量的接口」，而设备每 30 s 就在报。
+   */
+  private powerPercent: number | null = null;
+  private charging: boolean | null = null;
+  private wearing: boolean | null = null;
   /** v1 线协议垫片：原语 ↔ 控制串 / 状态帧，图像帧归属；v2 连接为 `null` */
   private readonly v1: V1Session | null;
 
@@ -355,6 +364,7 @@ class VoiceConnection {
       env: {
         call: (call) => this.sendCall(call),
         assemble: (text) => { this.assembler.addSentence(text); },
+        deviceNote: () => this.deviceNote(),
         // 收尾前先明说「这次会话结束了」。
         //
         // 只 `end()` 掉 socket 的话，App 那边只看到「对端关闭」，和网络掉线一模一样
@@ -672,9 +682,25 @@ class VoiceConnection {
     this.onDeviceEvent(event);
   }
 
+  /**
+   * 给这一轮附上的设备现状。
+   *
+   * 模型看不到上行事件流，这行是它唯一知道「电量多少、戴没戴」的途径。
+   * 没有数据时返回 `undefined`（而不是空串），让调用方干净地略过。
+   */
+  private deviceNote(): string | undefined {
+    const parts: string[] = [];
+    if (this.wearing !== null) {
+      parts.push(this.wearing ? '用户正戴着' : '用户摘下了');
+    }
+    if (this.powerPercent !== null) {
+      parts.push(`电量 ${this.powerPercent}%${this.charging ? '，充电中' : ''}`);
+    }
+    return parts.length === 0 ? undefined : `设备现状：${parts.join('；')}`;
+  }
+
   /** 一条原语事件：拍照的归收件箱，佩戴 / 电量 / 招呼归宠物环。 */
-  private onDeviceEvent(event: DeviceEvent): void {
-    switch (event.kind) {
+  private onDeviceEvent(event: DeviceEvent): void {    switch (event.kind) {
       case 'capture.waiting':
       case 'capture.failed': {
         const say = this.photos.onEvent(event);
@@ -685,9 +711,16 @@ class VoiceConnection {
         return;
       }
       case 'presence':
-      case 'power':
-      case 'summon':
+        this.wearing = event.wearing;
         // 「事件后补 tick」在 AppSession 里（ADR-0002 §3.1）
+        this.app?.deviceEvent(event);
+        return;
+      case 'power':
+        this.powerPercent = event.percent;
+        this.charging = event.charging;
+        this.app?.deviceEvent(event);
+        return;
+      case 'summon':
         this.app?.deviceEvent(event);
         return;
       case 'played':
