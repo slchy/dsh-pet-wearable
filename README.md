@@ -1,186 +1,148 @@
 # dsh-pet-wearable
 
-住在智能眼镜里的 dsh 插件：**它不会被唤醒词叫起来，而是按自己的时机开口。**
+**一个针对智能穿戴设备场景优化的、基于云端 dsh 的全双工语音驱动 agent。**
 
-|  | 常见的双工语音插件 | 这个 |
+设备只做耳朵和嘴（录音、播放、拍照、上报状态），思考全在云端 dsh 里。
+戴上就能说话、随时能打断，它也会自己开口。不绑型号——设备握手时自报能力，插件零改动。
+
+## 为什么是「pet」
+
+语音助手是**叫才应**的工具。但在眼镜、耳机这种全天戴着的东西上，你不会一直叫它——
+大部分时间里它只需要安静地知道"你在"，偶尔在合适的时候说一句。
+
+所以这个 agent 的形态更像一只跟在身边的**小东西**，而不是一个待命的按钮：
+
+|  | 待命式助手 | pet |
 |---|---|---|
-| 谁决定何时说话 | 用户（点麦 / 唤醒词） | 插件（时机状态机） |
-| 允许说"没用"的话 | 否 | 是 |
+| 默认状态 | 等你说话 | 在场（知道戴没戴、电够不够、是不是深夜） |
+| 说话主动权 | 只有你 | 你 **+ 它**（有节制的主动开口） |
+| 被打断 | 从头再来 | 记着没说完的那段，下一轮能接 |
+| 长任务 | 阻塞，或者说"做不到" | 丢后台跑，主对话不失聪，跑完回来说 |
+| 边界 | 预设技能 | **agent**：跑命令、查资料、派子代理 |
 
-## 现在能不能用
+「pet」说的是**在场感和主动性**，不是形象：这里没有像素、没有动画、没有人格表演。
+人格（语气、习惯）是提示词里的一段文字，可以随便换；pet 是它的行为形态。
 
-`0.0.x` 是骨架版本：能被 dsh 正常加载、能读配置，但**还不通设备、不驱动对话**。
+## 换一副眼镜要做什么
+
+不需要改这个仓库。
+
+| 场景约束 | 这里的做法 |
+|---|---|
+| 设备自报能力 | 设备在 `Hello` 里声明（能不能免手拍、能不能听、支不支持能量/佩戴上报），插件不认型号。接[雷鸟 X3 Pro](./docs/devices/RAYNEO-X3-PRO.md) 就是照这个来的 |
+| 远场麦克风、电平低（实测底噪 −60…−51 dBFS） | 上行增益 + 能量门（−40 dBFS）+ **语义判停**，不靠固定静音时长 |
+| 电池 | 设备不做 ASR / TTS / 推理；**电量低时它自己闭嘴** |
+| 没有屏幕 | 应答天生是语音；真要"看"的时候让设备拍一张回来 |
+| 网络会断 | 断线重连 + 会话对齐 + 断开期间的后台结果存着，连上补播 |
+| 说话说一半 | 判停看**音频本身**（Smart Turn），不看问号 |
+| 随时插话 | 能量门或 ASR 增量任一命中就打断，**不看关键词**（噪声骗得过峰值，骗不过识别器） |
+
+## 三十秒跑起来（零密钥）
+
+不需要眼镜、不需要任何 API key——canned 识别 + 静音合成 + echo agent 就能跑通整条链路：
+
+```bash
+npm install
+node src/main.ts --listen 8766 --stt canned --tts silent --agent echo
+```
+
+另一个终端推一段音频进去：
+
+```bash
+node tools/fake-phone.ts --port 8766 --sbc tmp/voice.sbc
+```
+
+想看**主动开口**（零网络、零密钥、零 ffmpeg，虚拟时间跑全套场景）：
+
+```bash
+npm run sim                                  # 声明式场景
+npm run sim -- --explore --runs 500          # 随机探索，找不变量违反
+npm run sim -- --trace out/                  # 时间线写成 JSONL
+```
+
+接真设备要 `ffmpeg`（mSBC 解码）+ 一个 STT/TTS 供应商；`dsh` 不在依赖里，跑真实对话才需要。
+
+## 架构
+
+```
+  眼镜 / 耳机 / 手机                        云端
+┌────────────────────┐            ┌──────────────────────────────┐
+│ AudioRecord        │   mSBC ──► │ transport   帧 / 鉴权 / 心跳   │
+│ AudioTrack         │   ◄── PCM  │      ↓                        │
+│ Camera2            │            │ 能量门 → ASR → 判停 → 一轮     │
+│ 佩戴 / 电量 / 触摸   │   Event ──► │      ↓                        │
+└────────────────────┘            │ TTS ← dsh agent               │
+                                  │       工具 / 后台 job / 子代理  │
+                                  └──────────────────────────────┘
+```
+
+三条原则：
+
+1. **设备无关** —— `src/devices/` 只定义要用的原语（6 个下行操作、6 个上行事件、一份能力声明）。插件不认型号，设备自报；能力不够就降级（不能免手拍就不主动拍，不能听就不开麦）。
+2. **可替换件** —— STT / TTS / agent 都是注入的工厂（契约在 [`src/providers.ts`](./src/providers.ts)）。不给密钥就跑离线实现；换供应商不动业务代码。
+3. **判据可测** —— 时机、判停、打断、监听地址全抽成不碰 socket 的纯函数，`npm test`（302 条）覆盖；线协议做成假设备，不用真机也能验。
+
+## 全双工具体是什么
+
+- **打断**：用户一开口（能量门命中或 ASR 出增量）就作废当前轮次并下发 `audio.stop`。打断时记下"没播完的那段"，下一轮要接就能接上。
+- **不失聪**：前台命令只等 1 秒，超时**不杀**而是转后台 job，主对话立刻自由。工具分层：`ls` 这种直接跑，探索 / 编译 / 开别的 CLI 派给 subagent。
+- **不抢话**：话筒有仲裁表（`user` > `reply` > `announce` > `pet` > `reflex`），后台结果要等用户说完。
+
+## 主动开口
+
+不是定时说话，是一个**时机状态机**（[ADR-0001](./docs/adr/0001-app-layer-and-pet.md)）：佩戴变化、电量、深夜、安静时长、话筒归属、两次开口的最小间隔，每条都有明确判据。
+
+默认偏向"宁可少说"。想更活泼就调 `chatterAfterIdleMs`，**不要加新规则**——规则越多越难解释它为什么沉默。
+
+独立进程形态默认关，要 `PET_PROACTIVE=1` 才装（启动日志会打「宠物环 开/关」）。
+
+## 现状
+
+`0.0.x`，能跑但还在磨。诚实清单：
 
 | | 状态 |
 |---|---|
-| dsh 插件入口（`name` / `inject` / `Config` / `apply`） | 可用 |
-| 配置项 | 可用，见下 |
-| 语音链路（mSBC → STT → 判停 → TTS → 打断） | 代码齐全，目前只通过独立进程形态跑（`src/main.ts`） |
-| 设备会话（拉起眼镜语音、拍照、佩戴 / 电量） | 手机端已跑通，插件侧未接线 |
-| 主动开口（时机 / 阶段 / 打断 / 结局） | 已按 [ADR-0001](./docs/adr/0001-app-layer-and-pet.md) 实现并接进对话连接。**独立进程形态默认关**，要 `PET_PROACTIVE=1` 才装这一层（启动时会打「宠物环   开/关」）。`npm run sim` 可离线跑全套场景 |
+| 语音链路（mSBC → STT → 判停 → 一轮 → TTS → 打断） | **真机跑通**（`src/main.ts` 独立进程形态） |
+| 设备会话（拉起语音、拍照回传、佩戴 / 电量上报） | **手机端跑通** |
+| 主动开口 | **已实现**，`sim` 可离线复现；独立进程要 `PET_PROACTIVE=1` |
+| dsh 插件形态（`driver.ts`） | 入口/配置可用，**语音链路未接线**——目前用独立进程形态 |
+| 首字延迟 | 中位 2.0 s / p90 8.3 s（20 轮真实对话实测）。瓶颈是 agent 的多步推理（每步 1.1–1.5 s），不是生成、也不是 TTS |
 
-## 装进 dsh
+排障和优化都靠可复算的证据，不靠猜：`scripts/latency-report.ts`（逐轮分段）、`scripts/dsh-timeline.ts`（对齐 dsh 自己的会话日志，拆开 agent 内部那几秒）。
+
+## 配置
+
+完整表见 [docs/OPERATIONS.md](./docs/OPERATIONS.md)。最常动的几个：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `port` | `8766` | 设备连上来的端口 |
+| `host` | `127.0.0.1` | **非本机地址要求 `tls` + `auth` 同时配齐**，缺一个就不监听（见 [`bind-policy.ts`](./src/bind-policy.ts)） |
+| `tls.keyPath` / `certPath` | `''` | 要么都给，要么都不给 |
+| `auth.tokenFile` | `''` | 设备 token，用 `npm run pair -- new` 生成，**别自己想字符串** |
+| `voice` | `Chloe` | TTS 音色 |
+| `turnThreshold` | `0.5` | 判停阈值 |
+
+装进 dsh：
 
 ```bash
 dsh plugin --profile <profile> add dsh-pet-wearable
 ```
 
-或在 profile 的 `cordis.patch.yml` 里显式插入：
-
-```yaml
-- insert:
-    - id: pet-wearable
-      name: dsh-pet-wearable
-      config:
-        port: 8766
-        voice: Chloe
-```
-
-patch 的语义要记住：裸条目是**按 id 覆盖**已有节点，**新增**节点必须写在 `insert:` 下，
-否则报 `entry not found`。
-
-## 配置
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `port` | `8766` | 手机连上来的 TCP 端口 |
-| `host` | `127.0.0.1` | 监听地址。**非本机地址要求 `tls` 与 `auth` 同时配齐**，否则拒绝加载 |
-| `tls.keyPath` / `tls.certPath` | `''` | TLS 证书（PEM）。要么两个都给，要么都不给 |
-| `auth.tokenFile` | `''` | 设备 token 文件（每行 `token` 或 `token:deviceId`）。留空 = 不鉴权。**用 `npm run pair new` 生成，别自己想字符串** |
-| `device` | `''` | v1 手机的型号提示（如 `xiaomi-glasses`）。新协议设备在握手时自报能力，不用填；留空 = v1 基线 |
-| `voice` | `Chloe` | TTS 音色 |
-| `turnThreshold` | `0.5` | 判停阈值。调高更不容易被判为"说完了" |
-| `proactive.greetAfterAwayMs` | `300000` | 离场超过多久，重戴时才打招呼 |
-| `proactive.chatterAfterIdleMs` | `1200000` | 安静多久后可以主动搭话 |
-| `proactive.minProactiveGapMs` | `600000` | 两次主动开口的最小间隔 |
-| `proactive.quietFromHour` | `23` | 深夜起点（本地小时，含） |
-| `proactive.quietToHour` | `7` | 深夜终点（本地小时，不含） |
-| `proactive.lowBatteryPercent` | `20` | 低于此电量就不主动开口；读不到电量时不受限 |
-
-**改配置现在会重建插件**：dsh 的 loader 对非 `volatile()` 字段走完整的 dispose → `apply`，
-监听会关闭、连接会断。把这些参数标成 `volatile()`（热读、不重建）是待办事项。
-
-`proactive` 的默认值一律偏向"宁可少说"。想让它更活泼，调 `chatterAfterIdleMs`，
-**不要加新规则** —— 规则越多越难解释它为什么沉默。
-
-### 监听地址的硬判据
-
-手机这一侧是一条能被任何人连上的 TCP 口，而设备 token 是**明文写在 `Hello` 里的**。
-所以判据只有一条，写在 [`src/bind-policy.ts`](./src/bind-policy.ts)，两处共用
-（`transport.ts` 在 `listen()` 之前、`driver.ts` 在 `apply()` 里）：
-
-| 绑到哪 | 要求 |
-|---|---|
-| 本机（`127.0.0.0/8`、`::1`、`localhost`） | 无 |
-| **任何非本机地址**（含 `0.0.0.0`、`::`、留空） | **token + TLS 缺一不可**，缺了就**不监听** |
-
-不是"打一条警告然后照绑"—— 拒绝的路径一根 socket 都不开，退出码 2。
-两条正当出路：保持 `127.0.0.1` 走 `adb reverse`；或让反向代理终结 TLS、把 `--host` 写回
-`127.0.0.1`。
-
-### 配对：谁来生成 token
-
-**谁初始化，谁生成。** 不用自己想字符串，也不该把眼镜的 token 拿来用：
-
-```bash
-npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
-```
-
-输出一条配对串，直接贴进手机 App：
-
-```
-dshpet://pair?host=203.0.113.10&port=8766&tls=1&token=<64 位 hex>&device=pixel-9
-```
-
-规则：
-
-| 子命令 | 作用 |
-|---|---|
-| `npm run pair -- new` | 生成 32 字节随机 token，**追加**进文件（不覆盖已有设备），打印配对串 |
-| `npm run pair -- list` | 列设备 + 打码的 token。完整值只在生成时出现一次 |
-| `npm run pair -- revoke --device <id>` | 吊销。服务端**按文件变化热读**，不必重启 |
-| `npm run pair -- check <配对串>` | 不碰服务端，验一条串合不合格 |
-
-四件事是刻意的：
-
-1. **追加不覆盖** —— 重新生成不会把所有已配对设备一起踢下线
-2. **强度不达标就拒启动** —— `< 32 字节` 直接报错。顺带把 `^[0-9a-f]{32}$` 判成
-   "这看起来是眼镜的 token"：那是 16 字节 UUID，是 SPP 会话密钥的根，不该出现在这里
-3. **吊销立即生效** —— 新连接按新表判；已建立的连接不踢（那要重启）
-4. **`token:deviceId` 是真绑定** —— `Hello.deviceId` 对不上同样拒绝。以前这一列只是注释
-
-## 外部依赖
-
-| 依赖 | 必需 | 用途 |
-|---|---|---|
-| Node.js ≥ 22.18 | 是 | 原生跑 `.ts`（type stripping）。`dsh` 本身也要求 |
-| `ffmpeg` | 是 | mSBC → PCM 解码 |
-| 阿里云 NLS | 否 | 实时识别。不给密钥就用 `--stt canned` 跑离线链路 |
-| MiMo | 否 | TTS / ASR。不给密钥就用 `--tts silent` |
-| `smart_turn/` Python 侧车 | 否 | 判停模型。缺失时退回能量门 + 静音时长 |
-| `models/silero_vad.onnx` | 否 | 本地 VAD（惰性加载；文件不在就跳过） |
-
-## 开发
-
-```bash
-npm install
-npm run typecheck
-npm test                            # node --test tests/*.test.ts
-npm run sim                         # 宠物主动开口的离线场景（零网络 / 零密钥 / 零 ffmpeg）
-npm run sim -- --explore --runs 500 # 随机探索：找不变量违反并收缩成最小复现
-npm run sim -- --trace out/         # 把每个场景的时间线写成 JSONL
-
-# 不需要任何密钥：canned 识别 + 静音合成 + echo agent
-node src/main.ts --listen 8766 --stt canned --tts silent --agent echo
-
-# 另一个终端：最小客户端，推一段 mSBC
-node tools/fake-phone.ts --port 8766 --sbc tmp/voice.sbc
-```
-
-手机侧先 `adb reverse tcp:8766 tcp:8766`。
-
-### 三个可替换件
-
-| 开关 | 取值 | 说明 |
-|---|---|---|
-| `--stt` | `aliyun` `noop` `canned` `<模块路径>` | 上行识别，每次连接开一个会话 |
-| `--tts` | `mimo` `silent` `<模块路径>` | 下行合成，采样率由实现自己声明 |
-| `--agent` | `dsh` `echo` `none` `<模块路径>` | 裸 `--agent` 等价 `dsh` |
-
-`<模块路径>` 指向一个导出工厂的文件（契约在 `src/providers.ts`）：
-
-```ts
-// my-stt.ts
-import type { SttProvider } from '../src/providers.ts';
-export function stt(): SttProvider {
-  return { name: 'my-stt', open: (h) => ({ feed: h.onSentence, hangup() {}, close() {} }) };
-}
-```
-
-### 设备能力
-
-`src/devices/` 只定义插件两个环（对话环 / 宠物环）要用的原语：6 个下行操作、6 个上行事件、
-一份能力声明。设备在 `Hello` 里自报能力，插件不认型号；P2P、相册、快门、手势细节这类
-设备侧实现归手机端或你自己的适配器。新增一台设备 = 设备侧自报能力，插件零改动
-（雷鸟 X3 Pro 的写法见 [docs/devices/RAYNEO-X3-PRO.md](./docs/devices/RAYNEO-X3-PRO.md)）。
-
-`--device` / `PET_DEVICE` 只是给**不会自报的 v1 手机**补默认能力（`xiaomi-glasses`）；
-不给就走 v1 基线。
+patch 语义：裸条目是**按 id 覆盖**，**新增**节点必须写在 `insert:` 下，否则报 `entry not found`。
 
 ## 文档
 
 | 文件 | 内容 |
 |---|---|
-| [docs/adr/0001-app-layer-and-pet.md](./docs/adr/0001-app-layer-and-pet.md) | **应用层与宠物层**：端口、状态机、三张登记表、模拟器、实施顺序 |
-| [docs/adr/0002-virtual-time-simulator.md](./docs/adr/0002-virtual-time-simulator.md) | **虚拟时间模拟器**：单一调度器、假件、声明式场景、三层判定、随机探索 |
-| [docs/CLOUD-ARCHITECTURE.md](./docs/CLOUD-ARCHITECTURE.md) | 分层、类职责、并发模型、状态机、扩展点 |
-| [docs/device-protocol.md](./docs/device-protocol.md) | 线协议：帧格式、控制串、状态帧、拍照时间预算（写手机端的人看） |
-| [docs/OPERATIONS.md](./docs/OPERATIONS.md) | 部署形态、鉴权与 TLS、原始档案、延迟报告、待补播 |
-| [docs/ALIYUN-ASR-PROBED.md](./docs/ALIYUN-ASR-PROBED.md) | 阿里云实时识别实测 |
-| [docs/MIMO-API-PROBED.md](./docs/MIMO-API-PROBED.md) | MiMo 接口实测 |
-| [docs/STT-TTS-REALTIME-QUESTIONS.md](./docs/STT-TTS-REALTIME-QUESTIONS.md) | 实时性问题的排查记录 |
+| [ADR-0001](./docs/adr/0001-app-layer-and-pet.md) | 应用层与 pet：端口、状态机、三张登记表、实施顺序 |
+| [ADR-0002](./docs/adr/0002-virtual-time-simulator.md) | 虚拟时间模拟器：单一调度器、假件、声明式场景、三层判定 |
+| [CLOUD-ARCHITECTURE](./docs/CLOUD-ARCHITECTURE.md) | 分层、类职责、并发模型、扩展点 |
+| [device-protocol](./docs/device-protocol.md) | 线协议：帧格式、控制串、状态帧（写设备端的人看） |
+| [OPERATIONS](./docs/OPERATIONS.md) | 部署形态、鉴权与 TLS（含证书轮换）、原始档案、延迟报告 |
+| [RAYNEO-X3-PRO](./docs/devices/RAYNEO-X3-PRO.md) | 接一台新设备要做什么 |
 
-设备侧（手机 App、眼镜 SDK）不在本仓库：本仓库只消费上面的线协议。
+设备侧（手机 App、眼镜 SDK）不在本仓库：这里只消费上面那份线协议。
 
 ## 明确不做
 
