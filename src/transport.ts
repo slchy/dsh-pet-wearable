@@ -14,8 +14,10 @@ import { createServer as createTlsServer } from 'node:tls';
 import { checkBindSafety } from './bind-policy.ts';
 import {
   DownstreamFrameType,
+  FRAME_MAX_BYTES,
   FrameDecoder,
   FrameWriter,
+  UNAUTH_FRAME_MAX_BYTES,
   UpstreamFrameType,
 } from './frame.ts';
 
@@ -102,7 +104,13 @@ export class Connection {
     this.onClosed = onClosed;
     this.remote = `${socket.remoteAddress}:${socket.remotePort}`;
     this.frames = new FrameWriter(socket);
-    this.decoder = new FrameDecoder((message) => { log(`  ✗ ${message}`); });
+    this.decoder = new FrameDecoder(
+      (message) => {
+        log(`  ✗ ${message}`);
+      },
+      // 需要鉴权时先收着：未鉴权的对端没资格声明大帧
+      authenticate === undefined ? FRAME_MAX_BYTES : UNAUTH_FRAME_MAX_BYTES,
+    );
     this.authed = authenticate === undefined;
     this.authDeviceId = undefined;
 
@@ -207,16 +215,26 @@ export class Connection {
       this.onHello(payload);
       return;
     }
-    if (type === UpstreamFrameType.Ping) {
-      // 心跳不必等鉴权：它不携带任何信息，也不触发业务
-      if (!this.closed) {
-        this.frames.write(DownstreamFrameType.Pong, Buffer.alloc(0));
-      }
-      return;
-    }
+    /**
+     * **鉴权前什么都不放行** —— 包括 `Ping`。
+     *
+     * 以前 `Ping` 在这一段之前就回了 `Pong`，理由是"它不携带信息、不触发业务"。
+     * 但 `onData` 里**任何字节**都刷新 `lastRxAt`，于是未鉴权的连接每 5 秒发一个
+     * 空 Ping 就能永久占着一条连接（`checkIdle` 永不触发）。
+     *
+     * 正常客户端的心跳是在 `Hello` 之后才开始的（`VoiceLink` 连接后立刻发 Hello，
+     * 心跳 10 s 一次），所以这里收紧不影响任何合法路径。
+     */
     if (!this.authed) {
       this.log(`  鉴权    未收到 Hello 就发帧（type=${type}），断开`);
       this.closeWith('auth_required');
+      return;
+    }
+    if (type === UpstreamFrameType.Ping) {
+      // 已鉴权：心跳照常回，它确实不携带信息
+      if (!this.closed) {
+        this.frames.write(DownstreamFrameType.Pong, Buffer.alloc(0));
+      }
       return;
     }
     this.handlers?.onFrame(type, payload);
@@ -247,6 +265,8 @@ export class Connection {
     }
     this.authed = true;
     this.authDeviceId = hello.deviceId;
+    // 身份确认了，才允许大帧（图片、整段音频）
+    this.decoder.setMaxBytes(FRAME_MAX_BYTES);
     this.log(`  鉴权    通过（deviceId=${hello.deviceId ?? '?'} proto=${hello.proto ?? '?'}）`);
     this.handlers?.onHello?.(hello);
   }

@@ -15,6 +15,17 @@ export const FRAME_HEADER_BYTES = 5;
  */
 export const FRAME_MAX_BYTES = 32 << 20;
 
+/**
+ * **鉴权前**允许的帧长上限。
+ *
+ * 未通过 `Hello` 的连接只该发 `Hello`（几百字节）。给 64 KB 余量已经足够宽松，
+ * 但比 32 MB 少三个数量级 —— 未鉴权的对端没法先声明一个 32 MB 的帧再把服务端
+ * 的内存慢慢灌满（`push()` 每来一块都要 `Buffer.concat`，灌 32 MB 是 O(n²) 拷贝）。
+ *
+ * 鉴权通过后由 {@link FrameDecoder.setMaxBytes} 放宽回 {@link FRAME_MAX_BYTES}。
+ */
+export const UNAUTH_FRAME_MAX_BYTES = 64 * 1024;
+
 /** 上行帧类型（手机 → 云端） */
 export const UpstreamFrameType = {
   /** mSBC 原始字节，未解码 */
@@ -94,9 +105,31 @@ export interface DecodedFrame {
 export class FrameDecoder {
   private readonly onProtocolError: (message: string) => void;
   private buffer: Buffer = Buffer.alloc(0);
+  /**
+   * 当前允许的最大帧长。
+   *
+   * 刻意做成**可变**：未鉴权的连接只配拿 `Hello`，上限收紧到
+   * {@link UNAUTH_FRAME_MAX_BYTES}；鉴权通过后由 {@link setMaxBytes} 放宽。
+   */
+  private maxBytes: number;
 
-  constructor(onProtocolError: (message: string) => void) {
+  constructor(onProtocolError: (message: string) => void, maxBytes: number = FRAME_MAX_BYTES) {
     this.onProtocolError = onProtocolError;
+    this.maxBytes = maxBytes;
+  }
+
+  /**
+   * 调整帧长上限（鉴权通过后调用）。
+   *
+   * 只放宽不放宽到超过 {@link FRAME_MAX_BYTES}；同时把已经攒着但已超限的缓冲丢掉 ——
+   * 那些字节属于未鉴权阶段的越权尝试，没有保留的意义。
+   */
+  setMaxBytes(maxBytes: number): void {
+    this.maxBytes = Math.min(Math.max(1, maxBytes), FRAME_MAX_BYTES);
+    if (this.buffer.length > this.maxBytes) {
+      this.onProtocolError(`未鉴权期间攒了 ${this.buffer.length} B，超过上限，丢弃`);
+      this.buffer = Buffer.alloc(0);
+    }
   }
 
   push(chunk: Buffer): DecodedFrame[] {
@@ -106,8 +139,8 @@ export class FrameDecoder {
     while (this.buffer.length >= FRAME_HEADER_BYTES) {
       const type = this.buffer[0] ?? 0;
       const length = this.buffer.readUInt32LE(1);
-      if (length > FRAME_MAX_BYTES) {
-        this.onProtocolError(`帧长异常 ${length}，丢弃整个缓冲`);
+      if (length > this.maxBytes) {
+        this.onProtocolError(`帧长异常 ${length}（上限 ${this.maxBytes}），丢弃整个缓冲`);
         this.buffer = Buffer.alloc(0);
         break;
       }
