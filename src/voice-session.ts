@@ -552,6 +552,7 @@ class VoiceConnection {
       // HTTP 超时比收件箱的兜底再宽 5 s：让设备上报的失败原因先回来
       hqTimeoutMs: detail === null ? undefined : this.photos.timeoutFor(detail.needsUser) + 5_000,
       handlers: {
+        capabilities: () => this.caps,
         takePhoto: () => this.requestToolCapture('glance'),
         // 没有 `detail` 意图时不传 `takePhotoHq`：`tool-control` 会回落到 `takePhoto`
         takePhotoHq: detail === null ? undefined : () => this.requestToolCapture('detail'),

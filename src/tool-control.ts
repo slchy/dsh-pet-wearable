@@ -5,6 +5,8 @@
  * 独立进程，只能通过一个 URL 与 harness 通信。本模块只负责 HTTP 层：
  * 路由、并发保护、超时、响应码；真正的硬件动作由调用方注入。
  *
+ * - `GET /capabilities`  → 当前连接设备的能力（JSON）。**给 MCP 工具进程用**：
+ *   工具该不该存在、要不要提示「需要用户动手」，都由它决定，不写死在工具描述里。
  * - `POST /take_photo`  → 调 {@link ToolControlHandlers.takePhoto} 取 JPEG（低清，快）
  * - `POST /take_photo_hq` → 高清版，见 {@link ToolControlHandlers.takePhotoHq}
  * - `POST /end_session` → 调 {@link ToolControlHandlers.endSession}
@@ -14,9 +16,18 @@
  *   `start_capture` 这类"要让设备配合做动作"的实验，没法从对话里自然触发）
  */
 import { createServer, type Server } from 'node:http';
+import type { DeviceCapabilities } from './devices/primitives.ts';
 import type { PhotoOutcome } from './photo-inbox.ts';
 
 export interface ToolControlHandlers {
+  /**
+   * 当前连接设备的能力；没有连接时返回 `null`。
+   *
+   * MCP 工具进程靠它决定暴露哪些工具：设备只报 `glance` 就只有一个拍照工具，
+   * 报了 `detail` 才有高清那个。`needsUser` 也从这里读，不在描述里写死
+   * 「必须按快门」——小米要按，别的设备直接拍。
+   */
+  readonly capabilities?: () => DeviceCapabilities | null;
   /** 取一张照片；`ok:false` 表示超时/失败，`reason` 会原样写回模型 */
   readonly takePhoto: () => Promise<PhotoOutcome>;
   /** 取一张**高清**照片（手机侧开一次 P2P 拉原图再缩，需要用户按快门），无此能力时回落到 [takePhoto] */
@@ -55,6 +66,20 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
   let photoInFlight = false;
 
   const server: Server = createServer((req, res) => {
+    // 能力查询是 GET：MCP 工具进程用它决定暴露哪些工具，不做任何硬件动作。
+    // 没有连接时回 503，工具进程据此认为「此刻没有可用的拍照能力」。
+    if (req.method === 'GET' && req.url === '/capabilities') {
+      const caps = handlers.capabilities?.() ?? null;
+      if (caps === null) {
+        res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
+          .end('{"error":"no-device"}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+        .end(JSON.stringify(caps));
+      return;
+    }
+
     if (req.method !== 'POST') {
       res.writeHead(404).end();
       return;

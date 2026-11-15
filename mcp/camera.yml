@@ -88,6 +88,8 @@
         command: node
         args:
           - /path/to/dsh-pet-wearable/mcp/mcp-camera.mjs
+        # 不带任何设备参数：工具表由 server 运行时从 harness 的
+        # `GET /capabilities` 现查现生成。换设备只改设备适配层，这里和 MCP 代码都不用动。
         toolCallTimeoutMs: 30000
         failOnStartupError: false
     - id: mcp-session
