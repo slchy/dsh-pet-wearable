@@ -195,8 +195,9 @@ test('热词表：只有配置了真 ID 才下发 vocabulary_id', async () => {
     return (JSON.parse(raw) as { payload: Record<string, unknown> }).payload;
   };
 
-  // 没配就别下发。传假 ID 服务端会静默忽略、也不报错，所以宁可不下发，
-  // 免得线上压根没启用还误以为在起作用。
+  // 没配就别下发：控制台的「项目热词」与 appkey 绑定、自动生效，不走这个字段；
+  // 只有 POP API 建的业务专属词表才需要真 ID。下发假值除了制造"已启用"的错觉
+  // 没有任何用处，所以宁可不下发。
   const plain = await startParams();
   assert.equal('vocabulary_id' in plain, false);
   assert.equal(plain['sample_rate'], 16000, '其它 Start 参数不受影响');

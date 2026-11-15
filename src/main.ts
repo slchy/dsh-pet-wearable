@@ -389,7 +389,7 @@ async function main(): Promise<void> {
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
     console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);
     console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
-    console.error('            [--vocab-id <id>] 阿里云热词表，专有名词识别不准时用');
+    console.error('            [--vocab-id <id>] 业务专属热词表 ID（控制台项目热词无需配置）');
     process.exit(2);
   }
 

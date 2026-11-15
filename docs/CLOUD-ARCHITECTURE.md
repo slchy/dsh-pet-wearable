@@ -391,7 +391,7 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
 | `--agent` | `dsh` / `echo` / `none`；`--dsh-sdk` 走 SDK 会话而不是 headless |
 | `--replay` | 离线回放，不监听端口 |
 | `--ffmpeg` / `--gap-ms` · `--sentence-silence` | 解码器路径 / 解帧间隔 / 判停静音阈值 |
-| `--vocab-id` | 阿里云热词表 ID，专有名词（市值、审计）识别不准时用；留空不下发 |
+| `--vocab-id` | 业务专属热词表 ID（POP API 建的那种）；控制台配的项目热词与 Appkey 绑定，无需此项 |
 | `--work-dir` · `--ask-image` | agent 工作目录 · 单图提问 |
 
 调优类几乎都有对应环境变量（`MIAI_*`：增益、电平表、档案、补播、TTS 音色与风格、
