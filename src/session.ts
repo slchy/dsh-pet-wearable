@@ -53,11 +53,19 @@ export interface TokenUsage {
  * - `inputTokens` / `outputTokens` / `cacheReadTokens` **累加** = 这一轮总共花了多少
  * - `contextTokens` 取**最后一个** step 的输入 = 当时上下文有多大
  *
- * 混成一个数会得出两个错误结论之一：要么低估成本，要么永远看不出上下文已经
+ * `contextTokens` 必须是 `inputTokens + cacheReadTokens`：DeepSeek 只把**未命中缓存**
+ * 的那部分算进 inputTokens，命中的记在 cacheReadTokens 里。真机实测一轮
+ * `tokens=144/13 cache=67584`，只取 inputTokens 会得出「上下文 144 token」这种
+ * 离谱数字 —— 压缩阈值永远看着没到，实际早就该压了。
+ *
+ * 混成一个数还会得出两个错误结论之一：要么低估成本，要么永远看不出上下文已经
  * 逼近压缩阈值（累加值一直在涨，反而更像"正常"）。
  */
 export function foldStepUsage(acc: TokenUsage | null, step: TokenUsage): TokenUsage {
-  const contextTokens = step.inputTokens ?? acc?.contextTokens;
+  const hasContext = step.inputTokens !== undefined || step.cacheReadTokens !== undefined;
+  const contextTokens = hasContext
+    ? (step.inputTokens ?? 0) + (step.cacheReadTokens ?? 0)
+    : acc?.contextTokens;
   return {
     inputTokens: (acc?.inputTokens ?? 0) + (step.inputTokens ?? 0),
     outputTokens: (acc?.outputTokens ?? 0) + (step.outputTokens ?? 0),
@@ -162,8 +170,11 @@ export function parseEvents(stdout: string): {
       const u = e['usage'];
       if (u && typeof u === 'object') {
         const parsed = u as TokenUsage;
-        // headless 的 status 是收尾那一次，inputTokens 本身就是上下文规模
-        usage = { ...parsed, contextTokens: parsed.inputTokens };
+        // 收尾那一次的输入就是上下文规模；同样要含缓存命中部分
+        usage = {
+          ...parsed,
+          contextTokens: (parsed.inputTokens ?? 0) + (parsed.cacheReadTokens ?? 0),
+        };
       }
     }
   }
