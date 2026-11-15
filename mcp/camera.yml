@@ -14,7 +14,7 @@
 #                 transactionId/requestId 发 multiModel，再把 JPEG 回给它
 #   end_session → harness 挂「本轮说完就结束」的旗子，播完断开连接
 
-# ---- 主对话常驻：bash 前台最多等 3 s，超时自动转后台 job ----
+# ---- 主对话常驻：bash 前台最多等 1 s，超时自动转后台 job ----
 #
 # 这是全双工能成立的前提：前台跑命令会把主对话整个占住，这几秒里用户说什么都
 # 进不来（真机 05:40:37 那次网上搜索占了 10.19 s，用户问「你查好了吗」排到了
@@ -24,11 +24,16 @@
 #
 # 所以不需要在应用层猜用户在问什么（关键词匹配既是漏判也是误伤），
 # 也不需要提示词逼模型"一律派后台"——调短等待就够了，一个主对话能同时挂多个 job。
+#
+# 为什么是 1 s 而不是 3 s：`ls` / `git status` / `cat` 这类毫秒级命令一秒内必定
+# 返回，不受影响；而编译、探索、开别的 harness 本来就不该在**前台**跑，它们多卡
+# 2 秒就是主对话多失聪 2 秒。提示词那边已经按「要不要当场拿结果」分了层，这里
+# 只是把判断失手的代价压低。
 - id: bash-sandbox
   config:
-    timeoutMs: 3000
+    timeoutMs: 1000
     # 模型自己传 timeoutMs 也不能把它拉长，否则它一问就又把主对话堵回去
-    maxTimeoutMs: 3000
+    maxTimeoutMs: 1000
 
 # 子代理开满思考。
 #
@@ -53,6 +58,17 @@
     toolName: subagent_fork
     agentOptions:
       reasoningEffort: max
+
+# 显式写死这两项，不靠默认值：
+# - `promoteOnTimeout`：超时不杀，转后台。**这是 1 s 安全的前提** —— 如果它被关掉，
+#   1 秒就是把命令直接杀掉。
+# - `enableRunInBackground`：允许模型自己主动选择后台跑，不必等超时。
+# 字段定义见 `@deepseek-ai/dsh-tool-bash` 的 config schema（两者默认都是 true，
+# 但默认值是别人的代码，写死才不会被下次升级悄悄改掉）。
+- id: tool-bash
+  config:
+    promoteOnTimeout: true
+    enableRunInBackground: true
 
 # 同上，`job_output wait:true` 默认会等 **30 秒**（dsh-tool-jobs 的
 # `waitTimeoutMs ?? 3e4`）—— 模型刚被踢到后台，转头又用 job_output 干等，
