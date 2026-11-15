@@ -4,13 +4,14 @@
  * 语音层的日志里从来没出现过 `后台 任务完成 → 播报`，也就是说这条链路
  * 从未被真实触发过。这里绕开语音层，直接对 DshSession 验一次。
  *
- * 跑法（服务器上）：
- *   set -a; . ~/miai-cloud/.env; set +a
- *   node /tmp/announce-probe.mjs
+ * 跑法（在仓库根目录，或把 MIAI_REPO 指过去）：
+ *   set -a; . .env; set +a
+ *   MIAI_REPO=$PWD node scripts/probe-announce.mjs
  */
 import { mkdirSync } from 'node:fs';
 
-import { DshSession } from '<部署路径>/miai-cloud/src/session.ts';
+const REPO = process.env['MIAI_REPO'] ?? process.cwd();
+const { DshSession } = await import(`${REPO}/src/session.ts`);
 
 const DIR = '/tmp/announce-probe';
 mkdirSync(DIR, { recursive: true });

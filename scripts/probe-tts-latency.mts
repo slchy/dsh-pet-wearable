@@ -5,11 +5,12 @@
  * 两轮对话间隔通常十几秒，等于每次都要重新 TLS 握手。如果真是这样，
  * 隔 1 秒连续两次会比隔 15 秒快出一截。
  *
- * 跑法（服务器上）：
- *   set -a; . ~/miai-cloud/.env; set +a
- *   node /tmp/tts-probe.mts
+ * 跑法（在仓库根目录，或把 MIAI_REPO 指过去）：
+ *   set -a; . .env; set +a
+ *   MIAI_REPO=$PWD node scripts/probe-tts-latency.mts
  */
-import { ttsStream } from '<部署路径>/miai-cloud/src/mimo.ts';
+const REPO = process.env['MIAI_REPO'] ?? process.cwd();
+const { ttsStream } = await import(`${REPO}/src/mimo.ts`);
 
 async function firstChunkMs(text: string, voice: string): Promise<number> {
   const started = Date.now();
