@@ -558,7 +558,11 @@ async function main(): Promise<void> {
           // 所以缩短它不会让它判得更差。
           quietMs: envNumber('SMART_TURN_QUIET_MS', 150),
           extendMs: SMART_TURN_EXTEND_MS,
-          maxExtensions: envNumber('SMART_TURN_MAX_EXT', 3),
+          // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
+          // SmartTurn `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
+          // 的兜底，而我们原来只有 3×400=1.2 s —— 触发点比人家快、兜底却只有一半，
+          // 用户说半句停下来想一下就会被强制收下。7×400 ≈ 2.8 s，对齐业界。
+          maxExtensions: envNumber('SMART_TURN_MAX_EXT', 7),
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
         }
         : undefined,
