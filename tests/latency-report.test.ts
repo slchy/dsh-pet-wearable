@@ -58,6 +58,26 @@ test('缺 tts.first 的旧档案：首字延迟记 null，不拿 0 冒充', () =
   assert.match(formatReport(computeTurns(parseEvents(legacy))), /tts\.first×1/);
 });
 
+test('gate.close 带 gapMs：起点取「停嘴时刻」，而不是记录时刻', () => {
+  // 真实顺序：能量门要 holdMs（2 s）才关，所以 gate.close 记在 turn.start **之后**。
+  // 停嘴 @1000，gate.close 记在 @3000（gapMs 2000）。
+  const real = jsonl([
+    { t: 1000, ev: 'gate.open', peakDbfs: -20 },
+    { t: 1800, ev: 'asr.sentence', text: '我记得', index: 0 },
+    { t: 2200, ev: 'turn.start', text_len: 3, image: false },
+    { t: 3000, ev: 'gate.close', gapMs: 2000 },
+    { t: 4000, ev: 'tts.first', ms: 1800 },
+    { t: 7000, ev: 'turn.end', interrupted: false, dsh_ms: 1500 },
+  ]);
+  const [turn] = computeTurns(parseEvents(real));
+  assert.ok(turn);
+  // ① = asr.sentence - 停嘴 = 1800 - 1000
+  assert.equal(turn.silenceToAsr, 800);
+  // 首字延迟 = tts.first - 停嘴 = 4000 - 1000（若取记录时刻会误报 1000）
+  assert.equal(turn.firstWordMs, 3000);
+  assert.deepEqual(turn.missing, []);
+});
+
 test('多轮不串味：第二轮没有 gate.close 就记 null，不复用第一轮的', () => {
   const two = jsonl([
     { t: 1000, ev: 'gate.close' },

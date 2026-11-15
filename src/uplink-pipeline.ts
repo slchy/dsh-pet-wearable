@@ -64,8 +64,8 @@ export interface UplinkPipelineOptions {
   /** 有声开始：先把 preroll 喂进 STT，再继续喂后续 */
   readonly onSpeechOpen: (peakDbfs: number, preroll: readonly Buffer[], prerollMs: number) => void;
   readonly onSpeech: (pcm: Buffer) => void;
-  /** 持续静音：请 STT 出定稿并挂断这一路 */
-  readonly onSpeechClose: () => void;
+  /** 持续静音：请 STT 出定稿并挂断这一路。`gapMs` = 距最后一个有声块多久 */
+  readonly onSpeechClose: (gapMs?: number) => void;
 }
 
 export class UplinkPipeline {
@@ -213,7 +213,7 @@ export class UplinkPipeline {
         '  上行    持续静音 → 停推并挂断（避免 IDLE_TIMEOUT）'
         + (decision.closedGapMs === undefined ? '' : `，距上次有声 ${Math.round(decision.closedGapMs)} ms`),
       );
-      onSpeechClose();
+      onSpeechClose(decision.closedGapMs);
     }
   }
 }

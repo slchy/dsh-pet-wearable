@@ -446,8 +446,10 @@ class AliyunConnection {
         }
       },
       onSpeech: (pcm) => { this.stt.feed(pcm); },
-      onSpeechClose: () => {
-        this.archive?.event('gate.close');
+      onSpeechClose: (gapMs) => {
+        // 带上 gapMs：能量门要 holdMs（默认 2 s）才关门，所以 `t` 本身**不是**
+        // 「用户停嘴」的时刻，`t - gapMs` 才是。延迟报告靠这个还原真实起点。
+        this.archive?.event('gate.close', gapMs === undefined ? undefined : { gapMs });
         this.stt.hangup();
       },
     });

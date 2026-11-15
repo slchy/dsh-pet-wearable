@@ -72,4 +72,7 @@ function main(argv: readonly string[]): number {
   return 0;
 }
 
-process.exit(main(process.argv.slice(2)));
+// 不用 `process.exit()`：stdout 走管道时写入是异步的，立即退出会撞上
+// libuv 的 `!(handle->flags & UV_HANDLE_CLOSING)` 断言（Windows 上必现）。
+// 设 exitCode 让事件循环自然收尾。
+process.exitCode = main(process.argv.slice(2));

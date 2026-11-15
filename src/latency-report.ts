@@ -40,6 +40,8 @@ export interface ArchiveEvent {
   readonly dsh_ms?: unknown;
   readonly audio_s?: unknown;
   readonly interrupted?: unknown;
+  /** `gate.close` 专有：距最后一个有声块多久（ms）。有它才能还原「用户停嘴」的时刻 */
+  readonly gapMs?: unknown;
 }
 
 /** 一轮里可能缺席的时刻名。 */
@@ -129,6 +131,7 @@ export function parseEvents(jsonl: string): ArchiveEvent[] {
       dsh_ms: obj['dsh_ms'],
       audio_s: obj['audio_s'],
       interrupted: obj['interrupted'],
+      gapMs: obj['gapMs'],
     });
   }
   return out;
@@ -172,11 +175,29 @@ function delta(
 }
 
 /**
+ * 「用户停嘴」的绝对时刻：`gate.close` 的 `t` 减去 `gapMs`。
+ *
+ * 能量门要等 `holdMs`（默认 2 s）才关门，所以 `t` 本身比真实停嘴晚一大截；
+ * `gapMs` 就是那段等待。旧档案没有 `gapMs`，退回 `t`。
+ */
+function speechStopAt(events: readonly ArchiveEvent[], at: number): number | null {
+  const ev = events[at];
+  if (!ev) {
+    return null;
+  }
+  const gap = num(ev.gapMs);
+  return gap === undefined ? ev.t : ev.t - gap;
+}
+
+/**
  * 把事件序列折算成逐轮延迟。
  *
  * 配对规则（每条都限定了搜索边界，避免跨轮串味）：
- * - `gate.close` / `asr.sentence` 只在本轮 `turn.start` **与上一轮 `turn.start` 之间**找
+ * - `asr.sentence` 只在本轮 `turn.start` **与上一轮 `turn.start` 之间**找
  * - `tts.first` / `turn.end` 只在本轮 `turn.start` **与下一轮 `turn.start` 之间**找
+ * - `gate.close` 从本轮 `turn.start` **往前**找（含之前所有轮）—— 它必然晚于
+ *   `asr.sentence`（能量门 holdMs 2 s > ASR 静音 0.8 s），按位置往前扒只会
+ *   扒到上一轮的。用它的 `t - gapMs` 还原真实停嘴时刻，见 {@link speechStopAt}。
  *
  * 主动播报（`announce`）没有 `asr.sentence`，所以它的 ①② 为 `null`；
  * 若它触发了 `turn.start`，仍会算进 ③④。
@@ -201,12 +222,29 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     const prevAt = n === 0 ? -1 : (starts[n - 1] ?? -1);
     const nextAt = starts[n + 1] ?? events.length;
 
-    // ① 的起点：本轮范围内的最后一个 gate.close
+    // ① 的起点 = **用户停嘴**的时刻。
+    //
+    // 不能直接用 `gate.close` 的 `t`：能量门要 `holdMs`（默认 2 s）才关门，而 ASR
+    // 静音只有 0.8 s，所以 `gate.close` 必然晚于 `asr.sentence`、甚至晚于
+    // `turn.start`。旧版只在本轮 `turn.start` **之前**找，于是每次都扒到上一轮那个，
+    // 把整轮播放时间算进了首字延迟（实测把 3.1 s 报成 7.1 s）。
+    //
+    // 范围取本轮 `[turn.start, 下一轮 turn.start)`：容得下记在后面的，又不会串轮。
+    // 旧档案里它也可能记在 `turn.start` 之前，退回上一段区间再找一次。
+    // 真正的起点是 `t - gapMs`（最后一个有声块），见 {@link speechStopAt}。
     let gateAt = -1;
-    for (let i = at - 1; i > prevAt; i -= 1) {
+    for (let i = at; i < nextAt; i += 1) {
       if (events[i]?.ev === 'gate.close') {
         gateAt = i;
         break;
+      }
+    }
+    if (gateAt < 0) {
+      for (let i = at - 1; i > prevAt; i -= 1) {
+        if (events[i]?.ev === 'gate.close') {
+          gateAt = i;
+          break;
+        }
       }
     }
     // ② 的中间点：本轮范围内的最后一个 asr.sentence
@@ -234,12 +272,16 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       }
     }
 
-    const silenceToAsr = delta(events, asrAt, gateAt);
+    // ① 和「首字总延迟」都以**停嘴时刻**为起点（不是 gate.close 的记录时刻）
+    const stopAt = speechStopAt(events, gateAt);
+    const asrEv = asrAt < 0 ? undefined : events[asrAt];
+    const firstEv = firstAt < 0 ? undefined : events[firstAt];
+    const silenceToAsr = stopAt === null || asrEv === undefined ? null : asrEv.t - stopAt;
     const asrToTurn = delta(events, at, asrAt);
     const turnToAudio = delta(events, firstAt, at);
     const playbackMs = delta(events, endAt, firstAt);
-    // 首字延迟必须以 gate.close 为起点：缺任何一环都不猜
-    const firstWordMs = delta(events, firstAt, gateAt);
+    // 首字延迟必须以「用户停嘴」为起点：缺任何一环都不猜
+    const firstWordMs = stopAt === null || firstEv === undefined ? null : firstEv.t - stopAt;
 
     const missing: MissingMark[] = [];
     if (gateAt < 0) {
@@ -392,6 +434,17 @@ export function formatReport(turns: readonly TurnLatency[], header = ''): string
       first.p90 <= FIRST_WORD_BUDGET_MS
         ? `判定：p90 ${Math.round(first.p90)} ms 在预算内，形态成立。`
         : `判定：p90 ${Math.round(first.p90)} ms 超预算，宠物会显得"迟钝"——先治 ③，别做插件。`,
+    );
+  }
+  // ① 为负 = ASR 定稿早于能量门关门。正常情况下不可能（门要等 holdMs 才关），
+  // 说明这份档案是**旧格式**、`gate.close` 没带 `gapMs`，起点实际偏晚一大截，
+  // 于是首字延迟被低估。这种数字不能当真，必须说出来。
+  const unreliable = turns.filter((t) => t.silenceToAsr !== null && t.silenceToAsr < 0).length;
+  if (unreliable > 0) {
+    lines.push(
+      `⚠ 起点不可靠：${unreliable}/${turns.length} 轮的 ① 为负 —— 这份档案的 `
+      + '`gate.close` 没有 `gapMs`（旧格式），停嘴时刻只能取记录时刻（比真实停嘴晚'
+      + ` holdMs），**首字延迟被低估**。重录一次即得准数，新档案带 \`gapMs\`。`,
     );
   }
   return lines.join('\n');
