@@ -17,3 +17,20 @@
 - id: llm-deepseek
   config:
     reasoningEffort: off
+
+# 上下文压缩阈值。
+#
+# 不设的话永远不会压缩：`llm-deepseek` 的 `DEFAULT_CONTEXT_WINDOW` 是 1e6，
+# 压缩默认 `thresholdRatio` 0.8 → 要到 **80 万 token** 才动手。真机 212 轮
+# 才 10.6 万，首步已经从 1 s 退化到 2.8–4.6 s（第 208 轮缓存全失效那轮 34.6 秒），
+# 却始终不触发压缩 —— 因为阈值高到根本够不着。
+#
+# 0.125 × 1e6 = **12.5 万**，即你要的上限。触发后把早期对话压成摘要、
+# 保留尾部 3 万 token 原文（够接上「刚才那个怎么样了」这类追问）。
+#
+# 必须同时给 retainTokens：默认 retainRatio 0.16 意味着保留 16 万，
+# 比 12.5 万的阈值还大，会直接抛 `retainTokens >= thresholdTokens`。
+- id: compaction-basic
+  config:
+    thresholdRatio: 0.125
+    retainTokens: 30000
