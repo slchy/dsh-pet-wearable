@@ -68,7 +68,7 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 1. **设备无关**：`src/devices/` 仅定义标准原语（6 个下行操作、6 个上行事件及一份能力声明），通过握手协议动态适配硬件。
 
-2. **组件可替换**：STT、TTS 与 agent 都通过工厂契约注入（见 [src/providers.ts](./src/providers.ts)），无密钥时自动回落离线实现。
+2. **组件可替换**：STT、TTS 与 agent 都通过工厂契约注入（见 [src/providers.ts](./src/providers.ts)），无密钥时自动回落离线实现。换上新的 STT/TTS 只需一个实现文件加一个装配分支，业务逻辑不动；agent 走同一契约，但内置实现绑定 `dsh`。
 
 3. **逻辑可单测**：时机判定、判停、打断与绑定策略均抽离为不依赖 Socket 的纯函数，由 `npm test`（302 条用例）与假设备线协议测试完整覆盖。
 
