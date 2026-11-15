@@ -355,7 +355,16 @@ class VoiceConnection {
       env: {
         call: (call) => this.sendCall(call),
         assemble: (text) => { this.assembler.addSentence(text); },
-        end: () => { this.conn.end(); },
+        // 收尾前先明说「这次会话结束了」。
+        //
+        // 只 `end()` 掉 socket 的话，App 那边只看到「对端关闭」，和网络掉线一模一样
+        // —— supervisor 会在 1 秒后自己连回来，用户看到的就是「说完再见它又活了」。
+        //
+        // 延迟关闭是给控制串留出发出去 + App 读线程处理的时间（它收到就置位，不再重连）。
+        end: () => {
+          this.conn.sendControl('end_session');
+          setTimeout(() => { this.conn.end(); }, 250).unref?.();
+        },
         forget: (id) => { this.v1?.forget(id); },
         ...(this.caps.listenStart
           ? {

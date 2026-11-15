@@ -134,6 +134,11 @@ function onFrame(type: number, payload: Buffer): void {
     return;
   }
   if (type === DOWN.Audio) return; // 下行音频帧很多，不打印
+  if (type === DOWN.Control) {
+    // 控制串是 UTF-8 文本：`stop` / `end_session` / `auth_required` / `take_photo` …
+    console.log(`← Control ${JSON.stringify(payload.toString('utf8'))}`);
+    return;
+  }
   console.log(`← 帧 type=${type}（${payload.length} B）`);
 }
 
