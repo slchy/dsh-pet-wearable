@@ -30,6 +30,30 @@
     # 模型自己传 timeoutMs 也不能把它拉长，否则它一问就又把主对话堵回去
     maxTimeoutMs: 3000
 
+# 子代理开满思考。
+#
+# `agentOptions` 不是 volatile 字段（`llm-deepseek` / `agent-default-model` 的
+# 那些才是），所以这里能通过配置生效。只设 reasoningEffort、不设 provider/model，
+# 子代理就继承父会话的路由 —— **同一个模型，但想得更透**。
+#
+# 为什么不是主会话也想得透：真机实测同一个「你好」，high 档有一次想了 2916 字 /
+# 10 秒还没出正文（多 step 只在吐 reasoning、`text 0 字`）。语音要的是快，所以
+# 主会话关掉（见 profile 的 llm-deepseek.reasoningEffort=off），把"想得多"搬到
+# 调查、查资料这类真正需要推理的活儿上 —— 那正是 subagent 的用途。
+- id: tool-subagent
+  config:
+    provider: spawn
+    toolName: subagent
+    agentOptions:
+      reasoningEffort: max
+
+- id: tool-subagent-fork
+  config:
+    provider: fork
+    toolName: subagent_fork
+    agentOptions:
+      reasoningEffort: max
+
 # 同上，`job_output wait:true` 默认会等 **30 秒**（dsh-tool-jobs 的
 # `waitTimeoutMs ?? 3e4`）—— 模型刚被踢到后台，转头又用 job_output 干等，
 # 主对话照样被堵（实测：sleep 8 转后台后，它又等 5 秒把结果取回来）。

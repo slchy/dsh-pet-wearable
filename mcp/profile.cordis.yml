@@ -1,0 +1,19 @@
+# dsh sdk profile 的持久 patch 层 —— 部署时被安装到
+# `~/.dsh/profiles/sdk/cordis.patch.yml`。
+#
+# 为什么不放在 camera.yml 里：`--patch` 叠加层改不动 `llm-deepseek` 的
+# volatile 字段，**profile 的持久 patch 层可以**（实测：同一个
+# `reasoningEffort: off`，写进 --patch 无效，写进这个文件就生效）。
+#
+# 为什么只设 reasoningEffort、不设 thinking: disabled：
+#   dsh-llm-deepseek L1713 的校验是
+#     `connection.defaults.thinking === "disabled" && effort !== "off"` → 抛错
+#   一旦设了 thinking: disabled，子代理想要 max 就会 UNSUPPORTED_REASONING_EFFORT。
+#   只给默认 effort=off —— 主会话不传 effort 就落到 off，子代理自带 max 仍合法。
+#
+# 效果（真机实测）：
+#   主会话  request/header → effort=off   reasoning 0 字
+#   子代理  request/header → effort=max   reasoning 真的在想
+- id: llm-deepseek
+  config:
+    reasoningEffort: off
