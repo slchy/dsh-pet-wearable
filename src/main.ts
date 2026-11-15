@@ -288,10 +288,22 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
  * 所以模型治不了这个，只能靠这条领域规则。
  */
 /** 服务端断句静音阈值。阿里云默认 800 ms；早先压到 500，比默认还激进。 */
-const DEFAULT_SENTENCE_SILENCE_MS = 800;
+/**
+ * 服务端判句所需静音（`max_sentence_silence`）。
+ *
+ * 800 → 400：这一段是**纯等待**，用户说完要干等 800 ms 才拿到 SentenceEnd。
+ * 敢砍是因为下游有 `UtteranceAssembler` 兜底——它本来就把「多句合成一轮」，
+ * 断得碎一点只是多几次 `句 N`，不会变成多轮。
+ */
+const DEFAULT_SENTENCE_SILENCE_MS = 400;
 
-/** Smart Turn 判为「没说完」时再多等多久 */
-const SMART_TURN_EXTEND_MS = Number(process.env['SMART_TURN_EXTEND_MS'] ?? 700);
+/**
+ * Smart Turn 判为「没说完」时再多等多久。
+ *
+ * 700 → 400：日志里「没说完，再等 700 ms」出现得极密，一轮叠 2–3 次就是
+ * 1.4–2.1 秒的纯等待。400 仍够覆盖正常换气，且 `maxExtensions` 会给上限。
+ */
+const SMART_TURN_EXTEND_MS = Number(process.env['SMART_TURN_EXTEND_MS'] ?? 400);
 
 /** 读一个数字型环境变量，非法值退回默认 */
 function envNumber(name: string, fallback: number): number {
@@ -541,7 +553,10 @@ async function main(): Promise<void> {
         ? {
           pythonPath: smartTurnPython,
           scriptPath: smartTurnScript,
-          quietMs: envNumber('SMART_TURN_QUIET_MS', 350),
+          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150：这一段同样是纯等待，
+          // 而判停器看的是**累积的最近音频**（`recentMaxBytes`），不依赖这段静默长度，
+          // 所以缩短它不会让它判得更差。
+          quietMs: envNumber('SMART_TURN_QUIET_MS', 150),
           extendMs: SMART_TURN_EXTEND_MS,
           maxExtensions: envNumber('SMART_TURN_MAX_EXT', 3),
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
