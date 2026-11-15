@@ -8,7 +8,7 @@
  */
 
 import type { TtsProvider } from './providers.ts';
-import { BASE_STYLE, asEmotion, styleFor, type Emotion } from './emotion.ts';
+import { asEmotion, type Emotion } from './emotion.ts';
 
 const API_URL = 'https://api.xiaomimimo.com/v1/chat/completions';
 const ASR_MODEL = 'mimo-v2.5-asr';
@@ -142,6 +142,35 @@ export async function asr(wav: Buffer, language = 'auto'): Promise<{ text: strin
  * （12 s 的回复就要多等 3.8 s）；边收边播把这一项降到首块延迟。
  */
 export const DEFAULT_TTS_VOICE = 'Chloe';
+
+/**
+ * 基础音色风格。**报数字和地名要放慢、咬字清楚**是有意的：语音助手念错的代价
+ * 比念慢的代价高得多。
+ *
+ * 放在这里而不是 `emotion.ts`：这是 **MiMo 的表达方式**（它的风格是自然语言进
+ * `user` 消息），换个 TTS 就得另写一套。
+ */
+export const BASE_STYLE =
+  '十七八岁的少女音，明亮清甜，带一点奶气但不做作，语速中等偏快；'
+  + '报数字和地名时放慢、咬字清楚，长时间听不累。';
+
+/** 情绪 key → MiMo 的风格描述（可用 `MIMO_TTS_STYLE_*` 覆盖）。 */
+export const EMOTION_STYLES: Record<Emotion, string> = {
+  happy: '语调上扬，节奏轻快，带笑意。',
+  proud: '尾音拖长一点，带小骄傲，像在等着被夸。',
+  calm: '语速放稳，干脆利落。',
+  worried: '语速放慢，音量放低，声音柔一点。',
+  sulk: '音调略低，带一点鼻音和拖腔，但不哭腔。',
+};
+
+/** 基础音色 + 情绪变体，拼成 MiMo 要的那一段风格描述。 */
+export function styleFor(
+  emotion: Emotion,
+  base: string = BASE_STYLE,
+  overrides: Partial<Record<Emotion, string>> = {},
+): string {
+  return `${base}${overrides[emotion] ?? EMOTION_STYLES[emotion]}`;
+}
 
 export async function* ttsStream(
   text: string,

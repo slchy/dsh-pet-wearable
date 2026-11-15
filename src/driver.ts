@@ -12,7 +12,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { checkBindSafety } from './bind-policy.ts'
-import { DEFAULT_TTS_VOICE } from './mimo.ts'
 import { DEFAULT_PET_TIMING, type PetTimingOptions } from './pet/pet-timing.ts'
 
 export const name = 'pet-wearable'
@@ -41,7 +40,10 @@ export interface PetConfig {
    * 给 `xiaomi-glasses` 补上唤醒词过滤与「看清细节」档。留空 = v1 基线。
    */
   device: string
-  /** TTS 音色 */
+  /**
+   * TTS 音色。**留空表示用 provider 自己的默认值** —— 具体的可选音色是 provider
+   * 的事，插件不该替它决定（换个 TTS 就换一套名字）。
+   */
   voice: string
   /** 判停阈值：Smart Turn 概率高于此值就认为这一轮说完了 */
   turnThreshold: number
@@ -95,7 +97,7 @@ export const Config: Schema<PetConfig> = Schema.object({
   tls: TlsConfigSchema,
   auth: AuthConfigSchema,
   device: Schema.string().default('').description('v1 手机的型号提示（如 xiaomi-glasses）；自报能力的设备不用填'),
-  voice: Schema.string().default(DEFAULT_TTS_VOICE).description('TTS 音色'),
+  voice: Schema.string().default('').description('TTS 音色；留空 = 用 provider 自己的默认值'),
   turnThreshold: Schema.percent().default(0.5).description('判停阈值，调高更不容易被判为说完'),
   proactive: ProactiveConfig,
 })

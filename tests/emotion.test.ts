@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { EMOTION_STYLES } from '../src/mimo.ts';
 import { BASE_STYLE, EMOTIONS, parseEmotion, styleFor } from '../src/emotion.ts';
 
 test('五个标签都能认出来，并剥掉标签', () => {
@@ -46,7 +47,9 @@ test('只认开头那一个：正文里的方括号不动', () => {
 });
 
 test('风格串 = 基础音色 + 该情绪的描述，且可被覆盖', () => {
-  assert.equal(styleFor('worried'), `${BASE_STYLE}${EMOTIONS.worried}`);
+  // 「某个情绪该用什么语气」属于 provider（MiMo 是自然语言进 user 消息），
+  // 所以描述表在 `mimo.ts`；`emotion.ts` 只认 key。
+  assert.equal(styleFor('worried'), `${BASE_STYLE}${EMOTION_STYLES.worried}`);
   assert.equal(
     styleFor('happy', '基础。', { happy: '自定义。' }),
     '基础。自定义。',

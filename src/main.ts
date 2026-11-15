@@ -1,12 +1,13 @@
 /**
- * 云端 harness（TS 版）：mSBC 流 → ffmpeg 解码 → silero-vad 判停 → MiMo ASR。
+ * 云端 harness：设备音频流 → 解码 → 判停 → 一轮 → TTS → 下发。
  *
- *   node src/main.ts --replay ../../tmp/voice_1793905201973.sbc
- *   node src/main.ts --listen 8765
+ * STT / TTS / agent 都是**注入的**（见 `providers.ts`），这里只做装配：
+ * 按 `--stt` / `--tts` / `--agent` 选实现，其余全是编排。
  *
- * 与 Python 版（scripts/cloud_harness.py + webrtcvad）的差异：
- * - VAD 从 webrtcvad 换成 silero-vad（ONNX），实测能正确忽略远场回声
- * - 其余链路不变，判停口径仍以"静音 4 秒"为准
+ *   node src/main.ts --listen 8766                                  # 真供应商
+ *   node src/main.ts --listen 8766 --stt canned --tts silent --agent echo   # 零密钥
+ *
+ * 旧路径（`--replay`、本地 silero-vad、MiMo ASR）见 `legacy-pipeline.ts`。
  */
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -19,8 +20,8 @@ import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mimoTts } from './mimo.ts';
-import { BASE_STYLE, EMOTIONS } from './emotion.ts';
-import { DEFAULT_TTS_VOICE } from './mimo.ts';
+import { EMOTIONS } from './emotion.ts';
+import { BASE_STYLE, DEFAULT_TTS_VOICE } from './mimo.ts';
 import {
   cannedStt,
   echoAgent,
@@ -77,7 +78,7 @@ async function buildStt(
 
 /** `--tts mimo|silent|<path>` */
 async function buildTts(spec: string): Promise<TtsProvider> {
-  if (spec === 'silent') return silentTts();
+  if (spec === 'silent') return silentTts(24_000);
   if (spec === 'mimo') {
     if (!process.env['MIMO_API_KEY']) {
       throw new Error('MIMO_API_KEY 未设置（用 --tts silent 可跳过 TTS）');

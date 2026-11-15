@@ -1,24 +1,24 @@
 /**
  * 情绪标签：agent 在回复开头写一个 `[开心]` 之类的标签，TTS 据此换语调。
  *
- * 为什么要这一层：MiMo 的 TTS 是聊天式的（风格进 `user` 消息），一个固定提示词
- * 只能给出一种语气。让**模型自己**给每句标情绪，再把标签翻成风格提示词，语调就
- * 跟着内容走了 —— 而不是永远"平静"。
+ * 为什么要这一层：语音 TTS 通常支持「用一句话描述语气」，一个固定提示词只能给出
+ * 一种语气。让**模型自己**给每句标情绪，再由具体 provider 翻成它自己的表达方式，
+ * 语调就跟着内容走了 —— 而不是永远"平静"。
  *
- * 分工：
- * - 本模块只做**纯解析与拼装**（标签 → 规范化情绪 key → 风格串），不碰网络
- * - agent 负责产出标签，TTS provider 负责用风格串合成
+ * 分工（**本模块不认识任何厂商**）：
+ * - 这里只做**纯解析**：中文标签 ⇄ 情绪 key
+ * - 「某个 key 该用什么语气」是 provider 的事，见 `mimo.ts` 的风格表
  *
  * 标签缺失 / 不认识时一律回落 `calm`：宁可语调普通，也不要因为模型漏写标签就报错。
  */
 
-/** 五个情绪 + 各自的默认风格（可被 `MIMO_TTS_STYLE_*` 覆盖） */
+/** 五个情绪（key 是通用的，具体怎么用由 TTS provider 决定；见 `mimo.ts` 的风格表） */
 export const EMOTIONS = {
-  happy: '语调上扬，节奏轻快，带笑意。',
-  proud: '尾音拖长一点，带小骄傲，像在等着被夸。',
-  calm: '语速放稳，干脆利落。',
-  worried: '语速放慢，音量放低，声音柔一点。',
-  sulk: '音调略低，带一点鼻音和拖腔，但不哭腔。',
+  happy: true,
+  proud: true,
+  calm: true,
+  worried: true,
+  sulk: true,
 } as const;
 
 export type Emotion = keyof typeof EMOTIONS;
@@ -65,6 +65,16 @@ export function stripEmotionTags(text: string): string {
 export const DEFAULT_EMOTION: Emotion = 'calm';
 
 /**
+ * 兼容再导出。
+ *
+ * 「某个情绪该用什么语气」现在是 **provider 的表达方式**，值定义在 `mimo.ts`
+ * （换个 TTS 就得另写一套，不该留在这里）。但 `styleFor` / `BASE_STYLE` 早先是
+ * 从这里导出的，为了不把引用点全改一遍，这里继续透出。
+ *
+ * 新代码请直接从 provider 模块取。
+ */
+export { BASE_STYLE, EMOTION_STYLES, styleFor } from './mimo.ts';
+/**
  * 把外部传来的情绪字符串规范成 key。
  *
  * provider 拿到的是 `AgentReplyView.emotion`（可能来自别的 agent 实现、可能是
@@ -81,14 +91,6 @@ export function asEmotion(value: unknown): Emotion {
   return LABELS[key] ?? DEFAULT_EMOTION;
 }
 
-/**
- * 基础音色风格。**报数字和地名要放慢、咬字清楚**是有意的：语音助手念错的代价
- * 比念慢的代价高得多。
- */
-export const BASE_STYLE =
-  '十七八岁的少女音，明亮清甜，带一点奶气但不做作，语速中等偏快；'
-  + '报数字和地名时放慢、咬字清楚，长时间听不累。';
-
 const TAG = /^\s*[\[【]\s*([^\]】]{1,4})\s*[\]】]\s*/;
 
 /**
@@ -97,25 +99,12 @@ const TAG = /^\s*[\[【]\s*([^\]】]{1,4})\s*[\]】]\s*/;
  * 只认**开头**那一个：模型可能在正文里也写方括号，但那不该影响语调。
  * 解析不到就把原文原样返回、情绪用默认值 —— 绝不因为格式问题丢内容。
  */
-export function parseEmotion(text: string): { emotion: Emotion; rest: string } {  const m = TAG.exec(text);
+export function parseEmotion(text: string): { emotion: Emotion; rest: string } {
+  const m = TAG.exec(text);
   if (!m) {
     return { emotion: DEFAULT_EMOTION, rest: text };
   }
   const label = m[1] ?? '';
   const emotion = LABELS[label] ?? DEFAULT_EMOTION;
   return { emotion, rest: text.slice(m[0].length) };
-}
-
-/**
- * 组装最终风格提示词：基础音色 + 情绪变体。
- *
- * @param overrides 按情绪覆盖（来自环境变量），给了就用它替换该情绪的默认描述
- */
-export function styleFor(
-  emotion: Emotion,
-  base: string = BASE_STYLE,
-  overrides: Partial<Record<Emotion, string>> = {},
-): string {
-  const mood = overrides[emotion] ?? EMOTIONS[emotion];
-  return `${base}${mood}`;
 }

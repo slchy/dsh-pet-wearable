@@ -110,12 +110,18 @@ export function noopStt(): SttProvider {
   };
 }
 
-/** 不出声：synthesize 产出一段静音。用于只测 STT/Agent 的链路。 */
-export function silentTts(sampleRate = 24_000, seconds = 0.5): TtsProvider {
+/**
+ * 不出声：synthesize 产出一段静音。用于只测 STT/Agent 的链路。
+ *
+ * `sampleRate` **必填**：默认值只能猜某个厂商的采样率，猜错了会让播放端按错的
+ * 速率播放（1.5 倍速升调那个坑）。交给调用方显式声明。
+ */
+export function silentTts(sampleRate: number, seconds = 0.5): TtsProvider {
   return {
     name: 'silent',
     sampleRate,
-    async* synthesize() {      const bytes = Math.round(sampleRate * 2 * seconds);
+    async* synthesize() {
+      const bytes = Math.round(sampleRate * 2 * seconds);
       yield Buffer.alloc(bytes);
     },
   };
