@@ -19,7 +19,6 @@
     reasoningEffort: off
 
 # 上下文压缩阈值。
-#
 # 不设的话永远不会压缩：`llm-deepseek` 的 `DEFAULT_CONTEXT_WINDOW` 是 1e6，
 # 压缩默认 `thresholdRatio` 0.8 → 要到 **80 万 token** 才动手。真机 212 轮
 # 才 10.6 万，首步已经从 1 s 退化到 2.8–4.6 s（第 208 轮缓存全失效那轮 34.6 秒），
@@ -34,3 +33,25 @@
   config:
     thresholdRatio: 0.125
     retainTokens: 30000
+
+# dsh 自己注入的那层系统提示词。
+#
+# 装配顺序：harness 身份 → personaPrefix → 各工具插件的用法说明 → personaSuffix
+# → runtime context。工具说明夹在中间，所以前后各能把调子定一次。
+#
+# 关掉 harness 身份：默认那句是 "You are an AI agent powered by DeepSeek Harness."，
+# 和「你是米馍」直接打架 —— 两套人格并存时，模型偶尔会滑回通用助手腔
+# （「有什么可以帮你的吗」那种）。
+#
+# prefix / suffix 是 dsh 官方留给部署方的注入口：base bundle 里 personaPrefix
+# 默认空字符串，原注释就写着 "The deployment persona is a deployment choice"。
+# 前面定「这是语音场景」，后面压「输出必须能直接念」—— 详细规则仍在
+# src/agent.ts 的 VOICE_SYSTEM 里，每轮随用户消息下发，这里只定调不重复。
+- id: system-prompt
+  config:
+    includeHarnessIdentity: false
+    personaPrefix: |-
+      你是运行在智能眼镜上的语音助手，回复会被 TTS 直接念出来。
+    personaSuffix: |-
+      输出前自检：这句话能直接念出来吗？不要出现 markdown、列表、表格、代码块、表情符号。
+      端口号、路径、命令这类技术词汇逐字符念，别按数值读。
