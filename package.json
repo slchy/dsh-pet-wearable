@@ -1,7 +1,7 @@
 {
   "name": "dsh-pet-wearable",
   "version": "0.0.1",
-  "description": "Pet for DeepSeek Harness (dsh) that lives on smart glasses — it speaks up on its own and shares your view. Early development; no stable API yet.",
+  "description": "Full-duplex voice agent for smart wearables, powered by cloud dsh. Speak anytime, interrupt anytime - it speaks up on its own too.",
   "type": "module",
   "license": "MIT",
   "author": "slchy",
@@ -21,15 +21,18 @@
   },
   "keywords": [
     "dsh",
-    "dsh-plugin",
     "deepseek-harness",
+    "voice-agent",
+    "full-duplex",
+    "barge-in",
+    "speech-to-text",
+    "text-to-speech",
+    "realtime-audio",
     "smart-glasses",
     "ar-glasses",
     "wearable",
     "pet",
-    "voice",
-    "proactive",
-    "full-duplex"
+    "proactive"
   ],
   "exports": {
     ".": "./src/driver.ts",
