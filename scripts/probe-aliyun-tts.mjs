@@ -29,13 +29,15 @@ const ROUNDS = Number(process.env['ALIYUN_TTS_ROUNDS'] ?? 5);
 
 const hex32 = () => randomUUID().replace(/-/g, '');
 
-interface ProbeResult {
-  firstAudioMs: number;
-  bytes: number;
-  note: string;
-}
+/**
+ * @typedef {object} ProbeResult
+ * @property {number} firstAudioMs
+ * @property {number} bytes
+ * @property {string} note
+ */
 
-async function once(token: string): Promise<ProbeResult> {
+/** @returns {Promise<ProbeResult>} */
+async function once(token) {
   return await new Promise((resolve) => {
     const ws = new WebSocket(
       `wss://nls-gateway-${REGION}.aliyuncs.com/ws/v1?token=${encodeURIComponent(token)}`,
@@ -46,7 +48,7 @@ async function once(token: string): Promise<ProbeResult> {
     let note = '';
     let settled = false;
 
-    const finish = (why: string): void => {
+    const finish = (why) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -75,7 +77,7 @@ async function once(token: string): Promise<ProbeResult> {
 
     ws.addEventListener('message', (event) => {
       if (typeof event.data === 'string') {
-        const message = JSON.parse(event.data) as { header?: { name?: string; status_text?: string } };
+        const message = JSON.parse(event.data);
         const name = message.header?.name;
         if (name === 'TaskFailed') {
           note = String(message.header?.status_text ?? '').slice(0, 160);
@@ -85,7 +87,7 @@ async function once(token: string): Promise<ProbeResult> {
         }
         return;
       }
-      const chunk = Buffer.from(event.data as ArrayBuffer);
+      const chunk = Buffer.from(event.data);
       if (chunk.length === 0) return;
       if (firstAudioMs < 0) firstAudioMs = Date.now() - started;
       bytes += chunk.length;
@@ -101,7 +103,7 @@ const token = await createToken(
   REGION,
 );
 
-const results: ProbeResult[] = [];
+const results = [];
 for (let i = 1; i <= ROUNDS; i += 1) {
   const result = await once(token.id);
   results.push(result);
