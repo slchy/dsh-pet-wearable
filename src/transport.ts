@@ -28,6 +28,17 @@ export interface HelloInfo {
   readonly token?: string;
   /** v2 自报的能力，**原样**交给设备层解析（这一层不认识它） */
   readonly capabilities?: unknown;
+  /**
+   * 这是**自动重连**，不是用户主动开的通道。
+   *
+   * 手机端的 supervisor 在网络抖动、云端重启、心跳超时（30 s 收不到字节）时会自己
+   * 重连。这种重连不该被当成"用户想说话"—— 否则每次抖一下都会把眼镜的语音会话
+   * 重新拉起来（亮灯、耗电、可能还有提示音）。
+   *
+   * 缺省当作 `false`：老 App 不带这个字段，保持"连接就绪就开麦"的老行为，
+   * 免得它变成"点开了却没声音"。
+   */
+  readonly resumed?: boolean;
 }
 
 /** 解析 `Hello`；坏 JSON 返回 null（由调用方决定拒绝还是忽略）。 */
@@ -43,6 +54,8 @@ export function parseHello(payload: Buffer): HelloInfo | null {
       deviceId: typeof o.deviceId === 'string' ? o.deviceId : undefined,
       token: typeof o.token === 'string' ? o.token : undefined,
       capabilities: o.capabilities,
+      // 只认真正的布尔 true：字符串 "true" / 数字 1 都不算，见 `hello-resumed.test.ts`
+      resumed: o.resumed === true ? true : undefined,
     };
   } catch {
     return null;

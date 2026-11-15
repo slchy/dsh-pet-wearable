@@ -80,6 +80,17 @@ const ASSEMBLER_FALLBACK_WINDOW_MS = 600;
 const INITIAL_LISTEN_MS = 60_000;
 
 /**
+ * 连接就绪后等多久看「设备有没有在推流」。
+ *
+ * `EXPERIMENTS §42` 实测：手机发 `WakeUpEvent` 后 0.62 s 内就来流。所以 1.5 s
+ * 足够判断"设备本来就在采集"还是"需要拉一把"。
+ *
+ * 太短会在设备慢启动时误判成需要唤醒（多一次无谓的 requestWakeUp），
+ * 太长则首次连接要多等这么久才开麦。
+ */
+const CAPTURE_GRACE_MS = 1_500;
+
+/**
  * 送给判停器的「最近音频」上限（秒）。
  *
  * 判停器要听到整句话的尾巴才能判「说完了」，8 s 足够覆盖常见的一句话，
@@ -260,7 +271,7 @@ function handshake(conn: Connection, options: VoiceSessionOptions): void {
     } else if (hello?.proto !== undefined && hello.proto >= 2) {
       console.log('  握手    设备要 v2 但能力不合法 → 不回 Welcome，按 v1 走');
     }
-    new VoiceConnection(conn, options, link).start(first);
+    new VoiceConnection(conn, options, link).start(first, hello?.resumed === true);
   };
 
   conn.bind({
@@ -478,7 +489,11 @@ class VoiceConnection {
   /**
    * @param first - 握手期间先到的那一帧（v1 手机不发 `Hello` 时），原样补交
    */
-  start(first?: { type: number; payload: Buffer }): void {
+  /**
+   * @param first 握手前先到的那一帧（v1 没发 `Hello` 时可能有）
+   * @param resumed 这是**自动重连**，不是用户主动开的通道（见 `HelloInfo.resumed`）
+   */
+  start(first?: { type: number; payload: Buffer }, resumed = false): void {
     console.log(`已连接 ${this.conn.remote}\n`);
     console.log(
       `  设备    ${this.link.label}（v${this.link.proto}）：${describeCapabilities(this.caps)}`,
@@ -508,18 +523,17 @@ class VoiceConnection {
     }
     // 心跳由 AppSession 自己开（clock.every），这里不再 setInterval
 
-    // 连接就绪就把麦拉起来。
+    // 连接就绪时**不立刻开麦**，而是先看设备是不是已经在采集。
     //
-    // 为什么必须做：设备侧的 Aivs 会话会被**它自己**结束 —— 真机 05:57 那次，
-    // 云端正在重连（断了 35 s），设备上报 `state=3` 并停采；等云端连上，
-    // 用户再说一帧都上不来，表现就是「未响应」（云端日志里上行帧数为 0）。
+    // 历史：以前无条件发 `listen.start`（修「未响应」），结果 App 的网络抖动重连
+    // 也会把眼镜唤醒；改成看 `Hello.resumed` 跳过重连，又暴露出另一头 ——
+    // 重连时设备侧的 Aivs 会话**确实**可能已经自毁（真机 `会话状态 3` + 采集停止），
+    // 那时不唤醒就等于未响应。
     //
-    // 采集只能由设备发起，或由手机发 WakeUpEvent 拉起（`EXPERIMENTS §42`，
-    // 实测 0.62 s 内就来流）。v2 的 `listen.start` 正是这条路径，App 侧走
-    // `requestWakeUp`。等有东西要播时，播报会自己再开一次（幂等）。
+    // 所以判据改成最本质的那条：**有没有上行音频**。设备在推流就什么都不做；
+    // 一段时间内一帧都没有，才说明需要把它拉起来。
     if (this.caps.listenStart && backlog.length === 0) {
-      this.sendCall({ op: 'listen.start', maxMs: INITIAL_LISTEN_MS });
-      console.log('  开麦    连接就绪 → 请设备推流（采集只能由设备或手机拉起，见 §42）');
+      this.armCaptureWatch(resumed);
     }
 
     const detail = captureMode(this.caps, 'detail');
@@ -548,6 +562,12 @@ class VoiceConnection {
   private onFrame(type: number, payload: Buffer): void {
     switch (type) {
       case UpstreamFrameType.Audio:
+        // 有上行音频 = 设备确实在采集，不需要（再）唤醒它
+        if (this.captureWatch !== null) {
+          clearTimeout(this.captureWatch);
+          this.captureWatch = null;
+          console.log('  开麦    设备已在推流 → 不主动唤醒');
+        }
         // 首帧上行 = 麦真的开了（不用手机回执：ACK 只证明命令进了队列）
         this.onMicOpened();
         // `uplink.sbc` 只存压缩帧；PCM 上行由 pipeline 的 onRawPcm 写 `uplink.pcm`
@@ -715,6 +735,44 @@ class VoiceConnection {
   private micPending = false;
   /** 等首帧上行的人（播报用；宠物走 `AppSession.micOpened()`） */
   private micWaiters: Array<() => void> = [];
+
+  /**
+   * 连接就绪后观察「设备到底在不在采集」的定时器。
+   *
+   * 到期时还没收到任何上行音频，才发 `listen.start` 把它拉起来。收到帧就取消
+   * （说明设备已经在推流，不需要唤醒 —— 重连场景多半是这样）。
+   */
+  private captureWatch: NodeJS.Timeout | null = null;
+
+  /**
+   * 开始等设备的第一帧上行音频。
+   *
+   * 为什么不是"连接就绪就开麦"：那样每次网络抖动重连都会唤醒眼镜（亮灯、耗电、
+   * 可能还有提示音），而那一刻根本没人在说话。
+   *
+   * 为什么不干脆"重连就跳过"：设备侧的 Aivs 会话可能已经自毁（真机 `会话状态 3`
+   * 后采集停止），那种情况下不唤醒就是「未响应」。
+   *
+   * 判据只能是设备有没有在推流 —— 等 {@link CAPTURE_GRACE_MS} 看有没有帧。
+   */
+  private armCaptureWatch(resumed: boolean): void {
+    const why = resumed ? '自动重连' : '连接就绪';
+    this.captureWatch = setTimeout(() => {
+      this.captureWatch = null;
+      if (this.conn.isClosed || this.micPending) {
+        return;
+      }
+      console.log(`  开麦    ${why}但 ${CAPTURE_GRACE_MS} ms 内没有上行音频 → 请设备推流（§42）`);
+      this.sendListenStart();
+    }, CAPTURE_GRACE_MS);
+    this.captureWatch.unref?.();
+  }
+
+  /** 发一次 `listen.start` 并进入等首帧的状态。 */
+  private sendListenStart(): void {
+    this.micPending = true;
+    this.sendCall({ op: 'listen.start', maxMs: INITIAL_LISTEN_MS });
+  }
 
   private resolveMicWaiters(): void {
     const waiters = this.micWaiters;

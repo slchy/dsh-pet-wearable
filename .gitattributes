@@ -1,0 +1,10 @@
+# shell 脚本必须用 LF。
+#
+# 2026-11-16 踩过：`probe-api-speed.sh` 在 Windows 上被编辑成 CRLF，传到 Linux 后
+# `bash -n` 报 `unexpected end of file` —— 因为 heredoc 的结束标记变成了 `NODE\r`，
+# 永远匹配不上 `NODE`。症状是"脚本莫名其妙语法错"，而文件内容看着完全正常。
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Python 侧车同理（虽然 python 容忍 CRLF，但 shebang 行带 \r 会找不到解释器）
+*.py text eol=lf

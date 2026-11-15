@@ -13,7 +13,7 @@
 | 上行 | 3 | `Wake` | 唤醒事件 |
 | 上行 | 4 | `Ping` | — |
 | 上行 | 5 | `Status` | UTF-8 JSON，见下 |
-| 上行 | 6 | `Hello` | UTF-8 JSON `{proto, deviceId, token, capabilities?}` |
+| 上行 | 6 | `Hello` | UTF-8 JSON `{proto, deviceId, token, capabilities?, resumed?}` |
 | 上行 | 7 | `Event` | v2：UTF-8 JSON `DeviceEvent` |
 | 上行 | 8 | `CaptureImage` | v2：`[idLen:u8][id:UTF-8][JPEG]` |
 | 下行 | 1 | `Audio` | PCM16 单声道小端 |
@@ -110,6 +110,23 @@ v1 手机不会说 `say`，由垫片按 `reason` 代说（见 [`src/devices/xiao
 
 能力位 `listenStart: false` 的设备（雷鸟能装自己的 APK，麦克风随开随用）不会收到这条命令，
 服务端直接开口。
+
+### `Hello.resumed`：别把重连当成「用户想说话」
+
+连接就绪时服务端会主动发一次 `listen.start`，把因为设备侧会话自毁而停掉的采集拉回来
+（见上，这修的是「未响应」）。但手机端的 supervisor 在网络抖动、云端重启、心跳超时时
+会**自己重连** —— 那种重连不该开麦，否则每次抖一下眼镜都会被唤醒（亮灯、耗电、提示音）。
+
+所以设备在 `Hello` 里带 `resumed: true` 表示「这条是自动重连，不是用户主动开的通道」，
+服务端看到就跳过那次 `listen.start`。
+
+| 情况 | `resumed` | 服务端 |
+|---|---|---|
+| 用户点开通道 / App 启动后第一次连 | 不带（或 `false`） | 发 `listen.start` |
+| supervisor 自动重连（第 2 次及以后） | `true` | 不发，日志记「自动重连 → 不主动唤醒设备」 |
+| 老 App（不认识这个字段） | 不带 | 发 —— 保持老行为，免得变成「点开了却没声音」 |
+
+用户**手动关掉再打开**是新的连接实例，计数从 0 开始，所以仍然会开麦。
 
 ## v2（向下兼容）
 
