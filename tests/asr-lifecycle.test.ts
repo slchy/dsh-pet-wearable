@@ -18,7 +18,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { AliyunAsr } from '../src/aliyun-asr.ts';
+import { AliyunAsr, type AliyunAsrOptions } from '../src/aliyun-asr.ts';
 
 /** 够用的 WebSocket 替身：手动驱动 open/message/close。 */
 class FakeWs {
@@ -94,7 +94,7 @@ interface Harness {
   sentences: string[];
 }
 
-function makeAsr(): Harness {
+function makeAsr(overrides: Partial<AliyunAsrOptions> = {}): Harness {
   FakeWs.instances = [];
   const sentences: string[] = [];
   const asr = new AliyunAsr({
@@ -104,6 +104,7 @@ function makeAsr(): Harness {
     region: 'cn-shanghai',
     onSentence: (text) => { sentences.push(text); },
     tokenProvider: async () => ({ id: 'tok', expireAtSec: Math.floor(Date.now() / 1000) + 3600 }),
+    ...overrides,
   });
   return { asr, sentences };
 }
@@ -183,4 +184,23 @@ test('挂断是幂等的：没有连接时不出声、不抛异常', () => {
   asr.hangup();
   asr.hangup();
   assert.equal(FakeWs.instances.length, 0);
+});
+
+test('热词表：只有配置了真 ID 才下发 vocabulary_id', async () => {
+  const startParams = async (overrides: Partial<AliyunAsrOptions> = {}): Promise<Record<string, unknown>> => {
+    const { asr } = makeAsr(overrides);
+    const ws = await connectReady(asr);
+    const raw = ws.sent[0];
+    assert.ok(raw, '应当发出 StartTranscription');
+    return (JSON.parse(raw) as { payload: Record<string, unknown> }).payload;
+  };
+
+  // 没配就别下发。传假 ID 服务端会静默忽略、也不报错，所以宁可不下发，
+  // 免得线上压根没启用还误以为在起作用。
+  const plain = await startParams();
+  assert.equal('vocabulary_id' in plain, false);
+  assert.equal(plain['sample_rate'], 16000, '其它 Start 参数不受影响');
+
+  const withVocab = await startParams({ vocabularyId: 'voc-123' });
+  assert.equal(withVocab['vocabulary_id'], 'voc-123');
 });

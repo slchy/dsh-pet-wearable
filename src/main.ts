@@ -66,7 +66,10 @@ async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
 /** `--stt aliyun|noop|canned|<path>` */
 async function buildStt(
   spec: string,
-  creds: { akId: string; akSecret: string; appkey: string; region: string; maxSentenceSilenceMs: number },
+  creds: {
+    akId: string; akSecret: string; appkey: string; region: string;
+    maxSentenceSilenceMs: number; vocabularyId?: string;
+  },
 ): Promise<SttProvider> {
   if (spec === 'noop') return noopStt();
   if (spec === 'canned') return cannedStt();
@@ -386,6 +389,7 @@ async function main(): Promise<void> {
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
     console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);
     console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
+    console.error('            [--vocab-id <id>] 阿里云热词表，专有名词识别不准时用');
     process.exit(2);
   }
 
@@ -467,9 +471,12 @@ async function main(): Promise<void> {
     const sentenceSilenceMs = Number(
       opt('--sentence-silence', String(DEFAULT_SENTENCE_SILENCE_MS)),
     );
+    // 热词表 ID 留空就不下发该字段（传不存在的 ID 会被服务端静默忽略，不报错）
+    const vocabularyId = opt('--vocab-id', process.env['ALIYUN_VOCAB_ID'] ?? '');
     // 只有阿里云实现关心 region/appkey；换成别的实现时别把无关信息印出来
     const sttBanner = resolvedStt === 'aliyun'
       ? `region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms`
+        + (vocabularyId ? `  vocab=${vocabularyId}` : '  vocab=(未配置)')
       : '(外部/内置实现，无需凭据)';
     console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
@@ -479,6 +486,7 @@ async function main(): Promise<void> {
       appkey,
       region,
       maxSentenceSilenceMs: sentenceSilenceMs,
+      ...(vocabularyId ? { vocabularyId } : {}),
     });
     const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);

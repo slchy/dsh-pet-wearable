@@ -51,6 +51,13 @@ export interface AliyunAsrOptions {
   tokenProvider?: () => Promise<AliyunToken>;
   /** 一句结束后判定「说完了」所需的静音时长（毫秒） */
   maxSentenceSilenceMs?: number;
+  /**
+   * 热词表 ID（智能语音交互控制台 → 自学习平台创建）。
+   *
+   * 专有名词靠 LM 先验猜不准时的对症手段：真机实测「审计」在同一轮里错两次、
+   * 每次错法都不同，这类词只能靠词表给声学解码加偏置。留空则不下发该字段。
+   */
+  vocabularyId?: string;
   /** 中间结果（边说边出字），可选 */
   onPartial?: (text: string) => void;
   /** 一句说完，text 是完整句子 */
@@ -256,6 +263,9 @@ export class AliyunAsr {
         ...(this.opts.maxSentenceSilenceMs
           ? { max_sentence_silence: this.opts.maxSentenceSilenceMs }
           : {}),
+        // 热词表：只在配置了真 ID 时下发。传不存在的 ID 服务端会静默忽略，
+        // 所以别拿假值试探——那样只会得出「字段没生效」的错误结论。
+        ...(this.opts.vocabularyId ? { vocabulary_id: this.opts.vocabularyId } : {}),
       },
       // 缺 context 会被回误导性的 "Missing message name!"
       context: { sdk: { name: 'nls-nodejs-sdk', version: '0.0.1', language: 'nodejs' } },
