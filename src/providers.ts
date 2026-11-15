@@ -42,6 +42,15 @@ export interface AgentReplyView {
 export interface AgentProvider {
   readonly name: string;
   /**
+   * 当前 dsh 会话 id（`null` = 还没有会话 / 不用 dsh）。
+   *
+   * 只用于**观测**：写进 `turn.end`，好把这一轮和
+   * `~/.dsh/sessions/<workspace>/<id>/session.v4.jsonl.zstd` 里的 step/tool 轨迹
+   * 对上。agent 内部那几秒到底花在哪（多步推理？工具调用？），只有那份日志说得清，
+   * 我们自己插桩拿不到 reasoning 和工具参数。
+   */
+  readonly sessionId?: string | null;
+  /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
    */

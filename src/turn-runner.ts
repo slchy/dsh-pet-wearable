@@ -229,6 +229,8 @@ export class TurnRunner {
         heard_s: Number(heardSeconds.toFixed(2)),
         dsh_ms: agentLatencyMs,
         tts_first_ms: firstChunkAtMs === 0 ? -1 : firstChunkAtMs,
+        // 记下 dsh 的会话 id，事后才能把这一段和 dsh 自己的 step/tool 轨迹对齐
+        ...(this.options.agent.sessionId ? { dsh_session: this.options.agent.sessionId } : {}),
       });
 
       return {
