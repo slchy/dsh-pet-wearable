@@ -1,14 +1,19 @@
 /**
- * 定论：SpeechTranscriber 到底用不用 customization_id / vocabulary_id。
+ * 探测 SpeechTranscriber 是否真的在解码时使用 customization_id / vocabulary_id。
  *
- * 前两次探测只看到 TranscriptionStarted 就收手了，但词表往往是在**解码时**才查的，
- * Start 那一刻不校验完全正常。所以必须真的推音频，看三组有没有区别：
+ * 只看到 TranscriptionStarted 不够：词表往往到**解码时**才查。所以必须真推音频对比：
  *   - 都不带      -> 正常出 SentenceEnd
- *   - 带假 ID     -> 若字段有效，应 TaskFailed 或结果明显不同
- *   - 字段被忽略  -> 三组结果逐字相同
+ *   - 带 ID       -> 看三组结果有无区别
+ *
+ * ⚠️ 判读限制（我踩过这个坑）：**传假 ID 得到三组相同结果，不能证明字段不被支持**。
+ * 功能未开通 / ID 不存在时，服务端静默忽略是常见行为。要证明字段生效，必须：
+ *   1. 先在控制台建一个**真词表**，拿到真 ID；
+ *   2. 用同一段含目标词的音频，带 / 不带真 ID 各跑一遍；
+ *   3. 只有"带词表时该词被纠对"才算闭环。
+ * 本脚本适合做第 2 步的 A/B，不适合拿假 ID 得出结论。
  *
  *   ALIYUN_AK_ID=... ALIYUN_AK_SECRET=... ALIYUN_APPKEY=... \
- *     node scripts/probe-nls-vocab4.mjs <pcm16> [起始秒] [时长秒]
+ *     node scripts/probe-nls-vocab.mjs <pcm16> [起始秒] [时长秒] [倍速]
  */
 import { createHmac, randomUUID } from 'node:crypto';
 import { openSync, readSync, closeSync, statSync } from 'node:fs';

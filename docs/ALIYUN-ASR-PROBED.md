@@ -229,24 +229,32 @@ close code = 4404 (40000004)
 - **16 kHz 显著优于 8 kHz**（8 kHz 把一句切成两倍多的碎片）。当前 `sample_rate: 16000`
   的配置是对的，不要再往下降。
 
-### 9.4 别指望热词表：实测阿里云实时识别不吃任何词表
+### 9.4 热词表：字段是对的，但得先在控制台开通
 
-原计划是把「审计」「市值」「代码」这类高频错词塞进热词表。**实测这条路走不通**：
+原计划是把「审计」「市值」「代码」这类高频错词塞进热词表。**这条路的可行性我一度判错，此处更正。**
 
-| 探测 | 结果 |
-|---|---|
-| `nls-meta` 上调 `CreateAsrCustomization` / `ListAsrCustomizations` | `404 InvalidAction`，该域名只提供 `CreateToken`（错误里的 `product=nls-cloud-meta` 印证） |
-| `nls-slp` 上调同名接口 | 端点**存在**（`product=nls-slp`），但试了 5 个 `Version` 全是 `InvalidVersion`，拿不到可用签名 |
-| `StartTranscription` 的 `payload` 加 `customization_id` = 假值 | 照样 `TranscriptionStarted` |
-| 加 `vocabulary_id` = 假值，**并真的推音频** | 三组转录结果**逐字相同** |
+`StartTranscription` 的 `payload` **支持** `vocabulary_id`（热词表）与 `customization_id`
+（自学习模型），两者并列。第三方实现可对照：[`moeru-ai/airi`](https://github.com/moeru-ai/airi)
+的 `aliyun-nls/session.ts` 就是直接塞 `payload.vocabulary_id`。
 
-最后一条是关键：词表通常到解码时才查，只看 `TranscriptionStarted` 不算数。
-真推了 8 秒含「审计」的音频后，`baseline` / 带 `customization_id` / 带 `vocabulary_id`
-三组输出**完全一致**，服务端对这两个字段都是静默忽略。
+**我之前为什么判成「不支持」**——两个推理都站不住脚：
 
-官方 SDK（`aliyun/alibabacloud-nls-nodejs-sdk` 的 `lib/st.js`）也印证这点：
-`defaultStartParams()` 只有 format / sample_rate / 三个 enable 开关，`payload` 原样透传，
-根本没有热词相关字段。热词能力在**一句话识别**和**录音文件识别**里，实时识别这条产品线没有。
+1. 传一个不存在的 `vocabulary_id`，三组转录结果逐字相同 → 我据此认为字段被忽略。
+   但**功能未开通时服务端静默忽略**是常见行为，尤其这个 appkey 从没建过词表；
+   「非法 ID 不报错」不足以推出「字段不被支持」。
+2. 官方 SDK `lib/st.js` 的 `defaultStartParams()` 里没有热词字段 → 但那只是**默认值**，
+   `payload` 是原样透传的，没写默认值不等于不支持。
+
+顺带记一下探测过程中的真结论：`nls-meta` 域名只提供 `CreateToken`（`product=nls-cloud-meta`），
+建词表的管理接口在 `nls-slp` 上，端点确实存在但 `Version` 没试对。**管理 API 走不通
+≠ 识别端不支持**，这两件事我当初混为一谈了。
+
+**启用路径**：智能语音交互控制台 → 自学习平台 → 创建热词表（填「审计」「市值」「代码」等）→
+拿到 ID → 填进 `StartTranscription` 的 `payload.vocabulary_id`。
+
+代码侧改动很小：`AliyunAsrOptions` 加 `vocabularyId`，`startTranscription()` 里条件带上即可。
+**当前阻塞**：需要有权限的人在控制台把词表建出来。建好后用真实 ID 做 A/B（同一段音频，
+带 / 不带词表各跑一遍），才算验证闭环。
 
 ### 9.5 真正的机制：声学置信度低，最后由语言模型拍板
 
@@ -276,9 +284,9 @@ close code = 4404 (40000004)
 
 | 方向 | 评价 |
 |---|---|
-| 热词表 | **已证伪**，实时识别不支持 |
+| 热词表 | **可做，待开通**：控制台建表 → 拿 ID → `payload.vocabulary_id`。之前判成「不支持」是我错了，见 §9.4 |
 | 保持 16 kHz | 已验证优于 8 kHz，务必别降 |
-| 换 ASR 供应商 | 唯一能实质提升的路，前提是对方实时接口支持热词 |
+| 换 ASR 供应商 | 次选，仅在热词表实测无效后再考虑 |
 | agent 侧上下文纠错 | 不依赖供应商：用上一轮对话把「数值/数据」改回「市值」。代价是多一次模型调用，或写进提示词 |
 | 说话侧习惯 | 2 字专有名词（市值、审计）建议放慢或补全成「那个市值」「审计代码」；这类词对任何声学模型都难 |
 
