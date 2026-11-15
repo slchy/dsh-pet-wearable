@@ -510,7 +510,7 @@ class VoiceConnection {
     this.archive?.event(EVENTS.deviceLink, { proto: this.link.proto, label: this.link.label });
 
     // 后台任务完成后的播报落在这条连接上
-    this.options.agent.setAnnouncer?.((speech) => { this.onAnnounce(speech); });
+    this.options.agent.setAnnouncer?.((speech, emotion) => { this.onAnnounce(speech, emotion); });
 
     // 上次离线期间攒下的汇报：连上就补播（旧的先播）
     const backlog = this.options.announceStore?.drain() ?? [];
@@ -859,9 +859,9 @@ class VoiceConnection {
    * 排队、让位、开麦的顺序都在 `app/dialog.ts`（与模拟器同一份实现），
    * 这里只记档并把话交进去。
    */
-  private onAnnounce(speech: string): void {
-    this.archive?.event(EVENTS.announce, { len: speech.length });
-    this.dialog.enqueueAnnounce(speech);
+  private onAnnounce(speech: string, emotion?: string): void {
+    this.archive?.event(EVENTS.announce, { len: speech.length, emotion });
+    this.dialog.enqueueAnnounce(speech, emotion);
   }
   private onClose(): void {
     // 有在途开口就记 aborted，然后丢掉执行器手里的计时器

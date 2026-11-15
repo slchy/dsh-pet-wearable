@@ -108,7 +108,7 @@ export class DialogRuntime {
   /** 串行队列里还没跑完的任务数 */
   private queued = 0;
 
-  private readonly announceQueue: string[] = [];
+  private readonly announceQueue: Array<{ speech: string; emotion?: string }> = [];
   private announcing = false;
   private disposed = false;
   /**
@@ -298,8 +298,8 @@ export class DialogRuntime {
    * 这条**不属于任何一轮**（`speakCanned` 的旁白通道），所以不占轮次票据、不改状态机。
    * 用户正在说话或正在播报时排队，等回到 `listening` 再放出来 —— 抢话比晚两秒更烦人。
    */
-  enqueueAnnounce(speech: string): void {
-    this.announceQueue.push(speech);
+  enqueueAnnounce(speech: string, emotion?: string): void {
+    this.announceQueue.push({ speech, emotion });
     // 有货就要让宠物知道：它在「让位」闸门里等着这条
     this.options.env.onAnnounce?.(true, false);
     void this.flushAnnounce();
@@ -326,16 +326,17 @@ export class DialogRuntime {
     env.onAnnounce?.(true, false);
     try {
       while (this.announceQueue.length > 0) {
-        const speech = this.announceQueue.shift();
-        if (speech === undefined) {
+        const item = this.announceQueue.shift();
+        if (item === undefined) {
           break;
         }
-        const speak = (text: string): Promise<void> => this.runner.speakCanned(text);
+        // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动
+        const speak = (text: string): Promise<void> => this.runner.speakCanned(text, item.emotion);
         if (mic === undefined) {
-          await speak(speech);
+          await speak(item.speech);
         } else {
           // 设备能开麦就先开：播报一开口就能被插话（ADR-0001 §6）。超时照播。
-          await speakAnnouncement(speech, {
+          await speakAnnouncement(item.speech, {
             listenStart: mic.listenStart,
             micOpenTimeoutMs: mic.micOpenTimeoutMs,
             listenMs: mic.listenMs,

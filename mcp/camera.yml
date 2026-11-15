@@ -79,6 +79,14 @@
     waitTimeoutMs: 1000
     maxWaitTimeoutMs: 1000
 
+# `web_search` 是**同步**的：它在跑的时候主对话整个被占住，用户说什么都进不来。
+# base bundle 给的是 60 000 ms —— 一次慢搜索等于失聪一分钟，比不搜更糟。
+# 真机实测一次两查询的搜索 5.6 s 就回来了，20 s 足够覆盖慢网；超时让它失败并
+# 重试一次，比干等一分钟好。
+- id: tool-web
+  config:
+    searchTimeoutMs: 20000
+
 - insert:
     - id: mcp-camera
       name: '@deepseek-ai/dsh-mcp-client'

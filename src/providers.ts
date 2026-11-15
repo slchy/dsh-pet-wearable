@@ -60,8 +60,11 @@ export interface AgentProvider {
    *
    * 传 `null` 表示当前没有连接可播报。实现方（`VoiceAgent`）负责把原始文本
    * 清洗成可朗读的句子；编排层只管什么时候播、能不能播。
+   *
+   * `emotion` 是模型写在回复开头的情绪标签。以前这条口只传 `speech`，后台
+   * 汇报的语气标签在这里就被截掉了 —— 模型写 `[开心]跑完了`，播出来还是平静。
    */
-  setAnnouncer?(cb: ((speech: string) => void) | null): void;
+  setAnnouncer?(cb: ((speech: string, emotion?: string) => void) | null): void;
 }
 
 /** STT 会话：一次连接一个，流式喂 PCM。 */
