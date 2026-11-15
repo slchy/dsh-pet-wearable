@@ -1,14 +1,20 @@
 #!/bin/bash
 # 测裸 DeepSeek API 的速度：TTFT + 输出 token/s。
 # 目的：判断 65–103 token/s 是模型本身，还是 dsh 层的开销。
-set -a
-. <部署路径>/miai-cloud/.env
-set +a
+# 凭据从哪来：MIAI_ENV 指向一个 .env（默认 $HOME/miai-cloud/.env），
+# 也可以直接 export DEEPSEEK_API_KEY 跳过读文件。
+ENV_FILE="${MIAI_ENV:-$HOME/miai-cloud/.env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
 
 KEY="${DEEPSEEK_API_KEY:-${DEEPSEEK_KEY:-${DSH_DEEPSEEK_API_KEY:-}}}"
 if [ -z "$KEY" ]; then
   echo "找不到 DeepSeek API key（试过 DEEPSEEK_API_KEY / DEEPSEEK_KEY / DSH_DEEPSEEK_API_KEY）"
-  cut -d= -f1 <部署路径>/miai-cloud/.env | grep -i -e deepseek | head -10
+  echo "可以从 .env 读：MIAI_ENV=/path/to/.env $0"
   exit 1
 fi
 
