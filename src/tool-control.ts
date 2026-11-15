@@ -51,8 +51,10 @@ export interface ToolControlOptions {
 }
 
 export interface ToolControl {
+  /** 实际监听端口。传 `0` 时由系统分配，读这里拿真实值（测试要用）。 */
+  readonly port: number;
   /** 停止监听。连接结束时必须调用，否则下一个连接会撞端口 */
-  close: () => void;
+  readonly close: () => void;
 }
 
 /**
@@ -181,6 +183,10 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
   server.listen(options.port, '127.0.0.1');
 
   return {
+    get port() {
+      const address = server.address();
+      return typeof address === 'object' && address !== null ? address.port : options.port;
+    },
     close: () => {
       server.close();
       // `close()` 只是停止**接受**新连接；已经建立的长连接（工具进程、keep-alive）会
