@@ -1,7 +1,7 @@
 /**
  * 上行管道：mSBC → PCM（ffmpeg）→ 能量门 → 交给 STT 的「有声段」。
  *
- * 抽出来的理由：这段逻辑原本埋在 `aliyun-session.ts` 的 `bindUpstream()` 里，
+ * 抽出来的理由：这段逻辑原本埋在 `voice-session.ts` 的 `bindUpstream()` 里，
  * 和 socket 回调混在一起，改一次判停就要动编排代码。
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';

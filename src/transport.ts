@@ -5,7 +5,7 @@
  * - 把字节变成 `onFrame(type, payload)` 事件
  * - 把 `sendAudio / sendControl / close` 变成字节
  *
- * 音频、判停、对话、拍照全在它之上（见 `aliyun-session.ts`）。抽出来的意义：
+ * 音频、判停、对话、拍照全在它之上（见 `voice-session.ts`）。抽出来的意义：
  * 以前这些和 socket 回调混在一个 600 行的类里，改心跳要动对话代码。
  */
 import { createServer, type Server, type Socket } from 'node:net';

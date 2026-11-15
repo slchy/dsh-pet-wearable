@@ -33,7 +33,7 @@ import {
 } from './providers.ts';
 import { DshSession } from './session.ts';
 import { expiryWarning } from './tls-cert.ts';
-import { runAliyunServer } from './aliyun-session.ts';
+import { runVoiceServer } from './voice-session.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
@@ -521,7 +521,7 @@ async function main(): Promise<void> {
         : '宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口\n',
     );
 
-    const code = await runAliyunServer({
+    const code = await runVoiceServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
       device: deviceSpec,

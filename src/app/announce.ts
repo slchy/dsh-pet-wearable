@@ -4,7 +4,7 @@
  * 对应 ADR-0001 §6：播报一开口就要能被插话，所以和宠物的 `listen` 阶段同一套规矩 ——
  * 截止 `micOpenTimeoutMs`，超时照播。关麦是整批播完之后的事，不在这里。
  *
- * 生产（`aliyun-session.ts`）和模拟器（`pet/sim/world.ts`）共用这一份，
+ * 生产（`voice-session.ts`）和模拟器（`pet/sim/world.ts`）共用这一份，
  * 场景测到的就是生产代码的顺序。
  */
 import type { DeviceCall } from '../devices/primitives.ts';

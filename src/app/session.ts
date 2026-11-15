@@ -13,7 +13,7 @@
  *
  * <h2>为什么心跳和补 tick 必须在这里</h2>
  *
- * 它们原先各有两份：生产在 `aliyun-session.ts`，模拟在 `harness.ts`。两份一定会漂移，
+ * 它们原先各有两份：生产在 `voice-session.ts`，模拟在 `harness.ts`。两份一定会漂移，
  * 于是模拟测的是自己的抄本（ADR-0002 P2）。现在只有这一份，适配层和模拟器都不许调
  * `tick()` / `acquireFloor()`。
  *

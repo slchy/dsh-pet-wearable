@@ -87,7 +87,7 @@ const INITIAL_LISTEN_MS = 60_000;
  */
 const ASSEMBLER_RECENT_SECONDS = 8;
 
-export interface AliyunSessionOptions {
+export interface VoiceSessionOptions {
   /** 监听端口 */
   readonly port: number;
   /**
@@ -215,7 +215,7 @@ export interface AliyunSessionOptions {
  *
  * 监听、鉴权、心跳、TLS 全在 `transport.ts`；这里只决定「一条连接里谁来干活」。
  */
-export async function runAliyunServer(options: AliyunSessionOptions): Promise<number> {
+export async function runVoiceServer(options: VoiceSessionOptions): Promise<number> {
   return await runTransport({
     port: options.port,
     host: options.host,
@@ -242,7 +242,7 @@ const HANDSHAKE_WAIT_MS = 1_000;
  * - 没配鉴权：`Hello` 先到就用它；先到的是别的帧或等满 {@link HANDSHAKE_WAIT_MS} → v1，
  *   那一帧原样转交，不丢
  */
-function handshake(conn: Connection, options: AliyunSessionOptions): void {
+function handshake(conn: Connection, options: VoiceSessionOptions): void {
   let decided = false;
   let timer: NodeJS.Timeout | null = null;
 
@@ -260,7 +260,7 @@ function handshake(conn: Connection, options: AliyunSessionOptions): void {
     } else if (hello?.proto !== undefined && hello.proto >= 2) {
       console.log('  握手    设备要 v2 但能力不合法 → 不回 Welcome，按 v1 走');
     }
-    new AliyunConnection(conn, options, link).start(first);
+    new VoiceConnection(conn, options, link).start(first);
   };
 
   conn.bind({
@@ -279,9 +279,9 @@ function handshake(conn: Connection, options: AliyunSessionOptions): void {
 }
 
 /** 一条连接的完整状态：只负责把各模块接起来。 */
-class AliyunConnection {
+class VoiceConnection {
   private readonly conn: Connection;
-  private readonly options: AliyunSessionOptions;
+  private readonly options: VoiceSessionOptions;
   private readonly link: DeviceLink;
   private readonly caps: DeviceCapabilities;
   /** v1 线协议垫片：原语 ↔ 控制串 / 状态帧，图像帧归属；v2 连接为 `null` */
@@ -312,7 +312,7 @@ class AliyunConnection {
   /** 原始档案（`MIAI_ARCHIVE_DIR` 为空时是 null） */
   private readonly archive: SessionArchive | null;
 
-  constructor(conn: Connection, options: AliyunSessionOptions, link: DeviceLink) {
+  constructor(conn: Connection, options: VoiceSessionOptions, link: DeviceLink) {
     this.conn = conn;
     this.options = options;
 
@@ -864,7 +864,7 @@ class AliyunConnection {
    * - `Voice`：旁白通道（`speakCanned`），`stop` 就是 `cancelCanned`
    */
   private createAppSession(
-    proactive: NonNullable<AliyunSessionOptions['proactive']>,
+    proactive: NonNullable<VoiceSessionOptions['proactive']>,
     dialog: DialogRuntime,
   ): AppSession {
     return new AppSession({
