@@ -8,3 +8,6 @@
 
 # Python 侧车同理（虽然 python 容忍 CRLF，但 shebang 行带 \r 会找不到解释器）
 *.py text eol=lf
+
+# 热词表要原样上传到阿里云控制台，行尾被转成 CRLF 后可能把 \r 带进词里
+docs/hotwords.txt text eol=lf
