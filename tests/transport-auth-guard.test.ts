@@ -95,9 +95,12 @@ test('未鉴权发 Ping：直接断开，不留保活通道', async () => {
   assert.equal(reply.subarray(HEADER).toString(), 'auth_required');
 });
 
-test('未鉴权声明 8 MB 帧：按 64 KB 上限拒收，不攒进内存', async () => {
+test('未鉴权声明 8 MB 帧：按 64 KB 上限拒收，并直接断开', async () => {
   const { port, logs } = await listen();
   const client = await open(port);
+  const chunks: Buffer[] = [];
+  client.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+  const gone = closed(client);
 
   // 只发 header：声明 8 MB 正文，但一个字节正文都不给
   const header = Buffer.alloc(HEADER);
@@ -105,15 +108,14 @@ test('未鉴权声明 8 MB 帧：按 64 KB 上限拒收，不攒进内存', asyn
   header.writeUInt32LE(8 << 20, 1);
   client.write(header);
 
-  await new Promise((resolve) => { setTimeout(resolve, 200); });
+  await gone;
+
   assert.match(logs.join('\n'), /帧长异常 8388608（上限 65536）/);
-
-  // 丢掉越权缓冲之后连接还能继续用：正常 Hello 应当通过
-  client.write(hello('good'));
-  await new Promise((resolve) => { setTimeout(resolve, 200); });
-  assert.match(logs.join('\n'), /鉴权\s+通过/);
-
-  client.destroy();
+  // 帧长异常之后字节流已经失去边界（缓冲整块丢掉了），接着读只会把半截载荷当帧头。
+  // 所以必须断开 —— 留着这条连接，对方只要每隔几秒发一个字节就能一直占着。
+  const reply = Buffer.concat(chunks);
+  assert.equal(reply[0], 2, '下行 Control 帧类型是 2');
+  assert.equal(reply.subarray(HEADER).toString(), 'frame_too_large');
 });
 
 test('闸不误伤：鉴权后 200 KB 帧照常收下', async () => {

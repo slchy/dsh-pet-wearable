@@ -107,6 +107,10 @@ export class Connection {
     this.decoder = new FrameDecoder(
       (message) => {
         log(`  ✗ ${message}`);
+        // 帧长异常之后字节流已经失去边界 —— 缓冲被整块丢掉，后面的字节无法重新对齐，
+        // 接着读下去只会把半截载荷当帧头。所以直接断开，不留一条"永远凑不齐帧"的
+        // 连接：未鉴权的对端可以声明一个超限帧然后无限拖着，靠每几秒一个字节保活。
+        this.closeWith('frame_too_large');
       },
       // 需要鉴权时先收着：未鉴权的对端没资格声明大帧
       authenticate === undefined ? FRAME_MAX_BYTES : UNAUTH_FRAME_MAX_BYTES,
@@ -189,6 +193,11 @@ export class Connection {
     }
     if (!this.socket.destroyed) {
       this.socket.end();
+      // `end()` 只是半关，真正的 `close` 要等对端也发 FIN。看门狗已经停了，
+      // 所以碰到不配合的对端（尤其被我们主动踢掉的）这条连接会一直挂着占 fd。
+      // 给个兜底：5 秒还没关就强制 destroy。
+      const force = setTimeout(() => { this.destroy(); }, 5_000);
+      force.unref();
     }
   }
 
