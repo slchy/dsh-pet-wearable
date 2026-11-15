@@ -28,8 +28,16 @@ import { dirname, join } from 'node:path';
 
 import { SpontaneousTurn } from './spontaneous.ts';
 
-/** 单轮超时。agent 可能跑工具，给得比纯对话宽。 */
-const DEFAULT_TIMEOUT_MS = 180_000;
+/**
+ * 单轮超时。
+ *
+ * 180 s → 60 s：语音场景里「等三分钟」等于挂了。真机最长一轮 8.27 s
+ * （1 步 + 一次 web_search），60 s 给了 7 倍余量；真卡住时用户最多等一分钟，
+ * 而不是对着空气说三分钟话。
+ *
+ * 后台作业不受影响：它们不经 `ask` 等待，结算后由 dsh 自发开一轮（见 `onAnnounce`）。
+ */
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface TokenUsage {
   inputTokens?: number;

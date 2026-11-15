@@ -17,6 +17,13 @@
 - id: llm-deepseek
   config:
     reasoningEffort: off
+    # 单次输出上限。dsh 默认 256 000 —— 语音回复 40 字约 60 token，这个值等于
+    # 「允许模型说 25 万字」。它不是首字延迟的瓶颈（prefill 由输入决定），但它是
+    # 一道**失控边界**：模型万一陷进复读或死循环，8k 就到顶，而不是先烧掉 25 万。
+    #
+    # `maxTokens` 是 volatile 字段（和 reasoningEffort 一样）：`--patch` 层改不动，
+    # 必须写在这个 profile 持久 patch 里才生效。
+    maxTokens: 8192
 
 # 上下文压缩阈值。
 # 不设的话永远不会压缩：`llm-deepseek` 的 `DEFAULT_CONTEXT_WINDOW` 是 1e6，
