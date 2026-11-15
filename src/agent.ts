@@ -142,7 +142,9 @@ export class VoiceAgent {
       + `${r.resumed ? '续会话' : '新会话'}  `
       + `情绪=${emotion}  `
       + `tokens=${usage?.inputTokens ?? '?'}/${usage?.outputTokens ?? '?'}`
-      + ` cache=${usage?.cacheReadTokens ?? 0}`,
+      + ` cache=${usage?.cacheReadTokens ?? 0}`
+      // 上下文规模：压缩阈值（12.5 万）看的是这条，累加的 input 看不出问题
+      + ` ctx=${usage?.contextTokens ?? '?'}`,
     );
     return { ...r, speech, emotion };
   }

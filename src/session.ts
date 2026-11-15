@@ -36,6 +36,34 @@ export interface TokenUsage {
   outputTokens?: number;
   cacheReadTokens?: number;
   totalTokens?: number;
+  /**
+   * 单次最大输入 = **最后一个 step** 的上下文规模。
+   *
+   * 一轮里有多个 step（工具调用）时，`inputTokens` 累加起来是"这一轮总共读了
+   * 多少 token"（成本口径），而 `contextTokens` 是"当时上下文有多大"（压缩阈值口径）。
+   * 监控 12.5 万那条线要看的是后者，累加值永远看不出问题。
+   */
+  contextTokens?: number;
+}
+
+/**
+ * 把一个 step 的 usage 折进本轮累计值。
+ *
+ * 两个口径必须分开：
+ * - `inputTokens` / `outputTokens` / `cacheReadTokens` **累加** = 这一轮总共花了多少
+ * - `contextTokens` 取**最后一个** step 的输入 = 当时上下文有多大
+ *
+ * 混成一个数会得出两个错误结论之一：要么低估成本，要么永远看不出上下文已经
+ * 逼近压缩阈值（累加值一直在涨，反而更像"正常"）。
+ */
+export function foldStepUsage(acc: TokenUsage | null, step: TokenUsage): TokenUsage {
+  const contextTokens = step.inputTokens ?? acc?.contextTokens;
+  return {
+    inputTokens: (acc?.inputTokens ?? 0) + (step.inputTokens ?? 0),
+    outputTokens: (acc?.outputTokens ?? 0) + (step.outputTokens ?? 0),
+    cacheReadTokens: (acc?.cacheReadTokens ?? 0) + (step.cacheReadTokens ?? 0),
+    ...(contextTokens === undefined ? {} : { contextTokens }),
+  };
 }
 
 export interface AskResult {
@@ -132,7 +160,11 @@ export function parseEvents(stdout: string): {
       if (typeof t === 'string') streamed += t;
     } else if (type === 'status') {
       const u = e['usage'];
-      if (u && typeof u === 'object') usage = u as TokenUsage;
+      if (u && typeof u === 'object') {
+        const parsed = u as TokenUsage;
+        // headless 的 status 是收尾那一次，inputTokens 本身就是上下文规模
+        usage = { ...parsed, contextTokens: parsed.inputTokens };
+      }
     }
   }
 
@@ -160,6 +192,14 @@ export class DshSession {
   >();
   /** 最近一条 assistant/message 的文本；多 step 时后者覆盖前者 */
   private assistantText = '';
+  /**
+   * 本轮各 step 的用量累加。
+   *
+   * `assistant/message` 自带 `usage`（协议原话：模型输出与它的记账一起走，
+   * 没有单独的 usage 记录）。以前这里只取了 message、把同级的 usage 丢了，
+   * 结果 SDK 模式永远打 `tokens=?/?` —— 刚配的压缩阈值等于没有仪表。
+   */
+  private turnUsage: TokenUsage | null = null;
   /** turn 结束（agent 整体 idle）时触发 */
   private onIdle: (() => void) | null = null;
   private sdkReady = false;
@@ -299,6 +339,7 @@ export class DshSession {
     }
 
     this.assistantText = '';
+    this.turnUsage = null;
     // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
     this.spontaneous.reset();
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
@@ -333,7 +374,7 @@ export class DshSession {
     return {
       text: answer,
       sessionId,
-      usage: null,
+      usage: this.turnUsage,
       durationMs: Date.now() - started,
       resumed,
     };
@@ -459,6 +500,13 @@ export class DshSession {
         if (block['type'] === 'text' && typeof block['text'] === 'string') parts.push(block['text']);
       }
       if (parts.length > 0) this.assistantText = parts.join('');
+
+      // usage 与 message 同级（`data.usage`），多 step 时逐 step 累加：
+      // 输入/输出累加是成本口径，最后一步的输入才是上下文规模。
+      const rawUsage = data?.['usage'];
+      if (rawUsage && typeof rawUsage === 'object') {
+        this.turnUsage = foldStepUsage(this.turnUsage, rawUsage as TokenUsage);
+      }
       return;
     }
 
