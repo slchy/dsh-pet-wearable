@@ -886,6 +886,9 @@ class VoiceConnection {
   private onPartial(text: string): void {
     console.log(`  … ${text}`);
     this.archive?.event(EVENTS.asrPartial, { text });
+    // 判停的**文本判据**：中间结果在出 = 用户还在说。只传信号不拼文本，
+    // 中间结果会反复改写，拼起来是乱的。
+    this.assembler.notePartial(text);
     // 用户已经开口了，「嗯，我看看」这种回执就没必要了
     // 宠物要在**用户刚开口**就收手，不能等到这句话定稿
     this.app?.userPartial();

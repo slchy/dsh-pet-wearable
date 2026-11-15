@@ -94,3 +94,28 @@ test('只多等一次，不会一直拖', async () => {
   await delay(200);
   assert.equal(utterances.length, before + 1, '最多多等一次，之后必须收');
 });
+
+test('音频说完了，但刚收到中间结果 → 不收敛', async () => {
+  // 这条是「判停不能只看音频」的核心：中间结果在出 = 用户还在说。
+  const { assembler, utterances } = makeAssembler({ partialGraceMs: 20, extendMs: 40 });
+
+  assembler.addSentence('我想问一下那个');
+  assembler.notePartial('我想问一下那');
+
+  await delay(15);
+  assert.equal(utterances.length, 0, '用户还在出字，这时候收下就是抢话');
+
+  await delay(120);
+  assert.equal(utterances.length, 1, '等过 grace 之后还是要收，不能吞掉');
+});
+
+test('中间结果是过去的，不影响收敛', async () => {
+  const { assembler, utterances } = makeAssembler({ partialGraceMs: 20, extendMs: 40 });
+
+  assembler.notePartial('很久以前的一段');
+  await delay(40);
+  assembler.addSentence('这句话已经说完了');
+
+  await delay(15);
+  assert.equal(utterances.length, 1, 'partial 早就停了，没有理由再等');
+});

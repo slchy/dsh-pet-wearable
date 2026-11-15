@@ -54,6 +54,16 @@ export interface UtteranceAssemblerOptions {
    * 是把判停的收益赔进去。ASR 断句间隔通常远小于 400 ms，够用了。
    */
   readonly shortFragmentWaitMs?: number;
+  /**
+   * ASR 中间结果刚到多久之内，音频判停「说完了」也不算数。默认 400 ms。
+   *
+   * 音频判据（Smart Turn）只看波形：句子之间那点停顿，它分不清是「说完了」
+   * 还是「换气」。而 ASR 的中间结果是**用户还在出字**的直接证据 ——
+   * 定稿之后 partial 还在增长，说明下一句已经在路上，这时候收下就是抢话。
+   *
+   * 设 0 关闭这条判据（只信音频，回到旧行为）。
+   */
+  readonly partialGraceMs?: number;
   /** 一轮定稿 */
   readonly onUtterance: (text: string) => void;
   readonly log: (line: string) => void;
@@ -74,6 +84,8 @@ export class UtteranceAssembler {
   private extensions = 0;
   /** 上一次真正收下一轮的时刻，用来判断「短碎片是不是紧跟其后」 */
   private lastUtteranceAt = Number.NEGATIVE_INFINITY;
+  /** 最近一次 ASR 中间结果的时刻：用户还在出字的直接证据 */
+  private lastPartialAt = Number.NEGATIVE_INFINITY;
   private disposed = false;
 
   constructor(options: UtteranceAssemblerOptions) {
@@ -93,6 +105,17 @@ export class UtteranceAssembler {
       const dropped = this.recentChunks.shift();
       this.recentBytes -= dropped?.length ?? 0;
     }
+  }
+
+  /**
+   * ASR 中间结果到了 —— 用户还在说话。
+   *
+   * 这**不是**用来拼文本的（中间结果会反复改写，拼起来是乱的），只当一个
+   * 「还在出字」的信号。以前这个信号只用来打断播放，判停完全看不到它，
+   * 于是「音频停顿 = 说完了」成了唯一判据。
+   */
+  notePartial(_text: string): void {
+    this.lastPartialAt = this.now();
   }
 
   /** 一句定稿的识别结果。 */
@@ -159,6 +182,19 @@ export class UtteranceAssembler {
       probability >= this.options.threshold
       || this.extensions >= this.options.maxExtensions
     ) {
+      // 文本判据：音频说完了，但用户还在出字 —— 这时候收下就是抢话。
+      // 只在还有 extension 额度时生效，避免无限等。
+      const grace = this.options.partialGraceMs ?? 400;
+      const sincePartial = this.now() - this.lastPartialAt;
+      if (grace > 0 && sincePartial < grace && this.extensions < this.options.maxExtensions) {
+        this.extensions += 1;
+        this.options.log(
+          `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
+        );
+        this.pendingTimer = setTimeout(() => { void this.evaluate(); }, this.options.extendMs);
+        return;
+      }
+
       if (this.shouldWaitForMore(this.pendingText)) {
         this.extensions += 1;
         const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);
