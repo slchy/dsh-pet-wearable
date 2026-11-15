@@ -34,6 +34,8 @@
 import { closeSync, mkdirSync, openSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { EVENTS } from './events.ts';
+
 export interface ArchiveOptions {
   /** 根目录；空串 = 关闭 */
   readonly rootDir: string;
@@ -142,7 +144,7 @@ export class SessionArchive {
     if (this.closed) {
       return;
     }
-    this.event('close', {
+    this.event(EVENTS.close, {
       sec: Math.round((Date.now() - this.startedAt) / 1000),
       events: this.eventCount,
       segments: this.segmentNo,
@@ -207,7 +209,7 @@ export class SessionArchive {
       pcm: openSync(join(dir, 'uplink.pcm'), 'a'),
       down: openSync(join(dir, 'downlink.pcm'), 'a'),
     };
-    this.event('open', { segment: this.segmentNo });
+    this.event(EVENTS.open, { segment: this.segmentNo });
   }
 
   /** 只保留最近 `keepSessions` 个会话目录 */

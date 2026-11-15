@@ -17,6 +17,7 @@
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
 import type { AnnounceStore } from './announce-store.ts';
+import { EVENTS } from './events.ts';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -176,7 +177,13 @@ export interface AliyunSessionOptions {
 
   /**
    * TLS。**不给就是明文** —— 本地开发不必先造证书；上公网时由部署方注入。
-   * 证书路径/内容属于部署细节，不进源码（见 `BACKLOG.md` B-004）。
+   *
+   * 证书的路径与内容属于**部署细节，不进源码**：内容以 `Buffer` 传，路径只走
+   * `MIAI_TLS_KEY` / `MIAI_TLS_CERT`（独立进程）或 `tls.keyPath` / `tls.certPath`
+   * （插件）。这样换证书不需要改代码，也不会有人把私钥误提交上来。
+   *
+   * 到期不会静默：`main.ts` 的 `loadTls()` 会读 `notAfter`，剩 30 天起在启动日志里
+   * 提醒，过期后明确说明「每次握手都会失败」（见 `tls-cert.ts`）。
    */
   readonly tls?: {
     readonly key: Buffer;
@@ -352,7 +359,7 @@ class AliyunConnection {
           : {}),
         onAnnounce: (pending, spoken) => { this.app?.announce(pending, spoken); },
         onTurnStart: (text, hasImage) => {
-          this.archive?.event('turn.start', { text_len: text.length, image: hasImage });
+          this.archive?.event(EVENTS.turnStart, { text_len: text.length, image: hasImage });
           this.app?.turnStart();
         },
         onTurnEnd: () => { this.app?.turnEnd(); },
@@ -440,7 +447,7 @@ class AliyunConnection {
         this.assembler.addAudio(pcm);
       },
       onSpeechOpen: (peakDbfs, preroll, prerollMs) => {
-        this.archive?.event('gate.open', { peakDbfs: Number(peakDbfs.toFixed(1)), prerollMs });
+        this.archive?.event(EVENTS.gateOpen, { peakDbfs: Number(peakDbfs.toFixed(1)), prerollMs });
         for (const part of preroll) {
           this.stt.feed(part);
         }
@@ -449,7 +456,7 @@ class AliyunConnection {
       onSpeechClose: (gapMs) => {
         // 带上 gapMs：能量门要 holdMs（默认 2 s）才关门，所以 `t` 本身**不是**
         // 「用户停嘴」的时刻，`t - gapMs` 才是。延迟报告靠这个还原真实起点。
-        this.archive?.event('gate.close', gapMs === undefined ? undefined : { gapMs });
+        this.archive?.event(EVENTS.gateClose, gapMs === undefined ? undefined : { gapMs });
         this.stt.hangup();
       },
     });
@@ -476,7 +483,7 @@ class AliyunConnection {
     console.log(
       `  设备    ${this.link.label}（v${this.link.proto}）：${describeCapabilities(this.caps)}`,
     );
-    this.archive?.event('device.link', { proto: this.link.proto, label: this.link.label });
+    this.archive?.event(EVENTS.deviceLink, { proto: this.link.proto, label: this.link.label });
 
     // 后台任务完成后的播报落在这条连接上
     this.options.agent.setAnnouncer?.((speech) => { this.onAnnounce(speech); });
@@ -484,7 +491,7 @@ class AliyunConnection {
     // 上次离线期间攒下的汇报：连上就补播（旧的先播）
     const backlog = this.options.announceStore?.drain() ?? [];
     if (backlog.length > 0) {
-      this.archive?.event('announce.replay', { count: backlog.length });
+      this.archive?.event(EVENTS.announceReplay, { count: backlog.length });
       console.log(`  补播    离线期间攒了 ${backlog.length} 条后台汇报`);
       for (const speech of backlog) {
         this.dialog.enqueueAnnounce(speech);
@@ -600,7 +607,7 @@ class AliyunConnection {
       return;
     }
     const name = typeof json['ev'] === 'string' ? json['ev'] : '';
-    this.archive?.event('status.recv', { name, raw: JSON.stringify(json).slice(0, 200) });
+    this.archive?.event(EVENTS.statusRecv, { name, raw: JSON.stringify(json).slice(0, 200) });
 
     // v1 的状态帧没有请求 id：垫片按它记着的在途请求补上
     const result = v1.status(json);
@@ -626,7 +633,7 @@ class AliyunConnection {
       console.error(`  ✗ Event 帧不是合法 JSON：${payload.toString('utf8').slice(0, 120)}`);
       return;
     }
-    this.archive?.event('event.recv', { raw: JSON.stringify(raw).slice(0, 200) });
+    this.archive?.event(EVENTS.eventRecv, { raw: JSON.stringify(raw).slice(0, 200) });
     const event = parseV2Event(raw);
     if (event === null) {
       console.log(`  ✗ 不认识的设备事件 ${JSON.stringify(raw).slice(0, 120)}，已忽略`);
@@ -655,7 +662,7 @@ class AliyunConnection {
         return;
       case 'played':
         // 播放进度目前由 TurnRunner 按时长估算；收到也只记档，留给以后替换估算
-        this.archive?.event('device.played');
+        this.archive?.event(EVENTS.devicePlayed);
         return;
     }
   }
@@ -676,19 +683,19 @@ class AliyunConnection {
       this.resolveMicWaiters();
     }
     if (!supportsCall(this.caps, call)) {
-      this.archive?.event('ctl.skip', { op: call.op, why: 'unsupported' });
+      this.archive?.event(EVENTS.ctlSkip, { op: call.op, why: 'unsupported' });
       console.log(`  控制    ✗ 设备未声明 ${call.op}，已跳过`);
       return false;
     }
     if (this.v1 === null) {
       const json = encodeV2Call(call);
-      this.archive?.event('call.send', { json });
+      this.archive?.event(EVENTS.callSend, { json });
       this.conn.sendCall(json);
       return true;
     }
     const text = this.v1.encode(call);
     if (text === null) {
-      this.archive?.event('ctl.skip', { op: call.op, why: 'v1-cannot-express' });
+      this.archive?.event(EVENTS.ctlSkip, { op: call.op, why: 'v1-cannot-express' });
       console.log(`  控制    ✗ v1 无法表达 ${call.op}，已跳过`);
       return false;
     }
@@ -698,7 +705,7 @@ class AliyunConnection {
 
   /** 下发控制串并记进档案：每次下发都能在时间线上对到当时的音频位置 */
   private sendControl(text: string): void {
-    this.archive?.event('ctl.send', { text });
+    this.archive?.event(EVENTS.ctlSend, { text });
     this.conn.sendControl(text);
   }
 
@@ -728,7 +735,7 @@ class AliyunConnection {
       return;
     }
     this.micPending = false;
-    this.archive?.event('mic.opened');
+    this.archive?.event(EVENTS.micOpened);
     this.resolveMicWaiters();
     this.app?.micOpened();
   }
@@ -785,7 +792,7 @@ class AliyunConnection {
    * 这里只记档并把话交进去。
    */
   private onAnnounce(speech: string): void {
-    this.archive?.event('announce', { len: speech.length });
+    this.archive?.event(EVENTS.announce, { len: speech.length });
     this.dialog.enqueueAnnounce(speech);
   }
   private onClose(): void {
@@ -810,7 +817,7 @@ class AliyunConnection {
 
   private onPartial(text: string): void {
     console.log(`  … ${text}`);
-    this.archive?.event('asr.partial', { text });
+    this.archive?.event(EVENTS.asrPartial, { text });
     // 用户已经开口了，「嗯，我看看」这种回执就没必要了
     // 宠物要在**用户刚开口**就收手，不能等到这句话定稿
     this.app?.userPartial();
@@ -822,12 +829,12 @@ class AliyunConnection {
 
   private onSentence(text: string, index: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
-    this.archive?.event('asr.sentence', { text, index });
+    this.archive?.event(EVENTS.asrSentence, { text, index });
     this.dialog.dispatch({ type: 'sentence', text });
   }
 
   private onAsrError(error: Error): void {
-    this.archive?.event('asr.error', { message: error.message.slice(0, 200) });
+    this.archive?.event(EVENTS.asrError, { message: error.message.slice(0, 200) });
     // 空闲挂断是预期行为（网关对「没听到有效语音」的连接 10 s 就踢），
     // 不是故障，不要用 ✗ 污染日志。
     if (error.message.includes('IDLE_TIMEOUT')) {
@@ -839,7 +846,7 @@ class AliyunConnection {
 
   private onWake(payload: Buffer): void {
     const [transactionId = '', requestId = ''] = payload.toString('utf8').split('\n');
-    this.archive?.event('wake', { transactionId, requestId: requestId.slice(0, 8) });
+    this.archive?.event(EVENTS.wake, { transactionId, requestId: requestId.slice(0, 8) });
     console.log(
       `  唤醒    transactionId=${transactionId}  requestId=${requestId.slice(0, 8)}…`,
     );

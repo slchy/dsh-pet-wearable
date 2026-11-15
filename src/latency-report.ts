@@ -29,9 +29,10 @@
  * `null`，报告里单独计数 —— **不拿 0 冒充缺失值**，否则历史基线会被伪造成「很快」。
  */
 
+import { EVENTS } from './events.ts';
+
 /** 档案里的一行事件；只声明报告用得到的字段，其余原样忽略。 */
-export interface ArchiveEvent {
-  /** 相对会话开始的毫秒数 */
+export interface ArchiveEvent {  /** 相对会话开始的毫秒数 */
   readonly t: number;
   /** 事件名 */
   readonly ev: string;
@@ -45,7 +46,7 @@ export interface ArchiveEvent {
 }
 
 /** 一轮里可能缺席的时刻名。 */
-export type MissingMark = 'gate.close' | 'asr.sentence' | 'tts.first' | 'turn.end';
+export type MissingMark = typeof EVENTS.gateClose | typeof EVENTS.asrSentence | typeof EVENTS.ttsFirst | typeof EVENTS.turnEnd;
 
 /** 一轮的分段耗时；`null` = 该段缺仪表。 */
 export interface TurnLatency {
@@ -208,7 +209,7 @@ function speechStopAt(events: readonly ArchiveEvent[], at: number): number | nul
 export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
   const starts: number[] = [];
   for (let i = 0; i < events.length; i += 1) {
-    if (events[i]?.ev === 'turn.start') {
+    if (events[i]?.ev === EVENTS.turnStart) {
       starts.push(i);
     }
   }
@@ -234,14 +235,14 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     // 真正的起点是 `t - gapMs`（最后一个有声块），见 {@link speechStopAt}。
     let gateAt = -1;
     for (let i = at; i < nextAt; i += 1) {
-      if (events[i]?.ev === 'gate.close') {
+      if (events[i]?.ev === EVENTS.gateClose) {
         gateAt = i;
         break;
       }
     }
     if (gateAt < 0) {
       for (let i = at - 1; i > prevAt; i -= 1) {
-        if (events[i]?.ev === 'gate.close') {
+        if (events[i]?.ev === EVENTS.gateClose) {
           gateAt = i;
           break;
         }
@@ -250,7 +251,7 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     // ② 的中间点：本轮范围内的最后一个 asr.sentence
     let asrAt = -1;
     for (let i = at - 1; i > prevAt; i -= 1) {
-      if (events[i]?.ev === 'asr.sentence') {
+      if (events[i]?.ev === EVENTS.asrSentence) {
         asrAt = i;
         break;
       }
@@ -259,14 +260,14 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     // ③④ 的终点：本轮范围内
     let firstAt = -1;
     for (let i = at; i < nextAt; i += 1) {
-      if (events[i]?.ev === 'tts.first') {
+      if (events[i]?.ev === EVENTS.ttsFirst) {
         firstAt = i;
         break;
       }
     }
     let endAt = -1;
     for (let i = at; i < nextAt; i += 1) {
-      if (events[i]?.ev === 'turn.end') {
+      if (events[i]?.ev === EVENTS.turnEnd) {
         endAt = i;
         break;
       }
@@ -285,16 +286,16 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
 
     const missing: MissingMark[] = [];
     if (gateAt < 0) {
-      missing.push('gate.close');
+      missing.push(EVENTS.gateClose);
     }
     if (asrAt < 0) {
-      missing.push('asr.sentence');
+      missing.push(EVENTS.asrSentence);
     }
     if (firstAt < 0) {
-      missing.push('tts.first');
+      missing.push(EVENTS.ttsFirst);
     }
     if (endAt < 0) {
-      missing.push('turn.end');
+      missing.push(EVENTS.turnEnd);
     }
 
     const end = endAt < 0 ? undefined : events[endAt];

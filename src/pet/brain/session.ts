@@ -16,6 +16,7 @@
  * 这样重放一份 `pet.in` 必然得到同一串 `pet.out`。
  */
 import type { DeviceCapabilities } from '../../devices/primitives.ts';
+import { EVENTS } from '../../events.ts';
 import { PetBrain } from './brain.ts';
 import { PetExecutor } from './executor.ts';
 import { FloorArbiter } from './floor.ts';
@@ -310,7 +311,7 @@ export class PetSession {
         if (input === undefined) {
           break;
         }
-        this.options.onEvent?.('pet.in', input as unknown as Record<string, unknown>);
+        this.options.onEvent?.(EVENTS.petIn, input as unknown as Record<string, unknown>);
         this.options.log?.(`宠物 ← ${describePetInput(input)}${this.phaseNote()}`);
         const result = this.brain.step(this.state, input);
         this.state = result.state;

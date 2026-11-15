@@ -30,6 +30,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
 
+import { EVENTS } from '../src/events.ts';
+
 interface OurEvent {
   readonly t: number;
   readonly ev: string;
@@ -274,9 +276,9 @@ function main(argv: readonly string[]): number {
     });
 
   const lastT = ourEvents.reduce((m, e) => Math.max(m, e.t), 0);
-  const turnEnds = ourEvents.filter((e) => e.ev === 'turn.end');
+  const turnEnds = ourEvents.filter((e) => e.ev === EVENTS.turnEnd);
   const wanted = turnEnds.map((e) => e.dsh_session).find((v) => typeof v === 'string');
-  const turnCount = ourEvents.filter((e) => e.ev === 'turn.start').length;
+  const turnCount = ourEvents.filter((e) => e.ev === EVENTS.turnStart).length;
 
   const dsh = pickDshSession(
     dshRoot,
@@ -290,10 +292,10 @@ function main(argv: readonly string[]): number {
   // miai 侧：turn 序号靠 turn.start 递增，好给 dsh 的 step 归轮
   let turnNo = 0;
   for (const e of ourEvents) {
-    if (e.ev === 'turn.start') {
+    if (e.ev === EVENTS.turnStart) {
       turnNo += 1;
     }
-    const skip = new Set(['asr.partial', 'pet.in']);
+    const skip = new Set<string>([EVENTS.asrPartial, EVENTS.petIn]);
     if (!verbose && skip.has(e.ev)) {
       continue;
     }
@@ -344,8 +346,8 @@ function main(argv: readonly string[]): number {
   if (dsh !== null) {
     console.log('\n=== 每轮的 agent 内部（对应 miai 的 turn.start → tts.first）');
     const dshRows = rows.filter((r) => r.src === 'dsh' && typeof r.ms === 'number');
-    const starts = ourEvents.filter((e) => e.ev === 'turn.start');
-    const firsts = ourEvents.filter((e) => e.ev === 'tts.first');
+    const starts = ourEvents.filter((e) => e.ev === EVENTS.turnStart);
+    const firsts = ourEvents.filter((e) => e.ev === EVENTS.ttsFirst);
     console.log(`${'轮'.padStart(3)}  ${'agent 段'.padStart(10)}  ${'步数'.padStart(4)}  ${'工具'.padStart(4)}  工具名`);
     for (let i = 0; i < starts.length; i += 1) {
       const from = starts[i]?.t ?? 0;

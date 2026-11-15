@@ -13,6 +13,7 @@
  */
 import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
+import { EVENTS } from './events.ts';
 import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
@@ -187,7 +188,7 @@ export class TurnRunner {
           firstAudioAtMs = this.options.clock.now();
           fsm.audioStarted(ticket);
           this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
-          this.options.onEvent?.('tts.first', { ms: firstChunkAtMs });
+          this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
         }
         audioBytes += chunk.length;
         this.options.onDownlinkChunk?.(chunk);
@@ -223,7 +224,7 @@ export class TurnRunner {
         ? 0
         : Math.min(audioSeconds, (this.options.clock.now() - firstAudioAtMs) / 1000);
 
-      this.options.onEvent?.('turn.end', {
+      this.options.onEvent?.(EVENTS.turnEnd, {
         interrupted,
         audio_s: Number(audioSeconds.toFixed(2)),
         heard_s: Number(heardSeconds.toFixed(2)),
@@ -244,7 +245,7 @@ export class TurnRunner {
       };
     } catch (error) {
       // 失败也留一条：否则报告里这一轮的 ④ 会显示"缺仪表"，与"没拿到音频"混在一起
-      this.options.onEvent?.('turn.end', { failed: true, dsh_ms: agentLatencyMs });
+      this.options.onEvent?.(EVENTS.turnEnd, { failed: true, dsh_ms: agentLatencyMs });
       this.log(`  ✗ 本轮失败: ${(error as Error).message}`);
       return null;
     } finally {

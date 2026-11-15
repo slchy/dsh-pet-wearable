@@ -6,3 +6,13 @@ dist/
 .env
 tokens.txt
 tmp/
+
+# 证书与私钥只存在于部署机，路径由 MIAI_TLS_KEY / MIAI_TLS_CERT 注入。
+# 这个仓平时一个证书文件都没有 —— 那条「没有文件所以进不了仓」的保证不算保证：
+# 谁哪天把 cert.pem 放进来就会直接被提交。将来若要放示例证书，用 .example 后缀。
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+!*.pem.example

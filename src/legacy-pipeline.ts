@@ -60,8 +60,19 @@ const VAD_THRESHOLD = 0.4;
 const MAX_UTTERANCE_SEC = 60;
 const FRAME_BYTES = WINDOW * 2;
 
-/** adb 目标设备，可用 ADB_SERIAL 覆盖 */
-const ADB_SERIAL = process.env.ADB_SERIAL ?? '192.168.1.100:5555';
+/**
+ * adb 目标设备。**不给就报错，但只在真要用 adb 的时候才报** ——
+ * 这个模块是被 `main.ts` 顶层 import 的，模块级的 `throw` 会让整个进程起不来
+ * （包括那些根本不用 legacy 后端的部署）。以前这里写的是 `192.168.1.100:5555`
+ * 这个谁都没有的地址，表现是 adb 连超时几十秒才失败，看不出是"没配"还是"设备掉了"。
+ */
+function adbSerial(): string {
+  const serial = process.env['ADB_SERIAL'] ?? '';
+  if (serial === '') {
+    throw new Error('legacy-pipeline 需要 ADB_SERIAL（例如 ADB_SERIAL=<设备地址>:36451）');
+  }
+  return serial;
+}
 const REMOTE_JAR = '/data/local/tmp/miai.jar';
 const REMOTE_PCM = '/data/local/tmp/reply.pcm';
 const LOCAL_TMP = join(process.cwd(), '..', 'tmp');
@@ -116,11 +127,11 @@ export async function speak(pcm: Buffer): Promise<void> {
   const local = join(LOCAL_TMP, `reply_${Date.now()}.pcm`);
   writeFileSync(local, pcm);
 
-  execFileSync('adb', ['-s', ADB_SERIAL, 'push', local, REMOTE_PCM], { stdio: 'pipe' });
+  execFileSync('adb', ['-s', adbSerial(), 'push', local, REMOTE_PCM], { stdio: 'pipe' });
 
   const shell = `app_process -Djava.class.path=${REMOTE_JAR} /system/bin `
     + `com.miaiglasses.MainPlay ${REMOTE_PCM} ${TTS_SAMPLE_RATE}`;
-  const out = execFileSync('adb', ['-s', ADB_SERIAL, 'shell', shell], {
+  const out = execFileSync('adb', ['-s', adbSerial(), 'shell', shell], {
     timeout: 120_000,
     encoding: 'utf8',
   });

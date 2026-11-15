@@ -31,6 +31,7 @@ import {
   type TtsProvider,
 } from './providers.ts';
 import { DshSession } from './session.ts';
+import { expiryWarning } from './tls-cert.ts';
 import { runAliyunServer } from './aliyun-session.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
@@ -145,7 +146,13 @@ function loadTls(): { key: Buffer; cert: Buffer } | undefined {
     return undefined;
   }
   try {
-    return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+    const cert = readFileSync(certPath);
+    // 到期检查：过期的证书服务端照常启动、照常监听，只是每一次握手都失败 ——
+    // 客户端只看到「连不上」，日志里一个字都没有。所以在这里喊出来。
+    for (const line of expiryWarning(cert) ?? []) {
+      console.warn(`  ${line}`);
+    }
+    return { key: readFileSync(keyPath), cert };
   } catch (error) {
     fail(`TLS 证书读不到：${(error as Error).message}`);
   }

@@ -58,7 +58,7 @@ send({
   id: 1,
   method: 'initialize',
   params: {
-    cwd: '<部署路径>/voice-workspace',
+    cwd: process.env.DSH_WORKSPACE ?? process.cwd(),
     provider: process.env.DSH_PROVIDER ?? 'deepseek-official',
     model: process.env.DSH_MODEL ?? 'deepseek-flash',
   },
