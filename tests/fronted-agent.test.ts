@@ -353,21 +353,40 @@ test('取消抛错不能影响本轮', async () => {
   assert.equal(reply.speech, '我在呢。');
 });
 
-test('投机那一轮已经有结果了，就不许再发取消（否则杀的是下一轮）', async () => {
-  const inner = fakeInner();
-  let cancelled = 0;
+test('取消一定带着本轮的票据传给下层（由 session 按在途票据丢过期）', async () => {
+  const inner = slowInner(200);
+  const seen: Array<{ no: number; gen: number } | undefined> = [];
   const wrapped: AgentProvider = {
     ...inner.agent,
-    cancelTurn: () => { cancelled += 1; },
-    // dsh 秒回：快模型还没吐第一个字，这一轮就已经结束了
-    reply: async (text, image, note) => inner.agent.reply(text, image, note),
+    cancelTurn: (ticket) => { seen.push(ticket); },
   };
-  // 快模型慢吞吞：3 个 token × 80 ms，首字也要 80 ms
-  const agent = agentWith(wrapped, async () => slowSse(['我', '在', '呢。'], 80) as never);
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']), { speculate: true });
   agent.attachLiveSink(() => {});
 
-  await agent.reply('你好呀');
-  assert.equal(cancelled, 0, '那一轮早就答完了，取消会落到下一轮头上');
+  await agent.reply('你好呀', undefined, undefined, { ticket: { no: 3, gen: 7 } });
+  assert.deepEqual(seen, [{ no: 3, gen: 7 }], '票据是唯一轮次令牌，必须原样传下去');
+});
+
+test('代次已经前进时，旧轮迟到的取消被丢弃', async () => {
+  const inner = slowInner(400);
+  const seen: Array<{ no: number; gen: number } | undefined> = [];
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: (ticket) => { seen.push(ticket); },
+  };
+  // 两个 token 之间隔 150 ms，好让第二轮插进来
+  const agent = agentWith(wrapped, async () => slowSse(['我', '在呢。'], 150) as never);
+  agent.attachLiveSink(() => {});
+
+  const first = agent.reply('你好呀', undefined, undefined, { ticket: { no: 1, gen: 1 } });
+  // 第二轮先把代次推到 2（`currentGen` 随之更新）
+  const second = agent.reply('谢谢你', undefined, undefined, { ticket: { no: 2, gen: 2 } });
+  await Promise.all([first, second]);
+
+  assert.ok(
+    seen.every((ticket) => ticket?.gen === 2),
+    `第 1 轮的取消必须被丢弃，实际收到：${JSON.stringify(seen)}`,
+  );
 });
 
 test('后台任务状态也要透传给外层（trackActivity 不能漏）', () => {

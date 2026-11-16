@@ -225,6 +225,17 @@ export class TurnRunner {
       return null;
     }
 
+    // **上游取消的唯一入口**：插话与连接结束都从 `DialogFsm.onInvalidate` 发出来。
+    // 带着票据说清楚要取消哪一轮 —— 迟到的取消由 session 层按代次丢弃。
+    const offInvalidate = fsm.onInvalidate((reason) => {
+      this.log(`  取消    ${reason === 'bargeIn' ? '插话' : '连接结束'} → 取消在途请求（第 ${ticket.no} 轮）`);
+      try {
+        agent.cancelTurn?.(ticket);
+      } catch (error) {
+        this.log(`  取消    ✗ ${(error as Error).message}`);
+      }
+    });
+
     let interrupted = false;
     let audioBytes = 0;
     let firstChunkAtMs = 0;
@@ -301,7 +312,7 @@ export class TurnRunner {
 
       let reply;
       try {
-        reply = await agent.reply(text, image, note);
+        reply = await agent.reply(text, image, note, { ticket });
       } finally {
         this.options.onLiveAvailable?.(null);
         queue?.close();
@@ -401,6 +412,7 @@ export class TurnRunner {
       this.log(`  ✗ 本轮失败: ${(error as Error).message}`);
       return null;
     } finally {
+      offInvalidate();
       fsm.audioDone(ticket);
       this.options.onTurnFinished();
     }

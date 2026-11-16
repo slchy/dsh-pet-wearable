@@ -31,6 +31,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import type { TurnTicket } from './dialog-fsm.ts';
 import { SpontaneousTurn } from './spontaneous.ts';
 import { SingleFlight } from './single-flight.ts';
 import { TaskBoard } from './task-board.ts';
@@ -257,6 +258,8 @@ export class DshSession {
   private cancelSupported: boolean | null = null;
   /** 在途的握手指令（并发 `ask` 必须等同一个，不能各自起进程） */
   private readonly handshaking = new SingleFlight<void>();
+  /** 当前在途那一轮的票据（`null` = 还没开始 / 已经结束）；取消时按它丢过期票据 */
+  private activeTicket: TurnTicket | null = null;
   /** 轮次串行队列的尾巴（`ask` 排队用，见 `ask` 的注释） */
   private turns: Promise<void> = Promise.resolve();
   /** 当前在途那一轮是不是**被我们主动取消**的（是的话收成空答复，不抛错） */
@@ -363,17 +366,18 @@ export class DshSession {
    * 编排层本来也是一轮一轮来，但投机/取消失败时慢车道那一轮可能还在跑 —— 这里排个队，
    * 把「重叠」降级成「等一会儿」。
    */
-  async ask(text: string, image?: ImageAttachment): Promise<AskResult> {
+  async ask(text: string, image?: ImageAttachment, turn?: { readonly ticket: TurnTicket }): Promise<AskResult> {
+    const ticket = turn?.ticket;
     const run = this.turns.then(
-      () => this.askOnce(text, image),
-      () => this.askOnce(text, image),
+      () => this.askOnce(text, image, ticket),
+      () => this.askOnce(text, image, ticket),
     );
     this.turns = run.then(() => undefined, () => undefined);
     return await run;
   }
 
-  private async askOnce(text: string, image?: ImageAttachment): Promise<AskResult> {
-    if (this.mode === 'sdk') return await this.askSdk(text, image);
+  private async askOnce(text: string, image?: ImageAttachment, ticket?: TurnTicket): Promise<AskResult> {
+    if (this.mode === 'sdk') return await this.askSdk(text, image, ticket);
     if (image) {
       throw new DshError('headless 模式的 stdin 只收纯文本，带图片请用 --dsh-sdk');
     }
@@ -401,10 +405,18 @@ export class DshSession {
    * 取消之后 dsh 自己会发 idle，但为防它不发，这里兜一个短定时器：超时就替等待者
    * 收尾，免得 `ask` 一路挂到 60 s 超时。
    */
-  cancelTurn(): void {
+  cancelTurn(ticket?: TurnTicket): void {
     const sessionId = this.openSessionId ?? this.readSession();
     const waiter = this.onIdle;
     if (this.proc === null || sessionId === null || waiter === null) {
+      return;
+    }
+    // **按代次丢弃迟到的取消**：只有「当前在途那一轮」的票据才允许取消。
+    // 没有这道检查时，快模型比 dsh 慢就会把取消打到下一轮头上（实测打死过 harness）。
+    const active = this.activeTicket;
+    if (ticket !== undefined && active !== null
+      && (ticket.no !== active.no || ticket.gen !== active.gen)) {
+      this.log(`  取消    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
       return;
     }
     // 取消是**故意的**：被取消的那一轮不该以异常收场（上层根本没法处理「用户不要了」
@@ -491,7 +503,7 @@ export class DshSession {
    * messageId，内容全靠 `session.event` 推。所以这里取**最后一条**
    * `assistant/message` 的 text 块 —— 多 step 时前面的都是中间过程。
    */
-  private async askSdk(text: string, image?: ImageAttachment): Promise<AskResult> {
+  private async askSdk(text: string, image?: ImageAttachment, ticket?: TurnTicket): Promise<AskResult> {
     await this.ensureSdk();
 
     const started = Date.now();
@@ -526,6 +538,9 @@ export class DshSession {
     this.exitError = null;
     // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
     this.spontaneous.reset();
+    // 记下这一轮的票据：`cancelTurn(ticket)` 靠它丢弃迟到的取消
+    this.activeTicket = ticket ?? null;
+    this.cancelRequested = false;
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
 
     await this.rpc('session/prompt', {
@@ -550,6 +565,7 @@ export class DshSession {
     } finally {
       clearTimeout(timer);
       this.onIdle = null;
+      this.activeTicket = null;
     }
 
     const answer = this.assistantText.trim();

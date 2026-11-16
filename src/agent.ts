@@ -19,6 +19,7 @@ import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { parseEmotion, stripEmotionTags } from './emotion.ts';
+import type { TurnTicket } from './dialog-fsm.ts';
 
 /**
  * dsh 的压缩阈值（token）—— 来自 profile 里的 `compaction-basic.thresholdRatio: 0.125`。
@@ -159,8 +160,8 @@ export class VoiceAgent {
   }
 
   /** 取消在途一轮（快车道胜出后，慢车道那一轮已经没人要了）。 */
-  cancelTurn(): void {
-    this.session.cancelTurn();
+  cancelTurn(ticket?: TurnTicket): void {
+    this.session.cancelTurn(ticket);
   }
 
   /** 硬中断：SIGINT 给 dsh 子进程（会退出，下一轮重启）。 */
@@ -173,12 +174,17 @@ export class VoiceAgent {
     return this.session.taskStatus();
   }
 
-  async reply(asrText: string, image?: ImageAttachment, note?: string): Promise<AgentReply> {
+  async reply(
+    asrText: string,
+    image?: ImageAttachment,
+    note?: string,
+    turn?: { readonly ticket: TurnTicket },
+  ): Promise<AgentReply> {
     // 人设与规则由 dsh 作为系统提示词注入（见 mcp/profile.cordis.yml），这里只发
     // 本轮真正变化的东西：可选的系统注记 + 哥说的话。
     const context = note === undefined ? '' : `（系统注记：${note}）\n`;
     const prompt = `${context}哥刚才说：\n${asrText}`;
-    const r = await this.session.ask(prompt, image);
+    const r = await this.session.ask(prompt, image, turn);
     // 情绪标签在最开头；剥掉它，剩下的才是要念的话
     const { emotion, rest } = parseEmotion(r.text);
     const speech = cleanForSpeech(rest);

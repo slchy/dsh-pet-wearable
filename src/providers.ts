@@ -10,6 +10,12 @@
  *   这个坑踩过：混用会 1.5 倍速升调）
  * - Agent：文本（+ 可选图片）→ 一句话回复
  */
+import type { TurnTicket } from './dialog-fsm.ts';
+
+/** 一轮的上下文：现在只有票据，将来要加东西就放这里，别再加位置参数。 */
+export interface TurnContext {
+  readonly ticket: TurnTicket;
+}
 
 /** 给 Agent 的图片附件（与 `session.ts` 的 `ImageAttachment` 同构）。 */
 export interface AgentImage {
@@ -62,10 +68,10 @@ export interface AgentProvider {
   /**
    * 可选能力：**取消在途的一轮**（宿主侧能力，走 dsh 的 `session/cancel`）。
    *
-   * 只对慢车道有意义，且必须自己确认真有在途 —— 没有在途时它会去取消自主工作。
-   * 调用方按「尽力而为」处理：失败不能影响本轮结果。
+   * 传 `ticket` 时按**轮次**取消：session 层会比对当前在途轮次的代次，
+   * 票据过期的取消直接丢弃 —— 否则迟到的取消会杀掉下一轮（实测踩过）。
    */
-  cancelTurn?(): void;
+  cancelTurn?(ticket?: TurnTicket): void;
   /**
    * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
    *
@@ -83,8 +89,15 @@ export interface AgentProvider {
   /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
+   * @param turn 本轮票据（`{no, gen}`）。**轮次令牌的唯一来源是 `DialogFsm`**：
+   *   上游取消要靠它判断"这是不是还在跑的那一轮"。
    */
-  reply(userText: string, image?: AgentImage, note?: string): Promise<AgentReplyView>;
+  reply(
+    userText: string,
+    image?: AgentImage,
+    note?: string,
+    turn?: TurnContext,
+  ): Promise<AgentReplyView>;
   /**
    * 可选：agent 在**没有任何一轮**的情况下主动要说的内容（后台任务完成汇报）。
    *

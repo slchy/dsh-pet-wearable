@@ -39,7 +39,8 @@
  */
 import { cleanForSpeech } from './agent.ts';
 import { parseEmotion } from './emotion.ts';
-import type { AgentImage, AgentProvider, AgentReplyView } from './providers.ts';
+import type { AgentImage, AgentProvider, AgentReplyView, TurnContext } from './providers.ts';
+import type { TurnTicket } from './dialog-fsm.ts';
 
 /** 快模型说「这个我答不了」的唯一暗号 */
 const DELEGATE = '[[DELEGATE]]';
@@ -374,7 +375,6 @@ export class FrontedAgent implements AgentProvider {
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
-  /** 快车道答过、还没进 dsh 会话的轮次（"用户: …" / "你: …" 两行一组） */
   private readonly pending: string[] = [];
   /**
    * 对话窗口：两条通道（快车道自己答的 + dsh 答的）都在这里，按时间顺序。
@@ -397,10 +397,20 @@ export class FrontedAgent implements AgentProvider {
   private sink: ((text: string) => void) | null = null;
   private innerMode: InnerMode = 'pass';
   private readonly buffered: string[] = [];
-  /** 本轮投机起的 dsh 是否已经被掐掉（只掐一次） */
-  private innerCancelled = false;
-  /** 投机那一轮是不是已经有结果了 —— 有结果就绝不能再发取消（否则杀的是下一轮） */
-  private innerDone = false;
+  /**
+   * 投机起的 dsh 那一轮属于哪个代次。
+   *
+   * 取消**按代次**判定：只有「现在这一轮的票据」才允许取消上游。以前用一个
+   * `innerDone` 布尔量挡「自己这一轮已经答完」，但那个布尔量和 dsh 的真实状态
+   * 之间没有共同标尺 —— 快模型比 dsh 慢时，等它吐第一个字，自己那轮早答完、
+   * 用户已经开了下一轮，取消落到下一轮头上（实测把 harness 打过一次）。
+   */
+  /** 当前这一轮（最近一次 eply）的代次。取消时用它丢弃迟到的票据 */
+  private currentGen = -1;
+  /** 没有真票据时用的本地代次（单测 / 保活） */
+  private localGen = 0;
+  /** 已经发过取消的代次（同一代次只发一次） */
+  private cancelledGen = -1;
 
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
@@ -458,7 +468,18 @@ export class FrontedAgent implements AgentProvider {
     this.inner.setAnnouncer?.(cb);
   }
 
-  async reply(userText: string, image?: AgentImage, note?: string): Promise<AgentReplyView> {
+  async reply(
+    userText: string,
+    image?: AgentImage,
+    note?: string,
+    turn?: TurnContext,
+  ): Promise<AgentReplyView> {
+    // 本轮票据：取消上游时带回去，让 session 层按代次判断"这是不是还在跑的那一轮"。
+    // 没有票据的调用（单测、保活 ping）自己发一个本地代次 —— 去重照样成立，
+    // 只是 session 层没有真票据可比对，会直接照办。
+    const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
+    this.currentGen = ticket.gen;
+    this.innerMode = 'pass';
     // dsh 上一条在问话，用户这句是短回话（好的/对/不用）—— 那是**对话里的回应**，
     // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
     if (this.lastDsh?.asked === true && looksLikeAnswer(userText)) {
@@ -493,13 +514,7 @@ export class FrontedAgent implements AgentProvider {
       // 先上闸再起跑：`inner.reply` 在第一个 await 之前是同步执行的，
       // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
       this.innerMode = 'buffer';
-      this.innerCancelled = false;
-      this.innerDone = false;
       dsh = this.startInner(userText, image, note);
-      dsh.then(
-        () => { this.innerDone = true; },
-        () => { this.innerDone = true; },
-      );
     }
 
     let emitted = '';
@@ -511,7 +526,7 @@ export class FrontedAgent implements AgentProvider {
         // 所以这一刻就把在途的 dsh 那一轮掐掉，别等它把整段答完再取消。
         // 只有真开了投机才动手：不投机时 dsh 里在跑的是**别的**轮次（比如后台任务
         // 的旁白），取消它等于把旁白吞了。
-        if (dsh !== null) this.cancelInner();
+        if (dsh !== null) this.cancelInner(ticket);
         this.sink?.(text);
       });
     } catch (error) {
@@ -520,7 +535,7 @@ export class FrontedAgent implements AgentProvider {
       if (emitted !== '') {
         this.log(`  快车道    ✗ ${why}（已播出一部分，按现有文本收下）`);
         dsh?.catch(() => undefined);
-        return this.commit(userText, emitted, 0, dsh);
+        return this.commit(userText, emitted, 0, dsh, ticket);
       }
       return await this.abandon(dsh, userText, image, note, `✗ ${why}`);
     }
@@ -531,7 +546,7 @@ export class FrontedAgent implements AgentProvider {
     if (cleanForSpeech(parseEmotion(answer.text).rest) === '') {
       return await this.abandon(dsh, userText, image, note, '空答复');
     }
-    return this.commit(userText, answer.text, answer.firstTokenMs, dsh);
+    return this.commit(userText, answer.text, answer.firstTokenMs, dsh, ticket);
   }
 
   /** 快车道胜出：**取消**在途的 dsh 那一轮，别白花钱、也别留幽灵历史 */
@@ -540,11 +555,12 @@ export class FrontedAgent implements AgentProvider {
     raw: string,
     firstTokenMs: number,
     dsh: Promise<AgentReplyView> | null,
+    ticket: TurnTicket,
   ): AgentReplyView {
     this.innerMode = 'drop';
     this.buffered.length = 0;
     if (dsh !== null) {
-      this.cancelInner();
+      this.cancelInner(ticket);
       dsh.then(
         () => { this.log('  快车道    慢车道那一轮已作废'); },
         () => undefined,
@@ -591,22 +607,27 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
-   * 掐掉投机起的 dsh 那一轮。只掐一次 —— 首字时掐过，`commit` 再调就是空转。
+   * 掐掉投机起的 dsh 那一轮。
+   *
+   * **按代次去重**：同一个代次只发一次取消；票据不存在（没有投机）就不动。
+   * 迟到的取消由 session 层按代次丢弃（那里才知道"在途的是哪一轮"）。
    *
    * 宿主层 `session/cancel` 实测 **5 ms 收敛**、进程不死、会话不丢、也不影响下一轮
    * （`turn/end` reason = `{kind:'aborted',reason:{kind:'user'}}`）。取消失败不算错：
    * 已经推给 TTS 的字收不回来，最坏也只是白跑一次生成。
    */
-  private cancelInner(): void {
-    if (this.innerCancelled || this.innerDone) {
+  private cancelInner(ticket: TurnTicket): void {
+    // 迟到的取消：这一轮已经过去（又有新的 reply 开始了）→ 丢弃。
+    // 注意这里比的是**代次**，不是布尔量：代次是 DialogFsm 发的唯一轮次令牌。
+    if (ticket.gen !== this.currentGen || this.cancelledGen === ticket.gen) {
       return;
     }
-    this.innerCancelled = true;
+    this.cancelledGen = ticket.gen;
     try {
       if (this.cancelMode === 'interrupt') {
         this.inner.interruptTurn?.();
       } else if (this.cancelMode === 'rpc') {
-        this.inner.cancelTurn?.();
+        this.inner.cancelTurn?.(ticket);
       }
     } catch (error) {
       this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);

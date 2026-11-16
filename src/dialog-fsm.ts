@@ -120,6 +120,8 @@ export class DialogFsm {
    * 只有真正跑起来才炸。
    */
   private readonly log: (line: string) => void;
+  /** 「本轮被作废」的订阅者（见 {@link onInvalidate}） */
+  private readonly invalidateListeners: Array<(reason: 'bargeIn' | 'closed') => void> = [];
 
   constructor(log: (line: string) => void) {
     this.log = log;
@@ -152,6 +154,24 @@ export class DialogFsm {
   /** 当前代次的票据。入队任务应当持有它，出队时用 {@link isStale} 校验。 */
   ticket(): TurnTicket {
     return { no: this._turn, gen: this._gen };
+  }
+
+  /**
+   * 订阅「本轮被作废」：插话与连接结束。
+   *
+   * 这是**上游取消**的唯一触发点（`TurnRunner` 收到就调 `agent.cancelTurn(ticket)`）——
+   * 别再在别处按状态猜：`bargeIn` 只在这里发生，`close` 也只在这里。
+   *
+   * @returns 退订函数
+   */
+  onInvalidate(cb: (reason: 'bargeIn' | 'closed') => void): () => void {
+    this.invalidateListeners.push(cb);
+    return () => {
+      const at = this.invalidateListeners.indexOf(cb);
+      if (at >= 0) {
+        this.invalidateListeners.splice(at, 1);
+      }
+    };
   }
 
   /** 该票据的轮次是否已被插话作废（代次变了） */
@@ -232,6 +252,9 @@ export class DialogFsm {
     this._gen += 1;
     this._endAfterSpeech = false;
     this.transition('listening', `插话「${why}」→ 代次 ${this._gen}`);
+    for (const cb of [...this.invalidateListeners]) {
+      cb('bargeIn');
+    }
     return true;
   }
 
@@ -268,6 +291,9 @@ export class DialogFsm {
   /** 连接收尾。任何状态都可以直接进 `closed`。 */
   close(): void {
     this.transition('closed', '连接结束');
+    for (const cb of [...this.invalidateListeners]) {
+      cb('closed');
+    }
   }
 
   private transition(to: DialogState, why: string): void {
