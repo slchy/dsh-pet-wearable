@@ -89,10 +89,22 @@ def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str) -
     if not patch.exists():
         raise RuntimeError(f"缺 patch：{patch}")
     work_dir.mkdir(parents=True, exist_ok=True)
+    # 会话指针必须是 bench 自己的一份，而且**每场从空会话开始**：
+    # - 不隔离：默认路径是 ~/.voice-agent/session.json，和生产共用，bench 会把生产的
+    #   会话 id 盖掉（实测踩过）；
+    # - 不清空：上一场的对话留在上下文里，模型一开口就接着上一个任务说，reward 不可信。
+    # 放在 work_dir **旁边**而不是里面：沙箱允许 agent 写 work_dir 内的一切（见 session.ts）。
+    session_file = work_dir.parent / f"{work_dir.name}.session.json"
+    session_file.unlink(missing_ok=True)
+    log.info("dsh 会话指针 %s（每场清空）", session_file)
     env = {
         **os.environ,
         "DSH_PATCH": str(patch),
         "TAU2_BRIDGE_URL": f"http://127.0.0.1:{bridge_port}",
+        "VOICE_AGENT_SESSION": str(session_file),
+        # 离线播报队列同理：默认也在 ~/.voice-agent/ 下，bench 攒的话会被生产补播出去。
+        # 空串 = 不持久化（见 main.ts）。
+        "MIAI_ANNOUNCE_FILE": "",
     }
     log_path = Path("/tmp/dsh-bench.log")
     log_file = log_path.open("w", encoding="utf-8")

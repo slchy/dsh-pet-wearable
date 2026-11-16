@@ -57,8 +57,14 @@ export function newActivityState(now: number): ActivityState {
  * 给 agent 包一层，记下活动痕迹。
  *
  * 包在 `reply` 外面而不是塞进 `VoiceAgent`：保活是个**旁路**，不该为了让别人看见
- * 自己而去改动主链路的类。顺带一提，`setAnnouncer` 也必须原样透传 —— 漏了它
- * 后台任务的汇报就再也播不出来，而且不报错。
+ * 自己而去改动主链路的类。
+ *
+ * **`AgentProvider` 上的每个可选能力都必须原样透传**，漏一个就是静默降级、不报错：
+ * - `setAnnouncer` 漏了 —— 后台任务的汇报再也播不出来
+ * - `attachLiveSink` 漏了 —— 流式增量到了 `session` 却没人接，边生成边合成拿到
+ *   空文本，每轮都退回整段合成（实测踩过：日志里 `首增量` 一次都不出现）
+ *
+ * 给 `AgentProvider` 加新的可选方法时，这里要跟着加一行。
  */
 export function trackActivity(
   agent: AgentProvider,
@@ -78,6 +84,7 @@ export function trackActivity(
       }
     },
     ...(agent.setAnnouncer === undefined ? {} : { setAnnouncer: agent.setAnnouncer.bind(agent) }),
+    ...(agent.attachLiveSink === undefined ? {} : { attachLiveSink: agent.attachLiveSink.bind(agent) }),
   };
 }
 

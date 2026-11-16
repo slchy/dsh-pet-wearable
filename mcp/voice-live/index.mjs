@@ -58,6 +58,7 @@ export function apply(ctx) {
   };
 
   const connectOnce = () => {
+    console.error('[voice-live] connect 127.0.0.1:' + port);
     try {
       const sock = connect({ host: '127.0.0.1', port }, () => {
         socket = sock;

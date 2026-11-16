@@ -191,6 +191,23 @@ test('trackActivity 原样透传 setAnnouncer', () => {
   assert.equal(trackActivity(plain, newActivityState(0)).setAnnouncer, undefined);
 });
 
+test('trackActivity 原样透传 attachLiveSink', () => {
+  const calls: string[] = [];
+  const inner: AgentProvider = {
+    name: 'fake',
+    reply: async () => ({ text: '' }) as AgentReplyView,
+    attachLiveSink: (sink) => { calls.push(sink === null ? 'null' : 'set'); },
+  };
+  const wrapped = trackActivity(inner, newActivityState(0));
+  assert.ok(wrapped.attachLiveSink, '漏了它，流式增量没人接，每轮都退回整段合成');
+  wrapped.attachLiveSink?.(() => {});
+  wrapped.attachLiveSink?.(null);
+  assert.deepEqual(calls, ['set', 'null']);
+
+  const plain: AgentProvider = { name: 'plain', reply: async () => ({ text: '' }) as AgentReplyView };
+  assert.equal(trackActivity(plain, newActivityState(0)).attachLiveSink, undefined);
+});
+
 test('保活输入不像用户的话', () => {
   assert.ok(!KEEPALIVE_PROMPT.includes('？'), '别写成一问一答，模型会当成真实对话去回应');
 });

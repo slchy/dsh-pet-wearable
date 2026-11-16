@@ -72,7 +72,13 @@ export interface TurnRunnerOptions {
 export interface TurnResult {
   /** 是否被用户插话中断 */
   readonly interrupted: boolean;
-  /** 模型给的、准备念的全文（被打断时用来算"还剩哪段没说完"） */
+  /**
+   * **实际送去念的全文**，从这一轮第一个字算起（被打断时用来算"还剩哪段没说完"）。
+   *
+   * 不一定等于 `reply.speech`：模型多步（先说一句、调工具、再说一句）时，流式这条路
+   * 每一步的话都会念，而 `reply.speech` 只是最后一步。拿最后一步去对已播时长，
+   * 切出来的"没说完"会是错的段落。
+   */
   readonly speech: string;
   /** 下发的字节数 */
   readonly audioBytes: number;
@@ -262,11 +268,20 @@ export class TurnRunner {
         : null;
 
       let streaming: Promise<void> | null = null;
+      /** 流式这条路收到的全部增量（未清洗）。多步时包含每一步的话，见 `TurnResult.speech` */
+      let streamedRaw = '';
       if (queue !== null && streamTts !== undefined) {
-        this.options.onLiveAvailable?.((delta) => { queue.push(delta); });
+        this.log('  流式    分支=stream（边生成边合成）');
+        this.options.onLiveAvailable?.((delta) => {
+          streamedRaw += delta;
+          // `tts_first_ms` 的起点是「有文本可送」，不是任务开跑：run-task 在本轮一开始
+          // 就发了，从那儿算会把模型生成整段记到 TTS 头上（实测 3614 = dsh 2970 + 644），
+          // 和整段合成那条路的口径（送文本 → 首块）就比不了了。
+          if (firstSynthAt === 0) firstSynthAt = this.options.clock.now();
+          queue.push(delta);
+        });
         streaming = (async () => {
           await this.speechChain;
-          firstSynthAt = this.options.clock.now();
           // 情绪标签在开头，但流式任务开跑时 reply 还没回来 —— 这里只能先按默认语气；
           // 实测这一路是 calm（见 bench 日志 情绪=calm），暂不为了个别情绪牺牲首包。
           for await (const chunk of streamTts(queue, undefined)) {
@@ -274,7 +289,13 @@ export class TurnRunner {
             emit(chunk);
           }
         })();
+        // 先挂一个空的 catch：`agent.reply` 抛错时下面的 `await streaming` 走不到，
+        // 而这条流多半也会跟着失败（没文本 → 服务端拒空任务）。没人接的 rejection
+        // 在 Node 里是进程级错误，一轮失败会变成整个 harness 退出。
+        // 这只是标记「有人管」，下面 `await streaming` 照样能拿到错误去走兜底。
+        streaming.catch(() => undefined);
       } else {
+        this.log('  流式    分支=pump（逐句/整段）');
         this.options.onLiveAvailable?.((delta) => { pump?.push(delta); });
       }
 
@@ -298,7 +319,30 @@ export class TurnRunner {
 
       // 补齐没念的部分（没走流式时这一句就是整段合成），并等所有分片落地
       if (streaming !== null) {
-        await streaming;
+        try {
+          await streaming;
+          // 流式成功：念出去的是**全部增量**，不只是最后一步。用它做 `speech`，
+          // 打断续话才对得上已播时长。按全部增量算而不是按「已送批」算：被打断时
+          // 没来得及送的那截也是"没说完"的一部分，漏了它续话会少一段。
+          const spoken = cleanForSpeech(parseEmotion(streamedRaw).rest);
+          if (spoken !== '' && spoken !== speech) {
+            this.log(
+              `  流式    实际念了 ${[...spoken].length} 字`
+              + `（最后一步只有 ${[...speech].length} 字）`,
+            );
+            speech = spoken;
+          }
+        } catch (error) {
+          // 流式这条路挂了（最常见：这条路一个字都没收到，服务端会拒空文本）。
+          // 退回整段合成，宁可慢也不能哑。
+          this.log(`  流式    ✗ ${(error as Error).message}，退回整段合成`);
+          // 兜底这次才是真正的「送文本」时刻，口径同整段合成
+          firstSynthAt = this.options.clock.now();
+          for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
+            if (fsm.isStale(ticket)) break;
+            emit(chunk);
+          }
+        }
       } else {
         await pump?.drain(reply.speech);
       }

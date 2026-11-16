@@ -19,6 +19,11 @@
  *
  * 会话文件默认放在 workDir **之外**：workspace-write 沙箱允许 agent 写
  * workDir 内的一切，放里面它就能改自己的会话记录。
+ *
+ * **同一台机器上跑第二个实例（bench、探针）必须用 `VOICE_AGENT_SESSION` 指到别处。**
+ * 默认路径是按用户算的，不是按实例算的：两个实例共用它时，后写的会把先写的
+ * 会话 id 盖掉，而会话又绑定创建目录（第 1 条），被盖的那个下一轮恢复失败、
+ * 静默开新会话 —— 历史就这么丢了（实测：bench 盖掉过生产的指针）。
  */
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -116,7 +121,10 @@ export interface SessionOptions {
   program?: string;
   /** 固定工作目录：既是 dsh 的 cwd，也是沙箱的 workspaceRoot */
   workDir: string;
-  /** 会话 id 的持久化位置，默认 ~/.voice-agent/session.json */
+  /**
+   * 会话 id 的持久化位置。不给就看环境变量 `VOICE_AGENT_SESSION`，
+   * 再没有才是 ~/.voice-agent/session.json（见文件头：第二个实例必须换路径）。
+   */
   sessionFile?: string;
   timeoutMs?: number;
   /** 额外的 profile patch 文件（用于挂 MCP 工具等） */
@@ -256,6 +264,12 @@ export class DshSession {
    * 判断用的；这个是**原始增量**，供 `SentencePump` 断句送 TTS。
    */
   onLiveSink: ((text: string) => void) | null = null;
+
+  /** 侧通道增量计数（诊断用：首增量何时到、共几段） */
+  liveSinkCount = 0;
+  /** 侧通道收到/丢弃计数（诊断：区分「没发」和「被 sessionId 挡了」） */
+  liveMsgCount = 0;
+  liveDropCount = 0;
   /** 侧通道接收端；懒启动 */
   private liveRelay: LiveTextRelay | null = null;
   private readonly liveThreshold: number;
@@ -278,8 +292,10 @@ export class DshSession {
     this.program = opts.program ?? process.env['DSH_BIN'] ?? 'dsh';
     this.workDir = opts.workDir;
     this.patch = opts.patch;
+    // 空串当没给：`VOICE_AGENT_SESSION=` 这种写法不该落成「相对路径 ''」
+    const fromEnv = process.env['VOICE_AGENT_SESSION']?.trim();
     this.sessionFile = opts.sessionFile
-      ?? join(homedir(), '.voice-agent', 'session.json');
+      ?? (fromEnv ? fromEnv : join(homedir(), '.voice-agent', 'session.json'));
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.log = opts.log ?? (() => {});
     this.mode = opts.mode ?? 'headless';
@@ -492,6 +508,7 @@ export class DshSession {
     }
     const relay = new LiveTextRelay(this.log);
     const port = await relay.ready();
+    this.log('  流式    侧通道端口 ' + port);
     if (port <= 0) {
       this.log('  流式    侧通道没起来，退回整段交付');
       return;
@@ -508,8 +525,17 @@ export class DshSession {
    * 那些没有 sessionId 已经被插件挡掉了；但历史会话的迟到 token 也可能漂过来。
    */
   private onLiveMessage(msg: LiveMessage): void {
+    this.liveMsgCount += 1;
+    if (this.liveMsgCount <= 3) {
+      this.log(
+        `  流式    消息#${this.liveMsgCount} t=${msg.t} `
+        + `s=${msg.s ?? '-'} 当前=${this.currentSessionId ?? '-'} `
+        + `text=${typeof msg.text === 'string' ? msg.text.length : '无'}`,
+      );
+    }
     const current = this.currentSessionId;
     if (current === null || msg.s !== current) {
+      this.liveDropCount += 1;
       return;
     }
     if (msg.t === 'end') {
@@ -522,6 +548,12 @@ export class DshSession {
     }
     if (typeof msg.text !== 'string') {
       return;
+    }
+    if (this.onLiveSink !== null) {
+      this.liveSinkCount += 1;
+      if (this.liveSinkCount === 1) {
+        this.log(`  流式    首增量 ${msg.text.length} 字`);
+      }
     }
     this.onLiveSink?.(msg.text);
     // 首个 token 的时刻：TTS 要等整段生成完才开腔，所以"模型多久开口"和

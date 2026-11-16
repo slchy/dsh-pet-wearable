@@ -127,6 +127,7 @@ export class LiveTextRelay {
     try {
       const server = createServer((socket) => {
         this.handle = socket;
+        this.log('  流式    插件已连上侧通道');
         socket.setEncoding('utf8');
         socket.on('data', (chunk: string) => { this.consume(chunk); });
         socket.on('error', () => { this.handle = null; });
