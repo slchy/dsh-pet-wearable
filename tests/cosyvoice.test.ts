@@ -21,21 +21,33 @@ test('每个情绪都有自由指令，且没多没少', () => {
   assert.deepEqual(Object.keys(EMOTION_INSTRUCTIONS).sort(), [...KEYS].sort());
 });
 
-test('指令长度不超过阿里云上限（100 字符，汉字按 2 个计）', () => {
+test('指令都用阿里云认的单一情感句式，且以句号结尾', () => {
+  const VALUES = new Set(['neutral', 'happy', 'surprised', 'angry', 'sad', 'fearful', 'disgusted']);
   for (const key of KEYS) {
     const text = EMOTION_INSTRUCTIONS[key];
-    const cost = [...text].reduce((sum, ch) => sum + (/[\u4e00-\u9fff]/.test(ch) ? 2 : 1), 0);
-    assert.ok(cost <= 100, `${key} 指令 ${cost} 字符，超了`);
+    const m = /^你说话的情感是([a-z]+)。$/.exec(text);
+    assert.ok(m, `${key} 的指令不是「你说话的情感是X。」句式：${text}`);
+    assert.ok(VALUES.has(m[1]), `${key} 用了不认识的情感值 ${m[1]}`);
   }
 });
 
-test('情绪 → 语速是单调的：委屈最慢、开心最快', () => {
+test('委屈是最慢最沉的，得意比开心更高更急', () => {
   const ordered = [...KEYS].sort((a, b) => EMOTION_PROSODY[a].rate - EMOTION_PROSODY[b].rate);
   assert.equal(ordered.at(0), 'sulk');
-  assert.equal(ordered.at(-1), 'happy');
   // 平静必须是 1.0：它是「没有情绪」的基准，偏离了会让中性回复也变调
   assert.equal(EMOTION_PROSODY.calm.rate, 1);
   assert.equal(EMOTION_PROSODY.calm.pitch, 1);
+  // 得意和开心都用 happy 这条指令，靠 rate/pitch 拉开：得意要更高更急
+  assert.ok(EMOTION_PROSODY.proud.rate > EMOTION_PROSODY.happy.rate);
+  assert.ok(EMOTION_PROSODY.proud.pitch > EMOTION_PROSODY.happy.pitch);
+  // 担心应该是往下压的，不能反而更急
+  assert.ok(EMOTION_PROSODY.worried.rate < EMOTION_PROSODY.calm.rate);
+  assert.ok(EMOTION_PROSODY.worried.pitch < EMOTION_PROSODY.calm.pitch);
+});
+
+test('得意和开心共用同一条指令，所以必须靠 rate/pitch 区分开', () => {
+  assert.equal(EMOTION_INSTRUCTIONS.proud, EMOTION_INSTRUCTIONS.happy);
+  assert.notDeepEqual(EMOTION_PROSODY.proud, EMOTION_PROSODY.happy);
 });
 
 test('rate/pitch 都落在阿里云的合法区间（0.5–2 / 0.5–2）', () => {

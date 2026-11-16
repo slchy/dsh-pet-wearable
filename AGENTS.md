@@ -31,7 +31,7 @@
 
 - 本地改完要 `npm run install-profile`，否则跑的是没人设的通用 agent；
 - 服务器由 `scripts/deploy_cloud.py` 自动安装；
-- 【情绪标签】那行的五个标签必须与 `src/emotion.ts` 的 `EMOTION_LABELS` 一致，
+- 【情绪标签】那行的七个标签必须与 `src/emotion.ts` 的 `EMOTION_LABELS` 一致，
   `tests/profile-prompt.test.ts` 会卡住不一致。
 
 ## 跨层数据要一路接到底

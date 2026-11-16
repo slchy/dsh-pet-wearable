@@ -2,15 +2,15 @@
  * 阿里云 CosyVoice 流式语音合成（DashScope WebSocket）。
  *
  * 为什么换：MiMo 走 `/v1/chat/completions`（不是专用 TTS 端点），首包 ~700 ms
- * 且抖动极差 470 ms。CosyVoice 复用同一条 WebSocket 后实测 **247 ms、极差 24 ms**。
+ * 且抖动极差 470 ms。CosyVoice 复用同一条 WebSocket 后实测 **~350 ms、极差 < 80 ms**。
  *
- * 三条实测结论决定了这里的写法，别凭直觉改（数字都可用 `scripts/probe-cosyvoice-warm.mjs` 复算）：
+ * 几条实测结论决定了这里的写法，别凭直觉改（数字都可用 `scripts/probe-cosyvoice-warm.mjs` 复算）：
  *
  * 1. **必须复用连接**。新连接 ~590 ms 里 ~170 ms 是 TCP+TLS+Upgrade，~60 ms 是
  *    run-task 分配会话，只有剩下那部分是合成。复用同一条 WS 串行跑下一个 task
  *    时前两段几乎归零。
  * 2. **系统音色比复刻音色快，而且方差小**。同一账号、同一区域、同一时刻测：
- *      v3-flash + 系统音色     376 ms（343–460，单调分布）
+ *      v3-flash + 系统音色     350–390 ms（单调分布）
  *      v3-flash + 复刻音色     500 ms（305–832，双峰）
  *    → 系统音色是唯一「又快又稳」的选项，所以默认用它。
  * 3. **v3.5-flash 在本账号上并不更快**，尽管官方宣传「tokenizer 帧率减半、首包降低 35%」。
@@ -18,9 +18,15 @@
  *      v3-flash 复刻 500 ms / v3.5 复刻 664 ms（短句，各 8 轮）
  *      v3-flash 复刻 491 ms / v3.5 复刻 711 ms（90 字长句）
  *    两档都慢约 165–220 ms，长句也没逆转。所以选 v3-flash。
- * 4. **预设音色不吃 `instruction`**。`cosyvoice-v3-flash` + `longanhuan_v3`
- *    传 `parameters.instruction` 一律 `Engine return error code: 428`
- *    （字段位置在 dashscope SDK 里确认过，不是位置问题）。只有复刻/设计音色才吃。
+ * 4. **音色挑对了才有 `instruction`**。同为 v3-flash 档：
+ *      `longanhuan`    ✅ 吃 `你说话的情感是happy。`
+ *      `longanhuan_v3` ❌ 428；它只认方言写法（`请用山东话表达。`）
+ *    文档里「角色/场景/身份」那几种写法在这两个音色上都是 428，别混用。
+ * 5. **`instruction` 和 `rate`/`pitch` 能叠加，且不增加首包**
+ *    （happy 基准 351 ms；+rate 1.15 → 377 ms；+pitch 1.1 → 352 ms）。
+ *    所以情绪用 instruction 表达语义，rate/pitch 只做细微区分。
+ * 6. **一个 task 报错后这条连接上后续 task 全部静默挂死**，必须弃连接重连
+ *    （见 `Connection` 的失败处理）。探针里不重连会把「连接废了」误判成「模型慢」。
  *
  * `enable_ssml` 不能开：一旦为 true 只允许一次 continue-task，和「边生成边送文本」
  * 互斥，而流式送文本是首包延迟的下一个优化点。
@@ -35,41 +41,56 @@ import type { TtsProvider } from './providers.ts';
 
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/inference';
 const DEFAULT_MODEL = 'cosyvoice-v3-flash';
-/** 龙安欢(V3)：欢脱元气女，20~30 岁 —— 最贴人设的「明亮清甜」 */
-const DEFAULT_VOICE = 'longanhuan_v3';
+/**
+ * 龙安欢：欢脱元气女，20~30 岁 —— 最贴人设的「明亮清甜」。
+ *
+ * **别写成 `longanhuan_v3`**：那个是同一档下的另一个音色，只认方言指令，
+ * 传情感指令会 428（见文件头第 4 条）。
+ */
+const DEFAULT_VOICE = 'longanhuan';
 
 /** CosyVoice 输出的 PCM16 单声道采样率（与 MiMo 相同，宿主不用改） */
 export const COSYVOICE_SAMPLE_RATE = 24_000;
 
 /**
- * 情绪 →（语速, 音调）。
+ * 情绪 →（语速, 音调）。**叠加在 instruction 之上的细微区分**。
  *
- * **系统音色**没有 `instruction`（传了会 `Engine return error code: 428`），
- * 这五个档位就是情绪的全部表达能力。实测 `rate` 严格按比例缩放音频字节数
- * （1.3 → −16.8%，0.85 → +17.1%），所以这里的数值是可预期的，不是玄学调参。
+ * 实测 rate 严格按比例缩放音频字节数（1.15 → −13%，0.9 → +6.4%），所以这些
+ * 数值是可预期的，不是玄学调参。纯 rate/pitch 模式（音色不支持 instruction 时）
+ * 也用它。
  */
 export const EMOTION_PROSODY: Record<Emotion, { readonly rate: number; readonly pitch: number }> = {
-  happy: { rate: 1.30, pitch: 1.15 },
-  proud: { rate: 1.12, pitch: 1.12 },
+  happy: { rate: 1.00, pitch: 1.00 },
+  proud: { rate: 1.12, pitch: 1.10 },
   calm: { rate: 1.00, pitch: 1.00 },
-  worried: { rate: 0.92, pitch: 0.95 },
-  sulk: { rate: 0.85, pitch: 0.90 },
+  worried: { rate: 0.95, pitch: 0.97 },
+  sulk: { rate: 0.88, pitch: 0.90 },
+  angry: { rate: 1.15, pitch: 1.12 },
+  disgust: { rate: 0.95, pitch: 0.88 },
 };
 
 /**
- * 情绪 → 自由指令（**只有复刻/设计音色吃**，系统音色会 428）。
+ * 情绪 → 阿里云 Instruct 文本。
  *
- * 阿里云限制：≤100 字符，**一个汉字按 2 个计**，所以中文最多 50 字。
- * 实测最长的一条 23 汉字 = 46，留了余量。
+ * **必须是这个固定句式，结尾句号不能省**。实测（`cosyvoice-v3-flash` + `longanhuan`）：
+ * - `你说话的情感是<值>。` —— 7 个值全部有效：
+ *   neutral / happy / surprised / angry / sad / fearful / disgusted
+ *   （本项目用到 6 个：neutral / happy / fearful / sad / angry / disgusted；
+ *    surprised 目前没有对应情绪，留着备查）
+ * - `你正在进行<场景>，你说话的情感是<值>。` → 428
+ * - `你说话的角色是<角色>，你说话的情感是<值>。` → 428
  *
- * 代价：复刻音色让首包从 376 ms 涨到 500 ms（v3-flash）。
+ * 所以不要照抄文档里那几种"更花"的写法；在这两个音色上只有单一情感句式可用。
+ * 得意/委屈这类细分靠 {@link EMOTION_PROSODY} 叠加 rate/pitch 区分。
  */
 export const EMOTION_INSTRUCTIONS: Record<Emotion, string> = {
-  happy: '用特别开心雀跃的语气说，语速偏快，尾音上扬。',
-  proud: '用小得意的语气说，尾音拖长一点，像在等着被夸。',
-  calm: '用平静自然的语气说，语速中等。',
-  worried: '用有点担心的语气说，语速稍慢，声音放轻。',
-  sulk: '用委屈巴巴的语气说，语速慢，声音低落。',
+  happy: '你说话的情感是happy。',
+  proud: '你说话的情感是happy。',
+  calm: '你说话的情感是neutral。',
+  worried: '你说话的情感是fearful。',
+  sulk: '你说话的情感是sad。',
+  angry: '你说话的情感是angry。',
+  disgust: '你说话的情感是disgusted。',
 };
 
 export class CosyVoiceError extends Error {}
@@ -82,9 +103,11 @@ export interface CosyVoiceOptions {
   readonly voice?: string;
   readonly sampleRate?: number;
   /**
-   * voice 是**复刻/设计音色**时置 true：情绪改用自由 `instruction` 表达，
-   * 而不是 rate/pitch。系统音色置 true 会被服务端拒（428）。
-   * 代价是首包 376 → 500 ms（v3-flash）。
+   * 情绪是否用 `instruction` 表达。默认 `true` —— 默认音色 `longanhuan` 支持它，
+   * 且实测不增加首包。
+   *
+   * 换成不支持 `instruction` 的音色（比如 `longanhuan_v3`，只认方言指令）时必须
+   * 关掉，否则每句话都会 `Engine return error code: 428`。
    */
   readonly useInstruction?: boolean;
   /** 空闲多久后主动关连接（默认 5 分钟，避免长连接被服务端静默掐掉后下一句话付握手钱） */
@@ -224,6 +247,14 @@ class Connection {
     const error = await done;
     this.sink = null;
     if (error) {
+      // 428 = 这个音色不接受这条 instruction。上面那句报错本身不会告诉人怎么改，
+      // 这里补上唯一两条出路 —— 否则下次还得再查一遍文档。
+      if (useInstruction && error.message.includes('428')) {
+        throw new CosyVoiceError(
+          `${error.message} —— 当前音色不吃 instruction：`
+          + '改用 COSYVOICE_EMOTION_MODE=prosody，或把 COSYVOICE_VOICE 换成 longanhuan',
+        );
+      }
       throw error;
     }
   }
@@ -238,7 +269,8 @@ class Connection {
  * 把 CosyVoice 包成 {@link TtsProvider}。
  *
  * 内部保持**一条长连接**并串行复用（语音 agent 一轮只说一句，并发没有收益，
- * 串行才能吃到 247 ms）。断线后下一次 synthesize 自动重连。
+ * 串行才能吃到「握手成本归零」）。断线或报错后下一次 synthesize 自动重连 ——
+ * 一个 task 失败后同一条连接上后续 task 会静默挂死，必须弃掉。
  */
 export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
   const apiKey = options.apiKey ?? process.env['DASHSCOPE_API_KEY']?.trim() ?? '';
@@ -250,13 +282,13 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
   const voice = options.voice ?? process.env['COSYVOICE_VOICE'] ?? DEFAULT_VOICE;
   const sampleRate = options.sampleRate ?? COSYVOICE_SAMPLE_RATE;
   /**
-   * 情绪表达方式：`prosody`（rate/pitch，系统音色唯一能用的）或 `instruction`
-   * （自由指令，只有复刻/设计音色吃）；没给就用 prosody。
+   * 情绪表达方式：`instruction`（默认，语义级）或 `prosody`（只调 rate/pitch，
+   * 给不支持 instruction 的音色用）。
    *
    * 为什么不复用 `COSYVOICE_INSTRUCTION`：探针里那个变量是**指令文本**，
    * 同一个名字两种语义迟早出错，所以运行时单独一个变量。
    */
-  const envMode = process.env['COSYVOICE_EMOTION_MODE'] ?? 'prosody';
+  const envMode = process.env['COSYVOICE_EMOTION_MODE'] ?? 'instruction';
   const useInstruction = options.useInstruction ?? envMode === 'instruction';
   const idleCloseMs = options.idleCloseMs ?? 5 * 60_000;
 

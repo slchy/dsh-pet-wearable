@@ -161,6 +161,8 @@ export const EMOTION_STYLES: Record<Emotion, string> = {
   calm: '语速放稳，干脆利落。',
   worried: '语速放慢，音量放低，声音柔一点。',
   sulk: '音调略低，带一点鼻音和拖腔，但不哭腔。',
+  angry: '语气有点冲，音量提一点，但不喊不骂。',
+  disgust: '语气嫌弃，尾音往下拖，像在撇嘴。',
 };
 
 /** 基础音色 + 情绪变体，拼成 MiMo 要的那一段风格描述。 */

@@ -12,13 +12,15 @@
  * 标签缺失 / 不认识时一律回落 `calm`：宁可语调普通，也不要因为模型漏写标签就报错。
  */
 
-/** 五个情绪（key 是通用的，具体怎么用由 TTS provider 决定；见 `mimo.ts` 的风格表） */
+/** 七个情绪（key 是通用的，具体怎么用由 TTS provider 决定；见 `mimo.ts` / `cosyvoice.ts` 的风格表） */
 export const EMOTIONS = {
   happy: true,
   proud: true,
   calm: true,
   worried: true,
   sulk: true,
+  angry: true,
+  disgust: true,
 } as const;
 
 export type Emotion = keyof typeof EMOTIONS;
@@ -27,7 +29,7 @@ export type Emotion = keyof typeof EMOTIONS;
  * 情绪 key → 中文标签。
  *
  * **单一事实来源**：这份表同时被三处消费，别在别处再抄一遍
- * 1. 人设提示词里"从这五个里选一个"的枚举（`agent.ts`）
+ * 1. 人设提示词里"从这七个里选一个"的枚举（`mcp/profile.cordis.yml`）
  * 2. 句中残留标签的清理正则（`cleanForSpeech`）
  * 3. 解析模型输出时的反查（`asEmotion` / `parseEmotion`）
  *
@@ -39,6 +41,8 @@ export const EMOTION_LABELS: Record<Emotion, string> = {
   calm: '平静',
   worried: '担心',
   sulk: '委屈',
+  angry: '生气',
+  disgust: '厌恶',
 };
 
 /** 标签 → key（由 {@link EMOTION_LABELS} 反推，不单独维护） */
@@ -46,7 +50,7 @@ const LABELS: Record<string, Emotion> = Object.fromEntries(
   Object.entries(EMOTION_LABELS).map(([key, label]) => [label, key as Emotion]),
 );
 
-/** 提示词里用的枚举串：`[开心] [得意] [平静] [担心] [委屈]` */
+/** 提示词里用的枚举串：`[开心] [得意] [平静] [担心] [委屈] [生气] [厌恶]` */
 export function emotionTagList(): string {
   return Object.values(EMOTION_LABELS).map((label) => `[${label}]`).join(' ');
 }
