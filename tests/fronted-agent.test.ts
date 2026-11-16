@@ -256,6 +256,29 @@ test('投机：快车道胜出时取消掉慢车道那一轮', async () => {
   assert.equal(cancelled, 1, '没人要的那一轮必须尝试取消：省一次调用，也不留幽灵历史');
 });
 
+test('投机：被取消的慢车道以 reject 收场时不能带走进程', async () => {
+  // 线上真出现过：快车道先开口 → 掐掉在途 dsh 那一轮 → 取消后 dsh 没有可念的文本，
+  // `VoiceAgent.reply` 抛错 → 这一轮已经没人 await 了 → 未捕获 rejection → harness 退出。
+  let rejectInner: ((error: Error) => void) | null = null;
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: () => new Promise<AgentReplyView>((_resolve, reject) => { rejectInner = reject; }),
+    cancelTurn: () => { rejectInner?.(new Error('清洗后没有可朗读的内容')); },
+    attachLiveSink: () => {},
+  };
+  const agent = agentWith(
+    inner,
+    async () => slowSse(['我', '在', '呢', '。'], 15),
+    { speculate: true },
+  );
+  agent.attachLiveSink(() => {});
+
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '我在呢。');
+  // 取消发生在第一个字，rejection 在快模型还没说完时就落地了 —— 让它真的跑完
+  await new Promise((resolve) => setTimeout(resolve, 80));
+});
+
 test('投机：第一个字推给 TTS 的那一刻就取消，不等快模型把整句说完', async () => {
   const inner = fakeInner();
   let cancelled = 0;

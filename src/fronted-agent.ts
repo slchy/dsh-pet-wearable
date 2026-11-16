@@ -515,6 +515,11 @@ export class FrontedAgent implements AgentProvider {
       // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
       this.innerMode = 'buffer';
       dsh = this.startInner(userText, image, note);
+      // 先接住：快车道一开口就会掐掉这一轮，而它被掐时经常以 reject 收场（取消后没有
+      // 可念的文本）。真正要用它的 `commit`/`abandon` 挂得比「掐」晚，中间这段窗口里
+      // 的 rejection 是进程级的（线上真的这样挂过一次）。
+      // `catch` 派生的是另一个 promise，`await dsh` 该抛的还是抛，分支行为不变。
+      dsh.catch(() => undefined);
     }
 
     let emitted = '';
