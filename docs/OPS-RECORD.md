@@ -141,7 +141,25 @@ v2 新增：`Hello` / `Welcome` / `Call` / `Event` / `CaptureImage`。
 **跨路径不可比**：真机上行是 mSBC（570 B / 75 ms），bench adapter 是 PCM16（640 B / 20 ms）。
 **同一条路径改前 vs 改后**才可比。
 
-## 10. 远程执行
+## 10. TLS 证书
+
+| 项 | 事实 |
+|---|---|
+| 位置 | `~/miai-cloud/tls/key.pem` + `cert.pem`（0600），配 `MIAI_TLS_KEY` / `MIAI_TLS_CERT` |
+| 类型 | **自签**，`CN=miai-local`，SAN 含 `127.0.0.1` / `localhost` / 公网 IP |
+| 有效期 | 2026-11-13 → **2027-02-11**（发证时给的是 90 天；**到期前必须续**） |
+| 信任锚 | 客户端 `sdk/sample/src/main/assets/local-ca.pem`（gitignore），**缺失即拒绝连接** |
+| 第二张网（可选） | `assets/server-pin.txt` = SPKI SHA-256（base64 无填充），`scripts/gen_server_pin.py` 生成 |
+
+自签证书**本身就是自己的 CA**，所以 App 里的「CA PEM」填的就是 `cert.pem` 全文。
+
+**两个坑**：
+
+1. `scripts/gen_local_ca.py` **默认只发 3 天**（调试用）。随手重跑会让真机 3 天后集体连不上，
+   而现象是“突然连不上”，不会想到证书。换证必须显式给长期限。
+2. 轮换要**新旧重叠**：`gen_server_pin.py --cert new.pem --append`（新旧都认）→ 发布客户端 →
+   收尾只留新的。反过来做 = 换证当天所有客户端同时连不上。
+## 11. 远程执行
 
 **一律 Base64 传脚本**，禁止在 ssh 内联命令里写 `|` `>` `"` `$`（本地 shell 先解析，
 远端会收到半截命令或 ssh 挂死）。详见 [AGENTS.md](../AGENTS.md)。
