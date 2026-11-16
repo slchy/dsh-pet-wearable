@@ -499,8 +499,8 @@ async function main(): Promise<void> {
     // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
     const fastKey = process.env['DEEPSEEK_API_KEY']?.trim() ?? '';
     const fastOff = process.env['FAST_LANE'] === '0';
-    const memoryFile = new MemoryFile(process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md'));
-    if (fastOff || fastKey === '') {
+    const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md');
+    const memoryFile = new MemoryFile(memoryPath);    if (fastOff || fastKey === '') {
       console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 DEEPSEEK_API_KEY）'}`);
     } else {
       agent = new FrontedAgent({
@@ -528,6 +528,9 @@ async function main(): Promise<void> {
         log: (line) => { console.log(line); },
       });
       console.log('快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）');
+      // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
+      // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
+      console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
     }
     const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
     const activity = newActivityState(Date.now());

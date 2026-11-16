@@ -271,3 +271,16 @@ openssl x509 -in "$MIAI_TLS_CERT" -noout -dates -ext subjectAltName
 **profile 里那条硬规则是必要的**：只写「了解到长期事实就 remember」时，dsh 会回
 「这条我记下了」**却不调用工具**（文件没变）。加一句「不许只说记下了而不写」之后
 才真的写。改 `mcp/profile.cordis.yml` 要重跑 `scripts/install-profile-patch.mjs`。
+
+**探针一律写临时文件**：`MEMORY_FILE=/tmp/probe-memory.md`。写过一次真文件就会把
+mock 事实（「哥养了一只橘猫」）留在生产记忆里 —— 已经踩过，清理方式：
+
+```bash
+F=~/voice-workspace/MEMORY.md
+cp "$F" /tmp/MEMORY.mock.bak                      # 先备份
+printf '# 长期记忆\n\n这一行之下每行一条，越新越靠下。\n' > "$F"
+# 探针留下的会话目录也顺手清（别删 UUID/长历史的那些）
+ls ~/.dsh/sessions/--home-slchy-voice-workspace-- | grep -E "^(probe|job-|sub2?-|sys-|mem-|idle-)"
+```
+
+harness 启动时会打 `记忆      路径（N 条，快车道只读）` —— 条数突然变多就是被污染了。
