@@ -18,8 +18,17 @@ node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
   └─ dsh --profile sdk --patch <patch.yml>      ← stdio JSON-RPC，一辈子跟着父进程
      ├─ mcp/mcp-camera.mjs       拍照
      ├─ mcp/mcp-session.mjs      挂断
-     └─ mcp/mcp-realtime.mjs     时间 / 天气 / 股价
+     ├─ mcp/mcp-realtime.mjs     时间 / 天气 / 股价
+     ├─ mcp/mcp-memory.mjs       remember（写 MEMORY.md）
+     └─ mcp/mcp-sessions.mjs     搜过去的对话
 ```
+
+`MEMORY.md` 放在 `--work-dir` 目录下，由 dsh 的 `agent-instructions` **每轮注入**
+系统提示词（不用调工具，省一轮往返）；改它会让下一轮前缀缓存失效一次。
+
+`KEEPALIVE_MINUTES`（默认 180，`0` 关闭）：空闲这么久就发一条极短请求把 DeepSeek
+的前缀缓存焐热。实测缓存空闲 4.7 小时仍热、23 小时凉，凉了当天第一次开口要多等
+1–3 秒。
 
 两个要点：
 

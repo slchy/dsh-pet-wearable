@@ -108,6 +108,15 @@
   config:
     searchTimeoutMs: 20000
 
+# 长期记忆靠 `agent-instructions` 注入：它把工作区里的指令文件当系统提示词的一部分
+# 读进去，所以记忆**每轮都在**，不用调工具去取（多一次工具调用就是多一轮往返，
+# 实测 +1.2 s）。代价是改 `MEMORY.md` 会让下一轮的前缀缓存失效一次。
+- id: agent-instructions
+  config:
+    maxBytes: 65536
+    instructionFileCandidates:
+      - MEMORY.md
+
 - insert:
     # 子代理的组合由这两个条目定义。`agent-preset-registry` 是名录，
     # `preset-voice-deep` 是一份**独立的插件组合** —— 子代理挂的就是它。
@@ -184,6 +193,30 @@
     # bash 之后必须有个毫秒级的正式出口 —— 派子代理去查天气，用户要多等几秒。
     # 城市不设默认值（`REALTIME_CITY` 留空）：按服务器 IP 猜出来的是机房所在地，
     # 念给哥听是确定性的错。他没说过城市时，工具会把话递回去让模型问一句。
+    # 长期记忆的写入口。读不走它 —— `MEMORY.md` 由上面的 `agent-instructions`
+    # 每轮注入，只有「记一条」需要工具。
+    - id: mcp-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: memory
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-memory.mjs
+        toolCallTimeoutMs: 10000
+        failOnStartupError: false
+    # 在过去的对话里搜。会话日志是多帧 zstd 的 JSONL，自己扫比走 dsh 的内部
+    # 索引简单（那个是服务不是工具，模型够不到）。
+    - id: mcp-sessions
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sessions
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-sessions.mjs
+        toolCallTimeoutMs: 15000
+        failOnStartupError: false
     - id: mcp-realtime
       name: '@deepseek-ai/dsh-mcp-client'
       config:

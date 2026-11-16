@@ -33,6 +33,7 @@ import {
   type TtsProvider,
 } from './providers.ts';
 import { DshSession } from './session.ts';
+import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer } from './voice-session.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
@@ -447,9 +448,43 @@ async function main(): Promise<void> {
   }
   if (dshSession) {
     console.log(`agent     dsh  workDir=${workDir}  dsh=${process.env['DSH_BIN'] ?? 'dsh'}  mode=${argv.includes('--dsh-sdk') ? 'sdk' : 'headless'}`);
-    console.log(`会话      ${dshSession.currentSessionId ?? '（新会话）'}\n`);
+    console.log(`会话      ${dshSession.currentSessionId ?? '（新会话）'}`);
   } else if (agent) {
-    console.log(`agent     ${agent.name}\n`);
+    console.log(`agent     ${agent.name}`);
+  }
+
+  /**
+   * 前缀保活。
+   *
+   * 空闲久了 DeepSeek 的前缀缓存会过期（实测：4.7 小时仍热，23 小时凉），凉了之后
+   * **当天第一次开口**要多等 1–3 秒重算整段前缀。这里在空闲时发一条极短请求把前缀
+   * 焐热，代价是一天几次几乎免费的调用。
+   *
+   * 只在真的用 dsh 时才有意义：别的 provider 没有「前缀缓存」这回事。
+   * `KEEPALIVE_MINUTES=0` 关掉。
+   */
+  let stopKeepalive: () => void = () => {};
+  if (dshSession && agent) {
+    const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
+    const activity = newActivityState(Date.now());
+    const trackedAgent = trackActivity(agent, activity);
+    agent = trackedAgent;
+    console.log(keepaliveMinutes > 0
+      ? `保活      空闲 ${keepaliveMinutes} 分钟发一次前缀保活（KEEPALIVE_MINUTES=0 关闭）\n`
+      : '保活      关（KEEPALIVE_MINUTES=0）\n');
+    stopKeepalive = startKeepalive({
+      clock: systemClock,
+      intervalMs: keepaliveMinutes * 60_000,
+      idleFor: () => Date.now() - activity.last,
+      isBusy: () => activity.inflight > 0,
+      ping: async () => {
+        const started = Date.now();
+        await trackedAgent.reply(KEEPALIVE_PROMPT);
+        console.log(`  [keepalive] 完成 ${Date.now() - started} ms`);
+      },
+      log: (line) => { console.log(line); },
+    });
+    process.on('exit', () => { stopKeepalive(); });
   }
 
   // ---------------------------------------------------------------- 图片 -> dsh 冒烟
