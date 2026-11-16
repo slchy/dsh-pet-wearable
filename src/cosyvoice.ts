@@ -27,6 +27,8 @@
  *    所以情绪用 instruction 表达语义，rate/pitch 只做细微区分。
  * 6. **一个 task 报错后这条连接上后续 task 全部静默挂死**，必须弃连接重连
  *    （见 `Connection` 的失败处理）。探针里不重连会把「连接废了」误判成「模型慢」。
+ * 7. **句尾自带几百毫秒数字静音**（「嗯。」1040 ms 里有约 600 ms 是 −113…−93 dBFS
+ *    的底噪）。这些块直接丢，但要留住句间停顿 —— 见 {@link isSilentChunk}。
  *
  * `enable_ssml` 不能开：一旦为 true 只允许一次 continue-task，和「边生成边送文本」
  * 互斥，而流式送文本是首包延迟的下一个优化点。
@@ -117,6 +119,33 @@ export interface CosyVoiceOptions {
 
 /** 阿里云的 task_id 必须 32 位无横线；`randomUUID()` 默认带横线会被拒。 */
 const hex32 = (): string => randomUUID().replace(/-/g, '');
+
+/**
+ * 一块音频是不是**数字静音**。
+ *
+ * CosyVoice 会在句尾吐好几百毫秒的静音（实测「嗯。」总共 1040 ms，其中
+ * 最后 4 块约 600 ms 是 −113…−93 dBFS 的底噪）。这些数据对听感没有任何贡献，
+ * 却会让设备多播一段无声、让状态机晚 ~600 ms 才回到 listening。
+ *
+ * 阈值取 −80 dBFS：16 bit 满量程是 0 dBFS，−80 dBFS 已经接近 1 LSB，
+ * 正常说话（哪怕很轻）不会掉到这里。
+ */
+export function isSilentChunk(chunk: Buffer, thresholdDb = -80): boolean {
+  if (chunk.length < 2) {
+    return true;
+  }
+  let sum = 0;
+  const samples = chunk.length >> 1;
+  for (let i = 0; i + 1 < chunk.length; i += 2) {
+    const s = chunk.readInt16LE(i);
+    sum += s * s;
+  }
+  const rms = Math.sqrt(sum / samples);
+  if (rms === 0) {
+    return true;
+  }
+  return 20 * Math.log10(rms / 32_768) < thresholdDb;
+}
 
 interface RunTaskArgs {
   readonly text: string;
@@ -357,16 +386,31 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
             notify?.();
           });
 
-        // 边收边吐：等整段收完再播会把音频总时长整个加到端到端延迟上
+        // 边收边吐：等整段收完再播会把音频总时长整个加到端到端延迟上。
+        //
+        // 静音块单独处理：**先攒着**，等后面出现有声块才补发（句间停顿要保留），
+        // 流结束时剩下的直接丢弃（句尾静音没人想听）。
+        // 这样既不前瞻、也不加延迟 —— 静音块本身没有信息，晚一个块发出去无损。
+        const heldSilence: Buffer[] = [];
         for (;;) {
           if (chunks.length > 0) {
-            yield chunks.shift()!;
+            const chunk = chunks.shift()!;
+            if (isSilentChunk(chunk)) {
+              heldSilence.push(chunk);
+              continue;
+            }
+            if (heldSilence.length > 0) {
+              yield Buffer.concat(heldSilence);
+              heldSilence.length = 0;
+            }
+            yield chunk;
             continue;
           }
           if (finished) break;
           await new Promise<void>((resolve) => { notify = resolve; });
           notify = null;
         }
+        heldSilence.length = 0;
         await run;
         if (failure) throw failure;
         touchIdle();

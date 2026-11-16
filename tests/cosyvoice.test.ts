@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts } from '../src/cosyvoice.ts';
+import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk } from '../src/cosyvoice.ts';
 import { EMOTIONS, type Emotion } from '../src/emotion.ts';
 
 const KEYS = Object.keys(EMOTIONS) as Emotion[];
@@ -63,8 +63,31 @@ test('缺 API key 时立刻报错，不要等到第一句话才发现', () => {
 });
 
 test('provider 声明自己的采样率（24 kHz，和 MiMo 一致，宿主不用改）', () => {
-  const tts = cosyVoiceTts({ apiKey: 'sk-test', voice: 'longanhuan_v3' });
+  const tts = cosyVoiceTts({ apiKey: 'sk-test', voice: 'longanhuan' });
   assert.equal(tts.sampleRate, COSYVOICE_SAMPLE_RATE);
   assert.equal(tts.sampleRate, 24_000);
   assert.match(tts.name, /^cosyvoice:/);
+});
+
+test('静音块判定：数字静音算静音，正常说话不算', () => {
+  // 全零
+  assert.equal(isSilentChunk(Buffer.alloc(8000)), true);
+  // ±1 LSB 的底噪（CosyVoice 句尾就是这种，实测 -113…-93 dBFS）
+  const dither = Buffer.alloc(8000);
+  for (let i = 0; i < dither.length; i += 2) {
+    dither.writeInt16LE(i % 4 === 0 ? 1 : -1, i);
+  }
+  assert.equal(isSilentChunk(dither), true);
+  // 正常说话（满量程约 10%）
+  const speech = Buffer.alloc(8000);
+  for (let i = 0; i < speech.length; i += 2) {
+    speech.writeInt16LE(Math.round(3000 * Math.sin(i / 20)), i);
+  }
+  assert.equal(isSilentChunk(speech), false);
+  // 很轻的气声（约 -60 dBFS）也得留住，那是语音不是静音
+  const breath = Buffer.alloc(8000);
+  for (let i = 0; i < breath.length; i += 2) {
+    breath.writeInt16LE(Math.round(33 * Math.sin(i / 20)), i);
+  }
+  assert.equal(isSilentChunk(breath), false);
 });
