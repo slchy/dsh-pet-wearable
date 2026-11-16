@@ -26,6 +26,11 @@ test('TTS 侧的风格串里不能出现给人看的格式（markdown / 标签�
 test('漏在句中的情绪标签不会被念出来', () => {
   assert.equal(cleanForSpeech('好的[开心]我知道'), '好的我知道');
   assert.equal(cleanForSpeech('【担心】你没事吧'), '你没事吧');
+  // 标签表之外的自造语气标签（实测模型会写），也不该被念出来
+  assert.equal(cleanForSpeech('好的[叹气]我记住了'), '好的我记住了');
+  assert.equal(cleanForSpeech('[笑]那就这么定了'), '那就这么定了');
+  // 快车道判委派前漏出来的半个标签，会和 dsh 的正文拼在一起
+  assert.equal(cleanForSpeech('[[[[平静]你好哥，眼镜快没电了'), '你好哥，眼镜快没电了');
   // 正常的方括号内容不该被吃掉
   assert.equal(cleanForSpeech('我买了[两]个'), '我买了[两]个');
 });

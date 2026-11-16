@@ -1,12 +1,12 @@
 /**
- * 播完以设备为准。
+ * 播完以设备为准 —— 但设备回执只能**延后**，不能提前。
  *
- * `speaking` 什么时候结束，过去是按下发字节数估的（`字节 / 采样率 + 尾量`）。
- * 这个估算必然偏保守：网络抖动、设备缓冲、TTS 首包慢都会让真实出声晚于估算，
- * 于是插话窗口比实际短。
+ * 真机实测：某个 v2 设备声明了 `played`，却在下行最后一批字节收到时就回执
+ * （4.58 s 的音频、1 s 就报播完）。按它收尾会让尾音还在放、状态已经回到
+ * `listening` —— 那段播放里的插话就不再算插话。
  *
- * 现在：**设备声明了 `played` 能力就等设备说**（`caps.played`）。估算时长退化成
- * 上限 —— 事件丢了顶多多等一会儿，不会把这一轮挂死。
+ * 现在的口径：估算时长是**下限**，`played` 只能把它拖后；上限只用来兜
+ * 「事件永远不来」。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -32,10 +32,12 @@ const clock: Clock = {
   },
 };
 
-function rig(deviceReportsPlayed: boolean): {
+function rig(
+  deviceReportsPlayed: boolean,
+  playedGraceMs = 300,
+): {
   start: () => Promise<{ interrupted: boolean } | null>;
   devicePlayed: () => void;
-  runner: TurnRunner;
 } {
   const agent: AgentProvider = {
     name: 'fake',
@@ -55,6 +57,7 @@ function rig(deviceReportsPlayed: boolean): {
     fsm: new DialogFsm(() => {}),
     playbackTailMs: 0,
     deviceReportsPlayed,
+    playedGraceMs,
     onTurnFinished: () => {},
     onLiveAvailable: () => {},
     log: () => {},
@@ -62,23 +65,35 @@ function rig(deviceReportsPlayed: boolean): {
   return {
     start: async () => await runner.run('你好'),
     devicePlayed: () => { runner.devicePlayed(); },
-    runner,
   };
 }
 
-test('设备报 played：不等估算时长，收到就结束这一轮', async () => {
+test('设备提前报 played：不能提前收尾，仍等估算时长', async () => {
   const r = rig(true);
   const started = clock.now();
   const running = r.start();
-  // 100 ms 后设备说播完了（真实 1 秒音频还没"播完"）
+  // 100 ms 就回执（真实 1 s 音频还没播完）
   await new Promise((resolve) => setTimeout(resolve, 100));
   r.devicePlayed();
   const result = await running;
   const spent = clock.now() - started;
 
   assert.ok(result);
-  assert.ok(spent < 700, `应当按 played 立刻结束，实际等了 ${Math.round(spent)} ms`);
+  assert.ok(spent >= 950, `回执早于估算时不能提前走，实际 ${Math.round(spent)} ms`);
   assert.equal(result.interrupted, false, '设备报完播不算插话');
+});
+
+test('设备晚于估算才报 played：等设备，可以拖后', async () => {
+  const r = rig(true);
+  const started = clock.now();
+  const running = r.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_400));
+  r.devicePlayed();
+  const result = await running;
+  const spent = clock.now() - started;
+
+  assert.ok(result);
+  assert.ok(spent >= 1_350, `设备说还没播完就得等，实际 ${Math.round(spent)} ms`);
 });
 
 test('设备不报 played：保留按时长估算的兜底', async () => {
@@ -89,15 +104,16 @@ test('设备不报 played：保留按时长估算的兜底', async () => {
 
   assert.ok(result);
   assert.ok(spent >= 950, `没有 played 就得等估算的 1 s，实际 ${Math.round(spent)} ms`);
+  assert.ok(spent < 1_300, `没有 played 就不该多等余量之外的时间，实际 ${Math.round(spent)} ms`);
 });
 
-test('设备报 played 但事件丢了：估算时长是上限，不会挂死', async () => {
+test('设备报 played 但事件丢了：估算 + 余量是上限，不会挂死', async () => {
   const r = rig(true);
   const started = clock.now();
   const result = await r.start(); // 谁都不调 devicePlayed
   const spent = clock.now() - started;
 
   assert.ok(result, '事件丢了也必须能走完');
-  assert.ok(spent >= 950, `上限到了才走，实际 ${Math.round(spent)} ms`);
-  assert.ok(spent < 2_500, '不能无限等');
+  assert.ok(spent >= 1_250, `上限到了才走，实际 ${Math.round(spent)} ms`);
+  assert.ok(spent < 2_000, '不能无限等');
 });

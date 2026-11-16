@@ -32,6 +32,14 @@ import type { ImageAttachment } from './session.ts';
  */
 const PLAYBACK_POLL_MS = 100;
 
+/**
+ * 有 `played` 能力的设备，估算时长之后最多再等这么久。
+ *
+ * 真机的 `played` 只当**下限**用（见 `run()` 里的注释），所以需要一个「事件永远不来」
+ * 的上限；3 s 足够覆盖设备缓冲，也不会把一轮挂太久。
+ */
+const PLAYED_GRACE_MS = 3_000;
+
 export interface TurnRunnerOptions {
   /** 时钟端口：一轮里的所有等待与计时都走它（模拟器要用虚拟时间） */
   readonly clock: Clock;
@@ -45,11 +53,14 @@ export interface TurnRunnerOptions {
   /**
    * 设备会上报 `played`（`caps.played`）。
    *
-   * 为真时**等设备说播完**再离开 `speaking`；估算时长退化成上限（事件丢了也不会挂死）。
-   * 为假时保持老行为：按下发字节数估时长。降级方向必须是「宁可多等一会儿」，
-   * 因为提前离开 `speaking` 等于把插话窗口关掉。
+   * 为真时**等设备说播完**再离开 `speaking`，但估算时长是**下限**、设备回执只能延后。
+   * 实测某个 v2 设备在「最后一个字节收到」就报 `played`（4.58 s 的音频 1 s 就回执了），
+   * 按它收尾会让尾音还在放就已经回到 `listening` —— 那段播放里的插话就不再算插话。
+   * 为假时保持老行为：按下发字节数估时长。降级方向必须是「宁可多等一会儿」。
    */
   readonly deviceReportsPlayed?: boolean;
+  /** 有 `played` 的设备在估算时长之后最多再等多久（默认 {@link PLAYED_GRACE_MS}） */
+  readonly playedGraceMs?: number;
   /**
    * 下行语音增益（线性倍数，默认 1）。MiMo 输出偏小，实机听感要开到接近满格，
    * 所以默认放大一档；压峰用软限幅（见 `pcm.ts` 的 `pcm16Gain`）。
@@ -396,17 +407,20 @@ export class TurnRunner {
 
       // 状态机在整个等待期间保持 speaking；插话会让票据作废从而提前结束等待。
       if (!interrupted) {
-        const until = this.options.clock.now() + audioSeconds * 1000 + this.options.playbackTailMs;
-        if (this.options.deviceReportsPlayed === true) {
-          // 设备说播完就走；估算时长只当上限（事件丢了不会把这一轮挂死）
-          this.playedSeen = false;
-          while (!fsm.isStale(ticket) && !this.playedSeen && this.options.clock.now() < until) {
-            await this.wait(PLAYBACK_POLL_MS);
+        const estimateAt = this.options.clock.now() + audioSeconds * 1000;
+        // 设备回执只能**延后**，不能提前：真机上 `played` 有时在「最后一批字节收到」
+        // 就报上来了（4.58 s 音频 1 s 回执），按它走等于把尾音那段插话窗口关掉。
+        // 所以估算时长是下限，played 到了也要等到下限之后；上限只用来兜「事件永远不来」。
+        const graceMs = this.options.deviceReportsPlayed === true
+          ? Math.max(this.options.playbackTailMs, this.options.playedGraceMs ?? PLAYED_GRACE_MS)
+          : this.options.playbackTailMs;
+        const capAt = estimateAt + graceMs;
+        this.playedSeen = false;
+        while (!fsm.isStale(ticket) && this.options.clock.now() < capAt) {
+          if (this.playedSeen && this.options.clock.now() >= estimateAt) {
+            break;
           }
-        } else {
-          while (!fsm.isStale(ticket) && this.options.clock.now() < until) {
-            await this.wait(PLAYBACK_POLL_MS);
-          }
+          await this.wait(PLAYBACK_POLL_MS);
         }
         interrupted = fsm.isStale(ticket);
       }
