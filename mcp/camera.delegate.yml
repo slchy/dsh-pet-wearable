@@ -1,0 +1,224 @@
+# dsh profile patch：主对话工具面 + 子代理能力组合
+#
+# 用法：dsh --profile sdk --patch <仓库绝对路径>/mcp/camera.yml
+# 工具名对模型是 mcp__camera__take_photo、mcp__session__end_session、
+# mcp__realtime__get_weather 这类。
+#
+# 注意 patch 的格式（见 dsh-app-boot 的 applyEntryPatches）：
+#   - 裸条目 = 按 id 覆盖已有节点，找不到就报 "entry not found"
+#   - 要**新增**节点必须用 `insert:`，不带顶层 id 时追加到最外层
+#
+# args 里是绝对路径，部署到别处时要改成实际位置（或换成相对 cwd 的写法）。
+#
+# ============================================================================
+# 这个文件现在管的是「谁是主对话、谁是子代理」
+#
+# 主对话只保留**回答本身就要用**的动作：报时间/天气/股价、搜资料、看画面、
+# 挂断、派人干活、叫停。跑命令、读写文件、翻代码、编排工作流这些「慢活」
+# 全部下发给子代理 —— 语音是同步的，主对话一旦被占住就等于失聪。
+#
+# 真机取证（同一条长会话里能归到语音交互的调用）：挂断 32、拍照 16、
+# 天气/时间/股价 8、搜索 4。read/write/edit/glob/grep/workflow 在语音场景里
+# **一次都没有** —— 它们只出现在我自己调试的那几轮里。
+#
+# 工具面大小（request/header 实测）：29 个工具 20 929 字符 → 现在 7 个左右。
+# 顺带一提：这不是首字延迟的药（实测上下文与 TTFT 无正相关），药是**决策面**
+# —— 29 个语义重叠的工具里挑一个，比 7 个里挑一个更容易选错，也更容易多想一步。
+# ============================================================================
+
+# ---- 子代理：全能力，挂独立 preset ----
+#
+# `agentPreset` 让子代理挂 `preset-voice-deep`（见文件末尾 insert），它声明了
+# bash / 文件读写 / 搜索 / job / todo / goal / workflow 那一整套 —— 而主对话
+# 把这些插件**全关了**。这是 dsh 原生的「主窄子宽」：
+#   `dsh-agent-preset` 的 config 就是 `{id, plugins[]}`（一套独立的插件组合）
+#   `tool-subagent` 的 config 带 `agentPreset`
+#   `spawn` 后端宣告了 `capabilities.agentPreset = true`
+#
+# `agentOptions` 不是 volatile 字段（`llm-deepseek` / `agent-default-model` 的
+# 那些才是），所以这里能通过配置生效。只设 reasoningEffort、不设 provider/model，
+# 子代理就继承父会话的路由 —— **同一个模型，但想得更透**。
+#
+# 为什么不是主会话也想得透：真机实测同一个「你好」，high 档有一次想了 2916 字 /
+# 10 秒还没出正文。语音要的是快，所以主会话关掉（见 profile 的
+# llm-deepseek.reasoningEffort=off），把"想得多"搬到调查、跑脚本这类真正需要
+# 推理的活儿上 —— 那正是 subagent 的用途。
+- id: tool-subagent
+  config:
+    provider: spawn
+    toolName: subagent
+    agentPreset: voice-deep
+    agentOptions:
+      reasoningEffort: max
+
+# fork 版子代理**不能**挂独立 preset：fork 继承对话历史，而 dsh 明确拒绝
+# 「继承历史的 provider 用独立组合」。所以它只能是「同一个狭窄的我」，
+# 派了也干不了主对话干不了的事 —— 直接关掉。
+- id: tool-subagent-fork
+  disabled: true
+
+# 主对话一次只挂一个子代理，不需要列名单
+- id: tool-subagent-list-agents
+  disabled: true
+
+# ---- 关掉主对话用不到的工具 ----
+#
+# 关插件而不是关工具名：工具由插件注册，插件不挂就没有 schema，模型也就不会去选。
+# 行尾是它原先占的 schema 字符数（request/header 实测）。
+- id: tool-bash           # 2280
+  disabled: true
+- id: tool-jobs           # 1153（job_output / job_kill / job_list）
+  disabled: true
+- id: tool-fs-search      # 1452（glob / grep）
+  disabled: true
+- id: tool-workflow       # 3389（最大的一块，272 轮里 0 次）
+  disabled: true
+- id: tool-todo           # 856
+  disabled: true
+- id: tool-goal           # 1731（create / update / get_goal）
+  disabled: true
+- id: tool-skill          # 332
+  disabled: true
+- id: tool-working-directory  # 360
+  disabled: true
+- id: tool-plugin-manager
+  disabled: true
+- id: plan-mode           # exit_plan_mode：语音里没有「先给方案再批准」这回事
+  disabled: true
+# MCP 资源浏览（read_mcp_resource + list_*，共 1013 字符）：MCP client 还在
+# （下面 insert），只是不给模型翻资源清单的入口。
+- id: mcp-resources
+  disabled: true
+
+# 文件工具只留「读图」。
+# 拍照回来的是图像本身，但长图会被 image-offload 落成文件，模型得能把那张读回来；
+# read / write / edit 三件（2443 字符）主对话一次都没用过。
+- id: tool-fs
+  config:
+    read: false
+    write: false
+    edit: false
+    readImage: true
+
+# `web_search` 是**同步**的：它在跑的时候主对话整个被占住，用户说什么都进不来。
+# base bundle 给的是 60 000 ms —— 一次慢搜索等于失聪一分钟，比不搜更糟。
+# 真机实测一次两查询的搜索 5.6 s 就回来了，20 s 足够覆盖慢网；超时让它失败并
+# 重试一次，比干等一分钟好。
+- id: tool-web
+  config:
+    searchTimeoutMs: 20000
+
+# 长期记忆靠 `agent-instructions` 注入（详见 camera.yml 里的同名条目）。
+- id: agent-instructions
+  config:
+    maxBytes: 65536
+    instructionFileCandidates:
+      - MEMORY.md
+
+- insert:
+    # 子代理的组合由这两个条目定义。`agent-preset-registry` 是名录，
+    # `preset-voice-deep` 是一份**独立的插件组合** —— 子代理挂的就是它。
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        # 子代理默认挂这套；不配 allowedAgentPresets，模型就看不到选择项，
+        # 也就不会自作主张去挑组合。
+        default: voice-deep
+    - id: preset-voice-deep
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: voice-deep
+        name: 语音子代理
+        description: 会动手干活的子代理：能跑命令、读写文件、搜代码、编排工作流。
+        order: 1
+        plugins:
+          # bash 的超时不在 tool-bash 上，在根组合的 `bash-sandbox`（base 默认
+          # 60 s）。bash-sandbox 是根作用域的单例，子代理继承那个 60 s，
+          # 正好够跑编译和脚本 —— 这里不要再挂一遍。
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          # workflow 引擎（`workflow-ptc`）是**根作用域的单例**，子代理不能再挂一份
+          # ——实测会直接抛 `service "workflowEngine" has been registered`，
+          # 子代理整个起不来。这里只挂工具，引擎从根组合继承。
+          - id: tool-workflow
+            name: '@deepseek-ai/dsh-tool-workflow'
+          # 子代理的对话也可能长到需要压缩。压缩由根组合的 `compaction-basic`
+          # 提供（会话级服务），子代理继承即可 —— 这里再挂一份会与根冲突。
+
+    # 下面三个 MCP client 都是 stdio 子进程。
+    # camera / session 两个工具只 POST 本机控制口（默认 listen+2），真正的硬件与
+    # 连接动作在 harness 里：
+    #   take_photo  → harness 经常驻 TCP 让手机复用 WakeUpEvent 的
+    #                 transactionId/requestId 发 multiModel，再把 JPEG 回给它
+    #   end_session → harness 挂「本轮说完就结束」的旗子，播完断开连接
+    - id: mcp-camera
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: camera
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-camera.mjs
+        # 不带任何设备参数：工具表由 server 运行时从 harness 的
+        # `GET /capabilities` 现查现生成。换设备只改设备适配层，这里和 MCP 代码都不用动。
+        toolCallTimeoutMs: 30000
+        failOnStartupError: false
+    - id: mcp-session
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: session
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-session.mjs
+        toolCallTimeoutMs: 10000
+        failOnStartupError: false
+    # 报时间 / 天气 / 股价。这三件事原来是 `bash + curl` 顺手干的，主对话不挂
+    # bash 之后必须有个毫秒级的正式出口 —— 派子代理去查天气，用户要多等几秒。
+    # 默认城市由 `REALTIME_CITY` 环境变量给；没配就按上游的来源 IP 猜。
+    # 长期记忆的写入口；读走 agent-instructions 的注入，不用工具。
+    - id: mcp-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: memory
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-memory.mjs
+        toolCallTimeoutMs: 10000
+        failOnStartupError: false
+    - id: mcp-sessions
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sessions
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-sessions.mjs
+        toolCallTimeoutMs: 15000
+        failOnStartupError: false
+    - id: mcp-realtime
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: realtime
+        transport: stdio
+        command: node
+        args:
+          - /path/to/dsh-pet-wearable/mcp/mcp-realtime.mjs
+        toolCallTimeoutMs: 10000
+        failOnStartupError: false
+

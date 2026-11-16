@@ -25,6 +25,18 @@ node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
 `MEMORY.md` 放在 `--work-dir` 目录下，由 dsh 的 `agent-instructions` **每轮注入**
 系统提示词（不用调工具，省一轮往返）；改它会让下一轮前缀缓存失效一次。
 
+**两套主对话形态并存**，用部署侧的环境变量切（两份文件都在仓里，实测后再二选一）：
+
+| `MIAI_AGENT_SHAPE` | 工具面 | 人设 |
+|---|---|---|
+| `full`（默认） | 主对话握全部工具（bash / 文件 / 工作流都在） | `mcp/profile.cordis.yml` |
+| `delegate` | 主对话只留报时/天气/股价、搜资料、拍照、挂断、派人、叫停；跑命令与读写文件交给子代理 | `mcp/profile.delegate.cordis.yml` |
+
+```bash
+MIAI_AGENT_SHAPE=delegate python scripts/deploy_cloud.py   # 切到 delegate
+python scripts/deploy_cloud.py                             # 不带就回 full
+```
+
 `KEEPALIVE_MINUTES`（默认 180，`0` 关闭）：空闲这么久就发一条极短请求把 DeepSeek
 的前缀缓存焐热。实测缓存空闲 4.7 小时仍热、23 小时凉，凉了当天第一次开口要多等
 1–3 秒。

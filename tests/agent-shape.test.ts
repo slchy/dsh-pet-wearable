@@ -50,3 +50,51 @@ test('没有半挂着的子代理 preset', () => {
   assert.ok(!/agentPreset/.test(yml), 'agentPreset 指向的 preset 必须同时声明，不能只留一边');
   assert.ok(!/preset-voice-deep/.test(yml), 'preset 属于工具面那套，这一版不挂');
 });
+
+// ---------------------------------------------------------------- 两套并存
+//
+// `full`（上面钉的）与 `delegate` 两套都在仓里，用 `MIAI_AGENT_SHAPE` 切换。
+// delegate 那份是**实测对比用**的，放在这里钉住的关键是：它必须自洽 ——
+// 关了工具却忘了挂 preset，或者挂了 preset 却没关工具，跑起来都不报错，
+// 只是子代理干不了活、或者主对话又变成两套能力混着用。
+
+const delegateTools = readFileSync(new URL('../mcp/camera.delegate.yml', import.meta.url), 'utf8');
+const delegatePersona = readFileSync(
+  new URL('../mcp/profile.delegate.cordis.yml', import.meta.url),
+  'utf8',
+);
+
+test('delegate 形态：能力确实下发了，而且子代理接得住', () => {
+  assert.match(delegateTools, /agentPreset:\s*voice-deep/, '主对话要钉住 preset');
+  assert.match(delegateTools, /id:\s*preset-voice-deep/, 'preset 本身必须在文件里声明');
+  for (const plugin of ['tool-bash', 'tool-fs', 'tool-fs-search']) {
+    assert.ok(
+      delegateTools.includes(`name: '@deepseek-ai/dsh-${plugin}'`),
+      `preset 里少了 ${plugin}，子代理就干不了对应的活`,
+    );
+  }
+  assert.match(delegateTools, /^- id: tool-bash\s/m, '主对话的 bash 必须关掉');
+  assert.ok(
+    (delegateTools.match(/disabled:\s*true/g) ?? []).length >= 10,
+    'delegate 形态应当关掉一批工具，数量对不上说明改漏了',
+  );
+});
+
+test('delegate 形态：记忆和实时信息仍然齐全', () => {
+  for (const id of ['mcp-memory', 'mcp-sessions', 'mcp-realtime', 'mcp-camera', 'mcp-session']) {
+    assert.ok(delegateTools.includes(`id: ${id}`), `delegate 形态缺了 ${id}`);
+  }
+  assert.match(
+    delegateTools,
+    /instructionFileCandidates:\s*\n\s+- MEMORY\.md/,
+    'delegate 形态也要注入 MEMORY.md',
+  );
+});
+
+test('两套人设都带记忆小节，切形态不会把记忆弄丢', () => {
+  const full = readFileSync(new URL('../mcp/profile.cordis.yml', import.meta.url), 'utf8');
+  assert.ok(full.includes('【记忆】'));
+  assert.ok(delegatePersona.includes('【记忆】'));
+  assert.ok(!full.includes('【找人干活】'), 'full 形态用的是【怎么干活】');
+  assert.ok(delegatePersona.includes('【找人干活】'), 'delegate 形态才有【找人干活】');
+});
