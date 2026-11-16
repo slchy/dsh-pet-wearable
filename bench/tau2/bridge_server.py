@@ -66,7 +66,12 @@ class ToolBridge:
                 "error": bool(getattr(message, "error", False)),
             }
             self.calls.append(entry)
-        log.info("工具 %s → %s", name, (entry["content"] or "")[:120])
+        log.info(
+            "工具 %s(%s) → %s",
+            name,
+            json.dumps(entry["arguments"], ensure_ascii=False)[:200],
+            (entry["content"] or "")[:160],
+        )
         return {"content": entry["content"], "isError": entry["error"]}
 
 

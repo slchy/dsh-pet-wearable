@@ -46,8 +46,11 @@ DEFAULT_URL = (
     "wss://cn-beijing.maas.qianwenaiapi.com/api-ws/v1/realtime"
     "?model=qwen-audio-3.1-realtime-flash"
 )
-#: 顾客说出这些就当作挂断（τ² 的 STOP token 只有文本形态）
-_FAREWELL = re.compile(r"那就这样|就这样吧|没别的事|没事了|再见|谢谢，?拜拜")
+#: 顾客说出这些才当作挂断（τ² 的 STOP token 只有文本形态）。
+#: **只收明确的道别**：「那就这样」「没事了」在业务对话里常是**确认**而不是挂断
+#: （实测踩过：dsh 问「确认我就改」→ 顾客答「那就这样吧」→ 被误判成结束，
+#: 整场在改单之前就断了）。这类暧昧说法一律不算。
+_FAREWELL = re.compile(r"再见|拜拜|挂了|挂了吧|先挂|不聊了|结束通话")
 DEFAULT_VOICE = "longanqian"
 #: 上行送 16k PCM16（API 固定），下行收 24k PCM16（API 固定）
 INPUT_RATE = 16_000

@@ -78,7 +78,7 @@ def patch_builders(tick_ms: int, dsh_port: int, dsh_token: str | None) -> None:
     builder.build_voice_user = build_voice_user
 
 
-def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str) -> "subprocess.Popen[str]":
+def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str, sentence_silence_ms: int = 400) -> "subprocess.Popen[str]":
     """拉起一个**只服务本次 bench** 的 dsh（不动生产那个 63993）。"""
     import socket as _socket
     import subprocess
@@ -114,6 +114,7 @@ def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str) -
             str(repo / "src" / "main.ts"),
             "--listen", str(port),
             "--stt", stt,
+            "--sentence-silence", str(sentence_silence_ms),
             "--tts", tts,
             "--agent", "dsh",
             "--dsh-sdk",
@@ -178,6 +179,7 @@ def main() -> int:
     ap.add_argument("--list-tasks", action="store_true", help="只列任务，不跑")
     ap.add_argument("--spawn-dsh", action="store_true", help="由本方拉起 dsh（否则连已有的）")
     ap.add_argument("--timeout", type=float, default=150.0, help="整场墙钟上限（秒），到点就收尾判分")
+    ap.add_argument("--sentence-silence", type=int, default=400, help="阿里云 max_sentence_silence（200-2000）")
     ap.add_argument("--stt", default="aliyun")
     ap.add_argument("--tts", default="cosyvoice")
     ap.add_argument("--work-dir", default=None, help="dsh 工作目录（默认 /tmp/tau2-bench-work）")
@@ -251,7 +253,7 @@ def main() -> int:
     dsh_proc = None
     if args.spawn_dsh:
         # 必须先有桥再有 dsh：dsh 的 MCP 在启动时就要拉工具表（failOnStartupError）
-        dsh_proc = spawn_dsh(work_dir, args.dsh_port, args.bridge_port, args.stt, args.tts)
+        dsh_proc = spawn_dsh(work_dir, args.dsh_port, args.bridge_port, args.stt, args.tts, args.sentence_silence)
 
     log.info("开始：domain=%s task=%s tick=%dms 顾客=%s", args.domain, task.id, args.tick_ms, args.language)
     try:

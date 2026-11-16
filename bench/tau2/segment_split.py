@@ -77,6 +77,14 @@ def main() -> int:
                 turn = segment(events, rec["anchor_at"], rec["first_at"], "turn.start")
                 llm = segment(events, rec["anchor_at"], rec["first_at"], "llm.first")
                 tts = segment(events, rec["anchor_at"], rec["first_at"], "tts.first")
+            # 工具轮粗分：τ² 的档案里没有工具调用事件，只有 turn.end.dsh_ms。
+            # 实测工具轮 2300–2600、一般轮 900–1100，1800 是两者之间最宽的空档。
+            tool_turn = False
+            if events is not None:
+                for ev in events:
+                    if ev.get("ev") == "turn.end" and (ev.get("t") or -1) >= rec["anchor_at"]:
+                        tool_turn = float(ev.get("dsh_ms") or 0) >= 1800
+                        break
             rows.append({
                 "total": rec["first_at"] - rec["anchor_at"],
                 "a1": (asr - rec["anchor_at"]) if asr else None,
@@ -85,27 +93,33 @@ def main() -> int:
                 "a3": (tts - llm) if (tts and llm) else (tts - turn if tts and turn else None),
                 "a4": (rec["first_at"] - tts) if tts else None,
                 "arch": arch.name if arch else "-",
+                "tool": tool_turn,
             })
 
     if not rows:
         print("没有可对齐的打点（需要跑一次新版本）")
         return 1
 
-    def line(key: str, name: str) -> None:
+    def line(rows: list[dict], key: str, name: str) -> None:
         values = sorted(r[key] for r in rows if isinstance(r.get(key), int))
         if not values:
-            print(f"{name:22s} 无数据")
             return
         k = lambda q: values[max(0, min(len(values) - 1, int(round(q / 100 * (len(values) - 1)))))]  # noqa: E731
         print(f"{name:22s} p50={k(50):>5d}  p90={k(90):>5d}  均={statistics.mean(values):>6.0f}  n={len(values)}")
 
     print(f"对齐成功 {len(rows)} 轮（按端口匹配到档案 {sum(1 for r in rows if r['arch'] != '-')} 轮）\n")
-    line("a1", "① 说完→ASR")
-    line("a2", "② ASR→开跑")
-    line("a2b", "③ 开跑→模型开口")
-    line("a3", "④ 模型开口→TTS首块")
-    line("a4", "⑤ TTS首块→客户端")
-    line("total", "合计 说完→首帧")
+    for label, subset in (("工具轮（dsh_ms>=1800）", [r for r in rows if r.get("tool")]),
+                          ("一般轮", [r for r in rows if not r.get("tool")])):
+        if not subset:
+            continue
+        print(f"—— {label}，{len(subset)} 轮 ——")
+        line(subset, "a1", "① 说完→ASR")
+        line(subset, "a2", "② ASR→开跑")
+        line(subset, "a2b", "③ 开跑→模型开口")
+        line(subset, "a3", "④ 模型开口→TTS首块")
+        line(subset, "a4", "⑤ TTS首块→客户端")
+        line(subset, "total", "合计 说完→首帧")
+        print()
     return 0
 
 
