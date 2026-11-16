@@ -1,4 +1,4 @@
-# dsh profile patch：把 τ²-bench 那个域的**全部工具**挂成 MCP 工具
+﻿# dsh profile patch：把 τ²-bench 那个域的**全部工具**挂成 MCP 工具
 #
 # 用法（bench 用，生产不用）：
 #   DSH_PATCH=<仓库绝对路径>/mcp/tau2-bench.yml \
@@ -24,8 +24,9 @@
         transport: stdio
         command: node
         args:
-          - /path/to/Miaiglassses2grokbot/scripts/bench/tau2/mcp-tau2.mjs
+          - /path/to/dsh-pet-wearable/bench/tau2/mcp-tau2.mjs
         # 工具是幂等的数据库查询/改单，正常几十毫秒；30 s 是给冷启动留余量
         toolCallTimeoutMs: 30000
         # bench 场景要**响亮地失败**：工具表拉不到就没法判分，静默降级只会白跑一晚上
         failOnStartupError: true
+

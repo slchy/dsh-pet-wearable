@@ -16,3 +16,5 @@ tmp/
 *.p12
 *.jks
 !*.pem.example
+__pycache__/
+bench/**/*.json
