@@ -33,7 +33,7 @@ async function withControl(
     photoTimeoutMs: 200,
     handlers: {
       ...(capabilities === undefined ? {} : { capabilities }),
-      takePhoto: async () => ({ ok: false, failure: { code: 'unused' } }),
+      takePhoto: async () => ({ ok: false, failure: { code: 'failed' } }),
       endSession: () => {},
     },
   });

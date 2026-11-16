@@ -77,7 +77,7 @@ test('每种意图都有一行可读描述', () => {
       record: {
         id: 'e1',
         reason: 'greet',
-        outcome: 'spoke',
+        outcome: 'engaged',
         phase: 'speak',
         durations: {},
         startedAt: 0,

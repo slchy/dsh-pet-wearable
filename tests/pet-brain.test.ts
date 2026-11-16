@@ -426,7 +426,8 @@ test('上一次 engagement 的晚到结果不会串进下一次', () => {
   run([presence(true, 0), tick(20 * MIN)]);
   assert.equal(state.engagement?.id, 'pet-1');
   run([userFinal(20 * MIN + 100)]);
-  assert.equal(state.engagement, null);
+  const ended = state.engagement;
+  assert.equal(ended, null);
 
   // 第二次开口：又是 step 1 的 look
   run([tick(60 * MIN)]);

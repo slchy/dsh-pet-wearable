@@ -14,10 +14,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { cleanForSpeech } from '../src/agent.ts';
-import { BASE_STYLE, EMOTIONS } from '../src/emotion.ts';
+import { BASE_STYLE, EMOTION_STYLES } from '../src/emotion.ts';
 
 test('TTS 侧的风格串里不能出现给人看的格式（markdown / 标签）', () => {
-  for (const text of [BASE_STYLE, ...Object.values(EMOTIONS)]) {
+  // `EMOTIONS` 是 boolean 表（只有 key 有用），风格串在 `EMOTION_STYLES` 里
+  for (const text of [BASE_STYLE, ...Object.values(EMOTION_STYLES)]) {
     assert.ok(!/[*#`\[\]]/.test(text), `TTS 提示词里混进了格式字符：${text}`);
   }
 });

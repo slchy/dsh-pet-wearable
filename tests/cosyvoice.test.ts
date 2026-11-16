@@ -30,7 +30,9 @@ test('指令都用阿里云认的单一情感句式，且以句号结尾', () =>
     const text = EMOTION_INSTRUCTIONS[key];
     const m = /^你说话的情感是([a-z]+)。$/.exec(text);
     assert.ok(m, `${key} 的指令不是「你说话的情感是X。」句式：${text}`);
-    assert.ok(VALUES.has(m[1]), `${key} 用了不认识的情感值 ${m[1]}`);
+    const value = m[1];
+    assert.ok(typeof value === 'string', `${key} 的指令里没抓到情感值：${text}`);
+    assert.ok(VALUES.has(value), `${key} 用了不认识的情感值 ${value}`);
   }
 });
 

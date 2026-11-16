@@ -151,12 +151,14 @@ test('停止以后不再触发', async () => {
 
 test('trackActivity 记录在飞数与最后活动时间', async () => {
   let now = 1_000;
-  let release: (() => void) | null = null;
+  // 用持有对象而不是裸变量：TS 的控制流会把「只在回调里被赋值」的 let 收窄成 null，
+  // 于是 `release?.()` 报 "never has no call signatures"
+  const gate: { release?: () => void } = {};
   const inner: AgentProvider = {
     name: 'fake',
     sessionId: 'session-x',
     reply: async (): Promise<AgentReplyView> => {
-      await new Promise<void>((resolve) => { release = resolve; });
+      await new Promise<void>((resolve) => { gate.release = resolve; });
       return { text: '[平静]好' } as AgentReplyView;
     },
   };
@@ -169,7 +171,7 @@ test('trackActivity 记录在飞数与最后活动时间', async () => {
   const pending = wrapped.reply('你好');
   assert.equal(state.inflight, 1, '发出去了就算在飞');
   now = 5_000;
-  release?.();
+  gate.release?.();
   await pending;
   assert.equal(state.inflight, 0);
   assert.equal(state.last, 5_000, '结束时刻要记下来');
