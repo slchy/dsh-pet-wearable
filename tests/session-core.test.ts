@@ -109,8 +109,17 @@ test('播报中的定稿也要打断 —— 短促插话常常只有定稿、没
   assert.equal(core.phase, 'listening');
 });
 
-test('不在播报时，定稿照常只是攒进一轮（不要多打一枪停止）', () => {
+test('旁听反馈的定稿不打断播放 —— 和中间结果同一套判据', () => {
   const { core } = newCore();
+  toSpeaking(core);
+  // 真机日志：21:17:45 `插话「嗯。」→ 代次 4`，把正在播的回复打断了；
+  // 而同一个「嗯」作为中间结果什么都没做。ASR 加不加句号不该改变行为。
+  const effects = core.dispatch({ type: 'sentence', text: '嗯。' });
+  assert.deepEqual(callOps(effects), ['assemble'], '只攒进一轮，不停播');
+  assert.equal(core.phase, 'speaking', '仍在播报');
+});
+
+test('不在播报时，定稿照常只是攒进一轮（不要多打一枪停止）', () => {  const { core } = newCore();
   // listening 状态：没有音频在放，"停播"是空动作
   assert.deepEqual(callOps(core.dispatch({ type: 'sentence', text: '帮我看看这个' })), ['assemble']);
 });

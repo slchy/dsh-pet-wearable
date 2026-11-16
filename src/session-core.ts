@@ -152,8 +152,13 @@ export class SessionCore {
         // **定稿也要打断**。短促的插话（「退下」「好了」）常常只出定稿、不出中间结果，
         // 只听 `partial` 就会漏掉 —— 真机上表现为「有时候打断立刻生效、有时候要等
         // 下一句才停」。`bargeIn` 只在 `speaking` 成立，所以不会误伤别的状态。
+        //
+        // 但**旁听反馈不算**：`partial` 那条路径靠「不足 2 字」挡住了「嗯」，
+        // 一整句「嗯。」却会绕过那道过滤。真机日志里它把正在播的回复打断了
+        // （`插话「嗯。」→ 代次 4`），而同一个「嗯」作为中间结果什么都没做。
+        // 同一句话不该因为 ASR 有没有加句号而有两种行为。
         const effects: CoreEffect[] = [];
-        if (this.fsm.bargeIn(event.text)) {
+        if (!isBackchannelOnly(event.text) && this.fsm.bargeIn(event.text)) {
           effects.push({ type: 'call', call: { op: 'audio.stop' } });
         }
         effects.push({ type: 'assemble', text: event.text });

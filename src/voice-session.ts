@@ -1013,7 +1013,12 @@ class VoiceConnection {
   private onSentence(text: string, index: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
     this.archive?.event(EVENTS.asrSentence, { text, index });
-    this.dialog.dispatch({ type: 'sentence', text });
+    const effects = this.dialog.dispatch({ type: 'sentence', text });
+    // 打断有两处入口（中间结果 / 定稿），日志必须都打 —— 否则统计打断率会漏掉
+    // 「短促插话只出定稿」那一半，真机上就是 4 次里少记 1 次。
+    if (effects.some((effect) => effect.type === 'call' && effect.call.op === 'audio.stop')) {
+      console.log('  打断    听到定稿 → 停止播放，已排队的轮次作废');
+    }
   }
 
   private onAsrError(error: Error): void {
