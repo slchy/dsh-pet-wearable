@@ -78,6 +78,19 @@ systemd unit。
 
 同时 App 还会自报 v2 能力：`上行 msbc；拍照 glance/detail(等用户)；上报 presence power summon listenStart played`。
 
+## 5.0 时间基准（三种，别混）
+
+| 来源 | 时区 | 例子 |
+|---|---|---|
+| 服务器 `journalctl` / `date` | **CST = UTC+8** | `Nov 16 20:14` |
+| **档案目录名** | **UTC** | `20261116-121442` = 12:14 UTC = **20:14 CST** |
+| 手机 App / 眼镜日志 | CST | `晚上8:14` |
+| 开发机（本地终端） | **UTC−8** | `04:42` = 同样是 20:42 CST |
+
+**档案目录名是 UTC**，和 journalctl 差 8 小时。把 `115523` 当成 11:55 CST 读，就会把
+19:55 的真机会话错认成中午 —— 我踩过，结论跟着歪。
+
+对齐办法：`date -u -d @$(stat -c %Y <档案>)` 或直接用 `meta.json` 的 `startedAt`（带 `Z`）。
 ## 5. 档案（archive）
 
 ```
