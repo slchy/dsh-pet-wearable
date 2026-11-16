@@ -34,6 +34,7 @@ import {
 } from './providers.ts';
 import { DshSession } from './session.ts';
 import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
+import { FrontedAgent } from './fronted-agent.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 import { SmartTurn } from './smart-turn.ts';
@@ -493,6 +494,26 @@ async function main(): Promise<void> {
    */
   let stopKeepalive: () => void = () => {};
   if (dshSession && agent) {
+    // 快车道：短句纯闲聊直接答，其余零开销交给 dsh。放在 `trackActivity` **里面**，
+    // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
+    const fastKey = process.env['DEEPSEEK_API_KEY']?.trim() ?? '';
+    const fastOff = process.env['FAST_LANE'] === '0';
+    if (fastOff || fastKey === '') {
+      console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 DEEPSEEK_API_KEY）'}`);
+    } else {
+      agent = new FrontedAgent({
+        inner: agent,
+        apiKey: fastKey,
+        model: process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat',
+        ...(process.env['FAST_LANE_BASE_URL'] === undefined
+          ? {}
+          : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
+        timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 700),
+        maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
+        log: (line) => { console.log(line); },
+      });
+      console.log('快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）');
+    }
     const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
     const activity = newActivityState(Date.now());
     const trackedAgent = trackActivity(agent, activity);
