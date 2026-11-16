@@ -161,6 +161,25 @@ v2 新增：`Hello` / `Welcome` / `Call` / `Event` / `CaptureImage`。
 **跨路径不可比**：真机上行是 mSBC（570 B / 75 ms），bench adapter 是 PCM16（640 B / 20 ms）。
 **同一条路径改前 vs 改后**才可比。
 
+### 9.1 上下文膨胀：dsh 已经自带四层，别再写一套
+
+`~/.dsh/profiles/sdk/cordis.patch.yml` + base 里已经挂好，核对命令见文末：
+
+| 层 | 插件 | 配置 |
+|---|---|---|
+| 摘要压缩 | `dsh-compaction-basic` | `thresholdRatio: 0.125`（≈12.5 万 token）、`retainTokens: 30000` |
+| 手动 | `dsh-command-compact` | `/compact` |
+| 工具结果剪裁 | `dsh-compaction-tool-result-pruner` | `thresholdChars: 8192`，头 4096 / 尾 1024 |
+| 图片卸载 | `dsh-compaction-image-offload` | — |
+| 大结果外溢 | `dsh-spill-local` + `spill-policy` | `maxInlineTokens: 12500` |
+
+默认 `thresholdRatio` 是 0.8（80 万 token 才动手），真机 212 轮的会话会直接抛
+`retainTokens >= thresholdTokens` —— 所以这里改成 0.125。
+
+**压缩是看不见的代价**：撞上它的那一轮会突然慢几秒（压缩本身一次模型调用，溢出还要
+「先压缩再重试」）。所以 `agent.ts` 在 `dsh` 那行日志后面加了两个提示：`← 接近压缩阈值`
+和 `← 刚压缩过（上一轮 N）`。看到后者就别去查网络了。
+
 ## 10. TLS 证书
 
 | 项 | 事实 |
@@ -197,6 +216,8 @@ grep -oE '^[A-Z_]+' ~/miai-cloud/.env | tr '\n' ' '
 ls -d ~/miai-archive/*/ | wc -l; ls ~/miai-vectors
 # 设备 token 名
 awk -F: '{print $2}' ~/miai-cloud/tokens.txt
+# dsh 实际挂载的插件与压缩阈值（改了 profile 就重跑这条）
+dsh --profile sdk --dump-config | grep -A2 -E "compact|pruner|offload|spill-policy"
 # 证书有效期与 SAN（到期了要续）
 set -a; . ~/miai-cloud/.env; set +a
 openssl x509 -in "$MIAI_TLS_CERT" -noout -dates -ext subjectAltName

@@ -20,9 +20,36 @@ import { DshSession } from './session.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { parseEmotion, stripEmotionTags } from './emotion.ts';
 
+/**
+ * dsh 的压缩阈值（token）—— 来自 profile 里的 `compaction-basic.thresholdRatio: 0.125`。
+ *
+ * 默认是 0.8（80 万 token 才动手），真机 212 轮的会话直接抛
+ * `retainTokens >= thresholdTokens`，所以这里已经调成 0.125 ≈ 12.5 万。
+ * **改 profile 时这个常量也要跟着改**，否则日志里的「接近压缩阈值」会报错地方。
+ */
+const COMPACTION_THRESHOLD = 125_000;
+
+/**
+ * 上下文规模的两个「该说话」的时刻。
+ *
+ * 压缩是**看不见的代价**：撞上它的那一轮会突然慢几秒，而 `ctx` 曲线本身看不出
+ * 原因。所以只在两个点出声 —— 快到阈值了、刚被压过 —— 其余轮次一个字都不加。
+ */
+export function compactionNote(current: number | undefined, previous: number | undefined): string {
+  if (current === undefined) {
+    return '';
+  }
+  if (current >= COMPACTION_THRESHOLD * 0.8) {
+    return `  ← 接近压缩阈值（${COMPACTION_THRESHOLD}）`;
+  }
+  if (previous !== undefined && previous > 0 && current < previous * 0.7) {
+    return `  ← 刚压缩过（上一轮 ${previous}）：这一轮变慢可能是它`;
+  }
+  return '';
+}
+
 /** 兜底：TTS 前再清洗一遍，挡住模型偶尔漏掉的格式。 */
-export function cleanForSpeech(text: string): string {
-  // 情绪标签只该出现在开头（`parseEmotion` 已经剥过一次）；模型有时会在句中
+export function cleanForSpeech(text: string): string {  // 情绪标签只该出现在开头（`parseEmotion` 已经剥过一次）；模型有时会在句中
   // 再写一个，那些会被原样念出来（「方括号开心」）。标签表来自 `emotion.ts`，
   // 这里不重复抄写。
   return stripEmotionTags(text)
@@ -74,6 +101,8 @@ export class VoiceAgent {
   private readonly log: (line: string) => void;
   /** 播报出口。第二个参数是情绪 key，没有就按平静处理 */
   private announcer: ((speech: string, emotion?: string) => void) | null = null;
+  /** 上一轮的上下文规模，用来识别「刚压缩过」（见 `compactionHint`） */
+  private lastContextTokens: number | undefined;
   /** 没有连接时把汇报存下来，等下次连上补播（null = 不持久化） */
   private readonly announceStore: AnnounceStore | null;
 
@@ -149,8 +178,24 @@ export class VoiceAgent {
       + `tokens=${usage?.inputTokens ?? '?'}/${usage?.outputTokens ?? '?'}`
       + ` cache=${usage?.cacheReadTokens ?? 0}`
       // 上下文规模：压缩阈值（12.5 万）看的是这条，累加的 input 看不出问题
-      + ` ctx=${usage?.contextTokens ?? '?'}`,
+      + ` ctx=${usage?.contextTokens ?? '?'}`
+      + this.compactionHint(usage?.contextTokens),
     );
     return { ...r, speech, emotion };
+  }
+
+  /**
+   * 压缩提示：`ctx` 本身只会一路涨，看不出「刚才那轮为什么慢了三秒」。
+   *
+   * dsh 的 `compaction-basic` 在 `thresholdRatio 0.125`（≈12.5 万）触发，压缩本身
+   * 要一次模型调用、还可能「先压缩再重试」，那一轮会明显变慢。这里只在
+   * **接近阈值**和**刚压完（ctx 骤降）**两个时刻各打一句，平时不出声。
+   */
+  private compactionHint(contextTokens: number | undefined): string {
+    const note = compactionNote(contextTokens, this.lastContextTokens);
+    if (contextTokens !== undefined) {
+      this.lastContextTokens = contextTokens;
+    }
+    return note;
   }
 }
