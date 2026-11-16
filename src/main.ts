@@ -19,6 +19,7 @@ import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
+import { cosyVoiceTts } from './cosyvoice.ts';
 import { mimoTts } from './mimo.ts';
 import { EMOTIONS } from './emotion.ts';
 import { BASE_STYLE, DEFAULT_TTS_VOICE } from './mimo.ts';
@@ -79,9 +80,25 @@ async function buildStt(
   return loadProvider<SttProvider>(spec, 'stt');
 }
 
-/** `--tts mimo|silent|<path>` */
+/** `--tts cosyvoice|mimo|silent|<path>` */
 async function buildTts(spec: string): Promise<TtsProvider> {
   if (spec === 'silent') return silentTts(24_000);
+  if (spec === 'cosyvoice') {
+    if (!process.env['DASHSCOPE_API_KEY']) {
+      throw new Error('DASHSCOPE_API_KEY 未设置（CosyVoice 用的是 DashScope API key，不是阿里云 AK/SK）');
+    }
+    // 情绪表达有两档，见 `cosyvoice.ts` 顶部；模式由 COSYVOICE_EMOTION_MODE 选：
+    //   prosody（默认）：rate/pitch 缩放，系统音色可用，最省延迟
+    //   instruction：自由指令，只有复刻/设计音色吃，首包多 ~90 ms
+    // 系统音色配 instruction 会被服务端拒（428）。
+    return cosyVoiceTts({
+      apiKey: process.env['DASHSCOPE_API_KEY'],
+      url: process.env['COSYVOICE_URL'],
+      model: process.env['COSYVOICE_MODEL'],
+      voice: process.env['COSYVOICE_VOICE'],
+      useInstruction: process.env['COSYVOICE_EMOTION_MODE'] === 'instruction',
+    });
+  }
   if (spec === 'mimo') {
     if (!process.env['MIMO_API_KEY']) {
       throw new Error('MIMO_API_KEY 未设置（用 --tts silent 可跳过 TTS）');
@@ -397,7 +414,7 @@ async function main(): Promise<void> {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
     console.error('  --host <addr>   监听地址（默认 127.0.0.1）。非本机地址必须同时配');
     console.error('                  MIAI_TOKENS 与 MIAI_TLS_KEY/MIAI_TLS_CERT，否则拒绝启动');
-    console.error('  可替换件: --stt aliyun|noop|canned|<path>  --tts mimo|silent|<path>');
+    console.error('  可替换件: --stt aliyun|noop|canned|<path>  --tts cosyvoice|mimo|silent|<path>');
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
     console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);
     console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
