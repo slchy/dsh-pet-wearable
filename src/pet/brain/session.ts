@@ -41,6 +41,8 @@ export interface PetSessionOptions {
   readonly device: DevicePort;
   readonly agent: AgentPort;
   readonly params?: Partial<PetParams>;
+  /** 共用的话筒仲裁器（应用层造的那一个）；不给就自己造，单测用 */
+  readonly floor?: FloorArbiter;
   /** 档案钩子：每条输入 / 每条意图 / 每条结局 */
   readonly onEvent?: (name: string, fields: Record<string, unknown>) => void;
   /** 敲击要关掉正在播的后台汇报 */
@@ -124,7 +126,11 @@ export function describePetIntent(intent: PetIntent): string {
 }
 
 export class PetSession {
-  readonly floor = new FloorArbiter();
+  /**
+   * 话筒仲裁器。默认自己造一个，但**可以被注入** —— 应用层要拿同一个实例来仲裁
+   * `user` / `reply` / `announce`（ADR-0001 §6：仲裁在应用层，宠物只申请）。
+   */
+  readonly floor: FloorArbiter;
 
   private readonly options: PetSessionOptions;
   private readonly brain: PetBrain;
@@ -138,6 +144,7 @@ export class PetSession {
 
   constructor(options: PetSessionOptions) {
     this.options = options;
+    this.floor = options.floor ?? new FloorArbiter();
     this.brain = new PetBrain(options.params);
     this.state = this.brain.initial(options.caps, this.stamp());
     this.executor = new PetExecutor({
@@ -230,6 +237,21 @@ export class PetSession {
       this.enqueue({ kind: 'floor', busy: true, owner: this.floor.owner, ...this.stamp() });
     }
     return ok;
+  }
+
+  /**
+   * 移交话筒（`user → reply`）。和 {@link acquireFloor} 一样会把 `floor` 事件喂给
+   * 宠物环 —— 否则宠物看到的 `floorBusy` 会停在旧值上。
+   */
+  handoffFloor(from: FloorOwner, to: FloorOwner): boolean {
+    const before = this.floor.owner;
+    if (!this.floor.handoff(from, to)) {
+      return false;
+    }
+    if (this.floor.owner !== before) {
+      this.enqueue({ kind: 'floor', busy: true, owner: this.floor.owner, ...this.stamp() });
+    }
+    return true;
   }
 
   releaseFloor(owner: FloorOwner): void {

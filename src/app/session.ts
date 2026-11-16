@@ -26,7 +26,9 @@
  */
 import type { Clock } from './clock.ts';
 import type { DialogRuntime } from './dialog.ts';
+import type { DialogState } from '../dialog-fsm.ts';
 import type { DeviceCapabilities } from '../devices/primitives.ts';
+import { FloorArbiter } from '../pet/brain/floor.ts';
 import { PetSession } from '../pet/brain/session.ts';
 import type { PetParams } from '../pet/brain/registry.ts';
 import type {
@@ -51,6 +53,14 @@ export interface AppSessionOptions {
   readonly device: DevicePort;
   readonly agent: AgentPort;
   readonly params?: Partial<PetParams>;
+  /**
+   * 要不要建宠物子系统（默认 true）。
+   *
+   * 关掉时**仍然会有 `FloorArbiter`** —— 话筒归属是应用层的事，不是宠物的附属品：
+   * `user` / `reply` / `announce` 三个占用者必须在同一张表里仲裁，否则
+   * 「用户说话时旁白还在念」这类问题又得靠特判。
+   */
+  readonly pet?: boolean;
   /** 心跳间隔；默认 30 s */
   readonly tickMs?: number;
   readonly onEvent?: (name: string, fields: Record<string, unknown>) => void;
@@ -61,35 +71,46 @@ export interface AppSessionOptions {
 }
 
 export class AppSession {
-  /** 宠物子系统。外部只读，不要直接喂输入 —— 那会绕开心跳与话筒。 */
-  readonly pet: PetSession;
+  /**
+   * 宠物子系统。外部只读，不要直接喂输入 —— 那会绕开心跳与话筒。
+   * `null` = 这套配置不要宠物（`pet: false`），但话筒照常仲裁。
+   */
+  readonly pet: PetSession | null;
+
+  /**
+   * **话筒的唯一真相**（ADR-0001 §6）。应用层持有，宠物通过 `pet.floor` 读同一个实例。
+   *
+   * 谁占着 → `floor.owner`；要是空着 → `null`。没有任何第二份「现在谁在说话」的状态。
+   */
+  readonly floor: FloorArbiter;
 
   private readonly clock: Clock;
   private readonly stopHeartbeat: () => void;
   /** 对话层实体；没有就是"只有宠物环"（不开主动开口时） */
   private readonly dialog: DialogRuntime | null;
   private closed = false;
-  /** 现在谁占着话筒（对话层的视角；宠物自己占的不记在这里） */
-  private speaker: FloorOwner | null = null;
 
   constructor(options: AppSessionOptions) {
     this.clock = options.clock;
     this.dialog = options.dialog ?? null;
-    this.pet = new PetSession({
-      caps: options.caps,
-      clock: options.clock,
-      voice: options.voice,
-      device: options.device,
-      agent: options.agent,
-      ...(options.params === undefined ? {} : { params: options.params }),
-      ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
-      ...(options.dismissAnnounce === undefined ? {} : { dismissAnnounce: options.dismissAnnounce }),
-      ...(options.log === undefined ? {} : { log: options.log }),
-    });
+    this.floor = new FloorArbiter();
+    this.pet = options.pet === false
+      ? null
+      : new PetSession({
+        caps: options.caps,
+        clock: options.clock,
+        voice: options.voice,
+        device: options.device,
+        agent: options.agent,
+        floor: this.floor,
+        ...(options.params === undefined ? {} : { params: options.params }),
+        ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
+        ...(options.dismissAnnounce === undefined ? {} : { dismissAnnounce: options.dismissAnnounce }),
+        ...(options.log === undefined ? {} : { log: options.log }),
+      });
     // 心跳只有这一份：适配层与模拟器都不再各自 setInterval
     this.stopHeartbeat = options.clock.every(options.tickMs ?? 30_000, () => {
-      this.syncFloor();
-      this.pet.tick();
+      this.pet?.tick();
     });
   }
 
@@ -105,22 +126,22 @@ export class AppSession {
     if (this.closed) {
       return;
     }
-    this.pet.userPartial();
+    this.pet?.userPartial();
     this.claim('user');
   }
 
-  /** 一句话定稿。话筒转给"应答"。 */
+  /** 一句话定稿。话筒**移交**给"应答"（`reply` 抢不动 `user`，只能由 `user` 交出来）。 */
   userFinal(text: string): void {
     if (this.closed) {
       return;
     }
-    this.pet.userFinal(text);
-    this.claim('reply');
+    this.pet?.userFinal(text);
+    this.handToReply();
   }
 
   /** 设备事件。**事件之后立刻补一次心跳**，这样"刚戴回"才成立（ADR-0001 §5.2）。 */
   deviceEvent(event: AppDeviceEvent): void {
-    if (this.closed) {
+    if (this.closed || this.pet === null) {
       return;
     }
     switch (event.kind) {
@@ -142,7 +163,7 @@ export class AppSession {
     if (this.closed) {
       return;
     }
-    this.pet.image(id, image);
+    this.pet?.image(id, image);
   }
 
   /**
@@ -155,18 +176,56 @@ export class AppSession {
     if (this.closed) {
       return;
     }
-    this.pet.micOpened();
+    this.pet?.micOpened();
   }
 
-  /** 一轮对话开始 / 结束。对话层在跑的时候宠物不抢话筒。 */
+  /**
+   * 对话状态机转移后回调（`DialogRuntime` 每次 `dispatch` 之后调一次）。
+   *
+   * **话筒的占用/释放由这里驱动**，不再靠心跳里按布尔量校正：
+   *
+   * | FSM 状态 | 话筒 |
+   * |---|---|
+   * | `thinking` | `reply`（从 `user` 移交过来） |
+   * | `speaking` | `reply`（整段播放都算应答在说话） |
+   * | `listening` / `ending` / `closed` | 释放 `reply` |
+   * | `awaiting_shot` | 不动（用户随时可以说话，话筒本来就该空着等他） |
+   */
+  onDialogState(state: DialogState): void {
+    if (this.closed) {
+      return;
+    }
+    switch (state) {
+      case 'thinking':
+        this.handToReply();
+        return;
+      case 'speaking':
+        // 首块音频写出：正常该是 reply，兜一下（直接 prompt 进来的轮次没有 user 阶段）
+        this.claim('reply');
+        return;
+      case 'listening':
+      case 'ending':
+      case 'closed':
+        this.release('reply');
+        return;
+      case 'awaiting_shot':
+        return;
+    }
+  }
+
+  /**
+   * 一轮对话开始 / 结束。
+   *
+   * 生产由 {@link onDialogState} 驱动；这两个方法留给**模拟器**（`pet/sim/dialog.ts`
+   * 自己那套驱动）和直接调用方。重复调用无害：`acquire` 同一个人是幂等，
+   * 移交时 `from` 已经不对就返回 `false`。
+   */
   turnStart(): void {
-    this.claim('reply');
+    this.handToReply();
   }
 
   turnEnd(): void {
-    if (this.speaker === 'reply') {
-      this.release('reply');
-    }
+    this.release('reply');
   }
 
   /** 后台汇报排队状态。`spoken` = 刚刚播完一条（算"出过声"，推迟下次搭话）。 */
@@ -174,10 +233,11 @@ export class AppSession {
     if (this.closed) {
       return;
     }
-    this.pet.announce(pending, spoken);
+    this.pet?.announce(pending, spoken);
     if (pending) {
+      // `announce` 抢不动 `reply`（ADR-0001 §6）：正题没说完之前不插播
       this.claim('announce');
-    } else if (this.speaker === 'announce') {
+    } else {
       this.release('announce');
     }
   }
@@ -188,9 +248,7 @@ export class AppSession {
   }
 
   reflexEnd(): void {
-    if (this.speaker === 'reflex') {
-      this.release('reflex');
-    }
+    this.release('reflex');
   }
 
   close(): void {
@@ -199,19 +257,21 @@ export class AppSession {
     }
     this.closed = true;
     this.stopHeartbeat();
-    this.pet.close();
+    this.pet?.close();
+    this.floor.clear();
   }
 
   dispose(): void {
     this.closed = true;
     this.stopHeartbeat();
-    this.pet.dispose();
+    this.pet?.dispose();
     this.dialog?.dispose();
+    this.floor.clear();
   }
 
-  /** 排队空且没有在途动作。 */
+  /** 排队空且没有在途动作。没有宠物时恒为"安静"。 */
   isQuiet(): boolean {
-    return this.pet.isIdle();
+    return this.pet === null || this.pet.isIdle();
   }
 
   /**
@@ -221,43 +281,50 @@ export class AppSession {
    * 拿 `isQuiet()` 当条件会死锁。
    */
   hasPendingInput(): boolean {
-    return this.pet.hasPendingInput();
+    return this.pet !== null && this.pet.hasPendingInput();
   }
 
-  /** 状态快照（测试与档案用）。 */
-  snapshot(): ReturnType<PetSession['snapshot']> {
-    return this.pet.snapshot();
+  /** 状态快照（测试与档案用）。没有宠物时返回 `null`。 */
+  snapshot(): ReturnType<PetSession['snapshot']> | null {
+    return this.pet?.snapshot() ?? null;
   }
 
   // ---------------------------------------------------------------- 话筒
 
+  /** 申请（会走抢占表）。宠物在的时候经它转一手，好让它看到 `floorBusy` 变化。 */
   private claim(owner: FloorOwner): void {
-    if (this.pet.acquireFloor(owner)) {
-      this.speaker = owner;
+    if (this.pet === null) {
+      this.floor.acquire(owner);
+      return;
     }
+    this.pet.acquireFloor(owner);
   }
 
   private release(owner: FloorOwner): void {
+    if (this.pet === null) {
+      this.floor.release(owner);
+      return;
+    }
     this.pet.releaseFloor(owner);
-    if (this.speaker === owner) {
-      this.speaker = null;
-    }
   }
 
-  /**
-   * 按对话层的状态校正话筒。
-   *
-   * 只处理**对话层自己**占的那些（`reply` / `announce`）；宠物占着的 `pet` 不碰 ——
-   * 抢自己的话筒没有意义，还会把正在朗读的那一段切掉。
-   */
-  private syncFloor(): void {
-    if (this.speaker === 'reply' && !this.turnBusy()) {
-      this.release('reply');
+  /** 定稿后的移交：`user → reply`；没有 `user` 占着就走普通申请。 */
+  private handToReply(): void {
+    if (this.currentOwner() === 'reply') {
+      return;
     }
+    if (this.currentOwner() === 'user') {
+      if (this.pet === null) {
+        this.floor.handoff('user', 'reply');
+      } else {
+        this.pet.handoffFloor('user', 'reply');
+      }
+      return;
+    }
+    this.claim('reply');
   }
 
-  /** 对话层是不是在跑一轮。由 `turnStart` / `turnEnd` 维护。 */
-  private turnBusy(): boolean {
-    return this.speaker === 'reply';
+  private currentOwner(): FloorOwner | null {
+    return this.pet === null ? this.floor.owner : this.pet.floor.owner;
   }
 }

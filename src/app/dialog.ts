@@ -25,7 +25,7 @@ import { closeAnnounceMic, speakAnnouncement } from './announce.ts';
 import { isBackchannelOnly } from '../backchannel.ts';
 import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
-import type { TurnTicket } from '../dialog-fsm.ts';
+import type { TurnTicket, DialogState } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
 import { announceInterruptionNote, interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
 import type { AgentProvider, TtsProvider } from '../providers.ts';
@@ -75,6 +75,12 @@ export interface DialogEnv {
   /** 有没有一轮在跑（对话层占着话筒） */
   readonly onTurnStart?: (text: string, hasImage: boolean) => void;
   readonly onTurnEnd?: () => void;
+  /**
+   * 对话状态机每次转移后回调（实现见 `dispatch`）。
+   *
+   * 话筒归属就用它驱动（`AppSession.onDialogState`）：**由状态定，不由布尔量特判**。
+   */
+  readonly onDialogState?: (state: DialogState, previous: DialogState) => void;
   /**
    * 这一轮要附带给模型的**设备现状**（电量、佩戴…）。
    *
@@ -139,6 +145,8 @@ export class DialogRuntime {
   readonly runner: TurnRunner;
 
   private readonly options: DialogOptions;
+  /** 上一次通知过的状态机状态（只在真的变了时回调 `onDialogState`） */
+  private lastDialogState: DialogState;
   /** 一轮、一次拍照都排在这条链上，不并发 */
   private serialChain: Promise<void> = Promise.resolve();
   /** 串行队列里还没跑完的任务数 */
@@ -174,6 +182,7 @@ export class DialogRuntime {
       log: options.log,
       capabilities: options.caps,
     });
+    this.lastDialogState = this.core.fsm.state;
 
     this.photos = new PhotoInbox({
       clock: options.clock,
@@ -197,6 +206,7 @@ export class DialogRuntime {
       ...(options.onLiveAvailable === undefined ? {} : { onLiveAvailable: options.onLiveAvailable }),
       onTurnFinished: () => {
         this.execute(this.core.dispatch({ type: 'turnFinished' }));
+        this.notifyState();
         // 本轮结束，后台任务的播报可以接着放
         void this.flushAnnounce();
       },
@@ -229,7 +239,19 @@ export class DialogRuntime {
     }
     const effects = this.core.dispatch(event);
     this.execute(effects);
+    this.notifyState();
     return effects;
+  }
+
+  /** 状态真变了才回调（`dispatch` 每次都调，监听方不必自己去重）。 */
+  private notifyState(): void {
+    const next = this.core.fsm.state;
+    if (next === this.lastDialogState) {
+      return;
+    }
+    const previous = this.lastDialogState;
+    this.lastDialogState = next;
+    this.options.env.onDialogState?.(next, previous);
   }
 
   /**

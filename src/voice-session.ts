@@ -456,16 +456,15 @@ class VoiceConnection {
         onAnnounce: (pending, spoken) => { this.app?.announce(pending, spoken); },
         onTurnStart: (text, hasImage) => {
           this.archive?.event(EVENTS.turnStart, { text_len: text.length, image: hasImage });
-          this.app?.turnStart();
         },
-        onTurnEnd: () => { this.app?.turnEnd(); },
+        // 话筒占用/释放由状态机转移驱动（见 `AppSession.onDialogState`）
+        onDialogState: (state) => { this.app?.onDialogState(state); },
       },
       log,
     });
-    // 应用层（宠物环）建好之后，对话层的话筒与播报都交给它
-    this.app = proactive === undefined || proactive === null
-      ? null
-      : this.createAppSession(proactive, this.dialog);
+    // 应用层**总是**要建：话筒（user / reply / announce）必须在同一张表里仲裁，
+    // 没有宠物也要（ADR-0001 §6）。宠物只是这套应用层里的一个子系统。
+    this.app = this.createAppSession(proactive, this.dialog);
 
     // 档案先开：后面每一段音频/每个事件都要往里写
     this.archive = SessionArchive.open(
@@ -1052,14 +1051,15 @@ class VoiceConnection {
    * - `Voice`：旁白通道（`speakCanned`），`stop` 就是 `cancelCanned`
    */
   private createAppSession(
-    proactive: NonNullable<VoiceSessionOptions['proactive']>,
+    proactive: VoiceSessionOptions['proactive'],
     dialog: DialogRuntime,
   ): AppSession {
     return new AppSession({
       clock: this.clock,
       caps: this.caps,
       dialog,
-      ...(proactive.tickMs === undefined ? {} : { tickMs: proactive.tickMs }),
+      pet: proactive !== undefined && proactive !== null,
+      ...(proactive?.tickMs === undefined ? {} : { tickMs: proactive.tickMs }),
       device: {
         call: (call) => {
           if (call.op === 'capture') {
@@ -1117,12 +1117,12 @@ class VoiceConnection {
         },
         stop: () => { this.runner.cancelCanned(); },
       },
-      ...(proactive.params === undefined && proactive.listenMs === undefined
+      ...(proactive?.params === undefined && proactive?.listenMs === undefined
         ? {}
         : {
           params: {
-            ...proactive.params,
-            ...(proactive.listenMs === undefined ? {} : { listenMs: proactive.listenMs }),
+            ...proactive?.params,
+            ...(proactive?.listenMs === undefined ? {} : { listenMs: proactive.listenMs }),
           },
         }),
       onEvent: (name, fields) => {

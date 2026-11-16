@@ -127,7 +127,7 @@ export class SimWorld {
     );
 
     this.voice = new SimVoice(this.clock, this.sink, {
-      floorOwner: () => this.app.pet.floor.owner,
+      floorOwner: () => this.app.floor.owner,
       engagementId: () => this.engagementId,
       ...(options.world?.voicePerCharMs === undefined
         ? {}
