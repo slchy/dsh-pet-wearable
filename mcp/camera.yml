@@ -1,8 +1,7 @@
-# dsh profile patch：主对话工具面 + 子代理能力组合
+# dsh profile patch：把眼镜相机与会话控制挂成 MCP 工具
 #
 # 用法：dsh --profile sdk --patch <仓库绝对路径>/mcp/camera.yml
-# 工具名对模型是 mcp__camera__take_photo、mcp__session__end_session、
-# mcp__realtime__get_weather 这类。
+# 工具名对模型是 mcp__camera__take_photo 与 mcp__session__end_session。
 #
 # 注意 patch 的格式（见 dsh-app-boot 的 applyEntryPatches）：
 #   - 裸条目 = 按 id 覆盖已有节点，找不到就报 "entry not found"
@@ -10,95 +9,75 @@
 #
 # args 里是绝对路径，部署到别处时要改成实际位置（或换成相对 cwd 的写法）。
 #
-# ============================================================================
-# 这个文件现在管的是「谁是主对话、谁是子代理」
-#
-# 主对话只保留**回答本身就要用**的动作：报时间/天气/股价、搜资料、看画面、
-# 挂断、派人干活、叫停。跑命令、读写文件、翻代码、编排工作流这些「慢活」
-# 全部下发给子代理 —— 语音是同步的，主对话一旦被占住就等于失聪。
-#
-# 真机取证（同一条长会话里能归到语音交互的调用）：挂断 32、拍照 16、
-# 天气/时间/股价 8、搜索 4。read/write/edit/glob/grep/workflow 在语音场景里
-# **一次都没有** —— 它们只出现在我自己调试的那几轮里。
-#
-# 工具面大小（request/header 实测）：29 个工具 20 929 字符 → 现在 7 个左右。
-# 顺带一提：这不是首字延迟的药（实测上下文与 TTFT 无正相关），药是**决策面**
-# —— 29 个语义重叠的工具里挑一个，比 7 个里挑一个更容易选错，也更容易多想一步。
-# ============================================================================
+# 两个工具都只 POST 本机控制口（默认 listen+2），真正的硬件/连接动作在 harness 里：
+#   take_photo  → harness 经常驻 TCP 让手机复用 WakeUpEvent 的
+#                 transactionId/requestId 发 multiModel，再把 JPEG 回给它
+#   end_session → harness 挂「本轮说完就结束」的旗子，播完断开连接
 
-# ---- 子代理：全能力，挂独立 preset ----
+# ---- 主对话常驻：bash 前台最多等 1 s，超时自动转后台 job ----
 #
-# `agentPreset` 让子代理挂 `preset-voice-deep`（见文件末尾 insert），它声明了
-# bash / 文件读写 / 搜索 / job / todo / goal / workflow 那一整套 —— 而主对话
-# 把这些插件**全关了**。这是 dsh 原生的「主窄子宽」：
-#   `dsh-agent-preset` 的 config 就是 `{id, plugins[]}`（一套独立的插件组合）
-#   `tool-subagent` 的 config 带 `agentPreset`
-#   `spawn` 后端宣告了 `capabilities.agentPreset = true`
+# 这是全双工能成立的前提：前台跑命令会把主对话整个占住，这几秒里用户说什么都
+# 进不来（真机 05:40:37 那次网上搜索占了 10.19 s，用户问「你查好了吗」排到了
+# 这一轮之后）。dsh 的 bash 工具本身带 promoteOnTimeout：跑过 timeoutMs 之后
+# **不杀**命令，而是继续当 job 跑，调用返回
+# `[still running after <ms>; moved to background job <id>]`，主对话立刻自由。
+#
+# 所以不需要在应用层猜用户在问什么（关键词匹配既是漏判也是误伤），
+# 也不需要提示词逼模型"一律派后台"——调短等待就够了，一个主对话能同时挂多个 job。
+#
+# 为什么是 1 s 而不是 3 s：`ls` / `git status` / `cat` 这类毫秒级命令一秒内必定
+# 返回，不受影响；而编译、探索、开别的 harness 本来就不该在**前台**跑，它们多卡
+# 2 秒就是主对话多失聪 2 秒。提示词那边已经按「要不要当场拿结果」分了层，这里
+# 只是把判断失手的代价压低。
+- id: bash-sandbox
+  config:
+    timeoutMs: 1000
+    # 模型自己传 timeoutMs 也不能把它拉长，否则它一问就又把主对话堵回去
+    maxTimeoutMs: 1000
+
+# 子代理开满思考。
 #
 # `agentOptions` 不是 volatile 字段（`llm-deepseek` / `agent-default-model` 的
 # 那些才是），所以这里能通过配置生效。只设 reasoningEffort、不设 provider/model，
 # 子代理就继承父会话的路由 —— **同一个模型，但想得更透**。
 #
 # 为什么不是主会话也想得透：真机实测同一个「你好」，high 档有一次想了 2916 字 /
-# 10 秒还没出正文。语音要的是快，所以主会话关掉（见 profile 的
-# llm-deepseek.reasoningEffort=off），把"想得多"搬到调查、跑脚本这类真正需要
-# 推理的活儿上 —— 那正是 subagent 的用途。
+# 10 秒还没出正文（多 step 只在吐 reasoning、`text 0 字`）。语音要的是快，所以
+# 主会话关掉（见 profile 的 llm-deepseek.reasoningEffort=off），把"想得多"搬到
+# 调查、查资料这类真正需要推理的活儿上 —— 那正是 subagent 的用途。
 - id: tool-subagent
   config:
     provider: spawn
     toolName: subagent
-    agentPreset: voice-deep
     agentOptions:
       reasoningEffort: max
 
-# fork 版子代理**不能**挂独立 preset：fork 继承对话历史，而 dsh 明确拒绝
-# 「继承历史的 provider 用独立组合」。所以它只能是「同一个狭窄的我」，
-# 派了也干不了主对话干不了的事 —— 直接关掉。
 - id: tool-subagent-fork
-  disabled: true
-
-# 主对话一次只挂一个子代理，不需要列名单
-- id: tool-subagent-list-agents
-  disabled: true
-
-# ---- 关掉主对话用不到的工具 ----
-#
-# 关插件而不是关工具名：工具由插件注册，插件不挂就没有 schema，模型也就不会去选。
-# 行尾是它原先占的 schema 字符数（request/header 实测）。
-- id: tool-bash           # 2280
-  disabled: true
-- id: tool-jobs           # 1153（job_output / job_kill / job_list）
-  disabled: true
-- id: tool-fs-search      # 1452（glob / grep）
-  disabled: true
-- id: tool-workflow       # 3389（最大的一块，272 轮里 0 次）
-  disabled: true
-- id: tool-todo           # 856
-  disabled: true
-- id: tool-goal           # 1731（create / update / get_goal）
-  disabled: true
-- id: tool-skill          # 332
-  disabled: true
-- id: tool-working-directory  # 360
-  disabled: true
-- id: tool-plugin-manager
-  disabled: true
-- id: plan-mode           # exit_plan_mode：语音里没有「先给方案再批准」这回事
-  disabled: true
-# MCP 资源浏览（read_mcp_resource + list_*，共 1013 字符）：MCP client 还在
-# （下面 insert），只是不给模型翻资源清单的入口。
-- id: mcp-resources
-  disabled: true
-
-# 文件工具只留「读图」。
-# 拍照回来的是图像本身，但长图会被 image-offload 落成文件，模型得能把那张读回来；
-# read / write / edit 三件（2443 字符）主对话一次都没用过。
-- id: tool-fs
   config:
-    read: false
-    write: false
-    edit: false
-    readImage: true
+    provider: fork
+    toolName: subagent_fork
+    agentOptions:
+      reasoningEffort: max
+
+# 显式写死这两项，不靠默认值：
+# - `promoteOnTimeout`：超时不杀，转后台。**这是 1 s 安全的前提** —— 如果它被关掉，
+#   1 秒就是把命令直接杀掉。
+# - `enableRunInBackground`：允许模型自己主动选择后台跑，不必等超时。
+# 字段定义见 `@deepseek-ai/dsh-tool-bash` 的 config schema（两者默认都是 true，
+# 但默认值是别人的代码，写死才不会被下次升级悄悄改掉）。
+- id: tool-bash
+  config:
+    promoteOnTimeout: true
+    enableRunInBackground: true
+
+# 同上，`job_output wait:true` 默认会等 **30 秒**（dsh-tool-jobs 的
+# `waitTimeoutMs ?? 3e4`）—— 模型刚被踢到后台，转头又用 job_output 干等，
+# 主对话照样被堵（实测：sleep 8 转后台后，它又等 5 秒把结果取回来）。
+# 压到 1 秒：拿不到就结束这一轮，job 结算时系统会主动叫它（completionDelivery）。
+- id: tool-jobs
+  config:
+    waitTimeoutMs: 1000
+    maxWaitTimeoutMs: 1000
 
 # `web_search` 是**同步**的：它在跑的时候主对话整个被占住，用户说什么都进不来。
 # base bundle 给的是 60 000 ms —— 一次慢搜索等于失聪一分钟，比不搜更糟。
@@ -118,55 +97,6 @@
       - MEMORY.md
 
 - insert:
-    # 子代理的组合由这两个条目定义。`agent-preset-registry` 是名录，
-    # `preset-voice-deep` 是一份**独立的插件组合** —— 子代理挂的就是它。
-    - id: agent-preset-registry
-      name: '@deepseek-ai/dsh-agent-preset-registry'
-      config:
-        # 子代理默认挂这套；不配 allowedAgentPresets，模型就看不到选择项，
-        # 也就不会自作主张去挑组合。
-        default: voice-deep
-    - id: preset-voice-deep
-      name: '@deepseek-ai/dsh-agent-preset'
-      config:
-        id: voice-deep
-        name: 语音子代理
-        description: 会动手干活的子代理：能跑命令、读写文件、搜代码、编排工作流。
-        order: 1
-        plugins:
-          # bash 的超时不在 tool-bash 上，在根组合的 `bash-sandbox`（base 默认
-          # 60 s）。bash-sandbox 是根作用域的单例，子代理继承那个 60 s，
-          # 正好够跑编译和脚本 —— 这里不要再挂一遍。
-          - id: tool-bash
-            name: '@deepseek-ai/dsh-tool-bash'
-          - id: tool-fs
-            name: '@deepseek-ai/dsh-tool-fs'
-          - id: tool-fs-search
-            name: '@deepseek-ai/dsh-tool-fs-search'
-            config:
-              sampleOverCapGlobResults: false
-          - id: tool-jobs
-            name: '@deepseek-ai/dsh-tool-jobs'
-          - id: tool-todo
-            name: '@deepseek-ai/dsh-tool-todo'
-            config:
-              allowParallelInProgress: true
-          - id: tool-goal
-            name: '@deepseek-ai/dsh-tool-goal'
-          # workflow 引擎（`workflow-ptc`）是**根作用域的单例**，子代理不能再挂一份
-          # ——实测会直接抛 `service "workflowEngine" has been registered`，
-          # 子代理整个起不来。这里只挂工具，引擎从根组合继承。
-          - id: tool-workflow
-            name: '@deepseek-ai/dsh-tool-workflow'
-          # 子代理的对话也可能长到需要压缩。压缩由根组合的 `compaction-basic`
-          # 提供（会话级服务），子代理继承即可 —— 这里再挂一份会与根冲突。
-
-    # 下面三个 MCP client 都是 stdio 子进程。
-    # camera / session 两个工具只 POST 本机控制口（默认 listen+2），真正的硬件与
-    # 连接动作在 harness 里：
-    #   take_photo  → harness 经常驻 TCP 让手机复用 WakeUpEvent 的
-    #                 transactionId/requestId 发 multiModel，再把 JPEG 回给它
-    #   end_session → harness 挂「本轮说完就结束」的旗子，播完断开连接
     - id: mcp-camera
       name: '@deepseek-ai/dsh-mcp-client'
       config:
@@ -189,12 +119,6 @@
           - /path/to/dsh-pet-wearable/mcp/mcp-session.mjs
         toolCallTimeoutMs: 10000
         failOnStartupError: false
-    # 报时间 / 天气 / 股价。这三件事原来是 `bash + curl` 顺手干的，主对话不挂
-    # bash 之后必须有个毫秒级的正式出口 —— 派子代理去查天气，用户要多等几秒。
-    # 城市不设默认值（`REALTIME_CITY` 留空）：按服务器 IP 猜出来的是机房所在地，
-    # 念给哥听是确定性的错。他没说过城市时，工具会把话递回去让模型问一句。
-    # 长期记忆的写入口。读不走它 —— `MEMORY.md` 由上面的 `agent-instructions`
-    # 每轮注入，只有「记一条」需要工具。
     - id: mcp-memory
       name: '@deepseek-ai/dsh-mcp-client'
       config:
@@ -217,14 +141,3 @@
           - /path/to/dsh-pet-wearable/mcp/mcp-sessions.mjs
         toolCallTimeoutMs: 15000
         failOnStartupError: false
-    - id: mcp-realtime
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: realtime
-        transport: stdio
-        command: node
-        args:
-          - /path/to/dsh-pet-wearable/mcp/mcp-realtime.mjs
-        toolCallTimeoutMs: 10000
-        failOnStartupError: false
-

@@ -35,21 +35,11 @@ test('人设提示词的各个小节都在', () => {
     '【场景规则】',
     '【记忆】',
     '【情绪标签】',
-    '【找人干活】',
+    '【怎么干活】',
   ];
   for (const section of sections) {
     assert.ok(yml.includes(section), `profile.cordis.yml 缺少小节 ${section}`);
   }
-});
-
-test('工具用法已经不在主对话的人设里', () => {
-  // 【怎么干活】整段（bash 前后台判断、run_in_background、三种走法）随着工具一起
-  // 下发给子代理了。主对话不挂 bash，留着这段等于教模型去调不存在的工具。
-  assert.ok(
-    !yml.includes('【怎么干活】'),
-    '主对话已经没有 bash/job 工具了，人设里不该再教怎么用它们',
-  );
-  assert.ok(!yml.includes('run_in_background'), '主对话不挂 bash，不该再提 run_in_background');
 });
 
 test('人设不会重新长回去', () => {
@@ -68,8 +58,12 @@ test('人设不会重新长回去', () => {
   }
   const size = body.map((line) => line.slice(6)).join('\n').trim().length;
   // 系统提示词每个请求都要重发一遍。这里不是首字延迟的瓶颈（实测上下文与 TTFT
-  // 无正相关），但它是**每轮都要付的钱**，涨到三千字说明又有规则被塞回主对话了。
-  assert.ok(size < 2400, `personaPrefix 已经 ${size} 字符，超过 2400 —— 该挪去子代理的规则又塞回来了`);
+  // 无正相关），但它是**每轮都要付的钱**，涨过这个数说明又有整段规则被塞回主对话了。
+  //
+  // 上限 3200 对应「工具面保持全量」这一版：`【怎么干活】`（bash 前后台判断、
+  // 三种走法）还在里面。若哪天把工具砍到主对话只剩几个，那段就该一起删掉，
+  // 上限也要跟着降到 2400 左右。
+  assert.ok(size < 3200, `personaPrefix 已经 ${size} 字符，超过 3200 —— 该挪走的规则又塞回来了`);
 });
 
 test('personaPrefix 的内容没有跑出块缩进', () => {
