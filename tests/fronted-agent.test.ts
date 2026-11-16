@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { FrontedAgent, isFastCandidate } from '../src/fronted-agent.ts';
+import { FrontedAgent, isFastCandidate, isStatusQuestion } from '../src/fronted-agent.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
 
 interface FakeInner {
@@ -345,4 +345,104 @@ test('攒满上限的闲聊轮次，下次委派时补进 dsh 的注记', async 
   assert.ok(note.includes('用户: 你好呀'), `注记里要有第一轮，实际：${note}`);
   assert.ok(note.includes('用户: 谢谢你'), `注记里要有第二轮，实际：${note}`);
   assert.equal(inner.calls[0]?.text, '不用谢', '用户原话不能被改写');
+});
+
+test('后台任务事实进的是系统消息，不是用户话术', async () => {
+  const inner = fakeInner();
+  let body = '';
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      body = String((init as RequestInit | undefined)?.body ?? '');
+      return sse(['还在跑，哥。']);
+    },
+    { speculate: false, taskStatus: () => '后台任务：在跑 1 个 —— bash「sleep 20」已跑 12 秒。' },
+  );
+  agent.attachLiveSink(() => {});
+
+  const reply = await agent.reply('好了吗');
+  assert.equal(reply.speech, '还在跑，哥。');
+
+  const payload = JSON.parse(body) as { messages: Array<{ role: string; content: string }> };
+  const system = payload.messages.find((m) => m.role === 'system')?.content ?? '';
+  const user = payload.messages.find((m) => m.role === 'user')?.content ?? '';
+  assert.match(system, /sleep 20/, '事实要在系统消息里给模型');
+  assert.match(system, /照那条事实说/, '还要告诉它别编');
+  assert.equal(user, '好了吗', '用户话术原样，不能把事实混进去');
+});
+
+test('没有事实时不追加规则（空串 = 保持原样）', async () => {
+  const inner = fakeInner();
+  let body = '';
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      body = String((init as RequestInit | undefined)?.body ?? '');
+      return sse(['嗯。']);
+    },
+    { speculate: false, taskStatus: () => '' },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  const system = (JSON.parse(body) as { messages: Array<{ role: string; content: string }> })
+    .messages.find((m) => m.role === 'system')?.content ?? '';
+  assert.ok(!system.includes('后台任务'), system);
+});
+
+test('状态询问绕过任务词表（有事实才放行）', async () => {
+  const inner = fakeInner();
+  const asked: string[] = [];
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      const body = String((init as RequestInit | undefined)?.body ?? '');
+      asked.push(body);
+      return sse(['还在跑呢。']);
+    },
+    { speculate: false, taskStatus: () => '后台任务：在跑 1 个 —— bash「sleep 20」已跑 12 秒。' },
+  );
+  agent.attachLiveSink(() => {});
+
+  // 「查」在任务词表里，但这句问的是进度
+  const reply = await agent.reply('查到了吗');
+  assert.equal(reply.speech, '还在跑呢。');
+  assert.equal(asked.length, 1);
+
+  // 没有事实来源时不能放行：那样它只会瞎猜
+  const plain = agentWith(fakeInner().agent, async () => sse(['嗯。']), { speculate: false });
+  plain.attachLiveSink(() => {});
+  const delegated = await plain.reply('查到了吗');
+  assert.equal(delegated.speech, '慢车道答复。');
+});
+
+test('发起任务的句子不算状态询问', () => {
+  for (const text of ['帮我查一下订单', '请查一下天气', '给我看看现在几点']) {
+    assert.equal(isStatusQuestion(text), false, text);
+  }
+  for (const text of ['好了吗', '查到了吗', '还在跑吗', '怎么样了']) {
+    assert.equal(isStatusQuestion(text), true, text);
+  }
+});
+
+test('事实不能混进待同步给 dsh 的注记', async () => {
+  const inner = fakeInner();
+  let round = 0;
+  const agent = agentWith(
+    inner.agent,
+    async () => sse([`好呀第${++round}句。`]),
+    {
+      speculate: false,
+      keepTurns: 2,
+      taskStatus: () => '后台任务：在跑 1 个 —— bash「sleep 20」已跑 12 秒。',
+    },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  await agent.reply('谢谢你');
+  await agent.reply('帮我查一下订单');
+  const note = inner.calls[0]?.note ?? '';
+  assert.ok(note.includes('用户: 你好呀'), note);
+  assert.ok(!note.includes('sleep 20'), `注记里不该有后台事实：${note}`);
 });

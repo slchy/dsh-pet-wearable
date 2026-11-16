@@ -32,6 +32,8 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { SpontaneousTurn } from './spontaneous.ts';
+import { SingleFlight } from './single-flight.ts';
+import { TaskBoard } from './task-board.ts';
 import { LiveGate, LiveTextRelay, LIVE_TOKEN_THRESHOLD, type LiveEvent, type LiveMessage } from './live-text.ts';
 
 /**
@@ -253,6 +255,15 @@ export class DshSession {
   private sdkReady = false;
   /** 宿主运行时认不认 `session/cancel`（`null` = 还没探过） */
   private cancelSupported: boolean | null = null;
+  /** 在途的握手指令（并发 `ask` 必须等同一个，不能各自起进程） */
+  private readonly handshaking = new SingleFlight<void>();
+  /** 轮次串行队列的尾巴（`ask` 排队用，见 `ask` 的注释） */
+  private turns: Promise<void> = Promise.resolve();
+  /**
+   * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
+   * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
+   */
+  private readonly tasks = new TaskBoard(() => this.openSessionId);
   /**
    * 进程是不是在「一轮还没走完」时退出的。
    *
@@ -344,8 +355,22 @@ export class DshSession {
    *
    * 只有"带着存量 id"才会多试一次；全新会话失败就直接抛，
    * 避免把真实错误（比如缺 API key）当成会话失效反复重试。
+   *
+   * **串行**：`askSdk` 只用一个 `onIdle` 槽等 turn 结束，两轮重叠时后一轮会把
+   * 前一轮的等待者顶掉（前一轮永远不结束，后一轮等不到自己的 idle，一起挂到 60 s）。
+   * 编排层本来也是一轮一轮来，但投机/取消失败时慢车道那一轮可能还在跑 —— 这里排个队，
+   * 把「重叠」降级成「等一会儿」。
    */
   async ask(text: string, image?: ImageAttachment): Promise<AskResult> {
+    const run = this.turns.then(
+      () => this.askOnce(text, image),
+      () => this.askOnce(text, image),
+    );
+    this.turns = run.then(() => undefined, () => undefined);
+    return await run;
+  }
+
+  private async askOnce(text: string, image?: ImageAttachment): Promise<AskResult> {
     if (this.mode === 'sdk') return await this.askSdk(text, image);
     if (image) {
       throw new DshError('headless 模式的 stdin 只收纯文本，带图片请用 --dsh-sdk');
@@ -418,6 +443,15 @@ export class DshSession {
     } catch {
       // 已经退了
     }
+  }
+
+  /**
+   * 后台作业状态的一句话事实（给快车道照实说）。
+   *
+   * 返回的永远是完整句子，例如「后台任务：现在没有在跑的；刚结束 bash「sleep 20」（3 秒前）。」
+   */
+  taskStatus(): string {
+    return this.tasks.describe();
   }
 
   /** 关掉常驻进程（有的话）。headless 模式无副作用。 */
@@ -534,8 +568,16 @@ export class DshSession {
   /** 懒启动常驻进程并握手。崩溃后下次调用会自动重启。 */
   private async ensureSdk(): Promise<void> {
     if (this.proc && this.sdkReady) return;
-    if (this.proc) this.stop();
+    // 握手是异步的（spawn + initialize 约 2 s）。这期间又有 `ask` 进来时必须**等它**，
+    // 不能把刚起的进程 stop 掉 —— 投机会让这个窗口真实存在：快车道那一轮先起了 dsh，
+    // 用户第二句话在 initialize 还没回来时就到，原来会把进程连同在途握手一起杀掉
+    // （现象：`sdk 进程退出（code=0）`，那一轮直接失败）。
+    await this.handshaking.run(() => this.handshake());
+  }
 
+  private async handshake(): Promise<void> {
+    // 走到这里说明没有可用的 SDK 进程；残留的（崩过一半的）先收掉
+    if (this.proc) this.stop();
     // 流式侧通道要在 spawn **之前**就绪：端口靠 `VOICE_LIVE_PORT` 传给子进程，
     // dsh 里的 `voice-live` 插件启动时读它，读不到就整个不启用。
     await this.ensureLiveRelay();
@@ -738,6 +780,12 @@ export class DshSession {
       const ev = p['event'];
       if (!ev || typeof ev !== 'object') return;
       const e = ev as Record<string, unknown>;
+      // 后台作业/子代理的状态全在事件里，先喂给任务板（不认识的类型它自己忽略）
+      this.tasks.observe(
+        typeof p['sessionId'] === 'string' ? p['sessionId'] : '',
+        typeof e['type'] === 'string' ? e['type'] : '',
+        e['data'] as Record<string, unknown> | undefined,
+      );
       if (e['type'] !== 'assistant/message') return;
 
       const data = e['data'] as Record<string, unknown> | undefined;

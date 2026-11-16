@@ -168,6 +168,11 @@ export class VoiceAgent {
     this.session.interruptTurn();
   }
 
+  /** 后台任务状态的一句话事实（来自 dsh 自己的事件，不发请求）。 */
+  taskStatus(): string {
+    return this.session.taskStatus();
+  }
+
   async reply(asrText: string, image?: ImageAttachment, note?: string): Promise<AgentReply> {
     // 人设与规则由 dsh 作为系统提示词注入（见 mcp/profile.cordis.yml），这里只发
     // 本轮真正变化的东西：可选的系统注记 + 哥说的话。

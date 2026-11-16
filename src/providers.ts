@@ -74,6 +74,13 @@ export interface AgentProvider {
    */
   interruptTurn?(): void;
   /**
+   * 可选能力：**后台任务状态**的一句话事实（「在跑什么 / 刚跑完什么 / 什么都没有」）。
+   *
+   * 数据来自 dsh 自己发的事件（`job/registered`、`job/settled`、`subagent/catalog`），
+   * 不用额外发请求。给快车道用来**照实回答**「好了吗 / 查到没」，而不是瞎编进度。
+   */
+  taskStatus?(): string;
+  /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
    */

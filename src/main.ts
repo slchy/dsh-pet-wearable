@@ -518,6 +518,8 @@ async function main(): Promise<void> {
           return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
         })(),
         maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
+        // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
+        taskStatus: () => dshSession.taskStatus(),
         log: (line) => { console.log(line); },
       });
       console.log('快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）');

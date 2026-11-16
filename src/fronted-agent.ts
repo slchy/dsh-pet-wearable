@@ -73,6 +73,44 @@ const SYSTEM_PROMPT = [
   '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown，不要加语气标签。',
 ].join('\n');
 
+/**
+ * 有后台任务时追加的规则。**必须给事实才追加** —— 没事实时提「后台任务」反而
+ * 会诱导它编一个。
+ */
+const TASK_RULE = [
+  '',
+  '【这一轮额外给了你一条「后台任务」事实】',
+  '- 用户问进度（好了吗/查到了吗/还在跑吗/怎么样了/还要多久），**不要委派**，',
+  '  直接用那条事实说一句：在跑就说还在跑，别报结果；',
+  '- 事实说没有在跑的，就别编「正在查」，也别编「刚查到」；',
+  '- 不要复述整条事实，用口语说一句。',
+].join('\n');
+
+/**
+ * 问「进度」而不是「干活」的句子。
+ *
+ * 这类句子里的字（查/找/看）会命中 `TASK_WORDS` 被挡去 dsh，但它们问的是**已经在跑
+ * 的那件事**，有事实就能照实答 —— 那正是慢车道最不该拦的一类。
+ *
+ * 只在**有事实来源时**才放行（`FrontedAgent` 里判断），且要求句子里没有「请/帮/给我」
+ * 这类**发起任务**的词：「帮我查一下」是下指令，不是问进度。
+ */
+const STATUS_HINTS: readonly string[] = [
+  '好了吗', '好了没', '好了没有', '好没好', '弄好了吗', '搞定了吗',
+  '查到了吗', '查到没', '查到没有', '找到了吗', '找到没',
+  '还在跑', '在跑吗', '跑完了吗', '完事了吗', '完成了吗', '结束了吗',
+  '怎么样了', '进展', '到哪了', '还没好', '还要多久', '好了嘛',
+];
+
+const STATUS_BLOCKERS: readonly string[] = ['请', '帮', '给我', '替我', '一下'];
+
+export function isStatusQuestion(text: string): boolean {
+  const t = text.trim();
+  if (t === '') return false;
+  if (STATUS_BLOCKERS.some((w) => t.includes(w))) return false;
+  return STATUS_HINTS.some((w) => t.includes(w));
+}
+
 export interface FastLaneOptions {
   readonly inner: AgentProvider;
   /** DeepSeek key；空串 = 关闭快车道 */
@@ -105,6 +143,12 @@ export interface FastLaneOptions {
    * - `off`：什么都不做。
    */
   readonly cancelMode?: 'rpc' | 'interrupt' | 'off';
+  /**
+   * 后台任务状态的一句话事实（`session.taskStatus()`）。
+   *
+   * 只在**调用时**取，所以拿到的是本轮那一刻的真实状态。空串 = 不给（不追加规则）。
+   */
+  readonly taskStatus?: () => string;
   /** 测试注入用 */
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
@@ -222,6 +266,7 @@ export class FrontedAgent implements AgentProvider {
   private readonly keepTurns: number;
   private readonly speculate: boolean;
   private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
+  private readonly statusFacts: (() => string) | undefined;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
@@ -244,6 +289,7 @@ export class FrontedAgent implements AgentProvider {
     this.keepTurns = options.keepTurns ?? 4;
     this.speculate = options.speculate ?? true;
     this.cancelMode = options.cancelMode ?? 'rpc';
+    this.statusFacts = options.taskStatus;
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
@@ -288,9 +334,12 @@ export class FrontedAgent implements AgentProvider {
   }
 
   async reply(userText: string, image?: AgentImage, note?: string): Promise<AgentReplyView> {
+    const hasFacts = this.statusFacts !== undefined;
+    // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
     const candidate = this.apiKey !== ''
       && image === undefined
-      && isFastCandidate(userText, this.maxChars);
+      && (isFastCandidate(userText, this.maxChars)
+        || (hasFacts && isStatusQuestion(userText)));
     if (!candidate) {
       return await this.delegate(userText, image, note);
     }
@@ -436,6 +485,25 @@ export class FrontedAgent implements AgentProvider {
     return this.inner.reply(userText, image, note === undefined ? sync : `${note}\n\n${sync}`);
   }
 
+  /**
+   * 系统提示词 + 本轮的「后台任务」事实。
+   *
+   * 事实放在**系统消息**里而不是用户消息里：它不该被当成用户说的话，也不该进
+   * 待同步的对话缓冲（那几行是要原样补进 dsh 的）。
+   */
+  private systemPrompt(): string {
+    let facts = '';
+    try {
+      facts = this.statusFacts?.() ?? '';
+    } catch {
+      facts = '';
+    }
+    if (facts === '') {
+      return SYSTEM_PROMPT;
+    }
+    return `${SYSTEM_PROMPT}\n${TASK_RULE}\n${facts}`;
+  }
+
   private async ask(
     userText: string,
     startedAt: number,
@@ -470,7 +538,7 @@ export class FrontedAgent implements AgentProvider {
           temperature: 0.8,
           max_tokens: 64,
           messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'system', content: this.systemPrompt() },
             { role: 'user', content: userText },
           ],
         }),
