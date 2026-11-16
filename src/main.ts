@@ -500,7 +500,22 @@ async function main(): Promise<void> {
     const fastKey = process.env['DEEPSEEK_API_KEY']?.trim() ?? '';
     const fastOff = process.env['FAST_LANE'] === '0';
     const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md');
-    const memoryFile = new MemoryFile(memoryPath);    if (fastOff || fastKey === '') {
+    const memoryFile = new MemoryFile(memoryPath);
+
+    // **投机的前置条件**：宿主得能取消在途那一轮。
+    // 没有 `session/cancel` 时，快车道命中会在 dsh 那边留下一轮「用户没听过的回答」
+    // （白花钱 + 幽灵历史），所以探测失败就退回串行 —— 串行压根不提前发 dsh。
+    const wantSpeculate = process.env['FAST_LANE_SPECULATE'] !== '0';
+    let canCancel = false;
+    if (wantSpeculate) {
+      canCancel = await dshSession.probeCancelSupport(20_000);
+      console.log(canCancel
+        ? '快车道    投机=开（宿主支持 session/cancel，命中时可作废在途那一轮）'
+        : '快车道    投机=关 → 退回串行（宿主没有 session/cancel，作废不了在途那一轮）');
+    }
+    const speculate = wantSpeculate && canCancel;
+
+    if (fastOff || fastKey === '') {
       console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 DEEPSEEK_API_KEY）'}`);
     } else {
       agent = new FrontedAgent({
@@ -512,7 +527,8 @@ async function main(): Promise<void> {
           : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
         timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
         // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
-        speculate: process.env['FAST_LANE_SPECULATE'] !== '0',
+        // 前置条件：宿主必须能取消在途那一轮（启动时探测，见上面的 `canCancel`）。
+        speculate,
         // 胜出后怎么处置在途的慢车道那一轮：rpc（默认，当前 SDK 运行时未放行）/
         // interrupt（SIGINT，会重启，多花 ~2 s）/ off
         cancelMode: ((): 'rpc' | 'interrupt' | 'off' => {

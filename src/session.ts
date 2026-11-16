@@ -463,6 +463,30 @@ export class DshSession {
   }
 
   /**
+   * 启动时探测：宿主运行时认不认 `session/cancel`。
+   *
+   * 顺手把 SDK 握手拉起来（第一次探测本来就要 initialize），之后首轮会快一点。
+   * **探测失败一律当"不支持"**：拿不到答案时保守退回串行，比在投机里赌一把安全。
+   *
+   * @param timeoutMs 最多等多久；超时按不支持处理
+   */
+  async probeCancelSupport(timeoutMs = 20_000): Promise<boolean> {
+    const probe = (async (): Promise<boolean> => {
+      try {
+        await this.ensureSdk();
+      } catch (error) {
+        this.log(`  取消    探测失败：${(error as Error).message}`);
+        return false;
+      }
+      return this.cancelSupported === true;
+    })();
+    const timeout = new Promise<boolean>((resolve) => {
+      setTimeout(() => resolve(false), timeoutMs).unref?.();
+    });
+    return await Promise.race([probe, timeout]);
+  }
+
+  /**
    * 后台作业状态的一句话事实（给快车道照实说）。
    *
    * 返回的永远是完整句子，例如「后台任务：现在没有在跑的；刚结束 bash「sleep 20」（3 秒前）。」
