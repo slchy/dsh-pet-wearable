@@ -16,6 +16,7 @@ import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
 import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
+import { remainingSpeech } from './interrupted-tail.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
@@ -84,8 +85,23 @@ export class TurnRunner {
   private readonly log: (line: string) => void;
   /** 旁白与本轮回答共用一条下行音频，必须串行，否则两段 PCM 会交织在一起 */
   private speechChain: Promise<void> = Promise.resolve();
-  /** 用户在旁白播到一半改主意：停止下发，也别让下一轮排在它后面 */
-  private cannedCancelled = false;
+  /**
+   * 正在念的那条旁白。
+   *
+   * 记 `sentBytes` 和 `firstChunkAt` 是为了**被打断之后还能接着说**：语音没法暂停
+   * 再继续，只能按已播时长把剩下的文字重新合成一遍。不记的话，用户「嗯」一声就
+   * 把整条信息弄丢了 —— 后台任务的结论、高清照的引导语都属于「只说一次就没了」。
+   */
+  private canned: {
+    text: string;
+    emotion?: string;
+    sentBytes: number;
+    /** 首块音频下发的时刻；`-1` = 还没出过声 */
+    firstChunkAt: number;
+    cancelled: boolean;
+  } | null = null;
+  /** 被打断的旁白还没念完的那一段，等下一轮结束再补播。一次性。 */
+  private cannedResidue: { text: string; emotion?: string } | null = null;
 
   constructor(options: TurnRunnerOptions) {
     this.options = options;
@@ -107,31 +123,34 @@ export class TurnRunner {
    * {@link speechChain} 串行，两段音频不会撞在一起。
    */
   speakCanned(text: string, emotion?: string): Promise<void> {
-    this.cannedCancelled = false;
+    // 新的一条旁白：上一条的残留作废（它已经被这条取代了，再补播就是重复）
+    this.cannedResidue = null;
+    const current = { text, emotion, sentBytes: 0, firstChunkAt: -1, cancelled: false };
+    this.canned = current;
     const run = async (): Promise<void> => {
       const startedAt = this.options.clock.now();
-      let bytes = 0;
       let firstChunkAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(text, emotion)) {
-        if (this.cannedCancelled) {
+        if (current.cancelled) {
           this.log('  旁白    被打断，停止下发');
           return;
         }
         if (firstChunkAtMs < 0) {
           firstChunkAtMs = this.options.clock.now() - startedAt;
+          current.firstChunkAt = this.options.clock.now();
         }
-        bytes += chunk.length;
+        current.sentBytes += chunk.length;
         this.options.onDownlinkChunk?.(chunk);
         this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       }
-      const seconds = pcm16DurationMs(bytes, this.options.tts.sampleRate) / 1000;
+      const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
       this.log(
-        `  旁白    ${JSON.stringify(text)} ${bytes} B / ${seconds.toFixed(2)} s`
+        `  旁白    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
         + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
       );
       // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
       const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
-      while (this.options.clock.now() < until && !this.cannedCancelled) {
+      while (this.options.clock.now() < until && !current.cancelled) {
         await this.wait(PLAYBACK_POLL_MS);
       }
     };
@@ -140,9 +159,41 @@ export class TurnRunner {
     return next;
   }
 
-  /** 用户改主意：旁白不必播完，后面排队的那一轮也不必等它 */
+  /**
+   * 用户改主意：旁白不必播完，后面排队的那一轮也不必等它。
+   *
+   * **没念完的部分不丢**：按「用户实际可能听到的时长」切出剩下的文字放进
+   * {@link cannedResidue}，由对话层决定补播还是作废（双击掐播就是作废）。
+   *
+   * 已播时长取两个估计的**较小值**：下发出去的音频长度（合成慢时它更小）
+   * 和从首块到现在过了多久（播放快不起来，也就是它更小的情况）。只取前者会
+   * 严重高估 —— TTS 一次性把整段吐出来时，字节数等于全长，剩余部分就成了空串。
+   */
   cancelCanned(): void {
-    this.cannedCancelled = true;
+    const current = this.canned;
+    if (current === null || current.cancelled) {
+      return;
+    }
+    current.cancelled = true;
+    const sentMs = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate);
+    const elapsedMs = current.firstChunkAt < 0
+      ? 0
+      : this.options.clock.now() - current.firstChunkAt;
+    const heardMs = Math.min(sentMs, elapsedMs);
+    const rest = remainingSpeech(current.text, heardMs / 1000);
+    if (rest !== '') {
+      this.cannedResidue = {
+        text: rest,
+        ...(current.emotion === undefined ? {} : { emotion: current.emotion }),
+      };
+    }
+  }
+
+  /** 取走被打断旁白的剩余部分（一次性）。`null` = 没有剩余或已经念完。 */
+  takeCannedResidue(): { readonly text: string; readonly emotion?: string } | null {
+    const residue = this.cannedResidue;
+    this.cannedResidue = null;
+    return residue;
   }
 
   /**

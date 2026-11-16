@@ -22,7 +22,8 @@
  * 事件，所以虚拟时间里跑它不需要设备、不需要网络、不需要 ffmpeg。
  */
 import { closeAnnounceMic, speakAnnouncement } from './announce.ts';
-import type { Clock } from './clock.ts';
+import { isBackchannelOnly } from '../backchannel.ts';
+import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { TurnTicket } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
@@ -35,6 +36,18 @@ import { TurnRunner, type TurnResult } from '../turn-runner.ts';
 
 /** 被打断的那半句最多留这么久：再久就是另一段对话了。 */
 const TAIL_TTL_MS = 120_000;
+
+/**
+ * 用户最后一次开口之后，要安静这么久才敢播报。
+ *
+ * 状态机只在**一句话定稿之后**才 `listening → thinking`，所以「用户正说到一半」
+ * 和「用户不说话」在 `core.phase` 里是同一个 `listening`。光看 phase 就会在用户
+ * 换气的地方插进来 —— 实测最难受的不是慢两秒，是「它抢在我说完之前开口」。
+ */
+const ANNOUNCE_QUIET_MS = 800;
+
+/** 同一条旁白最多补播几次。一直被打断说明他确实不想听，再塞就是骚扰。 */
+const MAX_ANNOUNCE_RESUMES = 2;
 
 /** 播报时怎么开麦。设备没有 `listen.start` 就不给这个。 */
 export interface AnnounceMic {
@@ -132,6 +145,12 @@ export class DialogRuntime {
   private readonly announceQueue: Array<{ speech: string; emotion?: string }> = [];
   private announcing = false;
   private disposed = false;
+  /** 用户最后一次开口（中间结果也算）的时刻，用来判断「他是不是还在说」。 */
+  private lastUserSpeechAt = Number.NEGATIVE_INFINITY;
+  /** 因为用户还在说话而推迟的那次播报检查。同一时刻只排一个。 */
+  private announceRetry: Cancel | null = null;
+  /** 这一批播报已经补播过几次（见 {@link MAX_ANNOUNCE_RESUMES}）。 */
+  private announceResumes = 0;
   /**
    * 上一轮被打断、**没念出口**的那一段（一次性）。
    *
@@ -185,13 +204,62 @@ export class DialogRuntime {
    * @returns 这一批效果（调用方偶尔要先看一眼，比如"是不是要求停播"）
    */
   dispatch(event: CoreEvent): readonly CoreEffect[] {
-    // 用户只要开口（中间结果 / 定稿 / 成句），任何正在念的「回执」都要停。
+    // 用户只要开口（中间结果 / 定稿 / 成句），任何正在念的「回执」和「播报」都要停。
     // 只在 `onPartial` 上收回执是不够的：短促的插话常常只出定稿（真机 05:17:24）。
+    //
+    // 这里原来调的是 `cancelAck()`，那个方法在 39cbcd1 里被删掉之后调用没跟过来，
+    // 只剩下一个空壳 `if` —— 表现是「用户插话，旁白照念」。别再把这段改成空的：
+    // 旁白（后台汇报 / 回执）不占轮次票据，状态机也停在 `listening`，
+    // 所以 `bargeIn` 那条路对它不成立，**它是唯一能掐断播报的地方**。
     if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
+      this.lastUserSpeechAt = this.options.clock.now();
+      // 只是「嗯」一声、或者 ASR 把一个语气词当成中间结果 —— 这不算打断。
+      // 误判的代价不对称：打断错的代价是丢掉一整条后台汇报，不打断只是晚几百毫秒安静。
+      if (!isBackchannelOnly(event.text)) {
+        this.interruptCanned();
+      }
     }
     const effects = this.core.dispatch(event);
     this.execute(effects);
     return effects;
+  }
+
+  /**
+   * 掐断正在念的旁白，并把它**没念完的部分**挂回队首。
+   *
+   * 「不慎打断」是常态：用户在播报里插一句「嗯？」「等下」，那半条信息就没了 ——
+   * 而后台汇报只播一次。所以掐断之后先问 runner 要剩余文本，等下一轮结束再补播；
+   * 同一条最多续两次，一直打断说明他确实不想听。
+   */
+  private interruptCanned(): void {
+    this.runner.cancelCanned();
+    const residue = this.runner.takeCannedResidue();
+    if (residue === null) {
+      return;
+    }
+    if (this.announceResumes >= MAX_ANNOUNCE_RESUMES) {
+      this.options.log('  播报    被打断太多次，剩下的不再补');
+      return;
+    }
+    this.announceResumes += 1;
+    this.announceQueue.unshift({ speech: residue.text, ...(residue.emotion === undefined ? {} : { emotion: residue.emotion }) });
+    this.options.log(`  播报    被打断，剩 ${[...residue.text].length} 字，下一轮结束再补`);
+  }
+
+  /**
+   * 用户还在说话：稍后再看一次播报队列。
+   *
+   * 只排一个 —— `flushAnnounce` 会在每次入队、每轮结束时被反复调用，
+   * 每次都排一个定时器的话，用户说半分钟就能攒下几十个待触发的回调。
+   */
+  private scheduleAnnounceRetry(ms: number): void {
+    if (this.announceRetry !== null || this.disposed) {
+      return;
+    }
+    this.announceRetry = this.options.clock.after(Math.max(1, ms), () => {
+      this.announceRetry = null;
+      void this.flushAnnounce();
+    });
   }
 
   /** 队列空且没有在途任务。 */
@@ -332,6 +400,8 @@ export class DialogRuntime {
   clearAnnounce(): void {
     this.announceQueue.length = 0;
     this.runner.cancelCanned();
+    // 双击是明确的「别念了」，剩余部分直接作废 —— 不然它会被当成"不慎打断"补播回来
+    this.runner.takeCannedResidue();
   }
 
   async flushAnnounce(): Promise<void> {
@@ -340,6 +410,13 @@ export class DialogRuntime {
     }
     if (this.core.phase !== 'listening') {
       // 等本轮结束（`onTurnFinished` 会再叫一次）
+      return;
+    }
+    // 用户在说话时状态机也是 `listening`（要等一句话定稿才进 `thinking`），
+    // 所以还得看他最近有没有出过声 —— 否则会在换气处插进来。
+    const quietFor = this.options.clock.now() - this.lastUserSpeechAt;
+    if (quietFor < ANNOUNCE_QUIET_MS) {
+      this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS - quietFor);
       return;
     }
     const mic = this.options.env.announceMic;
@@ -368,8 +445,11 @@ export class DialogRuntime {
             speak,
           });
         }
-        if (this.core.phase !== 'listening') {
-          // 播报期间用户说话了，剩下的一条留到下一轮结束
+        // 播报期间用户说话了：这条已经被 `cancelCanned` 掐断，剩下的留到下一轮结束
+        if (
+          this.core.phase !== 'listening'
+          || this.options.clock.now() - this.lastUserSpeechAt < ANNOUNCE_QUIET_MS
+        ) {
           break;
         }
       }
@@ -378,6 +458,16 @@ export class DialogRuntime {
       if (mic !== undefined) {
         // 整批播完关麦（与 `pet/sim/world.ts` 同一个函数）
         closeAnnounceMic({ listenStart: mic.listenStart, call: mic.call });
+      }
+      // 整批顺利播完（队列空了、用户也没在说话）：补播预算归零
+      if (this.announceQueue.length === 0
+        && this.options.clock.now() - this.lastUserSpeechAt >= ANNOUNCE_QUIET_MS) {
+        this.announceResumes = 0;
+      } else if (this.announceQueue.length > 0) {
+        // 队列里还有货（被打断留下的残句、或者播报期间又来了新的）：
+        // 这里必须自己再排一次检查 —— `interruptCanned` 只会把残句塞回队列，
+        // 它没法在 `announcing` 还没落下来的时候叫醒任何人。
+        this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS);
       }
       // `spoken: true`：播报出声算"最近出过声"，由 minGap 推迟下一次搭话（ADR-0001 §6）
       env.onAnnounce?.(this.announceQueue.length > 0, true);
@@ -390,6 +480,8 @@ export class DialogRuntime {
     }
     this.disposed = true;
     this.announceQueue.length = 0;
+    this.announceRetry?.();
+    this.announceRetry = null;
     this.photos.dispose();
   }
 }
