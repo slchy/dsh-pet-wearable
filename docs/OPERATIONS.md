@@ -16,8 +16,9 @@
 ```
 node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
   └─ dsh --profile sdk --patch <patch.yml>      ← stdio JSON-RPC，一辈子跟着父进程
-     ├─ mcp/mcp-camera.mjs
-     └─ mcp/mcp-session.mjs
+     ├─ mcp/mcp-camera.mjs       拍照
+     ├─ mcp/mcp-session.mjs      挂断
+     └─ mcp/mcp-realtime.mjs     时间 / 天气 / 股价
 ```
 
 两个要点：

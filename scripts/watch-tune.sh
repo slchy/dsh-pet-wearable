@@ -11,7 +11,7 @@ set -u
 DURATION="${1:-60}"
 ADB_SERIAL="${ADB_SERIAL:-<设备地址>:45107}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-SSH_HOST="${SSH_HOST:-root@127.0.0.1}"
+SSH_HOST="${SSH_HOST:-${MIAI_SSH_USER:-root}@${MIAI_HOST:-127.0.0.1}}"
 
 OUT="${OUT:-tmp/tune-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
