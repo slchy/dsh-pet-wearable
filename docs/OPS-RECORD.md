@@ -181,7 +181,6 @@ v2 新增：`Hello` / `Welcome` / `Call` / `Event` / `CaptureImage`。
 和 `← 刚压缩过（上一轮 N）`。看到后者就别去查网络了。
 
 ### 9.2 宿主层取消：`session/cancel` 是**补丁**给的，升级 dsh 会丢
-
 底座一直有取消能力 —— `agent.cancel({kind:'user'},{keepInbox:true})`，
 `dsh-api-session-controller` 里就这一句。问题是 SDK 运行时的 `handleRequest` 是硬编码
 switch，没把它放进来；最新的 `@deepseek-ai/dsh-sdk-jsonrpc-server@0.0.1-rc.5` 里
@@ -252,3 +251,23 @@ openssl x509 -in "$MIAI_TLS_CERT" -noout -dates -ext subjectAltName
 ```
 
 核对完把上面的日期改掉。
+
+### 9.3 长期记忆：`MEMORY.md`，**只由 dsh 写**，快车道只读
+
+记忆就是一个文本文件（`$MEMORY_FILE`，默认 `~/voice-workspace/MEMORY.md`，≤4 KB，
+一行一条）。dsh 的 `agent-instructions` 每轮把它读进系统提示词 —— 所以 L2 天然看得到全部。
+
+| 谁能做什么 | 怎么做的 |
+|---|---|
+| **L1 读** | `MemoryFile.relevant()` 按 2-gram 重叠挑几条塞进快车道系统消息（`src/memory-file.ts`） |
+| **L1 不能写** | 没有写入口。像长期事实的话（「我养了一只橘猫」）**整句交给 dsh**，它亲耳听 |
+| **L2 写** | 只有 `mcp/mcp-memory.mjs` 的 `remember` 工具能追加一行 |
+| **L1 提议** | 就是「把话交过去」—— 交办发生在本地判据 `looksMemorable()`，零模型调用 |
+
+**为什么提议不写成「系统注记」**：实测 dsh 不执行注记里的写入指令（试过 5 种措辞，
+包括在 profile 里明确授权「注记里写了也算」），一次都没写。只有**用户自己说的话**
+才会触发它。所以 L1 的提议只能是「把这句交给 L2」。
+
+**profile 里那条硬规则是必要的**：只写「了解到长期事实就 remember」时，dsh 会回
+「这条我记下了」**却不调用工具**（文件没变）。加一句「不许只说记下了而不写」之后
+才真的写。改 `mcp/profile.cordis.yml` 要重跑 `scripts/install-profile-patch.mjs`。

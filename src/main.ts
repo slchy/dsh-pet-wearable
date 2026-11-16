@@ -35,6 +35,7 @@ import {
 import { DshSession } from './session.ts';
 import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
 import { FrontedAgent } from './fronted-agent.ts';
+import { MemoryFile } from './memory-file.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 import { SmartTurn } from './smart-turn.ts';
@@ -498,6 +499,7 @@ async function main(): Promise<void> {
     // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
     const fastKey = process.env['DEEPSEEK_API_KEY']?.trim() ?? '';
     const fastOff = process.env['FAST_LANE'] === '0';
+    const memoryFile = new MemoryFile(process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md'));
     if (fastOff || fastKey === '') {
       console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 DEEPSEEK_API_KEY）'}`);
     } else {
@@ -520,6 +522,9 @@ async function main(): Promise<void> {
         maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
         // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
         taskStatus: () => dshSession.taskStatus(),
+        // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），
+        // 按这句话挑几条进提示词，不全塞（4 KB ≈ 1.5k token）
+        memory: (text: string) => memoryFile.relevant(text),
         log: (line) => { console.log(line); },
       });
       console.log('快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）');

@@ -16,6 +16,7 @@ import {
   isFastCandidate,
   isStatusQuestion,
   looksLikeAnswer,
+  looksMemorable,
 } from '../src/fronted-agent.ts';
 import { trackActivity } from '../src/keepalive.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
@@ -424,16 +425,16 @@ test('快车道自己记得上一轮，dsh 最后一句也进系统消息', asyn
       systems.push((body.messages as Array<{ role: string; content: string }>)
         .find((m) => m.role === 'system')?.content ?? '');
       round += 1;
-      return sse([round === 1 ? '袁先生好。' : '你姓袁呀。']);
+      return sse([round === 1 ? '那少穿点吧。' : '你说今天热。']);
     },
     { speculate: false },
   );
   agent.attachLiveSink(() => {});
 
-  await agent.reply('我姓袁。');
-  await agent.reply('我姓什么来着');
-  assert.match(systems[1] ?? '', /用户「我姓袁。」/, '第二轮要能看到自己上一轮');
-  assert.match(systems[1] ?? '', /你「袁先生好。」/);
+  await agent.reply('今天真热。');
+  await agent.reply('我说什么来着');
+  assert.match(systems[1] ?? '', /用户「今天真热。」/, '第二轮要能看到自己上一轮');
+  assert.match(systems[1] ?? '', /你「那少穿点吧。」/);
 
   // 走一次 dsh，最后一句也要带上
   await agent.reply('帮我查一下订单');
@@ -453,6 +454,51 @@ test('回话判据：短确认算回答，长句/新话题不算', () => {
   }
   for (const speech of ['好的，已经删了。', '我叫米馍', '记下了，明天上午十点开会。']) {
     assert.equal(awaitsReply(speech), false, speech);
+  }
+});
+
+test('长期记忆只读进系统消息（L1 看得到，但碰不到文件）', async () => {
+  const inner = fakeInner();
+  let body = '';
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      body = String((init as RequestInit | undefined)?.body ?? '');
+      return sse(['你姓袁呀。']);
+    },
+    { speculate: false, memory: (text) => (text.includes('姓') ? ['哥姓袁，称呼袁哥。'] : []) },
+  );
+  agent.attachLiveSink(() => {});
+
+  const reply = await agent.reply('我姓什么来着');
+  assert.equal(reply.speech, '你姓袁呀。');
+  const system = (JSON.parse(body) as { messages: Array<{ role: string; content: string }> })
+    .messages.find((m) => m.role === 'system')?.content ?? '';
+  assert.match(system, /长期记忆（由 dsh 维护，你只能读）/);
+  assert.match(system, /哥姓袁/);
+});
+
+test('像长期事实的话交给 dsh 亲耳听（注记转述它一次都不写）', async () => {
+  const inner = fakeInner();
+  let fastCalls = 0;
+  const agent = agentWith(
+    inner.agent,
+    async () => { fastCalls += 1; return sse(['记心里了。']); },
+    { speculate: false },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('我姓袁。');
+  assert.equal(fastCalls, 0, '记忆只能由 dsh 写，所以这句必须让它自己听');
+  assert.equal(inner.calls[0]?.text, '我姓袁。', '用户原话原样交给 dsh，不改写');
+});
+
+test('提议判据：长期事实才提议，寒暄不提议', () => {
+  for (const text of ['我姓袁。', '记住我不吃香菜', '我住在杭州', '我最喜欢蓝色']) {
+    assert.equal(looksMemorable(text), true, text);
+  }
+  for (const text of ['你好呀', '有点冷', '那我该睡了不', '我姓什么来着', '我叫什么名字', '']) {
+    assert.equal(looksMemorable(text), false, text);
   }
 });
 

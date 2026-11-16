@@ -114,6 +114,36 @@ export function isStatusQuestion(text: string): boolean {
 /** 快车道自己记住几轮（再多就该让 dsh 知道了，靠 `pending` 同步） */
 const RECENT_TURNS = 2;
 
+/**
+ * 「这句值得长期记住」的本地判据 —— 只用来**提议**，不写。
+ *
+ * 记忆是 L2 的单一职责（`MEMORY.md` 只有 `remember` 工具能追加）。L1 在这里只做
+ * 「这句话像长期事实」的粗筛，把**用户原话**原样带去给 L2，由它决定写不写。
+ * 这样提议不可能被模型改写成一句错误的事实，也不需要多一次模型调用。
+ */
+const MEMORY_PROPOSALS: readonly RegExp[] = [
+  /^我(叫|姓|住|在|是)/,
+  /记住/,
+  /别忘了/,
+  /我(最)?(喜欢|讨厌|不吃|爱吃)/,
+  /我的.{0,8}是/,
+];
+
+/** 问句不是事实，绝不能拿去提议（实测「我姓什么来着」被 `^我姓` 误抓过） */
+const QUESTION_SHAPE = /[?？]|什么|哪|吗|呢|来着|多少|怎么|谁/;
+
+/** 像不像值得提议长期记住的一句话（太长的不算：那是叙述，不是事实） */
+export function looksMemorable(text: string): boolean {
+  const t = text.trim();
+  if (t === '' || t.length > 30) {
+    return false;
+  }
+  if (QUESTION_SHAPE.test(t)) {
+    return false;
+  }
+  return MEMORY_PROPOSALS.some((re) => re.test(t));
+}
+
 /** 短回话的形状：dsh 在等确认时，这类句子必须交给它，不能当闲聊答掉 */
 const CONFIRM_WORDS: readonly string[] = [
   '好的', '好呀', '好啊', '好', '行', '可以', '对', '是', '嗯', '要', '不',
@@ -183,6 +213,13 @@ export interface FastLaneOptions {
    * 只在**调用时**取，所以拿到的是本轮那一刻的真实状态。空串 = 不给（不追加规则）。
    */
   readonly taskStatus?: () => string;
+  /**
+   * 长期记忆的**只读**切面：给一句话，返回和它相关的几条记忆。
+   *
+   * 记忆由 L2（dsh）独占写入（`MEMORY.md`），这里只读；L1 想记什么只能提议，
+   * 由 L2 决定落不落盘。
+   */
+  readonly memory?: (userText: string) => readonly string[];
   /** 测试注入用 */
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
@@ -301,6 +338,7 @@ export class FrontedAgent implements AgentProvider {
   private readonly speculate: boolean;
   private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
   private readonly statusFacts: (() => string) | undefined;
+  private readonly memory: ((userText: string) => readonly string[]) | undefined;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
@@ -330,6 +368,7 @@ export class FrontedAgent implements AgentProvider {
     this.speculate = options.speculate ?? true;
     this.cancelMode = options.cancelMode ?? 'rpc';
     this.statusFacts = options.taskStatus;
+    this.memory = options.memory;
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
@@ -378,6 +417,14 @@ export class FrontedAgent implements AgentProvider {
     // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
     if (this.lastDsh?.asked === true && looksLikeAnswer(userText)) {
       this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
+      return await this.delegate(userText, image, note);
+    }
+    // 像「长期事实」的一句话：**必须让 dsh 亲耳听到**。
+    // 实测 dsh 只对「用户自己说的」话写记忆 —— 把它塞进系统注记里转述（试过 5 种措辞，
+    // 包括在 profile 里明确授权），一次都不写。所以这里的「提议」就是**把话交过去**，
+    // 让 L2 用自己的判断决定记不记；L1 不替它写、也不替它猜。
+    if (looksMemorable(userText)) {
+      this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
       return await this.delegate(userText, image, note);
     }
     const hasFacts = this.statusFacts !== undefined;
@@ -537,25 +584,32 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
-   * 调 dsh，顺便把攒着的快车道轮次经 `note` 补进上下文。
+   * 调 dsh，顺便把攒着的东西经 `note` 带过去：快车道答过的轮次 + 记忆提议。
    *
    * 用 `note` 而不是改用户原话：那一栏本来就是「系统注记」，dsh 会把两者分开。
+   * 提议只给用户原话，**不替 dsh 判断该不该记** —— 记忆的写权限在 L2 手里。
    */
   private startInner(
     userText: string,
     image: AgentImage | undefined,
     note: string | undefined,
   ): Promise<AgentReplyView> {
-    if (this.pending.length === 0) {
+    const blocks: string[] = [];
+    if (note !== undefined) {
+      blocks.push(note);
+    }
+    if (this.pending.length > 0) {
+      blocks.push([
+        '（下面几轮是刚才由快车道直接答给用户的，没有经过你的会话；当作已知上下文即可）',
+        ...this.pending,
+      ].join('\n'));
+      this.pending.length = 0;
+      this.log('  快车道    把缓冲的闲聊轮次补进 dsh 上下文');
+    }
+    if (blocks.length === 0) {
       return this.inner.reply(userText, image, note);
     }
-    const sync = [
-      '（下面几轮是刚才由快车道直接答给用户的，没有经过你的会话；当作已知上下文即可）',
-      ...this.pending,
-    ].join('\n');
-    this.pending.length = 0;
-    this.log('  快车道    把缓冲的闲聊轮次补进 dsh 上下文');
-    return this.inner.reply(userText, image, note === undefined ? sync : `${note}\n\n${sync}`);
+    return this.inner.reply(userText, image, blocks.join('\n\n'));
   }
 
   /**
@@ -567,8 +621,18 @@ export class FrontedAgent implements AgentProvider {
    * 三样东西按代价从低到高拼：后台任务事实（进度问答用）、快车道自己最近两轮
    * （不然「我叫什么」接不上）、dsh 最后一句（不然「好的」会在 dsh 问话之后被抢答）。
    */
-  private systemPrompt(): string {
+  private systemPrompt(userText: string): string {
     const parts: string[] = [SYSTEM_PROMPT];
+
+    let memories: readonly string[] = [];
+    try {
+      memories = this.memory?.(userText) ?? [];
+    } catch {
+      memories = [];
+    }
+    if (memories.length > 0) {
+      parts.push(`【长期记忆（由 dsh 维护，你只能读）】${memories.join('；')}`);
+    }
 
     if (this.lastDsh !== null) {
       parts.push(`【上一轮 dsh 说】${this.lastDsh.speech}`);
@@ -576,8 +640,11 @@ export class FrontedAgent implements AgentProvider {
     if (this.said.length > 0) {
       parts.push(`【你自己最近说的】${this.said.map((t) => `用户「${t.user}」→ 你「${t.you}」`).join('；')}`);
     }
-    if (this.lastDsh !== null || this.said.length > 0) {
-      parts.push('只用上面这些已发生过的话回答；问到别的事就 [[DELEGATE]]。');
+    if (this.lastDsh !== null || this.said.length > 0 || memories.length > 0) {
+      parts.push(memories.length > 0
+        // 记忆里已经有的，交给 dsh 就是白等一轮（它读的是同一份文件）
+        ? '【长期记忆】里已经写明的事（称呼、住处、偏好这类），直接用记忆照实回答，**不要委派**；记忆里没有的才 [[DELEGATE]]。'
+        : '只用上面这些已发生过的话回答；问到别的事就 [[DELEGATE]]。');
     }
 
     let facts = '';
@@ -626,7 +693,7 @@ export class FrontedAgent implements AgentProvider {
           temperature: 0.8,
           max_tokens: 64,
           messages: [
-            { role: 'system', content: this.systemPrompt() },
+            { role: 'system', content: this.systemPrompt(userText) },
             { role: 'user', content: userText },
           ],
         }),
