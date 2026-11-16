@@ -746,13 +746,14 @@ export class FrontedAgent implements AgentProvider {
     let timer: NodeJS.Timeout = setTimeout(() => {
       controller.abort(new Error(`首字超时 ${this.timeoutMs} ms`));
     }, this.timeoutMs);
-    timer.unref?.();
+    // 不 unref：`finally` 里一定会 clearTimeout，unref 省不了什么；
+    // 反而让「等这个定时器」变成不保活的事件循环 —— Node 22 的 test runner 会判定
+    // 「promise 永远悬着」（本地 Node 24 不复现，服务器上整片超时测试全挂）。
     const rearm = (): void => {
       clearTimeout(timer);
       timer = setTimeout(() => {
         controller.abort(new Error(`整句超时 ${this.totalMs} ms`));
       }, this.totalMs);
-      timer.unref?.();
     };
     try {
       const response = await doFetch(`${this.baseUrl}/chat/completions`, {
