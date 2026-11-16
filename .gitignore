@@ -18,3 +18,6 @@ tmp/
 !*.pem.example
 __pycache__/
 bench/**/*.json
+bench/e2e/out/
+bench/replay/out/
+bench/e2e/mictap/out/

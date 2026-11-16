@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  只为「让手机麦克风能出一段 PCM」而存在的最小包。
+
+  为什么不能继续用 app_process：Android 12 的录音权限检查走
+  AttributionSource（包名 + AppOps），app_process 没有包身份，
+  audioserver 直接 setRecordSilenced(uid:0, silenced 1) —— 拿 root 也没用。
+  有一个真包、一条 pm grant，才拿得到有声的录音轨。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.miaiglasses.mictap">
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <application android:label="MicTap" android:allowBackup="false">
+        <activity
+            android:name=".TapActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleInstance" />
+    </application>
+</manifest>
