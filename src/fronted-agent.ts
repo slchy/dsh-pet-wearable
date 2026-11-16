@@ -111,6 +111,40 @@ export function isStatusQuestion(text: string): boolean {
   return STATUS_HINTS.some((w) => t.includes(w));
 }
 
+/** 快车道自己记住几轮（再多就该让 dsh 知道了，靠 `pending` 同步） */
+const RECENT_TURNS = 2;
+
+/** 短回话的形状：dsh 在等确认时，这类句子必须交给它，不能当闲聊答掉 */
+const CONFIRM_WORDS: readonly string[] = [
+  '好的', '好呀', '好啊', '好', '行', '可以', '对', '是', '嗯', '要', '不',
+  '确认', '取消', '继续', '没错', '算了', '不用', '不要', '谢谢',
+];
+
+/** 这句像不像在回应上一句问话 */
+export function looksLikeAnswer(text: string): boolean {
+  const t = text.trim().replace(/[。！!，,、？?…\s]/g, '');
+  if (t === '' || t.length > 8) return false;
+  return CONFIRM_WORDS.some((w) => t.includes(w));
+}
+
+/**
+ * dsh 末尾这句是不是在**等用户回话**。
+ *
+ * 只看句尾不够 —— 真实的一句是「你要删哪条，说个大概内容，我找出来对一下再动手。」
+ * （句号结尾）。所以句中扫疑问词：只要出现就按「在等回话」处理，下一句短回话
+ * 一律交给 dsh。误判的代价只是那一句慢 700 ms，漏判的代价是业务断链。
+ */
+const ASK_MARKERS: readonly string[] = [
+  '？', '?', '吗', '呢', '嘛', '哪', '什么', '怎么', '为什么', '多少', '是否',
+  '要不要', '能不能', '可不可以', '说一下', '告诉我',
+];
+
+export function awaitsReply(speech: string): boolean {
+  const t = speech.trim();
+  if (t === '') return false;
+  return ASK_MARKERS.some((w) => t.includes(w));
+}
+
 export interface FastLaneOptions {
   readonly inner: AgentProvider;
   /** DeepSeek key；空串 = 关闭快车道 */
@@ -272,6 +306,10 @@ export class FrontedAgent implements AgentProvider {
   private readonly log: (line: string) => void;
   /** 快车道答过、还没进 dsh 会话的轮次（"用户: …" / "你: …" 两行一组） */
   private readonly pending: string[] = [];
+  /** 快车道自己答过的最近几轮（快模型默认只看得到当前一句，接不上「我叫什么」） */
+  private readonly said: Array<{ user: string; you: string }> = [];
+  /** 上一轮 dsh 说了什么、是不是在问话 */
+  private lastDsh: { speech: string; asked: boolean } | null = null;
   private sink: ((text: string) => void) | null = null;
   private innerMode: InnerMode = 'pass';
   private readonly buffered: string[] = [];
@@ -336,6 +374,12 @@ export class FrontedAgent implements AgentProvider {
   }
 
   async reply(userText: string, image?: AgentImage, note?: string): Promise<AgentReplyView> {
+    // dsh 上一条在问话，用户这句是短回话（好的/对/不用）—— 那是**对话里的回应**，
+    // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
+    if (this.lastDsh?.asked === true && looksLikeAnswer(userText)) {
+      this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
+      return await this.delegate(userText, image, note);
+    }
     const hasFacts = this.statusFacts !== undefined;
     // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
     const candidate = this.apiKey !== ''
@@ -416,8 +460,21 @@ export class FrontedAgent implements AgentProvider {
     const { emotion, rest } = parseEmotion(raw);
     const speech = cleanForSpeech(rest);
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
+    this.remember(userText, speech);
     this.log(`  快车道    ${firstTokenMs} ms 首字（流式） ：${JSON.stringify(speech)}`);
     return { text: raw, speech, firstTokenMs, emotion };
+  }
+
+  /**
+   * 记下这一轮（快车道自己的记忆 + dsh 最后说的话）。
+   *
+   * 快模型默认**只看到当前一句话**，所以「我姓袁」→「我叫什么」这种追问它接不上；
+   * 更危险的是 dsh 刚问过「确认要删除吗」，用户答「好的」会被当成闲聊答掉。
+   * 两处记忆都塞进系统消息，成本是每轮多几十个 token。
+   */
+  private remember(userText: string, said: string): void {
+    this.said.push({ user: userText.trim().slice(0, 40), you: said.slice(0, 40) });
+    if (this.said.length > RECENT_TURNS) this.said.shift();
   }
 
   /**
@@ -458,7 +515,9 @@ export class FrontedAgent implements AgentProvider {
     for (const text of held) {
       this.sink?.(text);
     }
-    return await promise;
+    const answer = await promise;
+    this.rememberDsh(answer.speech);
+    return answer;
   }
 
   private async delegate(
@@ -467,7 +526,14 @@ export class FrontedAgent implements AgentProvider {
     note?: string,
   ): Promise<AgentReplyView> {
     this.innerMode = 'pass';
-    return await this.startInner(userText, image, note);
+    const answer = await this.startInner(userText, image, note);
+    this.rememberDsh(answer.speech);
+    return answer;
+  }
+
+  /** 记下 dsh 最后说的话（快模型下一轮要看：它在问什么、答案是什么） */
+  private rememberDsh(speech: string): void {
+    this.lastDsh = { speech: speech.slice(0, 60), asked: awaitsReply(speech) };
   }
 
   /**
@@ -493,22 +559,37 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
-   * 系统提示词 + 本轮的「后台任务」事实。
+   * 系统提示词 + 本轮的事实。
    *
    * 事实放在**系统消息**里而不是用户消息里：它不该被当成用户说的话，也不该进
    * 待同步的对话缓冲（那几行是要原样补进 dsh 的）。
+   *
+   * 三样东西按代价从低到高拼：后台任务事实（进度问答用）、快车道自己最近两轮
+   * （不然「我叫什么」接不上）、dsh 最后一句（不然「好的」会在 dsh 问话之后被抢答）。
    */
   private systemPrompt(): string {
+    const parts: string[] = [SYSTEM_PROMPT];
+
+    if (this.lastDsh !== null) {
+      parts.push(`【上一轮 dsh 说】${this.lastDsh.speech}`);
+    }
+    if (this.said.length > 0) {
+      parts.push(`【你自己最近说的】${this.said.map((t) => `用户「${t.user}」→ 你「${t.you}」`).join('；')}`);
+    }
+    if (this.lastDsh !== null || this.said.length > 0) {
+      parts.push('只用上面这些已发生过的话回答；问到别的事就 [[DELEGATE]]。');
+    }
+
     let facts = '';
     try {
       facts = this.statusFacts?.() ?? '';
     } catch {
       facts = '';
     }
-    if (facts === '') {
-      return SYSTEM_PROMPT;
+    if (facts !== '') {
+      parts.push(TASK_RULE.trim(), facts);
     }
-    return `${SYSTEM_PROMPT}\n${TASK_RULE}\n${facts}`;
+    return parts.join('\n');
   }
 
   private async ask(

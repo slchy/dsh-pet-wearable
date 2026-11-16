@@ -10,7 +10,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { FrontedAgent, isFastCandidate, isStatusQuestion } from '../src/fronted-agent.ts';
+import {
+  awaitsReply,
+  FrontedAgent,
+  isFastCandidate,
+  isStatusQuestion,
+  looksLikeAnswer,
+} from '../src/fronted-agent.ts';
 import { trackActivity } from '../src/keepalive.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
 
@@ -371,6 +377,83 @@ test('后台任务状态也要透传给外层（trackActivity 不能漏）', () 
   };
   const tracked = trackActivity(base, { inflight: 0, last: 0 });
   assert.equal(tracked.taskStatus?.(), '后台任务：无');
+});
+
+test('dsh 上一条在问话：短回话必须交给 dsh，不能被快模型抢答', async () => {
+  const inner = fakeInner();
+  let fastCalls = 0;
+  const agent = agentWith(
+    {
+      ...inner.agent,
+      reply: async () => ({ text: '确认要删这条备忘录吗？', speech: '确认要删这条备忘录吗？' }),
+    },
+    async () => { fastCalls += 1; return sse(['好呀。']); },
+    { speculate: false },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('帮我查一下订单');
+  const reply = await agent.reply('好的');
+  assert.equal(fastCalls, 0, '「好的」是对 dsh 那句问话的回答，不是闲聊');
+  assert.equal(reply.speech, '确认要删这条备忘录吗？');
+});
+
+test('dsh 上一条不是问话：短回话照旧走快车道（别过度拦）', async () => {
+  const inner = fakeInner();
+  let fastCalls = 0;
+  const agent = agentWith(
+    inner.agent,
+    async () => { fastCalls += 1; return sse(['嗯，我在。']); },
+    { speculate: false },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('帮我查一下订单');
+  await agent.reply('好的');
+  assert.equal(fastCalls, 1);
+});
+
+test('快车道自己记得上一轮，dsh 最后一句也进系统消息', async () => {
+  const inner = fakeInner();
+  const systems: string[] = [];
+  let round = 0;
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}'));
+      systems.push((body.messages as Array<{ role: string; content: string }>)
+        .find((m) => m.role === 'system')?.content ?? '');
+      round += 1;
+      return sse([round === 1 ? '袁先生好。' : '你姓袁呀。']);
+    },
+    { speculate: false },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('我姓袁。');
+  await agent.reply('我姓什么来着');
+  assert.match(systems[1] ?? '', /用户「我姓袁。」/, '第二轮要能看到自己上一轮');
+  assert.match(systems[1] ?? '', /你「袁先生好。」/);
+
+  // 走一次 dsh，最后一句也要带上
+  await agent.reply('帮我查一下订单');
+  await agent.reply('你好呀');
+  assert.match(systems.at(-1) ?? '', /上一轮 dsh 说/);
+});
+
+test('回话判据：短确认算回答，长句/新话题不算', () => {
+  for (const text of ['好的', '嗯', '对。', '不用了谢谢', '确认']) {
+    assert.equal(looksLikeAnswer(text), true, text);
+  }
+  for (const text of ['你叫什么名字', '我姓袁', '今天天气怎么样呀', '']) {
+    assert.equal(looksLikeAnswer(text), false, text);
+  }
+  for (const speech of ['确认要删吗？', '还要别的吗', '你说呢。', '你要删哪条，说个大概内容，我找出来对一下再动手。']) {
+    assert.equal(awaitsReply(speech), true, speech);
+  }
+  for (const speech of ['好的，已经删了。', '我叫米馍', '记下了，明天上午十点开会。']) {
+    assert.equal(awaitsReply(speech), false, speech);
+  }
 });
 
 test('攒满上限的闲聊轮次，下次委派时补进 dsh 的注记', async () => {
