@@ -18,6 +18,7 @@ import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { remainingSpeech } from './interrupted-tail.ts';
 import { SentencePump } from './sentence-pump.ts';
+import { TokenQueue } from './token-queue.ts';
 import { cleanForSpeech } from './agent.ts';
 import { parseEmotion } from './emotion.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
@@ -228,38 +229,61 @@ export class TurnRunner {
       const agentStartedAt = this.options.clock.now();
       let firstSynthAt = 0;
       let firstAudioAtMs = -1;
-      // 逐句合成：token 一到就断句、送 TTS。钩子必须在 `await agent.reply` **之前**
-      // 挂上，否则等它返回时首句早过去了。旁白还在播时由 `gate` 挡住，不抢话。
-      const pump = new SentencePump({
-        synthesize: (sentence, emotion) => this.options.tts.synthesize(sentence, emotion),
-        clean: cleanForSpeech,
-        resolveEmotion: (raw) => parseEmotion(raw).emotion,
-        gate: this.speechChain,
-        isStale: () => fsm.isStale(ticket),
-        log: (line) => { this.log(line); },
-        onFirstSentence: () => {
-          firstSynthAt = this.options.clock.now();
-        },
-        onChunk: (chunk) => {
-          if (firstChunkAtMs === 0) {
-            firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
-            firstAudioAtMs = this.options.clock.now();
-            fsm.audioStarted(ticket);
-            this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
-            this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
-          }
-          audioBytes += chunk.length;
-          this.options.onDownlinkChunk?.(chunk);
-          downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
-        },
-      });
+      const emit = (chunk: Buffer): void => {
+        if (firstChunkAtMs === 0) {
+          firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
+          firstAudioAtMs = this.options.clock.now();
+          fsm.audioStarted(ticket);
+          this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
+          this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
+        }
+        audioBytes += chunk.length;
+        this.options.onDownlinkChunk?.(chunk);
+        downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
+      };
 
-      this.options.onLiveAvailable?.((delta) => { pump.push(delta); });
+      // 优先走「边生成边合成」：文本一到就 continue-task，首包与生成重叠。
+      // 没有流式通道时才退回 SentencePump（按句切，等价于整段）。
+      const streamTts = this.options.tts.synthesizeStream?.bind(this.options.tts);
+      const queue = streamTts === undefined || this.options.onLiveAvailable === undefined
+        ? null
+        : new TokenQueue();
+      const pump = queue === null
+        ? new SentencePump({
+            synthesize: (sentence, emotion) => this.options.tts.synthesize(sentence, emotion),
+            clean: cleanForSpeech,
+            resolveEmotion: (raw) => parseEmotion(raw).emotion,
+            gate: this.speechChain,
+            isStale: () => fsm.isStale(ticket),
+            log: (line) => { this.log(line); },
+            onFirstSentence: () => { firstSynthAt = this.options.clock.now(); },
+            onChunk: emit,
+          })
+        : null;
+
+      let streaming: Promise<void> | null = null;
+      if (queue !== null && streamTts !== undefined) {
+        this.options.onLiveAvailable?.((delta) => { queue.push(delta); });
+        streaming = (async () => {
+          await this.speechChain;
+          firstSynthAt = this.options.clock.now();
+          // 情绪标签在开头，但流式任务开跑时 reply 还没回来 —— 这里只能先按默认语气；
+          // 实测这一路是 calm（见 bench 日志 情绪=calm），暂不为了个别情绪牺牲首包。
+          for await (const chunk of streamTts(queue, undefined)) {
+            if (fsm.isStale(ticket)) return;
+            emit(chunk);
+          }
+        })();
+      } else {
+        this.options.onLiveAvailable?.((delta) => { pump?.push(delta); });
+      }
+
       let reply;
       try {
         reply = await agent.reply(text, image, note);
       } finally {
         this.options.onLiveAvailable?.(null);
+        queue?.close();
       }
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
       if (reply.firstTokenMs !== undefined) {
@@ -273,7 +297,11 @@ export class TurnRunner {
       );
 
       // 补齐没念的部分（没走流式时这一句就是整段合成），并等所有分片落地
-      await pump.drain(reply.speech);
+      if (streaming !== null) {
+        await streaming;
+      } else {
+        await pump?.drain(reply.speech);
+      }
 
       interrupted = interrupted || fsm.isStale(ticket);
       const audioSeconds = pcm16DurationMs(audioBytes, this.options.tts.sampleRate) / 1000;

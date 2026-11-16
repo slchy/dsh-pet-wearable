@@ -106,6 +106,11 @@ export interface TtsProvider {
   /** 输出采样率。**必须由 provider 声明**，不要在宿主里另配一份。 */
   readonly sampleRate: number;
   /**
+   * 边生成边合成（可选）：文本块一进来就送服务端，首包与模型生成重叠。
+   * 没实现就退回 {@link synthesize} 整段合成。
+   */
+  synthesizeStream?(chunks: AsyncIterable<string>, emotion?: string): AsyncIterable<Buffer>;
+  /**
    * @param emotion 情绪 key（见 `emotion.ts`）。provider 自己决定怎么用：MiMo 拿它
    *   拼风格提示词。不认识/不传就按默认语气合成。
    */

@@ -167,6 +167,10 @@ class Connection {
   private sink: ((chunk: Buffer) => void) | null = null;
   private settle: ((error: Error | null) => void) | null = null;
   private failure: Error | null = null;
+  /** 探针时刻（`COSYVOICE_TRACE=1` 时才有意义） */
+  private traceSentAt = 0;
+  private traceStartedAt = 0;
+  private traceFirstAt: number | null = null;
 
   constructor(url: string, apiKey: string) {
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
@@ -195,6 +199,9 @@ class Connection {
         header?: { event?: string; error_message?: string; error_code?: string };
       };
       const event = message.header?.event;
+      if (event === 'task-started') {
+        this.traceStartedAt = performance.now();
+      }
       if (event === 'task-finished') {
         this.sink = null;
         this.settle?.(null);
@@ -241,8 +248,29 @@ class Connection {
       throw new CosyVoiceError('连接正忙');
     }
     const taskId = hex32();
+    // 探针（`COSYVOICE_TRACE=1`）：把 346 ms 拆成「task 建立」与「首包合成」。
+    // 连接已复用（见类注释），所以这段全是服务端时间，只能靠提前 run-task 或
+    // 流式 continue-task 重叠掉。
+    const tracing = process.env['COSYVOICE_TRACE'] === '1';
+    if (tracing) {
+      this.traceSentAt = performance.now();
+      this.traceStartedAt = 0;
+      this.traceFirstAt = null;
+    }
+    const probed = (chunk: Buffer): void => {
+      if (tracing && this.traceFirstAt === null) {
+        this.traceFirstAt = performance.now();
+        const setup = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - this.traceSentAt;
+        const first = this.traceFirstAt - (this.traceStartedAt === 0 ? this.traceSentAt : this.traceStartedAt);
+        console.log(
+          `  TTS task  建立 ${setup.toFixed(0)} ms  首包 ${first.toFixed(0)} ms  `
+          + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
+        );
+      }
+      onChunk(chunk);
+    };
     const prosody = EMOTION_PROSODY[args.emotion];
-    this.sink = onChunk;
+    this.sink = probed;
     const done = new Promise<Error | null>((resolve) => { this.settle = resolve; });
 
     this.ws.send(JSON.stringify({
@@ -289,6 +317,75 @@ class Connection {
     }
   }
 
+  /**
+   * 边生成边合成的 task：`feed` 每来一段文本就 `send` 一次（对应一次
+   * `continue-task`），`feed` 返回后自动 `finish-task`。
+   *
+   * 为什么值得这么麻烦：实测 task 建立只要 62 ms，**首包合成要 281 ms**。
+   * 那 281 ms 只能靠把文本提前送上去、和模型生成重叠，而不是靠连接复用（早就复用了）。
+   */
+  async runFeed(
+    emotion: Emotion,
+    sampleRate: number,
+    model: string,
+    voice: string,
+    useInstruction: boolean,
+    feed: (send: (text: string) => void) => Promise<void>,
+    onChunk: (chunk: Buffer) => void,
+  ): Promise<void> {
+    if (!this.isIdle) {
+      throw new CosyVoiceError('连接正忙');
+    }
+    const taskId = hex32();
+    const prosody = EMOTION_PROSODY[emotion];
+    this.sink = onChunk;
+    const done = new Promise<Error | null>((resolve) => { this.settle = resolve; });
+
+    this.ws.send(JSON.stringify({
+      header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
+      payload: {
+        task_group: 'audio',
+        task: 'tts',
+        function: 'SpeechSynthesizer',
+        model,
+        parameters: {
+          text_type: 'PlainText',
+          voice,
+          format: 'pcm',
+          sample_rate: sampleRate,
+          volume: 50,
+          rate: prosody.rate,
+          pitch: prosody.pitch,
+          ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[emotion] } : {}),
+        },
+        input: {},
+      },
+    }));
+
+    const send = (text: string): void => {
+      this.ws.send(JSON.stringify({
+        header: { action: 'continue-task', task_id: taskId, streaming: 'duplex' },
+        payload: { input: { text } },
+      }));
+    };
+
+    let feedError: Error | null = null;
+    try {
+      await feed(send);
+    } catch (error) {
+      feedError = error instanceof Error ? error : new CosyVoiceError(String(error));
+    }
+    this.ws.send(JSON.stringify({
+      header: { action: 'finish-task', task_id: taskId, streaming: 'duplex' },
+      payload: { input: {} },
+    }));
+
+    const error = await done;
+    this.sink = null;
+    if (feedError) throw feedError;
+    if (error) throw error;
+  }
+
   close(): void {
     this.closed = true;
     try { this.ws.close(); } catch { /* 已经关了 */ }
@@ -302,6 +399,9 @@ class Connection {
  * 串行才能吃到「握手成本归零」）。断线或报错后下一次 synthesize 自动重连 ——
  * 一个 task 失败后同一条连接上后续 task 会静默挂死，必须弃掉。
  */
+/** 流式合成时每次 `continue-task` 送的字符数。太小会让服务端攒着不合成，太大等于没重叠 */
+const STREAM_BATCH_CHARS = 10;
+
 export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
   const apiKey = options.apiKey ?? process.env['DASHSCOPE_API_KEY']?.trim() ?? '';
   if (apiKey === '') {
@@ -391,6 +491,81 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         // 静音块单独处理：**先攒着**，等后面出现有声块才补发（句间停顿要保留），
         // 流结束时剩下的直接丢弃（句尾静音没人想听）。
         // 这样既不前瞻、也不加延迟 —— 静音块本身没有信息，晚一个块发出去无损。
+        const heldSilence: Buffer[] = [];
+        for (;;) {
+          if (chunks.length > 0) {
+            const chunk = chunks.shift()!;
+            if (isSilentChunk(chunk)) {
+              heldSilence.push(chunk);
+              continue;
+            }
+            if (heldSilence.length > 0) {
+              yield Buffer.concat(heldSilence);
+              heldSilence.length = 0;
+            }
+            yield chunk;
+            continue;
+          }
+          if (finished) break;
+          await new Promise<void>((resolve) => { notify = resolve; });
+          notify = null;
+        }
+        heldSilence.length = 0;
+        await run;
+        if (failure) throw failure;
+        touchIdle();
+      } finally {
+        release();
+      }
+    },
+
+    /**
+     * 边生成边合成：文本块一进来就 `continue-task` 喂给服务端。
+     *
+     * 收益来源是**重叠**而不是复用：连接早就复用了，task 建立也只占 62 ms，
+     * 真正贵的是首包合成 281 ms —— 只有把文本提前送上去才能盖住它。
+     */
+    async *synthesizeStream(chunksIn: AsyncIterable<string>, emotion?: string) {
+      const previous = chain;
+      let release!: () => void;
+      chain = new Promise<void>((resolve) => { release = resolve; });
+      await previous;
+      try {
+        const chunks: Buffer[] = [];
+        let notify: (() => void) | null = null;
+        let finished = false;
+        let failure: Error | null = null;
+
+        const connNow = await acquire();
+        const run = connNow.runFeed(
+          asEmotion(emotion),
+          sampleRate,
+          model,
+          voice,
+          useInstruction,
+          async (send) => {
+            let batch = '';
+            for await (const text of chunksIn) {
+              batch += text;
+              if (batch.length >= STREAM_BATCH_CHARS) {
+                send(batch);
+                batch = '';
+              }
+            }
+            if (batch !== '') send(batch);
+          },
+          (chunk) => {
+            chunks.push(chunk);
+            notify?.();
+          },
+        ).then(() => { finished = true; notify?.(); })
+          .catch((error: unknown) => {
+            failure = error instanceof Error ? error : new CosyVoiceError(String(error));
+            finished = true;
+            drop();
+            notify?.();
+          });
+
         const heldSilence: Buffer[] = [];
         for (;;) {
           if (chunks.length > 0) {
