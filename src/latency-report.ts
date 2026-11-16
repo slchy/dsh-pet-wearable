@@ -196,9 +196,9 @@ function speechStopAt(events: readonly ArchiveEvent[], at: number): number | nul
  * 配对规则（每条都限定了搜索边界，避免跨轮串味）：
  * - `asr.sentence` 只在本轮 `turn.start` **与上一轮 `turn.start` 之间**找
  * - `tts.first` / `turn.end` 只在本轮 `turn.start` **与下一轮 `turn.start` 之间**找
- * - `gate.close` 从本轮 `turn.start` **往前**找（含之前所有轮）—— 它必然晚于
- *   `asr.sentence`（能量门 holdMs 2 s > ASR 静音 0.8 s），按位置往前扒只会
- *   扒到上一轮的。用它的 `t - gapMs` 还原真实停嘴时刻，见 {@link speechStopAt}。
+ * - `gate.close` 从本轮 `asr.sentence` **往后**找（它必然晚于 asr，见
+ *   {@link speechStopAt}），且**一个只给一轮用**。找不到就记缺失 ——
+ *   宁可少一个数，也不能拿上一轮的停嘴时刻冒充这一轮（会把静音等待算进延迟）。
  *
  * 主动播报（`announce`）没有 `asr.sentence`，所以它的 ①② 为 `null`；
  * 若它触发了 `turn.start`，仍会算进 ③④。
@@ -215,6 +215,8 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
   }
 
   const out: TurnLatency[] = [];
+  /** 已被某一轮用掉的 `gate.close` 下标：一个能量门只对应一次「用户停嘴」 */
+  const usedGates = new Set<number>();
   for (let n = 0; n < starts.length; n += 1) {
     const at = starts[n];
     if (at === undefined) {
@@ -223,38 +225,45 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     const prevAt = n === 0 ? -1 : (starts[n - 1] ?? -1);
     const nextAt = starts[n + 1] ?? events.length;
 
-    // ① 的起点 = **用户停嘴**的时刻。
-    //
-    // 不能直接用 `gate.close` 的 `t`：能量门要 `holdMs`（默认 2 s）才关门，而 ASR
-    // 静音只有 0.8 s，所以 `gate.close` 必然晚于 `asr.sentence`、甚至晚于
-    // `turn.start`。旧版只在本轮 `turn.start` **之前**找，于是每次都扒到上一轮那个，
-    // 把整轮播放时间算进了首字延迟（实测把 3.1 s 报成 7.1 s）。
-    //
-    // 范围取本轮 `[turn.start, 下一轮 turn.start)`：容得下记在后面的，又不会串轮。
-    // 旧档案里它也可能记在 `turn.start` 之前，退回上一段区间再找一次。
-    // 真正的起点是 `t - gapMs`（最后一个有声块），见 {@link speechStopAt}。
-    let gateAt = -1;
-    for (let i = at; i < nextAt; i += 1) {
-      if (events[i]?.ev === EVENTS.gateClose) {
-        gateAt = i;
-        break;
-      }
-    }
-    if (gateAt < 0) {
-      for (let i = at - 1; i > prevAt; i -= 1) {
-        if (events[i]?.ev === EVENTS.gateClose) {
-          gateAt = i;
-          break;
-        }
-      }
-    }
     // ② 的中间点：本轮范围内的最后一个 asr.sentence
+    // （先算它：① 要拿它当下界，见下面 gate.close 的搜索）
     let asrAt = -1;
     for (let i = at - 1; i > prevAt; i -= 1) {
       if (events[i]?.ev === EVENTS.asrSentence) {
         asrAt = i;
         break;
       }
+    }
+
+    // ① 的起点 = **用户停嘴**的时刻。
+    //
+    // 不能直接用 `gate.close` 的 `t`：能量门要 `holdMs`（默认 2 s）才关门，而 ASR
+    // 静音只有 0.8 s，所以属于**这段语音**的 `gate.close` 必然晚于本轮的
+    // `asr.sentence`（甚至晚于 `turn.start`）。
+    //
+    // 从 `asr.sentence` 往后找，找不到就记缺失。**绝不回退去抢上一轮的**：
+    // 真机上出现过「上一轮说完、用户静音 6 s 才开口」，回退抓到的那个
+    // `gate.close` 属于上一轮，于是 ① 被算成 7.6 s（真实约 1.3 s）。
+    // 一个能量门只对应一次停嘴，所以 `usedGates` 保证不复用。
+    let gateAt = -1;
+    const gateFrom = asrAt >= 0 ? asrAt : at;
+    for (let i = gateFrom; i < nextAt; i += 1) {
+      if (events[i]?.ev === EVENTS.gateClose && !usedGates.has(i)) {
+        gateAt = i;
+        break;
+      }
+    }
+    // 旧档案里 `gate.close` 也可能记在 `turn.start` 之前，此时才回退一次
+    if (gateAt < 0) {
+      for (let i = at - 1; i > prevAt; i -= 1) {
+        if (events[i]?.ev === EVENTS.gateClose && !usedGates.has(i)) {
+          gateAt = i;
+          break;
+        }
+      }
+    }
+    if (gateAt >= 0) {
+      usedGates.add(gateAt);
     }
 
     // ③④ 的终点：本轮范围内

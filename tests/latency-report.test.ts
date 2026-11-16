@@ -102,6 +102,37 @@ test('多轮不串味：第二轮没有 gate.close 就记 null，不复用第一
   assert.deepEqual(turns[1]?.missing, ['gate.close']);
 });
 
+test('上一轮的 gate.close 落在本轮 turn.start 之后，也不能被本轮抢走', () => {
+  // 真机档案（20261116-003955）的形状：能量门要 2 s 才关，所以上一轮的
+  // gate.close 记在**上一轮 turn.start 之后**；随后用户静音 6 s 才开口，
+  // 本轮没有自己的 gate.close。
+  // 旧逻辑回退搜索 [上一轮 turn.start, 本轮 turn.start) 会抓到上一轮那个，
+  // 把 6 s 静音算进 ①，把真实的 1.3 s 报成 7.6 s。
+  const real = jsonl([
+    { t: 81787, ev: 'asr.sentence', text: '退一下。', index: 1 },
+    { t: 82011, ev: 'turn.start', text_len: 4, image: false },
+    { t: 83203, ev: 'gate.close', gapMs: 2011 },
+    { t: 83489, ev: 'tts.first', ms: 338 },
+    { t: 85325, ev: 'turn.end', interrupted: false, dsh_ms: 1138 },
+    // 用户静音 6 s 后才开口
+    { t: 87522, ev: 'gate.open', peakDbfs: -28.5, prerollMs: 795 },
+    { t: 88823, ev: 'asr.sentence', text: '断开连接。', index: 1 },
+    { t: 89047, ev: 'turn.start', text_len: 5, image: false },
+    { t: 91135, ev: 'tts.first', ms: 347 },
+    { t: 93693, ev: 'turn.end', interrupted: false, dsh_ms: 1740 },
+  ]);
+  const turns = computeTurns(parseEvents(real));
+  assert.equal(turns.length, 2);
+  // 第一轮正常拿到自己的 gate.close：81787 - (83203 - 2011)
+  assert.equal(turns[0]?.silenceToAsr, 595);
+  // 第二轮没有自己的 gate.close → 记缺失，绝不复用上一轮的
+  assert.equal(turns[1]?.silenceToAsr, null);
+  assert.equal(turns[1]?.firstWordMs, null);
+  assert.deepEqual(turns[1]?.missing, ['gate.close']);
+  // ③④ 不受影响
+  assert.equal(turns[1]?.turnToAudio, 2088);
+});
+
 test('主动播报轮：没有 asr.sentence 时 ①② 为 null，③④ 照算', () => {
   const announce = jsonl([
     { t: 100, ev: 'announce', len: 12 },
