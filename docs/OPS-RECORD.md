@@ -69,7 +69,14 @@ systemd unit。
 `tokens.txt` 现有设备：`M2004J7AC`（测试手机）、`pet-test`、`tau2-bench`（bench 专用）。
 文件改动**自动重读**，吊销不必重启。
 
-`Hello` 里 `deviceId` 必须与文件里绑定的名字一致，否则 `auth_failed` 且连接直接关闭。
+`Hello` 里 `deviceId` 必须与文件里绑定的名字一致，否则报
+`token 正确但 deviceId 不匹配（期望 X，收到 Y）` 并拒绝。
+
+**⚠️ App 发的 `deviceId` 是眼镜的蓝牙 MAC**（如 `04:34:C3:4C:D5:E5`），**不是**手机型号。
+所以 `tokens.txt` 里必须有一条绑到那个 MAC 的 token；绑到手机名（如 `M2004J7AC`）会一直被拒，
+而且报错里 token 是"正确的" —— 很容易误判成别的问题。实测踩过。
+
+同时 App 还会自报 v2 能力：`上行 msbc；拍照 glance/detail(等用户)；上报 presence power summon listenStart played`。
 
 ## 5. 档案（archive）
 
