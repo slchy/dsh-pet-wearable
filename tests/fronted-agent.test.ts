@@ -1,11 +1,11 @@
 /**
- * 快车道装饰器：只在「本地判据认定是闲聊」时才先问快模型，其余轮次零开销。
+ * 快车道装饰器：本地判据 + 流式传输 + 投机双轨。
  *
- * 这里不测 HTTP 细节，测的是**四条必须成立的边界**：
+ * 测的是**四条必须成立的边界**：
  * 1. 任务类请求永远不进快车道（误判成闲聊的代价比多等 690 ms 大得多）
- * 2. 快模型判自己答不了（`[[DELEGATE]]`）/ 超时 / 报错 → 必须原样交给 dsh，不能哑
- * 3. 快车道的回答要进流式通道，否则 TTS 那条路先付一次「拒空任务」再退回整段
- * 4. 攒满的闲聊轮次要在下一次委派时补进 dsh 的上下文注记
+ * 2. 快模型判自己答不了（`[[DELEGATE]]`）/ 超时 / 报错 → 原样交给 dsh，不能哑
+ * 3. 流式：过了暗号判定就逐字推给 TTS，不等整句；暗号本身一个字都不能推
+ * 4. 投机：dsh 与快模型同时起跑；快车道赢则丢掉 dsh 的增量，输则把它补放出来
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -13,23 +13,25 @@ import { test } from 'node:test';
 import { FrontedAgent, isFastCandidate } from '../src/fronted-agent.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
 
-/** 假 dsh：记录收到什么 */
-function fakeInner(): {
-  calls: Array<{ text: string; note?: string | undefined }>;
-  sinks: Array<((text: string) => void) | null>;
-  agent: AgentProvider;
-} {
+interface FakeInner {
+  readonly agent: AgentProvider;
+  readonly calls: Array<{ text: string; note?: string | undefined }>;
+  /** 模拟 dsh 往流式通道推一段增量（走 FrontedAgent 装的闸门） */
+  readonly push: (text: string) => void;
+}
+
+function fakeInner(): FakeInner {
   const calls: Array<{ text: string; note?: string | undefined }> = [];
-  const sinks: Array<((text: string) => void) | null> = [];
+  let sink: ((text: string) => void) | null = null;
   const agent: AgentProvider = {
     name: 'dsh',
     reply: async (text: string, _image, note): Promise<AgentReplyView> => {
       calls.push({ text, note });
       return { text: '慢车道答复。', speech: '慢车道答复。' };
     },
-    attachLiveSink: (sink) => { sinks.push(sink); },
+    attachLiveSink: (next) => { sink = next; },
   };
-  return { calls, sinks, agent };
+  return { agent, calls, push: (text) => { sink?.(text); } };
 }
 
 /** 把若干 token 拼成一条 SSE 响应（DeepSeek 兼容格式） */
@@ -40,24 +42,38 @@ function sse(tokens: string[], status = 200): Response {
   return new Response(body, { status, headers: { 'content-type': 'text/event-stream' } });
 }
 
+/** 每个 token 之间隔 `gapMs`，用来模拟「整句要几百毫秒才说完」 */
+function slowSse(tokens: string[], gapMs: number): Response {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      for (const t of tokens) {
+        controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: t } }] })}\n\n`));
+        await new Promise((resolve) => setTimeout(resolve, gapMs));
+      }
+      controller.enqueue(enc.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200 });
+}
+
 function agentWith(
   inner: AgentProvider,
   fetchImpl: typeof fetch,
   extra: Partial<ConstructorParameters<typeof FrontedAgent>[0]> = {},
-): { agent: FrontedAgent; lines: string[] } {
-  const lines: string[] = [];
-  const agent = new FrontedAgent({
+): FrontedAgent {
+  return new FrontedAgent({
     inner,
     apiKey: 'k',
     fetchImpl,
-    log: (line) => { lines.push(line); },
+    log: () => {},
     ...extra,
   });
-  return { agent, lines };
 }
 
 test('判据：闲聊候选 vs 任务请求', () => {
-  for (const text of ['你好呀', '谢谢你', '我可想你了', '你是谁']) {
+  for (const text of ['你好呀', '谢谢你', '我可想你了', '你是谁', '你叫什么名字']) {
     assert.equal(isFastCandidate(text), true, `该走快车道：${text}`);
   }
   for (const text of [
@@ -71,63 +87,113 @@ test('判据：闲聊候选 vs 任务请求', () => {
   }
 });
 
-test('闲聊：用快模型的回答，dsh 一次都不调', async () => {
-  const inner = fakeInner();
-  const { agent } = agentWith(inner.agent, async () => sse(['我在', '呢。']));
-  const reply = await agent.reply('你好呀');
-  assert.equal(reply.speech, '我在呢。');
-  assert.equal(inner.calls.length, 0, '命中快车道就不该惊动 dsh');
+test('「什么」不进任务词 —— 它会把「你叫什么名字」一起挡掉', () => {
+  assert.equal(isFastCandidate('你叫什么名字'), true);
+  assert.equal(isFastCandidate('几点了'), true, '要事实的问题交给快模型自己判委派');
 });
 
-test('快车道的回答要推给流式通道', async () => {
+test('任务类请求完全不问快模型', async () => {
   const inner = fakeInner();
-  const { agent } = agentWith(inner.agent, async () => sse(['我在呢。']));
+  let asked = 0;
+  const agent = agentWith(inner.agent, async () => {
+    asked += 1;
+    return sse(['不该被问到。']);
+  });
+  await agent.reply('帮我查一下订单');
+  assert.equal(asked, 0, '本地判据就该挡住');
+  assert.equal(inner.calls.length, 1);
+});
+
+test('流式：第一段文字不等整句说完就推给 TTS', async () => {
+  const inner = fakeInner();
+  const agent = agentWith(inner.agent, async () => slowSse(['我在', '呢', '。'], 40));
   const seen: string[] = [];
   agent.attachLiveSink((text) => { seen.push(text); });
-  await agent.reply('你好呀');
-  assert.deepEqual(seen, ['我在呢。'], '不推的话 turn-runner 会先付一次「拒空任务」');
-  assert.equal(inner.sinks.length, 1, 'attachLiveSink 必须透传给 dsh');
+
+  const reply = await agent.reply('你好呀');
+
+  assert.equal(reply.speech, '我在呢。');
+  // 断言的是**边界**而不是耗时：第一段只有第一个 token，说明没等整句说完。
+  // 用时间阈值会在 `node --test` 并行跑多个文件时随机失败（踩过）。
+  assert.deepEqual(seen, ['我在', '呢', '。'], '应当逐段推出，且分段边界与 token 对齐');
 });
 
-test('快模型说要委派：交给 dsh', async () => {
+test('暗号一个字都不推给 TTS', async () => {
   const inner = fakeInner();
-  const { agent, lines } = agentWith(inner.agent, async () => sse(['[[', 'DELEGATE]]']));
+  const agent = agentWith(inner.agent, async () => sse(['[[', 'DELEGATE]]']));
+  const seen: string[] = [];
+  agent.attachLiveSink((text) => { seen.push(text); });
+
   const reply = await agent.reply('你好呀');
   assert.equal(reply.speech, '慢车道答复。');
+  assert.deepEqual(seen, [], '`[[` 一旦出现就作废这条路，绝不能推进 TTS');
   assert.equal(inner.calls.length, 1);
-  assert.ok(lines.some((l) => l.includes('快车道')), '要留下判为委派的日志');
 });
 
-test('首字符是 [[ 就早退，不等整句说完', async () => {
+test('单个 `[` 不会被当成暗号（情绪标签是单方括号）', async () => {
   const inner = fakeInner();
-  const { agent } = agentWith(inner.agent, async () => {
-    const enc = new TextEncoder();
-    const first = `data: ${JSON.stringify({ choices: [{ delta: { content: '[[' } }] })}\n\n`;
-    const rest = `data: ${JSON.stringify({ choices: [{ delta: { content: 'DELEGATE]]' } }] })}\n\ndata: [DONE]\n\n`;
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        controller.enqueue(enc.encode(first));
-        // 句子的其余部分 300 ms 后才到 —— 早退的话根本不会等到它
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        controller.enqueue(enc.encode(rest));
-        controller.close();
-      },
-    });
-    return new Response(stream, { status: 200 });
-  }, { timeoutMs: 2_000 });
+  const agent = agentWith(inner.agent, async () => slowSse(['[开', '心]你好呀。'], 10));
+  const seen: string[] = [];
+  agent.attachLiveSink((text) => { seen.push(text); });
 
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '你好呀。', '情绪标签要被清洗掉');
+  assert.ok(seen.join('').includes('开'), '标签本身会推给 TTS（由 TTS 侧清洗）');
+});
+
+test('投机：dsh 与快模型同时起跑，命中时 dsh 的增量被丢掉', async () => {
+  const inner = fakeInner();
+  let innerCalledAt = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    reply: async (text, image, note) => {
+      innerCalledAt = Date.now();
+      inner.push('慢车道已经开始说话了');
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return inner.agent.reply(text, image, note);
+    },
+  };
+  const agent = agentWith(wrapped, async () => slowSse(['我在', '呢。'], 40));
+  const seen: string[] = [];
   const startedAt = Date.now();
-  const reply = await agent.reply('你好呀');
-  const elapsed = Date.now() - startedAt;
+  agent.attachLiveSink((text) => { seen.push(text); });
 
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '我在呢。');
+  assert.ok(innerCalledAt - startedAt < 40, '投机下 dsh 必须立刻开跑，不能等快模型判定');
+  assert.ok(!seen.includes('慢车道已经开始说话了'), '快车道胜出后，dsh 的增量不能混进 TTS');
+  assert.equal(inner.calls.length, 1, 'dsh 确实被跑了一次（代价：白花一次调用）');
+});
+
+test('投机：快车道让位时，dsh 已经推进来的增量要补放出去', async () => {
+  const inner = fakeInner();
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    reply: async (text, image, note) => {
+      inner.push('早就说出来的前半句');
+      return inner.agent.reply(text, image, note);
+    },
+  };
+  const agent = agentWith(wrapped, async () => sse(['[[', 'DELEGATE]]']));
+  const seen: string[] = [];
+  agent.attachLiveSink((text) => { seen.push(text); });
+
+  const reply = await agent.reply('你好呀');
   assert.equal(reply.speech, '慢车道答复。');
-  assert.equal(inner.calls.length, 1);
-  assert.ok(elapsed < 200, `看见 [[ 就该停，实际等了 ${elapsed} ms`);
+  assert.deepEqual(seen, ['早就说出来的前半句'], '缓冲的增量不能丢，也不能重复');
+});
+
+test('串行模式：命中闲聊时 dsh 一次都不调', async () => {
+  const inner = fakeInner();
+  const agent = agentWith(inner.agent, async () => sse(['我在呢。']), { speculate: false });
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '我在呢。');
+  assert.equal(inner.calls.length, 0, '关掉投机就不该白花 dsh 调用');
 });
 
 test('超时：交给 dsh，不能哑', async () => {
   const inner = fakeInner();
-  const { agent } = agentWith(
+  const agent = agentWith(
     inner.agent,
     (...args) => new Promise<Response>((_resolve, reject) => {
       const signal = (args[1] as RequestInit | undefined)?.signal;
@@ -142,35 +208,22 @@ test('超时：交给 dsh，不能哑', async () => {
 
 test('快模型 HTTP 出错：交给 dsh', async () => {
   const inner = fakeInner();
-  const { agent } = agentWith(inner.agent, async () => new Response('', { status: 500 }));
+  const agent = agentWith(inner.agent, async () => new Response('', { status: 500 }));
   const reply = await agent.reply('你好呀');
   assert.equal(reply.speech, '慢车道答复。');
-  assert.equal(inner.calls.length, 1);
-});
-
-test('任务类请求完全不问快模型', async () => {
-  const inner = fakeInner();
-  let asked = 0;
-  const { agent } = agentWith(inner.agent, async () => {
-    asked += 1;
-    return sse(['不该被问到。']);
-  });
-  await agent.reply('帮我查一下订单');
-  assert.equal(asked, 0, '本地判据就该挡住，不能多花一趟');
   assert.equal(inner.calls.length, 1);
 });
 
 test('攒满上限的闲聊轮次，下次委派时补进 dsh 的注记', async () => {
   const inner = fakeInner();
   let n = 0;
-  const { agent } = agentWith(
+  const agent = agentWith(
     inner.agent,
     async () => sse([`闲聊第${++n}句。`]),
-    { keepTurns: 2 },
+    { keepTurns: 2, speculate: false },
   );
   await agent.reply('你好呀');
   await agent.reply('谢谢你');
-  // 第 3 轮：攒满 2 轮，强制走 dsh 并带上缓冲
   await agent.reply('不用谢');
   assert.equal(inner.calls.length, 1);
   const note = inner.calls[0]?.note ?? '';

@@ -508,7 +508,9 @@ async function main(): Promise<void> {
         ...(process.env['FAST_LANE_BASE_URL'] === undefined
           ? {}
           : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
-        timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 700),
+        timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
+        // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
+        speculate: process.env['FAST_LANE_SPECULATE'] !== '0',
         maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
         log: (line) => { console.log(line); },
       });

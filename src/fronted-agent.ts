@@ -1,29 +1,41 @@
 /**
- * 快车道装饰器：**短句纯闲聊**直接答，其余原样交给内层 agent（dsh）。
+ * 快车道装饰器：**短句纯闲聊**直接答，其余交给内层 agent（dsh）。
  *
- * <h2>为什么是「先本地判、再调快模型」，不是「两条路同时发」</h2>
+ * <h2>三条路径</h2>
  *
- * 慢车道（dsh）的 token 是**直接流进 TTS** 的（`attachLiveSink`）。并行竞速只有
- * 两种写法，都不划算：
+ * ```text
+ *   isFastCandidate 为假 ──────────────▶ dsh（完全不启动快模型，0 ms 开销）
  *
- * - 把慢车道的增量先扣住，等快车道几百毫秒 —— 每一轮 dsh 都白加这段延迟，
- *   正好抵消收益；
- * - 不扣，让慢车道先出声 —— 那时快车道赢了也已经播出去了，撤不回来。
+ *   投机（默认开）：
+ *     快模型与 dsh **同时发**；
+ *     - 快模型先给出实质文本 → 用它的，dsh 的增量丢掉（请求照常跑完，见「已知代价」）
+ *     - 快模型说 [[DELEGATE]] / 超时 → 把 dsh 已到的增量补放出去，转用 dsh
  *
- * 所以只在**本地规则判定为闲聊候选**时先调快模型，其余轮次零开销直达 dsh。
+ *   串行（FAST_LANE_SPECULATE=0）：
+ *     先等快模型定下来，命中才答，否则再叫 dsh（委派轮白等一次判定）
+ * ```
  *
- * <h2>能赚多少（实测，别高估）</h2>
+ * **为什么投机能白赚**：dsh 的 TTFT 真机中位 690 ms，而快模型约 500 ms 就能判定
+ * 自己答不答得了 —— 判定通常早于 dsh 吐出第一个 token，所以把 dsh 的增量先扣在
+ * 缓冲里，正常轮次压根没有东西可扣。实测串行版的「委派代价」p50 是 570 ms，
+ * 投机把它压到 0（`bench/fast_lane` 可复现）。
  *
- * - 慢车道 TTFT 中位 `690 ms`（14 轮真机 568–1129 ms）
- * - 快模型（`deepseek-chat` → 实际路由到 flash）流式首字 `231–731 ms`
+ * <h2>流式传输</h2>
  *
- * 所以这里能赚的是**几百毫秒**，赚不到秒。工具轮那 6.5 秒不归这里管
- * —— 那条路要么把搜索下沉后台 Job，要么继续同步等。
+ * 快模型一旦吐出**确定不是暗号**的第一个字，就逐字推给 TTS 的流式通道，
+ * 不再等整句说完 —— 短答能省 150–200 ms。判定暗号只需要看开头两个字符：
+ * 情绪标签是单 `[`（`[开心]`），暗号是 `[[`，不会误伤。
  *
- * <h2>被拦下来的轮次怎么进 dsh 历史</h2>
+ * **一旦开闸就不能再退回 dsh**（已经播出去的声音收不回来），所以中途报错时
+ * 按「已播出的那部分」收下，而不是重播一遍。
  *
- * 快车道答的轮次没经过 dsh，会话历史里是空的。用满 {@link FastLaneOptions.keepTurns}
- * 轮就强制委派一次，借正常请求把这段缓冲无损刷进去（走 `note` 通道，不改用户原话）。
+ * <h2>已知代价（投机）</h2>
+ *
+ * 命中快车道的那一轮，dsh 也在后台把话答完了，但用户没听到：
+ * - 白花一次 dsh 调用（token 成本）
+ * - dsh 的会话历史里留着一条「用户没听过的回答」
+ *
+ * 换掉它的是委派轮不再白等判定。要退回串行：`FAST_LANE_SPECULATE=0`。
  */
 import { cleanForSpeech } from './agent.ts';
 import { parseEmotion } from './emotion.ts';
@@ -37,17 +49,24 @@ const DELEGATE = '[[DELEGATE]]';
  *
  * 刻意用**子串**匹配而不是分词：宁可误判成「需要 dsh」（多花 690 ms），
  * 也不要把「帮我查一下订单」当闲聊答了。
+ *
+ * 但**不收「什么」**：它会把「你叫什么名字」一起挡掉，而那句在系统提示词里
+ * 明确属于闲聊（`bench/fast_lane` 的用例集就是这么抓到的）。「几点 / 天气」
+ * 这类要事实的问题交给快模型自己判委派 —— 它在这一层比词表准。
  */
 const TASK_WORDS: readonly string[] = [
-  '查', '搜', '拍', '看', '打开', '帮我', '帮我看', '什么', '哪', '怎么', '多少', '为什么',
+  '查', '搜', '拍', '看', '打开', '帮我', '帮我看', '哪', '怎么', '多少', '为什么',
   '这个', '那个', '刚才', '记住', '记一下', '订单', '地址', '电话', '文件', '日志',
   '导航', '提醒', '设置', '翻译', '总结', '念', '读', '找',
 ];
 
 const SYSTEM_PROMPT = [
   '你是中文语音助手的「快车道」。用户戴着智能眼镜跟你闲聊。',
-  '只回答纯闲聊：招呼、寒暄、夸奖、撒娇、道别、问你是谁、情绪回应。',
-  '其余一律**只输出** [[DELEGATE]]（六个字，不要解释、不要加标点）：',
+  '回答这些，**不要委派**：',
+  '- 招呼、寒暄、夸奖、撒娇、道别、问你是谁/叫什么名字；',
+  '- **表达感受**：累、饿、冷、疼、难过、开心、烦躁 —— 只要他没要求你做事，',
+  '  就顺着他的话回应（例如「我好累啊」→「那歇会儿吧，我陪着你」）。',
+  '其余一律**只输出** [[DELEGATE]]（六个字符，不要解释、不要加标点）：',
   '- 要查资料、看东西、拍照、调工具、记住或回忆信息、改设置、导航、下单；',
   '- 涉及具体事实、数字、人名、时间、地点；',
   '- 你不确定的。',
@@ -60,12 +79,21 @@ export interface FastLaneOptions {
   readonly apiKey?: string;
   readonly model?: string;
   readonly baseUrl?: string;
-  /** 硬超时：超过就当委派（默认 700 ms） */
+  /**
+   * 首字超时。700 → 1200：`bench/fast_lane` 扫出来的 —— 首字 p90 是 598–723 ms，
+   * 700 ms 会掐掉正常答案（13 条闲聊里漏 1 条），1200 才 13/13。
+   * 放宽**不增加委派代价**：真委派是首字符 `[[` 早退，付的是 TTFT（实测 469–658 ms）；
+   * 这个超时只兜「模型一个字节都不出」的病态情况。
+   */
   readonly timeoutMs?: number;
+  /** 首字到了之后，整句最多再等这么久（默认 2800 ms） */
+  readonly totalMs?: number;
   /** 超过这么多字不当闲聊（默认 14） */
   readonly maxChars?: number;
   /** 最多攒几轮快车道对话就强制刷进 dsh（默认 4） */
   readonly keepTurns?: number;
+  /** 投机双轨：与 dsh 同时发（默认 true） */
+  readonly speculate?: boolean;
   /** 测试注入用 */
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
@@ -93,18 +121,31 @@ interface FastAnswer {
   readonly text: string;
   readonly firstTokenMs: number;
   readonly delegated: boolean;
+  /** 有没有已经推给 TTS（推过就不能再退回 dsh，否则重播） */
+  readonly opened: boolean;
 }
 
-/** 读 SSE 流，按需在发现 `[[` 时提前放弃。 */
+interface StreamHooks {
+  readonly onFirstToken: () => void;
+  readonly emit: (text: string) => void;
+}
+
+/** 读 SSE 流：判定暗号、按需早退、过了判定就逐字推给 TTS。 */
 async function readStream(
   body: ReadableStream<Uint8Array>,
   startedAt: number,
   now: () => number,
+  hooks: StreamHooks,
 ): Promise<FastAnswer> {
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
+  /** 开闸之前攒着的那点字（要看够两个字符才敢判断是不是暗号） */
+  let held = '';
+  let opened = false;
   let firstTokenMs = 0;
+
+  const finish = (delegated: boolean): FastAnswer => ({ text, firstTokenMs, delegated, opened });
 
   for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
     buffer += decoder.decode(chunk, { stream: true });
@@ -118,7 +159,7 @@ async function readStream(
       }
       const payload = line.slice('data:'.length).trim();
       if (payload === '[DONE]') {
-        return { text, firstTokenMs, delegated: text.trim().startsWith(DELEGATE) };
+        return finish(text.trim().startsWith(DELEGATE));
       }
       let parsed: { choices?: Array<{ delta?: { content?: string } }> };
       try {
@@ -132,17 +173,32 @@ async function readStream(
       }
       if (firstTokenMs === 0) {
         firstTokenMs = now() - startedAt;
+        hooks.onFirstToken();
       }
       text += piece;
-      // 暗号以 `[[` 开头，而情绪标签是单 `[`（`[开心]`），所以不会误伤。
-      // 早退省掉的是「等快模型把整句说完」，实测首字符 120–160 ms 就到。
-      if (text.trimStart().startsWith('[[')) {
-        return { text, firstTokenMs, delegated: true };
+      if (opened) {
+        hooks.emit(piece);
+        continue;
       }
+      held += piece;
+      const head = held.trimStart();
+      if (head.startsWith('[[')) {
+        return finish(true);
+      }
+      // 只有一个 `[` 时还看不出是不是暗号，再等一个字
+      if (head.startsWith('[') && head.length < 2) {
+        continue;
+      }
+      opened = true;
+      hooks.emit(held);
+      held = '';
     }
   }
-  return { text, firstTokenMs, delegated: text.trim().startsWith(DELEGATE) };
+  return finish(text.trim().startsWith(DELEGATE));
 }
+
+/** dsh 增量此刻该去哪：正常直通、进缓冲（等判定）、还是丢掉（快车道已胜出） */
+type InnerMode = 'pass' | 'buffer' | 'drop';
 
 export class FrontedAgent implements AgentProvider {
   private readonly inner: AgentProvider;
@@ -150,23 +206,29 @@ export class FrontedAgent implements AgentProvider {
   private readonly model: string;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly totalMs: number;
   private readonly maxChars: number;
   private readonly keepTurns: number;
+  private readonly speculate: boolean;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   /** 快车道答过、还没进 dsh 会话的轮次（"用户: …" / "你: …" 两行一组） */
   private readonly pending: string[] = [];
   private sink: ((text: string) => void) | null = null;
+  private innerMode: InnerMode = 'pass';
+  private readonly buffered: string[] = [];
 
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
     this.apiKey = options.apiKey ?? '';
     this.model = options.model ?? 'deepseek-chat';
     this.baseUrl = options.baseUrl ?? 'https://api.deepseek.com';
-    this.timeoutMs = options.timeoutMs ?? 700;
+    this.timeoutMs = options.timeoutMs ?? 1_200;
+    this.totalMs = options.totalMs ?? 2_800;
     this.maxChars = options.maxChars ?? 14;
     this.keepTurns = options.keepTurns ?? 4;
+    this.speculate = options.speculate ?? true;
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
@@ -181,12 +243,29 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
-   * 快车道的回答也要走这条通道 —— 否则流式那条路一个字都收不到，
-   * `turn-runner` 会先付一次「服务端拒空任务」再退回整段合成。
+   * 快车道的回答也走这条通道（不再等整句），dsh 的增量则按当前模式过闸。
+   *
+   * 闸门放在这里而不是 `reply()` 里：`attachLiveSink` 是**每轮**调一次，
+   * 而投机要挡的正是「dsh 早于快模型判定就开口」那一段。
    */
   attachLiveSink(sink: ((text: string) => void) | null): void {
     this.sink = sink;
-    this.inner.attachLiveSink?.(sink);
+    if (sink === null) {
+      this.innerMode = 'pass';
+      this.buffered.length = 0;
+      this.inner.attachLiveSink?.(null);
+      return;
+    }
+    this.inner.attachLiveSink?.((text) => {
+      if (this.innerMode === 'drop') {
+        return;
+      }
+      if (this.innerMode === 'buffer') {
+        this.buffered.push(text);
+        return;
+      }
+      sink(text);
+    });
   }
 
   setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
@@ -194,7 +273,10 @@ export class FrontedAgent implements AgentProvider {
   }
 
   async reply(userText: string, image?: AgentImage, note?: string): Promise<AgentReplyView> {
-    if (this.apiKey === '' || image !== undefined || !isFastCandidate(userText, this.maxChars)) {
+    const candidate = this.apiKey !== ''
+      && image === undefined
+      && isFastCandidate(userText, this.maxChars);
+    if (!candidate) {
       return await this.delegate(userText, image, note);
     }
     if (this.pending.length / 2 >= this.keepTurns) {
@@ -202,33 +284,78 @@ export class FrontedAgent implements AgentProvider {
       return await this.delegate(userText, image, note);
     }
 
-    let answer: FastAnswer;
     const startedAt = this.now();
-    try {
-      answer = await this.ask(userText, startedAt);
-    } catch (error) {
-      this.log(`  快车道    ✗ ${(error as Error).message} → 交给 dsh`);
-      return await this.delegate(userText, image, note);
-    }
-    if (answer.delegated) {
-      this.log(`  快车道    判为需要 dsh（${answer.firstTokenMs} ms 早退）`);
-      return await this.delegate(userText, image, note);
+    let dsh: Promise<AgentReplyView> | null = null;
+    if (this.speculate) {
+      // 先上闸再起跑：`inner.reply` 在第一个 await 之前是同步执行的，
+      // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
+      this.innerMode = 'buffer';
+      dsh = this.startInner(userText, image, note);
     }
 
-    const speech = cleanForSpeech(parseEmotion(answer.text).rest);
-    if (speech === '') {
-      return await this.delegate(userText, image, note);
+    let emitted = '';
+    let answer: FastAnswer;
+    try {
+      answer = await this.ask(userText, startedAt, (text) => {
+        emitted += text;
+        this.sink?.(text);
+      });
+    } catch (error) {
+      const why = (error as Error).message;
+      // 已经开闸 = 有字推给了 TTS，这时候再退回 dsh 会把同一句话播两遍
+      if (emitted !== '') {
+        this.log(`  快车道    ✗ ${why}（已播出一部分，按现有文本收下）`);
+        dsh?.catch(() => undefined);
+        return this.commit(userText, emitted, 0, dsh);
+      }
+      return await this.abandon(dsh, userText, image, note, `✗ ${why}`);
     }
-    const elapsed = this.now() - startedAt;
-    this.log(`  快车道    ${answer.firstTokenMs} ms 首字 / ${elapsed} ms 整句：${JSON.stringify(speech)}`);
+
+    if (answer.delegated) {
+      return await this.abandon(dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`);
+    }
+    if (cleanForSpeech(parseEmotion(answer.text).rest) === '') {
+      return await this.abandon(dsh, userText, image, note, '空答复');
+    }
+    return this.commit(userText, answer.text, answer.firstTokenMs, dsh);
+  }
+
+  /** 快车道胜出：dsh 的增量全部丢掉（请求照常跑完，别留下未处理的 rejection） */
+  private commit(
+    userText: string,
+    raw: string,
+    firstTokenMs: number,
+    dsh: Promise<AgentReplyView> | null,
+  ): AgentReplyView {
+    this.innerMode = 'drop';
+    this.buffered.length = 0;
+    dsh?.then(
+      (view) => { this.log(`  快车道    dsh 后台答完但没播：${JSON.stringify(view.speech.slice(0, 40))}`); },
+      () => undefined,
+    );
+    const { emotion, rest } = parseEmotion(raw);
+    const speech = cleanForSpeech(rest);
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
-    this.sink?.(answer.text);
-    return {
-      text: answer.text,
-      speech,
-      firstTokenMs: answer.firstTokenMs,
-      emotion: parseEmotion(answer.text).emotion,
-    };
+    this.log(`  快车道    ${firstTokenMs} ms 首字（流式） ：${JSON.stringify(speech)}`);
+    return { text: raw, speech, firstTokenMs, emotion };
+  }
+
+  /** 快车道让位：把 dsh 已经推进来的增量补放出去，然后等 dsh */
+  private async abandon(
+    dsh: Promise<AgentReplyView> | null,
+    userText: string,
+    image: AgentImage | undefined,
+    note: string | undefined,
+    why: string,
+  ): Promise<AgentReplyView> {
+    this.log(`  快车道    ${why} → 交给 dsh`);
+    const promise = dsh ?? this.startInner(userText, image, note);
+    this.innerMode = 'pass';
+    const held = this.buffered.splice(0);
+    for (const text of held) {
+      this.sink?.(text);
+    }
+    return await promise;
   }
 
   private async delegate(
@@ -236,8 +363,22 @@ export class FrontedAgent implements AgentProvider {
     image?: AgentImage,
     note?: string,
   ): Promise<AgentReplyView> {
+    this.innerMode = 'pass';
+    return await this.startInner(userText, image, note);
+  }
+
+  /**
+   * 调 dsh，顺便把攒着的快车道轮次经 `note` 补进上下文。
+   *
+   * 用 `note` 而不是改用户原话：那一栏本来就是「系统注记」，dsh 会把两者分开。
+   */
+  private startInner(
+    userText: string,
+    image: AgentImage | undefined,
+    note: string | undefined,
+  ): Promise<AgentReplyView> {
     if (this.pending.length === 0) {
-      return await this.inner.reply(userText, image, note);
+      return this.inner.reply(userText, image, note);
     }
     const sync = [
       '（下面几轮是刚才由快车道直接答给用户的，没有经过你的会话；当作已知上下文即可）',
@@ -245,14 +386,30 @@ export class FrontedAgent implements AgentProvider {
     ].join('\n');
     this.pending.length = 0;
     this.log('  快车道    把缓冲的闲聊轮次补进 dsh 上下文');
-    return await this.inner.reply(userText, image, note === undefined ? sync : `${note}\n\n${sync}`);
+    return this.inner.reply(userText, image, note === undefined ? sync : `${note}\n\n${sync}`);
   }
 
-  private async ask(userText: string, startedAt: number): Promise<FastAnswer> {
+  private async ask(
+    userText: string,
+    startedAt: number,
+    emit: (text: string) => void,
+  ): Promise<FastAnswer> {
     const doFetch = this.fetchImpl ?? fetch;
     const controller = new AbortController();
-    const timer = setTimeout(() => { controller.abort(); }, this.timeoutMs);
+    // **两段超时**：首字之前卡住 = 模型不干活，早点让给 dsh；
+    // 首字之后还在出字 = 正常，给足时间 —— 用一个固定总超时会把
+    // 「五百多毫秒才说完」的正常答案一起掐掉（实测 10 条闲聊里 6 条被掐）。
+    let timer: NodeJS.Timeout = setTimeout(() => {
+      controller.abort(new Error(`首字超时 ${this.timeoutMs} ms`));
+    }, this.timeoutMs);
     timer.unref?.();
+    const rearm = (): void => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        controller.abort(new Error(`整句超时 ${this.totalMs} ms`));
+      }, this.totalMs);
+      timer.unref?.();
+    };
     try {
       const response = await doFetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -275,7 +432,7 @@ export class FrontedAgent implements AgentProvider {
       if (!response.ok || response.body === null) {
         throw new Error(`HTTP ${response.status}`);
       }
-      return await readStream(response.body, startedAt, this.now);
+      return await readStream(response.body, startedAt, this.now, { onFirstToken: rearm, emit });
     } finally {
       clearTimeout(timer);
       controller.abort();
