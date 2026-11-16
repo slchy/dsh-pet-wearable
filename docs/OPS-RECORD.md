@@ -180,6 +180,32 @@ v2 新增：`Hello` / `Welcome` / `Call` / `Event` / `CaptureImage`。
 「先压缩再重试」）。所以 `agent.ts` 在 `dsh` 那行日志后面加了两个提示：`← 接近压缩阈值`
 和 `← 刚压缩过（上一轮 N）`。看到后者就别去查网络了。
 
+### 9.2 宿主层取消：`session/cancel` 是**补丁**给的，升级 dsh 会丢
+
+底座一直有取消能力 —— `agent.cancel({kind:'user'},{keepInbox:true})`，
+`dsh-api-session-controller` 里就这一句。问题是 SDK 运行时的 `handleRequest` 是硬编码
+switch，没把它放进来；最新的 `@deepseek-ai/dsh-sdk-jsonrpc-server@0.0.1-rc.5` 里
+`cancel` 出现 **0 次**，所以升级解决不了，只能补 6 行。
+
+| 项 | 事实 |
+|---|---|
+| 补丁位置 | `$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js` |
+| 怎么打 | `node scripts/patch-sdk-cancel.mjs`（幂等，锚点 `case "shutdown"`） |
+| 在不在 | `node scripts/patch-sdk-cancel.mjs --check`（0=在，3=不在） |
+| 生效条件 | **重启 miai-harness**：补丁在磁盘上，常驻子进程是旧的 |
+| 打丢了会怎样 | 退化成取消不了。客户端收 `-32603` 记一行日志，2000 ms 兜底唤醒在途轮次 |
+
+实测（`deepseek-flash`，`turn/end` 走 `{kind:'aborted',reason:{kind:'user'}}`）：
+
+| 项 | 值 |
+|---|---|
+| cancel → `status:idle` | **5–7 ms** |
+| 已生成的部分 | 落成 `assistant/message` 且带 `"interrupted": true` |
+| 取消后下一轮 | 670–901 ms，进程不死、不 resume、会话不丢 |
+
+**和 SIGINT 的区别**：SIGINT 是杀进程（exit 130），下一轮要重启 + resume，多花 ~2 s。
+只在「这轮肯定不要了、且一时不会再问」时才划算，默认不用。
+
 ## 10. TLS 证书
 
 | 项 | 事实 |
@@ -218,6 +244,8 @@ ls -d ~/miai-archive/*/ | wc -l; ls ~/miai-vectors
 awk -F: '{print $2}' ~/miai-cloud/tokens.txt
 # dsh 实际挂载的插件与压缩阈值（改了 profile 就重跑这条）
 dsh --profile sdk --dump-config | grep -A2 -E "compact|pruner|offload|spill-policy"
+# 宿主取消能力还在不在（dsh 升级后必查；丢了就跑 scripts/patch-sdk-cancel.mjs）
+node scripts/patch-sdk-cancel.mjs --check
 # 证书有效期与 SAN（到期了要续）
 set -a; . ~/miai-cloud/.env; set +a
 openssl x509 -in "$MIAI_TLS_CERT" -noout -dates -ext subjectAltName

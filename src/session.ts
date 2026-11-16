@@ -251,6 +251,8 @@ export class DshSession {
   /** turn 结束（agent 整体 idle）时触发 */
   private onIdle: (() => void) | null = null;
   private sdkReady = false;
+  /** 宿主运行时认不认 `session/cancel`（`null` = 还没探过） */
+  private cancelSupported: boolean | null = null;
   /**
    * 进程是不是在「一轮还没走完」时退出的。
    *
@@ -378,10 +380,18 @@ export class DshSession {
     if (this.proc === null || sessionId === null || waiter === null) {
       return;
     }
-    void this.rpc('session/cancel', { sessionId }).then(
-      () => { this.log(`  取消    已请求取消 ${sessionId} 的在途一轮`); },
-      (e: Error) => { this.log(`  取消    ✗ ${e.message}`); },
-    );
+    if (this.cancelSupported === false) {
+      // 补丁没打（比如 dsh 刚升级过）。不假装成功，也不硬 SIGINT 杀进程 —— 只等它自己说完
+      this.log('  取消    ✗ 宿主没有 session/cancel，这一轮取消不了');
+    } else {
+      void this.rpc('session/cancel', { sessionId }).then(
+        () => {
+          this.cancelSupported = true;
+          this.log(`  取消    已请求取消 ${sessionId} 的在途一轮`);
+        },
+        (e: Error) => { this.log(`  取消    ✗ ${e.message}`); },
+      );
+    }
     setTimeout(() => {
       if (this.onIdle === waiter) {
         this.onIdle = null;
@@ -575,6 +585,26 @@ export class DshSession {
     }, 120_000);
     this.sdkReady = true;
     this.log(`[sdk] 已就绪 provider=${this.provider} model=${this.model}`);
+    this.cancelSupported = await this.probeCancel();
+    this.log(this.cancelSupported
+      ? '  取消    session/cancel 可用（打断只作废下游输出，不动上游调用）'
+      : '  取消    ✗ 宿主运行时没有 session/cancel —— 跑一次 scripts/patch-sdk-cancel.mjs');
+  }
+
+  /**
+   * 探一下宿主运行时认不认 `session/cancel`。
+   *
+   * 认的话传一个不存在的 id 会回 `{accepted:false}`（我们的补丁特意不建会话）；
+   * 不认则回 `-32603 unknown ... runtime method`。补丁是打在全局 npm 包上的，
+   * 升级 dsh 会被覆盖，所以每次握手都探一次并打一行日志。
+   */
+  private async probeCancel(): Promise<boolean> {
+    try {
+      await this.rpc('session/cancel', { sessionId: '__probe__' }, 5_000);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
