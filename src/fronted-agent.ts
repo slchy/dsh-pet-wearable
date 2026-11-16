@@ -61,16 +61,23 @@ const TASK_WORDS: readonly string[] = [
 ];
 
 const SYSTEM_PROMPT = [
-  '你是中文语音助手的「快车道」。用户戴着智能眼镜跟你闲聊。',
+  // 人设：和 L2 是同一个角色，只是话更短。少一句人设，用户就会听出「换了个人」
+  '你是「米馍」，用户是「哥」—— 他戴着智能眼镜，你的话会变成语音在他耳边播放。',
+  '说话口语、简短、有人味；不用敬语，不卖萌过度，不解释你在做什么。',
+  '每句回复**最开头**写一个情绪标签，从这六个里选：[开心] [得意] [惊讶] [平静] [担心] [委屈]。',
+  '标签只给语音合成用，不会被念出来；正文里不要再出现方括号。',
+  '',
+  '下面是「快车道」的分流规则（这条链路只负责闲聊）：',
   '回答这些，**不要委派**：',
   '- 招呼、寒暄、夸奖、撒娇、道别、问你是谁/叫什么名字；',
   '- **表达感受**：累、饿、冷、疼、难过、开心、烦躁 —— 只要他没要求你做事，',
   '  就顺着他的话回应（例如「我好累啊」→「那歇会儿吧，我陪着你」）。',
-  '其余一律**只输出** [[DELEGATE]]（六个字符，不要解释、不要加标点）：',
+  '其余一律**只输出** [[DELEGATE]]（六个字符，不要解释、不要加标点、也不要写情绪标签）：',
   '- 要查资料、看东西、拍照、调工具、记住或回忆信息、改设置、导航、下单；',
   '- 涉及具体事实、数字、人名、时间、地点；',
   '- 你不确定的。',
-  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown，不要加语气标签。',
+  '**你没有工具**。需要工具才能答的，一律 [[DELEGATE]]，不要假装查过。',
+  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown。',
 ].join('\n');
 
 /**
@@ -113,6 +120,16 @@ export function isStatusQuestion(text: string): boolean {
 
 /** 快车道自己记住几轮（再多就该让 dsh 知道了，靠 `pending` 同步） */
 const RECENT_TURNS = 2;
+
+/**
+ * 对话窗口的预算（字符）。中文约 1 token/字，800 字 ≈ 800 token。
+ *
+ * 窗口按**整对**丢弃（用户+回答一起走），不然会出现「有回答没提问」的孤儿开头，
+ * 模型会把它当成自己上一句接着编。丢掉的轮次不是消失 —— 它们在 dsh 的会话里，
+ * 快车道不知道就该委派（提示词里写死了）。
+ */
+const WINDOW_CHARS = 800;
+const WINDOW_MESSAGES = 8;
 
 /**
  * 「这句值得长期记住」的本地判据 —— 只用来**提议**，不写。
@@ -311,8 +328,23 @@ async function readStream(
       if (head.startsWith('[[')) {
         return finish(true);
       }
-      // 只有一个 `[` 时还看不出是不是暗号，再等一个字
-      if (head.startsWith('[') && head.length < 2) {
+      // 模型偶尔会先写情绪标签再写暗号（`[平静][[DELEGATE]]`）—— 标签一出现闸门就开，
+      // 暗号会被当正文念出去。去掉开头的标签再看一眼。
+      const withoutTag = head.replace(/^\[[^[\]]{1,4}\]\s*/, '');
+      if (withoutTag !== head) {
+        if (withoutTag.startsWith('[[')) {
+          return finish(true);
+        }
+        if (withoutTag === '') {
+          continue; // 只有标签，还不知道后面是什么，再等一个字
+        }
+        opened = true;
+        hooks.emit(held);
+        held = '';
+        continue;
+      }
+      // 单个 `[` 还没闭合时看不出是标签还是暗号，再等几个字
+      if (head.startsWith('[') && !head.includes(']') && head.length < 6) {
         continue;
       }
       opened = true;
@@ -344,10 +376,24 @@ export class FrontedAgent implements AgentProvider {
   private readonly log: (line: string) => void;
   /** 快车道答过、还没进 dsh 会话的轮次（"用户: …" / "你: …" 两行一组） */
   private readonly pending: string[] = [];
-  /** 快车道自己答过的最近几轮（快模型默认只看得到当前一句，接不上「我叫什么」） */
-  private readonly said: Array<{ user: string; you: string }> = [];
-  /** 上一轮 dsh 说了什么、是不是在问话 */
-  private lastDsh: { speech: string; asked: boolean } | null = null;
+  /**
+   * 对话窗口：两条通道（快车道自己答的 + dsh 答的）都在这里，按时间顺序。
+   *
+   * 为什么自己攒而不是问 dsh：语音链路里多一次查询就是多一轮往返；而这些话
+   * 本来就流经这里，顺手记下来是零成本。窗口是按角色发的真 messages，
+   * 不是塞在系统提示词里的字符串 —— 这样前缀是「只往后长」的，缓存命中率高。
+   */
+  private readonly history: Array<{ who: 'user' | 'you' | 'dsh'; text: string }> = [];
+  /** 上一轮 dsh 说了什么、是不是在问话（从窗口里取，不另存） */
+  private get lastDsh(): { speech: string; asked: boolean } | null {
+    for (let i = this.history.length - 1; i >= 0; i -= 1) {
+      const turn = this.history[i];
+      if (turn !== undefined && turn.who === 'dsh') {
+        return { speech: turn.text, asked: awaitsReply(turn.text) };
+      }
+    }
+    return null;
+  }
   private sink: ((text: string) => void) | null = null;
   private innerMode: InnerMode = 'pass';
   private readonly buffered: string[] = [];
@@ -520,8 +566,28 @@ export class FrontedAgent implements AgentProvider {
    * 两处记忆都塞进系统消息，成本是每轮多几十个 token。
    */
   private remember(userText: string, said: string): void {
-    this.said.push({ user: userText.trim().slice(0, 40), you: said.slice(0, 40) });
-    if (this.said.length > RECENT_TURNS) this.said.shift();
+    this.push('user', userText);
+    this.push('you', said);
+    this.trim();
+  }
+
+  /** 把一轮记进窗口（dsh 答的也记，用户听得到的话 L1 就得知道） */
+  private push(who: 'user' | 'you' | 'dsh', text: string): void {
+    const clean = text.trim();
+    if (clean === '') {
+      return;
+    }
+    this.history.push({ who, text: clean });
+  }
+
+  /** 按**整对**裁窗口：宁可少记一轮，也不要留下没有提问的回答 */
+  private trim(): void {
+    const size = (): { chars: number } => ({
+      chars: this.history.reduce((n, t) => n + t.text.length, 0),
+    });
+    while (this.history.length >= 2 && (this.history.length > WINDOW_MESSAGES || size().chars > WINDOW_CHARS)) {
+      this.history.splice(0, 2);
+    }
   }
 
   /**
@@ -563,7 +629,7 @@ export class FrontedAgent implements AgentProvider {
       this.sink?.(text);
     }
     const answer = await promise;
-    this.rememberDsh(answer.speech);
+    this.rememberDsh(answer.speech, userText);
     return answer;
   }
 
@@ -574,13 +640,18 @@ export class FrontedAgent implements AgentProvider {
   ): Promise<AgentReplyView> {
     this.innerMode = 'pass';
     const answer = await this.startInner(userText, image, note);
-    this.rememberDsh(answer.speech);
+    this.rememberDsh(answer.speech, userText);
     return answer;
   }
 
   /** 记下 dsh 最后说的话（快模型下一轮要看：它在问什么、答案是什么） */
-  private rememberDsh(speech: string): void {
-    this.lastDsh = { speech: speech.slice(0, 60), asked: awaitsReply(speech) };
+  private rememberDsh(speech: string, userText: string): void {
+    // dsh 那一轮的用户话术也进窗口 —— 否则窗口里会出现「没有提问的回答」
+    if (this.history.at(-1)?.who !== 'user' || this.history.at(-1)?.text !== userText.trim()) {
+      this.push('user', userText);
+    }
+    this.push('dsh', speech);
+    this.trim();
   }
 
   /**
@@ -632,19 +703,10 @@ export class FrontedAgent implements AgentProvider {
     }
     if (memories.length > 0) {
       parts.push(`【长期记忆（由 dsh 维护，你只能读）】${memories.join('；')}`);
-    }
-
-    if (this.lastDsh !== null) {
-      parts.push(`【上一轮 dsh 说】${this.lastDsh.speech}`);
-    }
-    if (this.said.length > 0) {
-      parts.push(`【你自己最近说的】${this.said.map((t) => `用户「${t.user}」→ 你「${t.you}」`).join('；')}`);
-    }
-    if (this.lastDsh !== null || this.said.length > 0 || memories.length > 0) {
-      parts.push(memories.length > 0
-        // 记忆里已经有的，交给 dsh 就是白等一轮（它读的是同一份文件）
-        ? '【长期记忆】里已经写明的事（称呼、住处、偏好这类），直接用记忆照实回答，**不要委派**；记忆里没有的才 [[DELEGATE]]。'
-        : '只用上面这些已发生过的话回答；问到别的事就 [[DELEGATE]]。');
+      // 记忆里已经有的，交给 dsh 就是白等一轮（它读的是同一份文件）
+      parts.push('【长期记忆】里已经写明的事（称呼、住处、偏好这类），直接用记忆照实回答，**不要委派**；记忆里没有的才 [[DELEGATE]]。');
+    } else {
+      parts.push('只依据上面的对话和长期记忆回答；问到更早的事就 [[DELEGATE]]。');
     }
 
     let facts = '';
@@ -657,6 +719,18 @@ export class FrontedAgent implements AgentProvider {
       parts.push(TASK_RULE.trim(), facts);
     }
     return parts.join('\n');
+  }
+
+  /** 对话窗口 → OpenAI 格式的 messages（dsh 说的也算 assistant：用户听到的就是这个） */
+  private messages(userText: string): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
+    const out: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: this.systemPrompt(userText) },
+    ];
+    for (const turn of this.history) {
+      out.push({ role: turn.who === 'user' ? 'user' : 'assistant', content: turn.text });
+    }
+    out.push({ role: 'user', content: userText });
+    return out;
   }
 
   private async ask(
@@ -692,10 +766,7 @@ export class FrontedAgent implements AgentProvider {
           stream: true,
           temperature: 0.8,
           max_tokens: 64,
-          messages: [
-            { role: 'system', content: this.systemPrompt(userText) },
-            { role: 'user', content: userText },
-          ],
+          messages: this.messages(userText),
         }),
         signal: controller.signal,
       });

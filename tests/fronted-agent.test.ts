@@ -414,16 +414,55 @@ test('dsh 上一条不是问话：短回话照旧走快车道（别过度拦）'
   assert.equal(fastCalls, 1);
 });
 
-test('快车道自己记得上一轮，dsh 最后一句也进系统消息', async () => {
+test('暗号前面带了情绪标签也不许播出去', async () => {
   const inner = fakeInner();
-  const systems: string[] = [];
+  const emitted: string[] = [];
+  let fastCalls = 0;
+  const agent = agentWith(
+    inner.agent,
+    async () => { fastCalls += 1; return sse(['[平静]', '[[DELEGATE]]']); },
+    { speculate: false },
+  );
+  agent.attachLiveSink((t) => emitted.push(t));
+
+  const reply = await agent.reply('几点了');
+  assert.equal(fastCalls, 1, '「几点了」会进快车道，由模型自己判委派');
+  assert.equal(reply.speech, '慢车道答复。');
+  assert.deepEqual(emitted, [], '标签和暗号一个字都不能推给 TTS');
+});
+
+test('人设与情绪标签：和 dsh 是同一个角色，只是话更短', async () => {
+  const inner = fakeInner();
+  let system = '';
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}'));
+      system = (body.messages as Array<{ role: string; content: string }>)
+        .find((m) => m.role === 'system')?.content ?? '';
+      return sse(['[开心]在呢哥。']);
+    },
+    { speculate: false },
+  );
+  agent.attachLiveSink(() => {});
+
+  const reply = await agent.reply('你好呀');
+  assert.match(system, /米馍/, '人设要和 dsh 一致');
+  assert.match(system, /情绪标签/);
+  assert.match(system, /你没有工具/, '快车道不带 tools，必须明说');
+  assert.equal(reply.emotion, 'happy', '情绪标签要被解析出来，语音才有语调');
+  assert.equal(reply.speech, '在呢哥。');
+});
+
+test('对话窗口：自己答的和 dsh 答的都以 role 进 messages', async () => {
+  const inner = fakeInner();
+  const seen: Array<Array<{ role: string; content: string }>> = [];
   let round = 0;
   const agent = agentWith(
     inner.agent,
     async (_url, init) => {
       const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}'));
-      systems.push((body.messages as Array<{ role: string; content: string }>)
-        .find((m) => m.role === 'system')?.content ?? '');
+      seen.push(body.messages as Array<{ role: string; content: string }>);
       round += 1;
       return sse([round === 1 ? '那少穿点吧。' : '你说今天热。']);
     },
@@ -433,13 +472,50 @@ test('快车道自己记得上一轮，dsh 最后一句也进系统消息', asyn
 
   await agent.reply('今天真热。');
   await agent.reply('我说什么来着');
-  assert.match(systems[1] ?? '', /用户「今天真热。」/, '第二轮要能看到自己上一轮');
-  assert.match(systems[1] ?? '', /你「那少穿点吧。」/);
 
-  // 走一次 dsh，最后一句也要带上
+  // 第二轮的 messages：system → user(今天真热) → assistant(那少穿点吧) → user(当前)
+  const second = seen[1] ?? [];
+  assert.equal(second[0]?.role, 'system');
+  assert.deepEqual(
+    second.slice(1).map((m) => [m.role, m.content]),
+    [['user', '今天真热。'], ['assistant', '那少穿点吧。'], ['user', '我说什么来着']],
+  );
+
+  // 走一次 dsh，它说的话也要以 assistant 身份进窗口
   await agent.reply('帮我查一下订单');
   await agent.reply('你好呀');
-  assert.match(systems.at(-1) ?? '', /上一轮 dsh 说/);
+  const last = seen.at(-1) ?? [];
+  assert.ok(
+    last.some((m) => m.role === 'assistant' && m.content === '慢车道答复。'),
+    'dsh 说的话用户听到了，窗口里必须有',
+  );
+  assert.ok(last.some((m) => m.role === 'user' && m.content === '帮我查一下订单'));
+});
+
+test('窗口按整对裁剪：不留没有提问的回答', async () => {
+  const inner = fakeInner();
+  const seen: Array<Array<{ role: string; content: string }>> = [];
+  const long = '很长的一句回答'.repeat(25); // ~175 字
+  const agent = agentWith(
+    inner.agent,
+    async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}'));
+      seen.push(body.messages as Array<{ role: string; content: string }>);
+      return sse([long]);
+    },
+    { speculate: false },
+  );
+  agent.attachLiveSink(() => {});
+
+  // 用户话术都很短（本来就该走快车道），靠长回答把 800 字预算撑爆
+  for (let i = 0; i < 6; i += 1) {
+    await agent.reply(`${'好'.repeat(3 + i)}呀`);
+  }
+  const last = seen.at(-1) ?? [];
+  assert.ok(last.length <= 1 + 8 + 1, `窗口最多 8 条，实际 ${last.length}`);
+  assert.equal(last[0]?.role, 'system');
+  assert.equal(last[1]?.role, 'user', '裁完第一句仍然必须是用户提问，不能是孤儿回答');
+  assert.equal(last.at(-1)?.role, 'user');
 });
 
 test('回话判据：短确认算回答，长句/新话题不算', () => {
