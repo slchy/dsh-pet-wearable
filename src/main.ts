@@ -326,15 +326,22 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
  * 第二个才是真正的命令。Smart Turn 对「小爱同学。」给 0.957（它确实是完整的一句话），
  * 所以模型治不了这个，只能靠这条领域规则。
  */
-/** 服务端断句静音阈值。阿里云默认 800 ms；早先压到 500，比默认还激进。 */
 /**
  * 服务端判句所需静音（`max_sentence_silence`）。
  *
- * 800 → 400：这一段是**纯等待**，用户说完要干等 800 ms 才拿到 SentenceEnd。
- * 敢砍是因为下游有 `UtteranceAssembler` 兜底——它本来就把「多句合成一轮」，
- * 断得碎一点只是多几次 `句 N`，不会变成多轮。
+ * 800 → 400 → 200：这一段是**纯等待**，用户说完要干等这么久才拿到 `SentenceEnd`。
+ * 同机实测 400 与 200 差 294 ms（① 中位 640 → 346），比流式 TTS 的收益还大。
+ *
+ * 敢砍到 200 是因为下游补了一层：`max_sentence_silence` 计的是**收到的音频里的静音**，
+ * 说话人在数字组之间的换气（实测 200–400 ms）会被当成句尾，实测把
+ * 「#W8665881」切成两句。`UtteranceAssembler.unfinishedWaitMs` 专门兜这一类
+ * —— 结尾是数字/井号/连词时再等一拍，让后半句并进来。
+ *
+ * 另有一条硬约束：上行能量门的 `holdMs`（默认 2000）必须远大于这个值，否则
+ * 客户端停推之后服务端再也攒不到静音，句尾永远不来 —— 见
+ * `docs/ALIYUN-ASR-PROBED.md` §5.1。
  */
-const DEFAULT_SENTENCE_SILENCE_MS = 400;
+const DEFAULT_SENTENCE_SILENCE_MS = 200;
 
 /**
  * Smart Turn 判为「没说完」时再多等多久。
@@ -668,6 +675,10 @@ async function main(): Promise<void> {
           // 用户说半句停下来想一下就会被强制收下。7×400 ≈ 2.8 s，对齐业界。
           maxExtensions: envNumber('SMART_TURN_MAX_EXT', 7),
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
+          // 结尾像「还有下文」（数字串/井号/连词）时再多等一拍。见
+          // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，
+          // 数字组之间的换气会被当句尾，订单号被切成两句。
+          unfinishedWaitMs: envNumber('SMART_TURN_UNFINISHED_MS', 250),
         }
         : undefined,
       ...(smartTurnClient === null ? {} : { smartTurnClient }),

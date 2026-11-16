@@ -68,6 +68,19 @@ export interface UtteranceAssemblerOptions {
    * 见 {@link UtteranceAssembler} 里 `shouldWaitForMore` 的说明。
    */
   readonly shortFragmentChars?: number;
+  /**
+   * 结尾「像没说完」时再多等一拍多久。默认 0（关闭）。
+   *
+   * 动机：`max_sentence_silence` 从 400 压到 200 之后，说话人**数字组之间的换气**
+   * 也会被当成句尾 —— 实测「#W8665881」被切成「订单号是井号W866。」+「5881。」，
+   * 后半截单独成轮，模型只好瞎猜。句子本身没变短，只是断在了数字中间。
+   *
+   * 所以判据不是「短」，而是「结尾必须还有下文」：数字、井号、序数词、连词、
+   * 单个字母。见 {@link looksUnfinished}。
+   *
+   * 只影响这一类结尾的句子，**每句最多多等一次** —— 不许无限拖。
+   */
+  readonly unfinishedWaitMs?: number;
   /** 上一轮收下之后多久内出现的短碎片算「同一句话被切开」。默认 1200 ms */
   readonly shortFragmentWindowMs?: number;
   /**
@@ -98,6 +111,35 @@ export interface UtteranceAssemblerOptions {
 /** 判定一次的结果，便于日志与测试断言 */
 export type EndpointDecision = 'accept' | 'extend' | 'predictor-unavailable';
 
+/**
+ * 结尾「必须还有下文」的记号。纯机械，不做语义推断
+ * （和 `backchannel.ts`、`shouldWaitForMore` 同一条原则）。
+ *
+ * 只收「单独出现在句尾就不成立」的记号：
+ * - 数字 / 中文数字：`#W866`、`第`
+ * - 字母：`井号W`（订单号、型号被拦腰截断）
+ * - 连词与引子：`和` `就是` `因为` `的话`…
+ *
+ * **宁漏不误**：误判的代价是这一轮白等 {@link UtteranceAssemblerOptions.unfinishedWaitMs}，
+ * 漏判只是维持现状。
+ */
+const UNFINISHED_TAIL =
+  /(?:[0-9０-９]|[零一二三四五六七八九十百千万亿两]|[A-Za-z#＃]|井号|第|和|跟|与|及|还有|就是|因为|所以|但是|然后|如果|的话|或者|还是)$/u;
+
+/** 尾部标点 —— ASR 每个 `SentenceEnd` 都会补一个，作为句界记号而不是内容 */
+const TRAILING_PUNCT = /[\s。．.，,、!！?？~～…\-—:：;；"'“”‘’]+$/u;
+
+/** 丢掉尾部标点，只看最后那个字 */
+function stripTail(text: string): string {
+  return text.replace(TRAILING_PUNCT, '');
+}
+
+/** 结尾看起来「还有下文」吗 —— 见 {@link UNFINISHED_TAIL} */
+export function looksUnfinished(text: string): boolean {
+  const core = stripTail(text);
+  return core.length > 0 && UNFINISHED_TAIL.test(core);
+}
+
 export class UtteranceAssembler {
   private readonly options: UtteranceAssemblerOptions;
   private readonly now: () => number;
@@ -127,6 +169,8 @@ export class UtteranceAssembler {
   /** `predictAtMs` 的定时器 */
   private predictTimer: NodeJS.Timeout | null = null;
   private extensions = 0;
+  /** 这一句是否已经为「结尾像没说完」等过一拍（只等一次） */
+  private unfinishedWaited = false;
   /** 上一次真正收下一轮的时刻，用来判断「短碎片是不是紧跟其后」 */
   private lastUtteranceAt = Number.NEGATIVE_INFINITY;
   /** 最近一次 ASR 中间结果的时刻：用户还在出字的直接证据 */
@@ -168,11 +212,20 @@ export class UtteranceAssembler {
     if (this.disposed) {
       return;
     }
-    this.pendingText = this.pendingText ? this.pendingText + text : text;
+    // 上一截是「数字/井号结尾」时，那个句号是误判出来的句尾 —— 拼进去会把
+    // 订单号拦腰切开（「W866。5881」），模型读起来就是两个 token。
+    const joinedFromUnfinished = this.unfinishedWaited;
+    if (joinedFromUnfinished) {
+      const head = stripTail(this.pendingText);
+      this.pendingText = head ? head + text : text;
+    } else {
+      this.pendingText = this.pendingText ? this.pendingText + text : text;
+    }
     this.cancelTimer();
     // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿
     this.seq += 1;
     this.prediction = null;
+    this.unfinishedWaited = false;
     const seq = this.seq;
     const delay = this.options.predict
       ? this.options.quietMs
@@ -247,6 +300,7 @@ export class UtteranceAssembler {
     this.seq += 1;
     this.prediction = null;
     this.extensions = 0;
+    this.unfinishedWaited = false;
     const text = this.pendingText.trim();
     this.pendingText = '';
     if (!text) {
@@ -265,6 +319,7 @@ export class UtteranceAssembler {
     this.pendingText = '';
     this.recentChunks.length = 0;
     this.recentBytes = 0;
+    this.unfinishedWaited = false;
   }
 
   /** 判定当前这一轮是否定稿。 */
@@ -323,6 +378,24 @@ export class UtteranceAssembler {
           `  判停    ${shown} → 太短且紧跟前一轮，再等 ${wait} ms`,
         );
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
+        return;
+      }
+
+      // 结尾像「还有下文」（数字串、井号、连词…）：再等一拍，让后半句并进来。
+      // 每句只等一次 —— 等过之后仍然没下文，就认这是句尾。
+      const unfinishedWait = this.options.unfinishedWaitMs ?? 0;
+      if (
+        unfinishedWait > 0
+        && !this.unfinishedWaited
+        && this.extensions < this.options.maxExtensions
+        && looksUnfinished(this.pendingText)
+      ) {
+        this.unfinishedWaited = true;
+        this.extensions += 1;
+        this.options.log(
+          `  判停    ${shown} → 结尾像没说完（…${JSON.stringify(this.pendingText.slice(-8))}），再等 ${unfinishedWait} ms`,
+        );
+        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, unfinishedWait);
         return;
       }
       this.options.log(`  判停    ${shown} → 收下这一轮`);

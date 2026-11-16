@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 
-import { UtteranceAssembler, type UtteranceAssemblerOptions } from '../src/utterance-assembler.ts';
+import { UtteranceAssembler, looksUnfinished, type UtteranceAssemblerOptions } from '../src/utterance-assembler.ts';
 
 interface Harness {
   assembler: UtteranceAssembler;
@@ -221,6 +221,59 @@ test('连接收尾时，在飞的判停结果不会把话再说一遍', async ()
 
   await delay(150);
   assert.equal(utterances.length, 0, 'dispose 之后迟到的判停结果必须丢掉');
+});
+
+// ------------------------------------------------- 结尾像没说完（order id 被切碎）
+//
+// `max_sentence_silence` 压到 200 ms 之后，说话人**数字组之间的换气**也会被当成
+// 句尾。真机/bench 实测：「订单号是井号W8665881」被切成
+// 「订单号是井号W866。」+「5881。」，后半截单独成轮，模型对着「5881」瞎猜。
+//
+// 修法和短碎片那条一样机械：结尾是数字/井号/连词就再等一拍。
+
+test('looksUnfinished 只认「后面必须还有东西」的结尾', () => {
+  for (const text of ['订单号是井号W866。', '第', '井号W.', '我和', '因为', '号码是123']) {
+    assert.equal(looksUnfinished(text), true, `应当认为没说完：${text}`);
+  }
+  for (const text of ['就改成641室。', '好的。', '不对吗？', '没有了，谢谢。', '']) {
+    assert.equal(looksUnfinished(text), false, `不该再多等：${text}`);
+  }
+});
+
+test('结尾是数字时再等一拍，后半句并进来', async () => {
+  const { assembler, utterances } = makeAssembler({ unfinishedWaitMs: 60, extendMs: 200 });
+
+  assembler.addSentence('订单号是井号W866。');
+  await delay(20);
+  assert.equal(utterances.length, 0, '结尾是数字，不能当口就成轮');
+
+  // 用户喘了口气继续说 —— 上一句还没定稿，应当并成一轮
+  assembler.addSentence('5881。');
+  await delay(150);
+
+  assert.equal(utterances.length, 1);
+  assert.equal(utterances[0]?.text, '订单号是井号W8665881。', '订单号不能被切成两轮');
+});
+
+test('结尾像没说完也只多等一次，没下文就照常收下', async () => {
+  const { assembler, utterances } = makeAssembler({ unfinishedWaitMs: 40, extendMs: 40, maxExtensions: 7 });
+
+  const t0 = Date.now();
+  assembler.addSentence('订单号是井号W866。');
+  await delay(200);
+
+  assert.equal(utterances.length, 1, '等过一拍必须收下，不能无限拖');
+  const waited = (utterances[0]?.at ?? 0) - t0;
+  assert.ok(waited < 150, `只该多等一拍 40 ms，实际等了 ${waited} ms`);
+});
+
+test('结尾不像没说完的句子不受影响', async () => {
+  const { assembler, utterances } = makeAssembler({ unfinishedWaitMs: 200 });
+
+  assembler.addSentence('就改成641室。');
+  await delay(15);
+
+  assert.equal(utterances.length, 1, '正常句尾不该为这条判据多等');
 });
 
 test('判停器抛错按「不可用」处理，照常收下这一轮', async () => {
