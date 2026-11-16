@@ -32,6 +32,18 @@ export type LiveEvent =
 /** 门槛：默认 20 个 token 之内不流式。 */
 export const LIVE_TOKEN_THRESHOLD = 20;
 
+/**
+ * 句末标点 —— 到这儿就已经是一个完整的合成单元。
+ *
+ * 门槛是为了「短答不值得分段」，但它会把**垫话**一起扣住：真机实测
+ * 「好，我搜一下。」只有 9 个 token，模型说完这句就去调工具，下一个 token
+ * 要 5 秒后才到 —— 这一句被扣到工具返回才出声（`TTS首块 6.36 s`），
+ * 用户听到的是 6 秒沉默，而不是那句垫话。
+ *
+ * 句子已经完整就没有理由再等字数：放出去的仍然是**整句**，不是碎片。
+ */
+const SENTENCE_END = /[。！？!?…；;]\s*$/u;
+
 export class LiveGate {
   private readonly threshold: number;
   private tokens = 0;
@@ -52,15 +64,24 @@ export class LiveGate {
     if (this.released) {
       return [{ type: 'delta', text: token }];
     }
+    const merged = this.buffered + token;
+    // 一句说完了：立刻放，不等门槛（见 SENTENCE_END）
+    if (SENTENCE_END.test(merged)) {
+      this.released = true;
+      this.buffered = '';
+      return [{ type: 'start', text: merged }];
+    }
     if (this.tokens <= this.threshold) {
-      this.buffered += token;
+      this.buffered = merged;
       return [];
     }
     // 第 threshold+1 个 token：先释放缓冲里的前 N 个，这一个走直通
     this.released = true;
-    const text = this.buffered;
     this.buffered = '';
-    return [{ type: 'start', text }, { type: 'delta', text: token }];
+    return [
+      { type: 'start', text: merged.slice(0, merged.length - token.length) },
+      { type: 'delta', text: token },
+    ];
   }
 
   /** 流结束。没到阈值就整段交出去（调用方按"非流式"处理）。 */

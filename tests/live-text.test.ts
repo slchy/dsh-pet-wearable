@@ -53,15 +53,30 @@ test('释放之后逐 token 直通', () => {
   assert.deepEqual(feed(gate, ['你', '好']), ['delta:你', 'delta:好']);
 });
 
+test('一整句就说完：立刻释放，不等门槛', () => {
+  const gate = new LiveGate(20);
+  // 真机「好，我搜一下。」= 9 个 token，之后模型就去调工具了
+  const out = feed(gate, ['好', '，', '我', '搜', '一', '下', '。']);
+  assert.deepEqual(out, ['start:好，我搜一下。'], '句子完整就该出声，不该扣到 20 个 token');
+  assert.equal(gate.streaming, true);
+});
+
+test('句末标点之后继续出字：接续走直通', () => {
+  const gate = new LiveGate(20);
+  const out = feed(gate, ['好', '的', '。', '那', '我', '去']);
+  assert.deepEqual(out, ['start:好的。', 'delta:那', 'delta:我', 'delta:去']);
+});
+
 test('没到阈值就结束：整段一次交出，不算流式', () => {
   const gate = new LiveGate(20);
-  feed(gate, ['你', '好', '。']);
+  // 故意不带句末标点 —— 带了就会走「整句立刻释放」那条
+  feed(gate, ['你', '好']);
   const out = gate.finish();
   assert.deepEqual(out.map((e) => e.type), ['start', 'end']);
-  assert.equal(out[0]?.type === 'start' ? out[0].text : '', '你好。');
+  assert.equal(out[0]?.type === 'start' ? out[0].text : '', '你好');
   const end = out[1];
   assert.equal(end?.type === 'end' ? end.streaming : null, false, '这条仍然是"非流式"');
-  assert.equal(end?.type === 'end' ? end.tokens : null, 3);
+  assert.equal(end?.type === 'end' ? end.tokens : null, 2);
   assert.equal(gate.streaming, false, '调用方不该走分段播报');
 });
 
