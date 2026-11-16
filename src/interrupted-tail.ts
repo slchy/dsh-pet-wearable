@@ -90,3 +90,18 @@ export function interruptionNote(remaining: string): string {
     + '所以：如果他问你"说完了吗""好了吗"，如实说没说完，然后把这段接着讲掉；'
     + '如果他要你继续说，就接着说；如果他换了话题，就正常回答新话题，别主动翻旧账。';
 }
+
+/**
+ * 后台汇报被打断时的注记。
+ *
+ * 和 {@link interruptionNote} 是两回事：那段话**不是模型自己说的**，是它派出去
+ * 的活结算回来的结论。所以不能写成「你被打断了」，而要写清「你只念了一半、
+ * 哥没听到」，并把「要不要补」交给它判断 —— 它知道哥刚才问的是什么，
+ * 系统不知道。系统硬补播会在哥已经聊到别处时插一句无关的旧结论。
+ */
+export function announceInterruptionNote(remaining: string): string {
+  const rest = [...remaining].slice(0, MAX_NOTE_CHARS).join('');
+  return `刚才那条后台汇报你只念了一半就被哥打断，**剩下这段他真的没听到**：「${rest}」。`
+    + '要不要接着补你自己判断：他问「刚才说什么」「结果呢」就接着说；'
+    + '他已经在问别的事，就别翻旧账；你觉得这结论重要、一句话能说完，就直接补上。';
+}

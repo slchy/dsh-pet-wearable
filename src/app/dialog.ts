@@ -27,7 +27,7 @@ import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { TurnTicket } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
-import { interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
+import { announceInterruptionNote, interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
 import type { AgentProvider, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
 import type { ImageAttachment } from '../session.ts';
@@ -45,9 +45,6 @@ const TAIL_TTL_MS = 120_000;
  * 换气的地方插进来 —— 实测最难受的不是慢两秒，是「它抢在我说完之前开口」。
  */
 const ANNOUNCE_QUIET_MS = 800;
-
-/** 同一条旁白最多补播几次。一直被打断说明他确实不想听，再塞就是骚扰。 */
-const MAX_ANNOUNCE_RESUMES = 2;
 
 /** 播报时怎么开麦。设备没有 `listen.start` 就不给这个。 */
 export interface AnnounceMic {
@@ -149,8 +146,6 @@ export class DialogRuntime {
   private lastUserSpeechAt = Number.NEGATIVE_INFINITY;
   /** 因为用户还在说话而推迟的那次播报检查。同一时刻只排一个。 */
   private announceRetry: Cancel | null = null;
-  /** 这一批播报已经补播过几次（见 {@link MAX_ANNOUNCE_RESUMES}）。 */
-  private announceResumes = 0;
   /**
    * 上一轮被打断、**没念出口**的那一段（一次性）。
    *
@@ -158,6 +153,13 @@ export class DialogRuntime {
    * 顺序反过来（用户没再问）就丢掉 —— 隔了几句话还翻旧账更烦人。
    */
   private tail: { readonly text: string; readonly at: number } | null = null;
+  /**
+   * 被打断的**后台汇报**剩下的那半句。
+   *
+   * 和 {@link tail} 分开存：一条是「自回答被打断」，一条是「我派出去的活只念了
+   * 一半」，给模型的措辞完全不同（后者要它自己判断该不该补）。两条可能同时存在。
+   */
+  private announceTail: { readonly text: string; readonly at: number } | null = null;
 
   constructor(options: DialogOptions) {
     this.options = options;
@@ -225,11 +227,11 @@ export class DialogRuntime {
   }
 
   /**
-   * 掐断正在念的旁白，并把它**没念完的部分**挂回队首。
+   * 掐断正在念的旁白，把**没念完的部分**记下来交给下一轮的模型。
    *
-   * 「不慎打断」是常态：用户在播报里插一句「嗯？」「等下」，那半条信息就没了 ——
-   * 而后台汇报只播一次。所以掐断之后先问 runner 要剩余文本，等下一轮结束再补播；
-   * 同一条最多续两次，一直打断说明他确实不想听。
+   * 不自动补播：系统不知道哥刚才问的是什么，硬补会在人家已经聊到别处时插一句
+   * 无关的旧结论。模型手里有上下文，让它判断该不该接着说（见
+   * `announceInterruptionNote`）—— 这和「一轮回答被打断」是同一套处理。
    */
   private interruptCanned(): void {
     this.runner.cancelCanned();
@@ -237,13 +239,8 @@ export class DialogRuntime {
     if (residue === null) {
       return;
     }
-    if (this.announceResumes >= MAX_ANNOUNCE_RESUMES) {
-      this.options.log('  播报    被打断太多次，剩下的不再补');
-      return;
-    }
-    this.announceResumes += 1;
-    this.announceQueue.unshift({ speech: residue.text, ...(residue.emotion === undefined ? {} : { emotion: residue.emotion }) });
-    this.options.log(`  播报    被打断，剩 ${[...residue.text].length} 字，下一轮结束再补`);
+    this.announceTail = { text: residue.text, at: this.options.clock.now() };
+    this.options.log(`  播报    被打断，剩 ${[...residue.text].length} 字没念完 → 交给下一轮`);
   }
 
   /**
@@ -333,14 +330,26 @@ export class DialogRuntime {
     return this.serialChain;
   }
 
-  /** 取走「上一轮被打断的那段」并拼成给模型的注记（一次性）。 */
+  /** 取走「被打断的那两段」并拼成给模型的注记（一次性）。 */
   private takeTailNote(): string | undefined {
-    const tail = this.tail;
+    const notes: string[] = [];
+    const now = this.options.clock.now();
+
+    const replyTail = this.tail;
     this.tail = null;
-    if (tail === null) return undefined;
-    if (this.options.clock.now() - tail.at > TAIL_TTL_MS) return undefined;
-    this.options.log(`  续话    上一轮被打断，剩 ${[...tail.text].length} 字没说完 → 交给这一轮`);
-    return interruptionNote(tail.text);
+    if (replyTail !== null && now - replyTail.at <= TAIL_TTL_MS) {
+      this.options.log(`  续话    上一轮被打断，剩 ${[...replyTail.text].length} 字没说完 → 交给这一轮`);
+      notes.push(interruptionNote(replyTail.text));
+    }
+
+    const announceTail = this.announceTail;
+    this.announceTail = null;
+    if (announceTail !== null && now - announceTail.at <= TAIL_TTL_MS) {
+      this.options.log(`  续话    后台汇报只念了一半，剩 ${[...announceTail.text].length} 字 → 交给这一轮判断`);
+      notes.push(announceInterruptionNote(announceTail.text));
+    }
+
+    return notes.length === 0 ? undefined : notes.join('\n');
   }
 
   /** 记下这一轮被打断后**没念出口**的部分。 */
@@ -400,8 +409,9 @@ export class DialogRuntime {
   clearAnnounce(): void {
     this.announceQueue.length = 0;
     this.runner.cancelCanned();
-    // 双击是明确的「别念了」，剩余部分直接作废 —— 不然它会被当成"不慎打断"补播回来
+    // 双击是明确的「别念了」：残句连"要不要补"都不该再问，直接作废
     this.runner.takeCannedResidue();
+    this.announceTail = null;
   }
 
   async flushAnnounce(): Promise<void> {
@@ -459,14 +469,10 @@ export class DialogRuntime {
         // 整批播完关麦（与 `pet/sim/world.ts` 同一个函数）
         closeAnnounceMic({ listenStart: mic.listenStart, call: mic.call });
       }
-      // 整批顺利播完（队列空了、用户也没在说话）：补播预算归零
-      if (this.announceQueue.length === 0
-        && this.options.clock.now() - this.lastUserSpeechAt >= ANNOUNCE_QUIET_MS) {
-        this.announceResumes = 0;
-      } else if (this.announceQueue.length > 0) {
-        // 队列里还有货（被打断留下的残句、或者播报期间又来了新的）：
-        // 这里必须自己再排一次检查 —— `interruptCanned` 只会把残句塞回队列，
-        // 它没法在 `announcing` 还没落下来的时候叫醒任何人。
+      // 整批播完（队列空了、用户也没在说话）就没什么要处理的；
+      // 队列里还有货说明播报期间又来了新的 —— 得自己再排一次检查，
+      // 否则那一条会一直躺着等下一轮。
+      if (this.announceQueue.length > 0) {
         this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS);
       }
       // `spoken: true`：播报出声算"最近出过声"，由 minGap 推迟下一次搭话（ADR-0001 §6）

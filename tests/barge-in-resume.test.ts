@@ -1,23 +1,17 @@
 /**
- * 打断与续播：**不慎打断不能把信息弄丢**。
+ * 打断与善后：**不慎打断不能把信息弄丢，也不能硬塞回去**。
  *
  * 三件事各自都会静默出错，而且都只在真机上才感觉得出来：
  *
  *  1. 「嗯」一声就把正在播的后台汇报掐掉 —— 那条信息只播一次，丢了就没了；
- *  2. 真被打断之后，没念完的半句直接消失 —— 用户只听到一半，还以为听完了；
- *  3. 双击「别念了」之后又来补播 —— 用户明确不要听，系统却自己接着说。
+ *  2. 真被打断之后，没念完的那半句直接消失 —— 用户只听到一半还以为听完了；
+ *  3. 系统自作主张把剩下的补播一遍 —— 用户可能已经在问别的事，那一句就是插嘴。
+ *
+ * 所以定下来的规矩是：**掐断时留底，补不补由下一轮的模型判断**（它知道哥刚才
+ * 问的是什么，系统不知道）。这里钉的就是这条：留底进注记、不自动重播、
+ * 双击之后连注记都不留。
  *
  * 全部跑在虚拟时间上（`DialogSim` 用的是生产那一份 `DialogRuntime`）。
- *
- * <h2>为什么用「字节数反而变多」来判断</h2>
- *
- * 模拟器的 TTS 是一次性把整段吐出来的（真机是流式，但**吐得比播得快**），
- * 所以「播到哪儿了」只能按首块到现在的时间算。于是：
- *
- * - 没被打断 → 只合成一遍，字节数 = 基准；
- * - 被打断后补播 → 剩下的那半句**重新合成**一遍，字节数会**超过**基准。
- *
- * 反过来，补播要是没发生，字节数就停在基准 —— 那正是「信息丢了」的样子。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -68,32 +62,43 @@ test('「嗯」一声不算打断：不重新合成，也不留残句', async ()
   }
 });
 
-test('真打断之后，没念完的部分会补播', async () => {
+test('真打断之后：不自动重播，但把没念完的部分交给下一轮的模型', async () => {
   const full = await baselineBytes();
 
   const sim = makeSim();
   try {
     sim.announce(REPORT);
-    await sim.until(500);
-    // `partial` 只表示「用户开口了」，不开新的一轮 —— 单独测续播这条路径
+    // 念到 2 秒左右再打断：这时前几句他已经听到了，剩下的才算「没听到的部分」。
+    // （更早打断的话剩下的是整段 —— 模拟器的 TTS 是一次性吐完的，但真机是流式，
+    //   `cancelCanned` 取「已下发」和「已过时间」的较小值，所以进度按时间走。）
+    await sim.until(2_000);
     await sim.partial('等一下');
 
-    // 静默窗口内先别急着补（不然像是在跟用户抢话）
-    const atInterrupt = sim.downlink.bytes;
-    await sim.until(700);
-    assert.equal(sim.downlink.bytes, atInterrupt, '打断之后应当先安静一会儿');
-
     await sim.until(9_000);
+    assert.equal(
+      sim.downlink.bytes,
+      full,
+      '系统不该自己补播 —— 哥可能已经在问别的事',
+    );
+
+    // 下一轮：模型应当拿到「刚才那半句他没听到」这条注记
+    await sim.utterance('刚才说什么');
+    const note = sim.asked.at(-1)?.note ?? '';
+    assert.ok(note.includes('没听到'), `注记里要写清他没听到，实际「${note}」`);
     assert.ok(
-      sim.downlink.bytes > full,
-      `补播没有发生（${sim.downlink.bytes} 字节，基准 ${full}）—— 后半句丢了`,
+      note.includes('八百三十三'),
+      `注记里要带上没念完的那半句，实际「${note}」`,
+    );
+    assert.ok(
+      !note.includes('任务跑完了'),
+      `已经念过的开头不该再发一遍（模型会从头重念），实际「${note}」`,
     );
   } finally {
     sim.dispose();
   }
 });
 
-test('双击「别念了」之后不再补播', async () => {
+test('双击「别念了」之后，连注记都不留', async () => {
   const full = await baselineBytes();
 
   const sim = makeSim();
@@ -102,17 +107,20 @@ test('双击「别念了」之后不再补播', async () => {
     await sim.until(500);
     sim.runtime.clearAnnounce();
     await sim.until(9_000);
-    assert.equal(
-      sim.downlink.bytes,
-      full,
-      '明确要求别念了，就不该自己补播回来',
+    assert.equal(sim.downlink.bytes, full, '明确要求别念了，就不该自己补播回来');
+
+    await sim.utterance('好的');
+    const note = sim.asked.at(-1)?.note ?? '';
+    assert.ok(
+      !note.includes('没听到'),
+      `已经明确不要听了，不该再拿这个去问模型，实际「${note}」`,
     );
   } finally {
     sim.dispose();
   }
 });
 
-test('同一句被打断太多次就不再补（避免反复骚扰）', async () => {
+test('反复打断不会攒成一串补播', async () => {
   const full = await baselineBytes();
   const sim = makeSim();
   try {
@@ -122,9 +130,10 @@ test('同一句被打断太多次就不再补（避免反复骚扰）', async ()
       await sim.partial('等一下');
     }
     await sim.until(12_000);
-    assert.ok(
-      sim.downlink.bytes < full * 3,
-      `补播次数没有上限（${sim.downlink.bytes} 字节，基准 ${full}）`,
+    assert.equal(
+      sim.downlink.bytes,
+      full,
+      '补播交给模型之后，系统这边一次都不该多发',
     );
   } finally {
     sim.dispose();
