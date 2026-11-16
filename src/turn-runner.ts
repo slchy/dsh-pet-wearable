@@ -43,6 +43,14 @@ export interface TurnRunnerOptions {
   /** 预估播放时长之外再多等的余量 */
   readonly playbackTailMs: number;
   /**
+   * 设备会上报 `played`（`caps.played`）。
+   *
+   * 为真时**等设备说播完**再离开 `speaking`；估算时长退化成上限（事件丢了也不会挂死）。
+   * 为假时保持老行为：按下发字节数估时长。降级方向必须是「宁可多等一会儿」，
+   * 因为提前离开 `speaking` 等于把插话窗口关掉。
+   */
+  readonly deviceReportsPlayed?: boolean;
+  /**
    * 下行语音增益（线性倍数，默认 1）。MiMo 输出偏小，实机听感要开到接近满格，
    * 所以默认放大一档；压峰用软限幅（见 `pcm.ts` 的 `pcm16Gain`）。
    */
@@ -131,6 +139,20 @@ export class TurnRunner {
       this.options.clock.after(ms, resolve);
     });
   }
+
+  /**
+   * 设备报告「下行音频播完了」。
+   *
+   * 只在 `deviceReportsPlayed` 为真时有意义；由适配层收到设备 `played` 事件时调。
+   * 用轮询标志而不是 promise：等待循环本来就在轮询，多一条 promise 只会多一处
+   * 需要清理的悬挂引用。
+   */
+  devicePlayed(): void {
+    this.playedSeen = true;
+  }
+
+  /** 本轮是否已经收到设备的 `played` */
+  private playedSeen = false;
 
   /**
    * 播一句**系统旁白**（不是模型的回答）。
@@ -375,8 +397,16 @@ export class TurnRunner {
       // 状态机在整个等待期间保持 speaking；插话会让票据作废从而提前结束等待。
       if (!interrupted) {
         const until = this.options.clock.now() + audioSeconds * 1000 + this.options.playbackTailMs;
-        while (!fsm.isStale(ticket) && this.options.clock.now() < until) {
-          await this.wait(PLAYBACK_POLL_MS);
+        if (this.options.deviceReportsPlayed === true) {
+          // 设备说播完就走；估算时长只当上限（事件丢了不会把这一轮挂死）
+          this.playedSeen = false;
+          while (!fsm.isStale(ticket) && !this.playedSeen && this.options.clock.now() < until) {
+            await this.wait(PLAYBACK_POLL_MS);
+          }
+        } else {
+          while (!fsm.isStale(ticket) && this.options.clock.now() < until) {
+            await this.wait(PLAYBACK_POLL_MS);
+          }
         }
         interrupted = fsm.isStale(ticket);
       }

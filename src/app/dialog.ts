@@ -200,6 +200,8 @@ export class DialogRuntime {
       downlink: options.downlink,
       fsm: this.core.fsm,
       playbackTailMs: options.playbackTailMs,
+      // 设备能报 `played` 就以设备为准（估算退化成上限）
+      deviceReportsPlayed: options.caps.played,
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       ...(options.onDownlinkChunk === undefined ? {} : { onDownlinkChunk: options.onDownlinkChunk }),
       ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),

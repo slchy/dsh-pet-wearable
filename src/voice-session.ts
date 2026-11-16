@@ -798,7 +798,8 @@ class VoiceConnection {
         this.app?.deviceEvent(event);
         return;
       case 'played':
-        // 播放进度目前由 TurnRunner 按时长估算；收到也只记档，留给以后替换估算
+        // 设备说播完了：有 `played` 能力的设备靠它离开 speaking（时长估算只当上限）
+        this.runner.devicePlayed();
         this.archive?.event(EVENTS.devicePlayed);
         return;
     }
