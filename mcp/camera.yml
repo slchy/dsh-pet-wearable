@@ -129,6 +129,13 @@
           - /path/to/dsh-pet-wearable/mcp/mcp-memory.mjs
         toolCallTimeoutMs: 10000
         failOnStartupError: false
+    # 把 dsh 内部的流式文本转成 harness 的侧通道（`VOICE_LIVE_PORT` 指到哪就发到哪）。
+    #
+    # 为什么不在 SDK 层做：`assistant/message` 是整段交付的，等它到齐，长回答
+    # （后台任务汇报）已经等了几秒。`llm/stream` 是 cordis 的 waterfall，能拿到
+    # 逐 token 的 delta。门槛（20 token 内不流式）在 harness 侧，不在插件里。
+    - id: voice-live
+      name: voice-live
     # 在过去的对话里搜。会话日志是多帧 zstd 的 JSONL，自己扫比走 dsh 的内部
     # 索引简单（那个是服务不是工具，模型够不到）。
     - id: mcp-sessions

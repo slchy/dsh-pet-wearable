@@ -1,0 +1,11 @@
+{
+  "name": "voice-live",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "把 dsh 的流式文本转成 harness 的侧通道（语音链路要用）",
+  "main": "index.mjs",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}

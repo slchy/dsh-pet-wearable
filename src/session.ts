@@ -27,6 +27,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { SpontaneousTurn } from './spontaneous.ts';
+import { LiveGate, LiveTextRelay, LIVE_TOKEN_THRESHOLD, type LiveEvent, type LiveMessage } from './live-text.ts';
 
 /**
  * 单轮超时。
@@ -131,6 +132,12 @@ export interface SessionOptions {
   provider?: string;
   /** sdk 模式必填：模型名。实测可用 deepseek-flash / deepseek-v4-pro */
   model?: string;
+  /**
+   * 流式门槛：这么多 token 之内不流式，超了才把缓冲一次性放出去。
+   *
+   * 默认 20 —— 语音回复的中位长度就在这附近，短答走流式只会多几次 TTS 调用。
+   */
+  liveTokenThreshold?: number;
 }
 
 export class DshError extends Error {}
@@ -230,6 +237,16 @@ export class DshSession {
    */
   onAnnounce: ((text: string) => void) | null = null;
   /**
+   * 流式文本（侧通道）。三个事件：`start` 交出前 N 个 token、`delta` 逐 token 直通、
+   * `end` 这条流结束。**没到阈值的整段也走 start+end**，调用方据 `gate.streaming`
+   * 之外的信息无法区分，所以这里只保证"能按顺序捡到全部文本"。
+   */
+  onLive: ((event: LiveEvent) => void) | null = null;
+  /** 侧通道接收端；懒启动 */
+  private liveRelay: LiveTextRelay | null = null;
+  private readonly liveThreshold: number;
+  private liveGate: LiveGate;
+  /**
    * 自发轮次的判定：只在 prompt 期间挂 `onIdle`，所以那种轮次必须单独识别
    * （见 `spontaneous.ts` 的实测记录）。
    */
@@ -254,6 +271,8 @@ export class DshSession {
     this.mode = opts.mode ?? 'headless';
     this.provider = opts.provider ?? 'deepseek-official';
     this.model = opts.model ?? 'deepseek-flash';
+    this.liveThreshold = opts.liveTokenThreshold ?? LIVE_TOKEN_THRESHOLD;
+    this.liveGate = new LiveGate(this.liveThreshold);
     mkdirSync(dirname(this.sessionFile), { recursive: true });
     // spawn 的 cwd 必须存在，否则 ENOENT，且报错信息指向不明确
     mkdirSync(this.workDir, { recursive: true });
@@ -404,6 +423,10 @@ export class DshSession {
     if (this.proc && this.sdkReady) return;
     if (this.proc) this.stop();
 
+    // 流式侧通道要在 spawn **之前**就绪：端口靠 `VOICE_LIVE_PORT` 传给子进程，
+    // dsh 里的 `voice-live` 插件启动时读它，读不到就整个不启用。
+    await this.ensureLiveRelay();
+
     const proc = this.spawnProgram([
       '--profile', 'sdk',
       ...(this.patch ? ['--patch', this.patch] : []),
@@ -442,7 +465,53 @@ export class DshSession {
     this.log(`[sdk] 已就绪 provider=${this.provider} model=${this.model}`);
   }
 
-  private rpc(method: string, params: unknown, timeoutMs = this.timeoutMs): Promise<unknown> {
+  /**
+   * 起侧通道（幂等）。端口通过 `VOICE_LIVE_PORT` 传给 dsh 子进程 —— 这一行就是
+   * `mcp/voice-live` 插件的开关：读不到就不启用。
+   */
+  private async ensureLiveRelay(): Promise<void> {
+    if (this.liveRelay !== null) {
+      return;
+    }
+    const relay = new LiveTextRelay(this.log);
+    const port = await relay.ready();
+    if (port <= 0) {
+      this.log('  流式    侧通道没起来，退回整段交付');
+      return;
+    }
+    relay.onMessage((msg) => { this.onLiveMessage(msg); });
+    this.liveRelay = relay;
+    process.env['VOICE_LIVE_PORT'] = String(port);
+  }
+
+  /**
+   * 侧通道收到一行：只有**当前会话**的 token 才进语音链路。
+   *
+   * 按 `sessionId` 过滤是必须的：dsh 进程里可能同时跑着旁路调用（压缩、会话标题），
+   * 那些没有 sessionId 已经被插件挡掉了；但历史会话的迟到 token 也可能漂过来。
+   */
+  private onLiveMessage(msg: LiveMessage): void {
+    const current = this.currentSessionId;
+    if (current === null || msg.s !== current) {
+      return;
+    }
+    if (msg.t === 'end') {
+      const events = this.liveGate.finish();
+      this.liveGate = new LiveGate(this.liveThreshold);
+      for (const ev of events) {
+        this.onLive?.(ev);
+      }
+      return;
+    }
+    if (typeof msg.text !== 'string') {
+      return;
+    }
+    for (const ev of this.liveGate.push(msg.text)) {
+      this.onLive?.(ev);
+    }
+  }
+
+  private async rpc(method: string, params: unknown, timeoutMs = this.timeoutMs): Promise<unknown> {
     return new Promise<unknown>((resolve, reject) => {
       const stdin = this.proc?.stdin;
       if (!stdin?.writable) {

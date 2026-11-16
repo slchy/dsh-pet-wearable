@@ -64,6 +64,40 @@ import { UtteranceAssembler } from './utterance-assembler.ts';
 export const UPSTREAM_SAMPLE_RATE = 16_000;
 
 /**
+ * 判停器的最小接口（`SmartTurn` 满足它）。
+ *
+ * 抽成接口只为一件事：**共享与独占的判定要能单测**，不必起 python 侧车。
+ */
+export interface EndpointDetector {
+  predict(pcm: Buffer): Promise<number>;
+  stop(): void;
+}
+
+/**
+ * 决定这条连接用哪个判停器、以及要不要在断开时销毁它。
+ *
+ * 共享的那份由进程持有（`main.ts` 创建并预热），**连接断开时不能 stop**：
+ * 侧车冷启动要重新加载 8.7 MB ONNX（实测 ~300 ms），真机每次重连第一句都要付。
+ * 自己创建的那份（单连接命令行 / 测试）必须 stop，否则进程退不掉。
+ */
+export function resolveEndpointDetector(
+  options: { readonly smartTurn?: object; readonly smartTurnClient?: EndpointDetector },
+  create: () => EndpointDetector,
+  log: (line: string) => void,
+): { readonly client: EndpointDetector | null; readonly owned: boolean } {
+  if (options.smartTurnClient !== undefined) {
+    if (options.smartTurn === undefined) {
+      log('  判停    ⚠ 给了共享判停器但没有参数表（quietMs 等），会按 0 处理');
+    }
+    return { client: options.smartTurnClient, owned: false };
+  }
+  if (options.smartTurn === undefined) {
+    return { client: null, owned: false };
+  }
+  return { client: create(), owned: true };
+}
+
+/**
  * 没有判停器（SmartTurn 关掉）时的固定合并窗口。
  *
  * 旧行为：收到一句 ASR 就再等 600 ms 看有没有下文，没有就定稿。
@@ -142,6 +176,17 @@ export interface VoiceSessionOptions {
     readonly maxExtensions: number;
     readonly threshold: number;
   };
+  /**
+   * 进程级共享的判停器客户端。
+   *
+   * 给了就用它，并且**不随连接销毁** —— 侧车是 python + 8.7 MB ONNX，冷启动实测
+   * ~300 ms，而真机每次重连（网络抖动 / 服务重启 / 重开 App）第一句都要付这一刀。
+   * 常驻之后只有进程启动付一次。
+   *
+   * 与 {@link smartTurn} 一起给（后者提供静默窗等参数）；只给这个不给参数表是
+   * 配置错误，会退化成 `quietMs: 0`。
+   */
+  readonly smartTurnClient?: EndpointDetector;
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
@@ -336,7 +381,9 @@ class VoiceConnection {
 
   private readonly dialog: DialogRuntime;
   private readonly uplink: UplinkPipeline;
-  private readonly smartTurn: SmartTurn | null;
+  private readonly smartTurn: EndpointDetector | null;
+  /** 判停器是不是这条连接自己的（自己建的在断开时必须销毁，共享的不许） */
+  private readonly ownsSmartTurn: boolean;
   private readonly assembler: UtteranceAssembler;
   private readonly stt: SttSession;
 
@@ -441,13 +488,17 @@ class VoiceConnection {
     );
 
     const smartTurnOptions = options.smartTurn;
-    this.smartTurn = smartTurnOptions
-      ? new SmartTurn({
-        python: smartTurnOptions.pythonPath,
-        script: smartTurnOptions.scriptPath,
+    const detector = resolveEndpointDetector(
+      options,
+      () => new SmartTurn({
+        python: smartTurnOptions!.pythonPath,
+        script: smartTurnOptions!.scriptPath,
         log: (line) => { console.log(`  ${line}`); },
-      })
-      : null;
+      }),
+      (line) => { console.log(line); },
+    );
+    this.smartTurn = detector.client;
+    this.ownsSmartTurn = detector.owned;
 
     this.assembler = new UtteranceAssembler({
       quietMs: smartTurnOptions?.quietMs ?? 0,
@@ -922,7 +973,11 @@ class VoiceConnection {
     // 收件箱里还有等待者的话，定时器会拖住进程（不必再下发 hq_cancel：连接都断了）
     this.dialog.dispose();
     this.assembler.dispose();
-    this.smartTurn?.stop();
+    // 只有自己建的那份才销毁：共享侧车由进程持有，断开就 stop 等于每次重连都
+    // 重新加载 ONNX（实测 ~300 ms，第一句白吃）
+    if (this.ownsSmartTurn) {
+      this.smartTurn?.stop();
+    }
     this.control?.close();
     this.archive?.close();
     this.stt.close();

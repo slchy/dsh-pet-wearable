@@ -1,0 +1,31 @@
+# dsh profile patch：把 τ²-bench 那个域的**全部工具**挂成 MCP 工具
+#
+# 用法（bench 用，生产不用）：
+#   DSH_PATCH=<仓库绝对路径>/mcp/tau2-bench.yml \
+#   node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh --dsh-sdk
+#
+# 工具名对模型是 `mcp__tau2__<tool>`（例如 `mcp__tau2__get_order_details`）。
+#
+# 工具**不在这个进程里执行**：这一层只是个转发壳，真正的执行和打分发生在 bench
+# 进程持有的 tau2 `Environment` 上（见 scripts/bench/tau2/bridge_server.py）。
+# 地址由 `TAU2_BRIDGE_URL` 给，默认 http://127.0.0.1:8799。
+#
+# 注意 patch 的格式（见 dsh-app-boot 的 applyEntryPatches）：
+#   - 裸条目 = 按 id 覆盖已有节点，找不到就报 "entry not found"
+#   - 要**新增**节点必须用 `insert:`，不带顶层 id 时追加到最外层
+#
+# args 里是绝对路径，部署到别处时要改成实际位置。
+
+- insert:
+    - id: mcp-tau2
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: tau2
+        transport: stdio
+        command: node
+        args:
+          - /path/to/Miaiglassses2grokbot/scripts/bench/tau2/mcp-tau2.mjs
+        # 工具是幂等的数据库查询/改单，正常几十毫秒；30 s 是给冷启动留余量
+        toolCallTimeoutMs: 30000
+        # bench 场景要**响亮地失败**：工具表拉不到就没法判分，静默降级只会白跑一晚上
+        failOnStartupError: true

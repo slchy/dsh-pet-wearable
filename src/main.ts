@@ -35,7 +35,8 @@ import {
 import { DshSession } from './session.ts';
 import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
 import { expiryWarning } from './tls-cert.ts';
-import { runVoiceServer } from './voice-session.ts';
+import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
+import { SmartTurn } from './smart-turn.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
@@ -47,7 +48,6 @@ import {
   TokenGate,
 } from './tokens.ts';
 import { sleep } from './util.ts';
-
 /**
  * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` 工厂（或 default）。
  *
@@ -149,6 +149,27 @@ async function buildAgent(
       model: dsh.model,
       log: (l: string) => { console.log(`  [session] ${l}`); },
     });
+
+    /**
+     * 流式文本：只在**真的超过门槛**时才出声。
+     *
+     * 现在只打日志 —— 把"插件 → 侧通道 → 门槛"这条链先验证到位，再接 TTS。
+     * 这条日志本身就是仪表：`释放前 N 字` 出现说明这一轮是长回答，没出现说明
+     * 整段不到 20 token（走原来的整段路径）。
+     */
+    session.onLive = (event) => {
+      if (event.type === 'start') {
+        const chars = [...event.text].length;
+        console.log(
+          `  流式    释放前 ${chars} 字：${JSON.stringify(event.text.slice(0, 40))}`,
+        );
+      } else if (event.type === 'end') {
+        console.log(
+          `  流式    ${event.streaming ? '流式' : '整段'}交付 ${event.tokens} token`,
+        );
+      }
+    };
+
     return { agent: new VoiceAgent(session, dsh.log, announceStore), dsh: session };
   }
   return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
@@ -560,6 +581,37 @@ async function main(): Promise<void> {
     const smartTurnEnabled = process.env['SMART_TURN'] !== '0'
       && smartTurnPython !== '' && smartTurnScript !== '';
 
+    /**
+     * 判停器侧车：**进程级一份，跨连接常驻**。
+     *
+     * 以前每条连接建一个、断开就 `stop()`。侧车是 python + 8.7 MB ONNX，冷启动
+     * 实测 ~300 ms —— 真机每次重连（网络抖动 / 服务重启 / 重开 App）第一句都要
+     * 付这一刀，而它刚好落在「用户说完 → 开一轮」里。常驻之后只有进程启动付一次。
+     *
+     * 预热：先用 1 s 静音跑一次推理把模型加载进来，别让第一次真说话的那轮承担。
+     */
+    const smartTurnClient = smartTurnEnabled
+      ? new SmartTurn({
+        python: smartTurnPython,
+        script: smartTurnScript,
+        log: (line) => { console.log(`  ${line}`); },
+      })
+      : null;
+    if (smartTurnClient !== null) {
+      // 低幅正弦而不是全零：全零在 log-mel 里是 −∞ dB，不该拿它当"正常输入"试模型
+      const warmup = Buffer.alloc(UPSTREAM_SAMPLE_RATE * 2);
+      for (let i = 0; i < warmup.length / 2; i += 1) {
+        warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2);
+      }
+      const startedAt = Date.now();
+      const p = await smartTurnClient.predict(warmup);
+      console.log(
+        `判停    侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}）`
+        + '，之后所有连接共用这一份\n',
+      );
+      process.on('exit', () => { smartTurnClient.stop(); });
+    }
+
     // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」
     const ttsGain = envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1));
     const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1));
@@ -618,6 +670,7 @@ async function main(): Promise<void> {
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
         }
         : undefined,
+      ...(smartTurnClient === null ? {} : { smartTurnClient }),
       gate: {
         thresholdDbfs: peakDbfs,
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
