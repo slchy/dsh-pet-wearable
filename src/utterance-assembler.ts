@@ -19,6 +19,18 @@
  * 它说没说完就再等一段，最多 {@link UtteranceAssemblerOptions.maxExtensions} 次，
  * 之后强制收下，避免模型不确定时永远不定稿。
  *
+ * <h2>与静候窗重叠</h2>
+ *
+ * 判停器的往返实测约 70 ms，全部压在这一轮的「用户说完 → 开一轮」里。设
+ * {@link UtteranceAssemblerOptions.predictAtMs} 可以让它**提前出发**，与静候窗
+ * 重叠：窗口关掉时概率已经在手上。代价是模型少看几十毫秒的句尾静音（那是它判断
+ * 「说完了」的主要证据），所以提前量有个上限，不是越早越好。
+ *
+ * 提前算的那份结果带两个有效性条件，缺一不可：
+ * - **同一句**（`seq` 没变）—— 用户接着说，上一句的判定不能拿来定稿；
+ * - **算完之后没有再收到中间结果** —— 那份音频里没有他后半句。
+ * 任一不成立就现算一次（等于回到旧行为），不猜。
+ *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
 import { pcm16DurationMs } from './pcm.ts';
@@ -38,6 +50,18 @@ export interface UtteranceAssemblerOptions {
   readonly recentMaxBytes: number;
   /** 判停器。返回 <0 表示不可用 */
   readonly predict?: (pcm: Buffer) => Promise<number>;
+  /**
+   * 提前发起判停请求的时刻（相对句子到达，毫秒）。
+   *
+   * 不设 = 到 `quietMs` 到点才发（旧行为）。设了就与静候窗**重叠**：窗口关掉时
+   * 概率已经在手上，判停器那一趟往返（实测约 70 ms）不再落在关键路径上。
+   * 中位 `asrToTurn` 从 224 ms 降到静候窗本身（150 ms）。
+   *
+   * 为什么不设 0：判停器的输入是「**到此刻为止**的音频」，提前多少毫秒，模型就
+   * 少看多少毫秒的句尾静音（静音是「说完了」的主要证据）。65 ms 是「推理跑得完」
+   * 与「别把静音砍太多」的折中，见 `voice-session.ts` 里的常量。
+   */
+  readonly predictAtMs?: number;
   /**
    * 「太短」的门槛（去标点后的字数）。默认 3。
    *
@@ -81,6 +105,27 @@ export class UtteranceAssembler {
   private recentBytes = 0;
   private pendingText = '';
   private pendingTimer: NodeJS.Timeout | null = null;
+  /**
+   * 当前这一句的代号。`addSentence` / `flush` / `dispose` 都 +1。
+   *
+   * 在飞的判停与排队中的 `evaluate` 都拿着它出生的那个号：用户又说了新的一句，
+   * 旧号的判定就不能再用来定稿 —— 否则「上一句的概率」会把「这一句」提前收下，
+   * 合并窗口就失效了。
+   */
+  private seq = 0;
+  /**
+   * 提前发起的判停。只对同一个 `seq` 有效。
+   *
+   * `startedAt` 是**取音频快照**的时刻：之后又收到中间结果说明用户还在说，
+   * 那份音频里没有他后半句，结果作废（见 {@link takeProbability}）。
+   */
+  private prediction: {
+    readonly seq: number;
+    readonly startedAt: number;
+    readonly probability: Promise<number>;
+  } | null = null;
+  /** `predictAtMs` 的定时器 */
+  private predictTimer: NodeJS.Timeout | null = null;
   private extensions = 0;
   /** 上一次真正收下一轮的时刻，用来判断「短碎片是不是紧跟其后」 */
   private lastUtteranceAt = Number.NEGATIVE_INFINITY;
@@ -125,10 +170,71 @@ export class UtteranceAssembler {
     }
     this.pendingText = this.pendingText ? this.pendingText + text : text;
     this.cancelTimer();
+    // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿
+    this.seq += 1;
+    this.prediction = null;
+    const seq = this.seq;
     const delay = this.options.predict
       ? this.options.quietMs
       : this.options.fallbackWindowMs;
-    this.pendingTimer = setTimeout(() => { void this.evaluate(); }, delay);
+    this.schedulePrediction(seq, delay);
+    this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, delay);
+  }
+
+  /**
+   * 提前把判停请求发出去（与静候窗重叠）。
+   *
+   * 只在 `predictAtMs` 设了的时候才有这一步；窗口比提前量还短时按窗口到点算，
+   * 那就等于旧行为（不重叠），不发也是对的。
+   */
+  private schedulePrediction(seq: number, windowMs: number): void {
+    const at = this.options.predictAtMs;
+    if (at === undefined || this.options.predict === undefined) {
+      return;
+    }
+    this.cancelPredictTimer();
+    const lead = Math.max(0, Math.min(at, windowMs));
+    this.predictTimer = setTimeout(() => {
+      this.predictTimer = null;
+      this.startPrediction(seq);
+    }, lead);
+  }
+
+  /** 取一份音频快照送进判停器。结果只对 `seq` 这一句、且之后没有新 partial 时有效。 */
+  private startPrediction(seq: number): void {
+    const predict = this.options.predict;
+    if (this.disposed || predict === undefined || seq !== this.seq || this.prediction !== null) {
+      return;
+    }
+    const pcm = Buffer.concat(this.recentChunks);
+    const startedAt = this.now();
+    // 侧车可能抛（也可能同步抛）；两种都吞成「不可用」，否则这份提前发起的
+    // promise 没人接，会变成 unhandledRejection
+    const probability = Promise.resolve().then(() => predict(pcm)).catch(() => -1);
+    this.prediction = { seq, startedAt, probability };
+  }
+
+  /**
+   * 取这一句的判停概率。
+   *
+   * 优先用手上已经算好的那份；算好之后用户又开了口（`lastPartialAt` 晚于取快照的
+   * 时刻）就作废、现算一次 —— 那份音频里还没有他后半句，拿它定稿就是抢话。
+   * 现算的代价是那一趟往返，但只在「用户真的又说话了」时发生，和旧行为持平。
+   */
+  private async takeProbability(
+    seq: number,
+    predict: (pcm: Buffer) => Promise<number>,
+  ): Promise<number> {
+    const ready = this.prediction;
+    this.prediction = null;
+    if (ready !== null && ready.seq === seq && ready.startedAt >= this.lastPartialAt) {
+      return await ready.probability;
+    }
+    try {
+      return await predict(Buffer.concat(this.recentChunks));
+    } catch {
+      return -1;
+    }
   }
 
   /** 立即定稿（连接结束时兜底，避免最后一句被丢弃）。 */
@@ -137,6 +243,9 @@ export class UtteranceAssembler {
       return;
     }
     this.cancelTimer();
+    this.cancelPredictTimer();
+    this.seq += 1;
+    this.prediction = null;
     this.extensions = 0;
     const text = this.pendingText.trim();
     this.pendingText = '';
@@ -150,15 +259,18 @@ export class UtteranceAssembler {
   dispose(): void {
     this.disposed = true;
     this.cancelTimer();
+    this.cancelPredictTimer();
+    this.seq += 1;
+    this.prediction = null;
     this.pendingText = '';
     this.recentChunks.length = 0;
     this.recentBytes = 0;
   }
 
   /** 判定当前这一轮是否定稿。 */
-  private async evaluate(): Promise<void> {
+  private async evaluate(seq: number): Promise<void> {
     this.pendingTimer = null;
-    if (this.disposed || !this.pendingText.trim()) {
+    if (this.disposed || seq !== this.seq || !this.pendingText.trim()) {
       return;
     }
 
@@ -168,8 +280,17 @@ export class UtteranceAssembler {
       return;
     }
 
-    const probability = await predict(Buffer.concat(this.recentChunks));
+    // 判停**发起**的时刻：下面那条 partial 宽限看的是「窗口关掉那一刻」，不是
+    // 「推理跑完那一刻」。提前发起之后这两者会差一整个往返，取晚的那个等于
+    // 把宽限白白吃掉一截（旧写法就是这样，这条判据基本没生效过）。
+    const evaluatedAt = this.now();
+    const probability = await this.takeProbability(seq, predict);
     const shown = probability < 0 ? '故障' : probability.toFixed(3);
+
+    // 等待期间用户又说了新的一句：那一轮已经重新排好，这里什么都不做
+    if (this.disposed || seq !== this.seq) {
+      return;
+    }
 
     if (probability < 0) {
       // 判停器出问题就退回保守策略：宁可多合成一轮，也别把用户的话吞掉
@@ -185,13 +306,13 @@ export class UtteranceAssembler {
       // 文本判据：音频说完了，但用户还在出字 —— 这时候收下就是抢话。
       // 只在还有 extension 额度时生效，避免无限等。
       const grace = this.options.partialGraceMs ?? 400;
-      const sincePartial = this.now() - this.lastPartialAt;
+      const sincePartial = evaluatedAt - this.lastPartialAt;
       if (grace > 0 && sincePartial < grace && this.extensions < this.options.maxExtensions) {
         this.extensions += 1;
         this.options.log(
           `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
         );
-        this.pendingTimer = setTimeout(() => { void this.evaluate(); }, this.options.extendMs);
+        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
         return;
       }
 
@@ -201,7 +322,7 @@ export class UtteranceAssembler {
         this.options.log(
           `  判停    ${shown} → 太短且紧跟前一轮，再等 ${wait} ms`,
         );
-        this.pendingTimer = setTimeout(() => { void this.evaluate(); }, wait);
+        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
         return;
       }
       this.options.log(`  判停    ${shown} → 收下这一轮`);
@@ -213,7 +334,7 @@ export class UtteranceAssembler {
     this.options.log(
       `  判停    ${shown} → 没说完，再等 ${this.options.extendMs} ms`,
     );
-    this.pendingTimer = setTimeout(() => { void this.evaluate(); }, this.options.extendMs);
+    this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
   }
 
   /**
@@ -247,6 +368,13 @@ export class UtteranceAssembler {
     if (this.pendingTimer) {
       clearTimeout(this.pendingTimer);
       this.pendingTimer = null;
+    }
+  }
+
+  private cancelPredictTimer(): void {
+    if (this.predictTimer) {
+      clearTimeout(this.predictTimer);
+      this.predictTimer = null;
     }
   }
 

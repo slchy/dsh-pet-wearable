@@ -119,3 +119,122 @@ test('中间结果是过去的，不影响收敛', async () => {
   await delay(15);
   assert.equal(utterances.length, 1, 'partial 早就停了，没有理由再等');
 });
+
+// ---------------------------------------------------------------- 判停与静候窗重叠
+//
+// 判停器一趟往返实测约 70 ms，全部压在「用户说完 → 开一轮」里。提前发起请求
+// 让它藏进静默窗，但**结果的有效性**要跟着音频走：句子换了、用户又开口了，
+// 那份结果就不能用来定稿。
+
+test('判停请求提前发起，到点复用结果而不是再请求一次', async () => {
+  let calls = 0;
+  let firstCallAt = 0;
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 80,
+    predictAtMs: 10,
+    predict: async () => {
+      calls += 1;
+      firstCallAt ||= Date.now();
+      return 0.99;
+    },
+  });
+
+  assembler.addAudio(Buffer.alloc(3200));
+  const t0 = Date.now();
+  assembler.addSentence('帮我看看这个');
+
+  await delay(35);
+  assert.equal(calls, 1, '窗口还没到就该把请求发出去了');
+  assert.ok(firstCallAt - t0 < 60, `请求发得比窗口早（${firstCallAt - t0} ms）`);
+  assert.equal(utterances.length, 0, '窗口没到不能定稿');
+
+  await delay(120);
+  assert.equal(utterances.length, 1, '到点照常收下');
+  assert.equal(calls, 1, '到点复用手上那份结果，不该再请求一次');
+});
+
+test('用户接着说第二句时，上一句的预判作废并重算', async () => {
+  let calls = 0;
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 60,
+    predictAtMs: 0,
+    predict: async () => {
+      calls += 1;
+      return 0.99;
+    },
+  });
+
+  assembler.addAudio(Buffer.alloc(3200));
+  assembler.addSentence('你刚刚是怎么答的');
+  await delay(30); // 预判已发出，但静候窗还没关
+  assert.equal(calls, 1);
+
+  assembler.addSentence('具体用了哪个工具');
+  await delay(150);
+
+  assert.equal(utterances.length, 1, '两句要并成一轮，不能被上一句的判定提前收下');
+  assert.equal(utterances[0]?.text, '你刚刚是怎么答的具体用了哪个工具');
+  assert.equal(calls, 2, '新的一句要重新发起一次判停');
+});
+
+test('预判之后用户又开口，那份结果作废、现算一次', async () => {
+  let calls = 0;
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 60,
+    predictAtMs: 0,
+    partialGraceMs: 120,
+    extendMs: 40,
+    maxExtensions: 1,
+    predict: async () => {
+      calls += 1;
+      return 0.99;
+    },
+  });
+
+  assembler.addAudio(Buffer.alloc(3200));
+  assembler.addSentence('我想问一下那个');
+  await delay(20);
+  assembler.notePartial('我想问一下那');
+  await delay(70); // 窗口关掉：预判早于 lastPartialAt，不能信
+
+  assert.equal(calls, 2, '作废之后要现算一次，而不是拿旧的凑数');
+  assert.equal(utterances.length, 0, '用户刚又开口，这时候收下就是抢话');
+
+  await delay(200);
+  assert.equal(utterances.length, 1, '宽限过去之后还是要收下');
+});
+
+test('连接收尾时，在飞的判停结果不会把话再说一遍', async () => {
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 40,
+    predictAtMs: 0,
+    predict: async () => {
+      await delay(60);
+      return 0.99;
+    },
+  });
+
+  assembler.addAudio(Buffer.alloc(3200));
+  assembler.addSentence('这句还没定下来');
+  await delay(50); // evaluate 已经进入 await
+  assembler.dispose();
+
+  await delay(150);
+  assert.equal(utterances.length, 0, 'dispose 之后迟到的判停结果必须丢掉');
+});
+
+test('判停器抛错按「不可用」处理，照常收下这一轮', async () => {
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 30,
+    predictAtMs: 0,
+    predict: async () => {
+      throw new Error('侧车崩了');
+    },
+  });
+
+  assembler.addAudio(Buffer.alloc(3200));
+  assembler.addSentence('这句话必须收下');
+  await delay(150);
+
+  assert.equal(utterances.length, 1, '判停器坏了也不能吞掉用户的话');
+});

@@ -71,6 +71,19 @@ export const UPSTREAM_SAMPLE_RATE = 16_000;
 const ASSEMBLER_FALLBACK_WINDOW_MS = 600;
 
 /**
+ * 判停请求提前多久发起（与静候窗 `SMART_TURN_QUIET_MS` 重叠）。
+ *
+ * `asrToTurn` 实测中位 224 ms = 静候窗 150 + 判停器往返约 70 + 派发几毫秒。
+ * 提前 65 ms 把请求发出去，那趟往返就藏进静默窗里，中位降到约 150 ms；
+ * 而判停器看到的句尾静音只从约 550 ms 缩到约 465 ms —— 静音是它判断
+ * 「说完了」的主要证据，砍太多会把「没说完」的比例抬上去，长尾反而更烂。
+ *
+ * 判停器慢过 85 ms 时只会退化成旧行为，不会更慢：`evaluate` 到点是**等**
+ * 那份已经出发的请求，不会重发。
+ */
+const ASSEMBLER_PREDICT_LEAD_MS = 65;
+
+/**
  * 连接就绪时那次 `listen.start` 的时长。
  *
  * 它只是**把设备从待机叫回来**（`EXPERIMENTS §42`：0.62 s 内开始推流），
@@ -446,6 +459,8 @@ class VoiceConnection {
       predict: this.smartTurn
         ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
         : undefined,
+      // 只在有判停器时才有意义（没有判停器就走固定窗口，没有往返可叠）
+      ...(this.smartTurn ? { predictAtMs: ASSEMBLER_PREDICT_LEAD_MS } : {}),
       onUtterance: (text) => {
         this.app?.userFinal(text);
         console.log('\n--- 本轮 ---');
