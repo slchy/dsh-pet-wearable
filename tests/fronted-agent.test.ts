@@ -232,6 +232,46 @@ test('投机：快车道胜出时取消掉慢车道那一轮', async () => {
   assert.equal(cancelled, 1, '没人要的那一轮必须尝试取消：省一次调用，也不留幽灵历史');
 });
 
+test('投机：第一个字推给 TTS 的那一刻就取消，不等快模型把整句说完', async () => {
+  const inner = fakeInner();
+  let cancelled = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    reply: async (text, image, note) => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return inner.agent.reply(text, image, note);
+    },
+  };
+  // 每字隔 60 ms：整句要 180 ms 才说完，首字只要 60 ms
+  const agent = agentWith(wrapped, async () => slowSse(['我', '在', '呢。'], 60) as never);
+  let atFirstChar = -1;
+  agent.attachLiveSink(() => {
+    if (atFirstChar < 0) {
+      atFirstChar = cancelled;
+    }
+  });
+
+  await agent.reply('你好呀');
+  assert.equal(atFirstChar, 1, '首字一出就没回头路了，这时候就该掐掉 dsh');
+  assert.equal(cancelled, 1, '只掐一次');
+});
+
+test('不投机时绝不动手取消：dsh 里在跑的可能是后台任务的旁白', async () => {
+  const inner = fakeInner();
+  let cancelled = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']), { speculate: false });
+  agent.attachLiveSink(() => {});
+
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '我在呢。');
+  assert.equal(cancelled, 0);
+});
+
 test('取消模式 interrupt 走硬中断而不是 rpc', async () => {
   const inner = fakeInner();
   let rpc = 0;

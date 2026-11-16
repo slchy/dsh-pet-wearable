@@ -230,6 +230,8 @@ export class FrontedAgent implements AgentProvider {
   private sink: ((text: string) => void) | null = null;
   private innerMode: InnerMode = 'pass';
   private readonly buffered: string[] = [];
+  /** 本轮投机起的 dsh 是否已经被掐掉（只掐一次） */
+  private innerCancelled = false;
 
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
@@ -303,6 +305,7 @@ export class FrontedAgent implements AgentProvider {
       // 先上闸再起跑：`inner.reply` 在第一个 await 之前是同步执行的，
       // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
       this.innerMode = 'buffer';
+      this.innerCancelled = false;
       dsh = this.startInner(userText, image, note);
     }
 
@@ -311,6 +314,11 @@ export class FrontedAgent implements AgentProvider {
     try {
       answer = await this.ask(userText, startedAt, (text) => {
         emitted += text;
+        // 推出去的第一个字就是「这一轮归快车道」的判决书 —— 退回 dsh 会播两遍，
+        // 所以这一刻就把在途的 dsh 那一轮掐掉，别等它把整段答完再取消。
+        // 只有真开了投机才动手：不投机时 dsh 里在跑的是**别的**轮次（比如后台任务
+        // 的旁白），取消它等于把旁白吞了。
+        if (dsh !== null) this.cancelInner();
         this.sink?.(text);
       });
     } catch (error) {
@@ -343,16 +351,7 @@ export class FrontedAgent implements AgentProvider {
     this.innerMode = 'drop';
     this.buffered.length = 0;
     if (dsh !== null) {
-      // 尽力而为：没有取消能力就只能让它跑完，不能影响本轮
-      try {
-        if (this.cancelMode === 'interrupt') {
-          this.inner.interruptTurn?.();
-        } else if (this.cancelMode === 'rpc') {
-          this.inner.cancelTurn?.();
-        }
-      } catch (error) {
-        this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);
-      }
+      this.cancelInner();
       dsh.then(
         () => { this.log('  快车道    慢车道那一轮已作废'); },
         () => undefined,
@@ -363,6 +362,29 @@ export class FrontedAgent implements AgentProvider {
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
     this.log(`  快车道    ${firstTokenMs} ms 首字（流式） ：${JSON.stringify(speech)}`);
     return { text: raw, speech, firstTokenMs, emotion };
+  }
+
+  /**
+   * 掐掉投机起的 dsh 那一轮。只掐一次 —— 首字时掐过，`commit` 再调就是空转。
+   *
+   * 宿主层 `session/cancel` 实测 **5 ms 收敛**、进程不死、会话不丢、也不影响下一轮
+   * （`turn/end` reason = `{kind:'aborted',reason:{kind:'user'}}`）。取消失败不算错：
+   * 已经推给 TTS 的字收不回来，最坏也只是白跑一次生成。
+   */
+  private cancelInner(): void {
+    if (this.innerCancelled) {
+      return;
+    }
+    this.innerCancelled = true;
+    try {
+      if (this.cancelMode === 'interrupt') {
+        this.inner.interruptTurn?.();
+      } else if (this.cancelMode === 'rpc') {
+        this.inner.cancelTurn?.();
+      }
+    } catch (error) {
+      this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);
+    }
   }
 
   /** 快车道让位：把 dsh 已经推进来的增量补放出去，然后等 dsh */
