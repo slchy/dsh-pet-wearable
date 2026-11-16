@@ -17,6 +17,9 @@ import { EVENTS } from './events.ts';
 import type { DownlinkSink } from './transport.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { remainingSpeech } from './interrupted-tail.ts';
+import { SentencePump } from './sentence-pump.ts';
+import { cleanForSpeech } from './agent.ts';
+import { parseEmotion } from './emotion.ts';
 import type { AgentProvider, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
@@ -54,6 +57,13 @@ export interface TurnRunnerOptions {
   readonly onEvent?: (name: string, fields?: Record<string, unknown>) => void;
   /** 一轮结束（落盘用），无论成功失败都会调用 */
   readonly onTurnFinished: () => void;
+  /**
+   * 挂/摘「流式增量」的钩子。
+   *
+   * 传进来一个回调就表示这一轮开始收 token（`null` 表示这一轮结束、摘掉）。
+   * 有它才能「首句一生成就开腔」，没有就退回整段合成。
+   */
+  readonly onLiveAvailable?: (sink: ((text: string) => void) | null) => void;
   readonly log: (line: string) => void;
 }
 
@@ -216,7 +226,41 @@ export class TurnRunner {
 
     try {
       const agentStartedAt = this.options.clock.now();
-      const reply = await agent.reply(text, image, note);
+      let firstSynthAt = 0;
+      let firstAudioAtMs = -1;
+      // 逐句合成：token 一到就断句、送 TTS。钩子必须在 `await agent.reply` **之前**
+      // 挂上，否则等它返回时首句早过去了。旁白还在播时由 `gate` 挡住，不抢话。
+      const pump = new SentencePump({
+        synthesize: (sentence, emotion) => this.options.tts.synthesize(sentence, emotion),
+        clean: cleanForSpeech,
+        resolveEmotion: (raw) => parseEmotion(raw).emotion,
+        gate: this.speechChain,
+        isStale: () => fsm.isStale(ticket),
+        log: (line) => { this.log(line); },
+        onFirstSentence: () => {
+          firstSynthAt = this.options.clock.now();
+        },
+        onChunk: (chunk) => {
+          if (firstChunkAtMs === 0) {
+            firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
+            firstAudioAtMs = this.options.clock.now();
+            fsm.audioStarted(ticket);
+            this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
+            this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
+          }
+          audioBytes += chunk.length;
+          this.options.onDownlinkChunk?.(chunk);
+          downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
+        },
+      });
+
+      this.options.onLiveAvailable?.((delta) => { pump.push(delta); });
+      let reply;
+      try {
+        reply = await agent.reply(text, image, note);
+      } finally {
+        this.options.onLiveAvailable?.(null);
+      }
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
       if (reply.firstTokenMs !== undefined) {
         // 模型开口的时刻。和 TTS 首块分开记，才看得出"等生成"占了多少
@@ -228,27 +272,8 @@ export class TurnRunner {
         + JSON.stringify(reply.text.slice(0, 120)),
       );
 
-      // 旁白还没播完就先让路：否则「请按快门」和回答会叠在一起
-      await this.speechChain;
-
-      const ttsStarted = this.options.clock.now();
-      let firstAudioAtMs = -1;
-      for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
-        if (fsm.isStale(ticket)) {
-          interrupted = true;
-          break;
-        }
-        if (firstChunkAtMs === 0) {
-          firstChunkAtMs = this.options.clock.now() - ttsStarted;
-          firstAudioAtMs = this.options.clock.now();
-          fsm.audioStarted(ticket);
-          this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
-          this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
-        }
-        audioBytes += chunk.length;
-        this.options.onDownlinkChunk?.(chunk);
-        downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
-      }
+      // 补齐没念的部分（没走流式时这一句就是整段合成），并等所有分片落地
+      await pump.drain(reply.speech);
 
       interrupted = interrupted || fsm.isStale(ticket);
       const audioSeconds = pcm16DurationMs(audioBytes, this.options.tts.sampleRate) / 1000;

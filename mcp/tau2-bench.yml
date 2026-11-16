@@ -29,4 +29,8 @@
         toolCallTimeoutMs: 30000
         # bench 场景要**响亮地失败**：工具表拉不到就没法判分，静默降级只会白跑一晚上
         failOnStartupError: true
+    # 逐句合成要 token 级增量。注意这里是**插件**（`name: voice-live`），不是
+    # MCP server —— 它挂的是 `llm/stream` 这个 waterfall，不是工具表。
+    - id: voice-live
+      name: voice-live
 

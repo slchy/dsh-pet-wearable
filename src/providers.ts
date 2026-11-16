@@ -53,6 +53,13 @@ export interface AgentProvider {
    */
   readonly sessionId?: string | null;
   /**
+   * 逐句合成用：订阅**原始** token 增量（`null` = 摘掉）。
+   *
+   * 可选能力：没有它就走「等整段回来再合成」的老路。注意与 `onLive` 的区别 ——
+   * 那个带 20 token 门槛、只给日志判断用。
+   */
+  attachLiveSink?(sink: ((text: string) => void) | null): void;
+  /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
    */

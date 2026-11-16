@@ -421,6 +421,10 @@ class VoiceConnection {
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       onDownlinkChunk: (chunk) => { this.archive?.downlink(chunk); },
       onEvent: (name, fields) => { this.archive?.event(name, fields); },
+      onLiveAvailable: (sink) => {
+        // 逐句合成：把这一轮期间的 token 增量接到 TTS 上（见 sentence-pump.ts）
+        options.agent.attachLiveSink?.(sink);
+      },
       env: {
         call: (call) => this.sendCall(call),
         assemble: (text) => { this.assembler.addSentence(text); },

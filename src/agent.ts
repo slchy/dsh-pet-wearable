@@ -124,6 +124,11 @@ export class VoiceAgent {
     this.session.reset();
   }
 
+  /** 逐句合成：把原始 token 增量接到调用方（`null` 摘掉）。 */
+  attachLiveSink(sink: ((text: string) => void) | null): void {
+    this.session.onLiveSink = sink;
+  }
+
   async reply(asrText: string, image?: ImageAttachment, note?: string): Promise<AgentReply> {
     // 人设与规则由 dsh 作为系统提示词注入（见 mcp/profile.cordis.yml），这里只发
     // 本轮真正变化的东西：可选的系统注记 + 哥说的话。

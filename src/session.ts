@@ -248,6 +248,14 @@ export class DshSession {
    * 之外的信息无法区分，所以这里只保证"能按顺序捡到全部文本"。
    */
   onLive: ((event: LiveEvent) => void) | null = null;
+
+  /**
+   * 逐句合成的订阅口：每来一个 token 增量就调一次。
+   *
+   * 与 {@link onLive} 的区别：那个带着 20 token 门槛（短答整段给），是给日志/播报
+   * 判断用的；这个是**原始增量**，供 `SentencePump` 断句送 TTS。
+   */
+  onLiveSink: ((text: string) => void) | null = null;
   /** 侧通道接收端；懒启动 */
   private liveRelay: LiveTextRelay | null = null;
   private readonly liveThreshold: number;
@@ -515,6 +523,7 @@ export class DshSession {
     if (typeof msg.text !== 'string') {
       return;
     }
+    this.onLiveSink?.(msg.text);
     // 首个 token 的时刻：TTS 要等整段生成完才开腔，所以"模型多久开口"和
     // "整段生成多久"必须分开量，否则优化时不知道该动哪一头。
     if (this.firstTokenMs === null && this.turnStartedAt > 0) {

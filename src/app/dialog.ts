@@ -121,6 +121,11 @@ export interface DialogOptions {
   /** 时间线事件（进会话档案） */
   readonly onEvent?: (name: string, fields?: Record<string, unknown>) => void;
   /**
+   * 挂/摘「流式增量」的钩子（逐句合成用）。
+   * 宿主把它接到 dsh 的流式侧通道；不接就退回整段合成。
+   */
+  readonly onLiveAvailable?: (sink: ((text: string) => void) | null) => void;
+  /**
    * 长思考回执：一句话在 `afterMs` 内还没开始出声，就先用旁白说 `text`。
    * 不给就不回执。
    */
@@ -189,6 +194,7 @@ export class DialogRuntime {
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       ...(options.onDownlinkChunk === undefined ? {} : { onDownlinkChunk: options.onDownlinkChunk }),
       ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
+      ...(options.onLiveAvailable === undefined ? {} : { onLiveAvailable: options.onLiveAvailable }),
       onTurnFinished: () => {
         this.execute(this.core.dispatch({ type: 'turnFinished' }));
         // 本轮结束，后台任务的播报可以接着放
