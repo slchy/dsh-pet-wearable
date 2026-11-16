@@ -21,6 +21,8 @@ export interface AgentImage {
 export interface AgentReplyView {
   /** 原始文本（日志/调试用） */
   readonly text: string;
+  /** 首个输出 token 的耗时（ms）。没有流式钩子时缺席 */
+  readonly firstTokenMs?: number;
   /** 清洗后、准备送 TTS 的文本 */
   readonly speech: string;
   /**

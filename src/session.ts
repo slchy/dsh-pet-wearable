@@ -89,6 +89,8 @@ export interface AskResult {
   sessionId: string | null;
   usage: TokenUsage | null;
   durationMs: number;
+  /** 首个输出 token 的耗时（ms）。没有流式钩子时缺席 —— 缺了记 undefined，不拿 0 冒充 */
+  firstTokenMs?: number;
   /** 是否沿用了已有会话 */
   resumed: boolean;
 }
@@ -218,6 +220,10 @@ export class DshSession {
   >();
   /** 最近一条 assistant/message 的文本；多 step 时后者覆盖前者 */
   private assistantText = '';
+  /** 本轮开始的时刻（wall clock），算首个 token 耗时用 */
+  private turnStartedAt = 0;
+  /** 本轮首个 token 的耗时；`null` = 还没收到 */
+  private firstTokenMs: number | null = null;
   /**
    * 本轮各 step 的用量累加。
    *
@@ -378,6 +384,8 @@ export class DshSession {
 
     this.assistantText = '';
     this.turnUsage = null;
+    this.turnStartedAt = started;
+    this.firstTokenMs = null;
     // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
     this.spontaneous.reset();
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
@@ -415,6 +423,7 @@ export class DshSession {
       usage: this.turnUsage,
       durationMs: Date.now() - started,
       resumed,
+      ...(this.firstTokenMs === null ? {} : { firstTokenMs: this.firstTokenMs }),
     };
   }
 
@@ -506,6 +515,11 @@ export class DshSession {
     if (typeof msg.text !== 'string') {
       return;
     }
+    // 首个 token 的时刻：TTS 要等整段生成完才开腔，所以"模型多久开口"和
+    // "整段生成多久"必须分开量，否则优化时不知道该动哪一头。
+    if (this.firstTokenMs === null && this.turnStartedAt > 0) {
+      this.firstTokenMs = Date.now() - this.turnStartedAt;
+    }
     for (const ev of this.liveGate.push(msg.text)) {
       this.onLive?.(ev);
     }
@@ -587,7 +601,14 @@ export class DshSession {
         const block = c as Record<string, unknown>;
         if (block['type'] === 'text' && typeof block['text'] === 'string') parts.push(block['text']);
       }
-      if (parts.length > 0) this.assistantText = parts.join('');
+      if (parts.length > 0) {
+        this.assistantText = parts.join('');
+        // 没挂流式桥时（bench 就是这样）拿不到 token 级时刻，退一步记「首条 assistant
+        // 消息到达」。它晚于真正的首 token，但仍是"模型开始产出"的可比口径。
+        if (this.firstTokenMs === null && this.turnStartedAt > 0) {
+          this.firstTokenMs = Date.now() - this.turnStartedAt;
+        }
+      }
 
       // usage 与 message 同级（`data.usage`），多 step 时逐 step 累加：
       // 输入/输出累加是成本口径，最后一步的输入才是上下文规模。

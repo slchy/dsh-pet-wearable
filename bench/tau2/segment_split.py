@@ -71,16 +71,18 @@ def main() -> int:
             arch = archive_for_port(int(rec.get("port") or 0))
             if arch is not None:
                 events = load(arch)
-            asr = turn = tts = None
+            asr = turn = llm = tts = None
             if events is not None:
                 asr = segment(events, rec["anchor_at"], rec["first_at"], "asr.sentence")
                 turn = segment(events, rec["anchor_at"], rec["first_at"], "turn.start")
+                llm = segment(events, rec["anchor_at"], rec["first_at"], "llm.first")
                 tts = segment(events, rec["anchor_at"], rec["first_at"], "tts.first")
             rows.append({
                 "total": rec["first_at"] - rec["anchor_at"],
                 "a1": (asr - rec["anchor_at"]) if asr else None,
                 "a2": (turn - asr) if (turn and asr) else None,
-                "a3": (tts - turn) if (tts and turn) else None,
+                "a2b": (llm - turn) if (llm and turn) else None,
+                "a3": (tts - llm) if (tts and llm) else (tts - turn if tts and turn else None),
                 "a4": (rec["first_at"] - tts) if tts else None,
                 "arch": arch.name if arch else "-",
             })
@@ -100,8 +102,9 @@ def main() -> int:
     print(f"对齐成功 {len(rows)} 轮（按端口匹配到档案 {sum(1 for r in rows if r['arch'] != '-')} 轮）\n")
     line("a1", "① 说完→ASR")
     line("a2", "② ASR→开跑")
-    line("a3", "③ 开跑→TTS首块")
-    line("a4", "④ TTS首块→客户端")
+    line("a2b", "③ 开跑→模型开口")
+    line("a3", "④ 模型开口→TTS首块")
+    line("a4", "⑤ TTS首块→客户端")
     line("total", "合计 说完→首帧")
     return 0
 

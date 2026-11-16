@@ -40,6 +40,8 @@ export const EVENTS = {
   turnStart: 'turn.start',
   /** TTS 首块耗时（`ms`）。延迟复算的关键仪表之一 */
   ttsFirst: 'tts.first',
+  /** 首个输出 token 耗时（`ms`）。与 ttsFirst 之间夹着"整段生成"那一段 */
+  llmFirst: 'llm.first',
   /** 一轮结束。带 `dsh_session` 时可与 dsh 自己的会话档案对齐 */
   turnEnd: 'turn.end',
 

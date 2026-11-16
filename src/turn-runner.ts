@@ -218,6 +218,10 @@ export class TurnRunner {
       const agentStartedAt = this.options.clock.now();
       const reply = await agent.reply(text, image, note);
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
+      if (reply.firstTokenMs !== undefined) {
+        // 模型开口的时刻。和 TTS 首块分开记，才看得出"等生成"占了多少
+        this.options.onEvent?.(EVENTS.llmFirst, { ms: reply.firstTokenMs });
+      }
       speech = reply.speech;
       this.log(
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `
