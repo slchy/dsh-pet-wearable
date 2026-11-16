@@ -177,6 +177,9 @@ grep -oE '^[A-Z_]+' ~/miai-cloud/.env | tr '\n' ' '
 ls -d ~/miai-archive/*/ | wc -l; ls ~/miai-vectors
 # 设备 token 名
 awk -F: '{print $2}' ~/miai-cloud/tokens.txt
+# 证书有效期与 SAN（到期了要续）
+set -a; . ~/miai-cloud/.env; set +a
+openssl x509 -in "$MIAI_TLS_CERT" -noout -dates -ext subjectAltName
 ```
 
 核对完把上面的日期改掉。
