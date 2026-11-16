@@ -158,6 +158,16 @@ export class VoiceAgent {
     this.session.onLiveSink = sink;
   }
 
+  /** 取消在途一轮（快车道胜出后，慢车道那一轮已经没人要了）。 */
+  cancelTurn(): void {
+    this.session.cancelTurn();
+  }
+
+  /** 硬中断：SIGINT 给 dsh 子进程（会退出，下一轮重启）。 */
+  interruptTurn(): void {
+    this.session.interruptTurn();
+  }
+
   async reply(asrText: string, image?: ImageAttachment, note?: string): Promise<AgentReply> {
     // 人设与规则由 dsh 作为系统提示词注入（见 mcp/profile.cordis.yml），这里只发
     // 本轮真正变化的东西：可选的系统注记 + 哥说的话。

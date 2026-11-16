@@ -214,6 +214,81 @@ test('快模型 HTTP 出错：交给 dsh', async () => {
   assert.equal(inner.calls.length, 1);
 });
 
+test('投机：快车道胜出时取消掉慢车道那一轮', async () => {
+  const inner = fakeInner();
+  let cancelled = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    reply: async (text, image, note) => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return inner.agent.reply(text, image, note);
+    },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']));
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  assert.equal(cancelled, 1, '没人要的那一轮必须尝试取消：省一次调用，也不留幽灵历史');
+});
+
+test('取消模式 interrupt 走硬中断而不是 rpc', async () => {
+  const inner = fakeInner();
+  let rpc = 0;
+  let hard = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { rpc += 1; },
+    interruptTurn: () => { hard += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']), { cancelMode: 'interrupt' });
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  assert.equal(hard, 1);
+  assert.equal(rpc, 0, '硬中断会杀进程，不能两条路都发');
+});
+
+test('cancelMode=off 时什么都不做', async () => {
+  const inner = fakeInner();
+  let called = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { called += 1; },
+    interruptTurn: () => { called += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']), { cancelMode: 'off' });
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  assert.equal(called, 0);
+});
+
+test('投机：快车道让位时不取消（那一轮正是我们要的结果）', async () => {
+  const inner = fakeInner();
+  let cancelled = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['[[', 'DELEGATE]]']));
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  assert.equal(cancelled, 0, '让位说明 dsh 的答案要用，绝不能取消');
+});
+
+test('取消抛错不能影响本轮', async () => {
+  const inner = fakeInner();
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { throw new Error('IPC 挂了'); },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']));
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '我在呢。');
+});
+
 test('攒满上限的闲聊轮次，下次委派时补进 dsh 的注记', async () => {
   const inner = fakeInner();
   let n = 0;

@@ -60,6 +60,20 @@ export interface AgentProvider {
    */
   attachLiveSink?(sink: ((text: string) => void) | null): void;
   /**
+   * 可选能力：**取消在途的一轮**（宿主侧能力，走 dsh 的 `session/cancel`）。
+   *
+   * 只对慢车道有意义，且必须自己确认真有在途 —— 没有在途时它会去取消自主工作。
+   * 调用方按「尽力而为」处理：失败不能影响本轮结果。
+   */
+  cancelTurn?(): void;
+  /**
+   * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
+   *
+   * 会杀掉进程，下一轮要重启并 resume（实测多花 ~2 s）。只在「这一轮肯定不要了、
+   * 且短时间内不会再问」时才划算，调用方自己判断。
+   */
+  interruptTurn?(): void;
+  /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
    */

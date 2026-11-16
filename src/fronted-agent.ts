@@ -94,6 +94,17 @@ export interface FastLaneOptions {
   readonly keepTurns?: number;
   /** 投机双轨：与 dsh 同时发（默认 true） */
   readonly speculate?: boolean;
+  /**
+   * 快车道胜出后怎么处置在途的慢车道那一轮。
+   *
+   * - `rpc`（默认）：发 `session/cancel`。当前 dsh 的 **SDK 运行时没放行**这个方法
+   *   （实测 `unknown ... runtime method`），所以实际效果是「让它跑完」，
+   *   但换成支持它的运行时就能白赚。
+   * - `interrupt`：SIGINT 杀进程。**会退出**，下一轮重启 + resume 实测多花 ~2 s，
+   *   比省下的那次调用更贵 —— 只在确定不会再问时才值得。
+   * - `off`：什么都不做。
+   */
+  readonly cancelMode?: 'rpc' | 'interrupt' | 'off';
   /** 测试注入用 */
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
@@ -210,6 +221,7 @@ export class FrontedAgent implements AgentProvider {
   private readonly maxChars: number;
   private readonly keepTurns: number;
   private readonly speculate: boolean;
+  private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
@@ -229,6 +241,7 @@ export class FrontedAgent implements AgentProvider {
     this.maxChars = options.maxChars ?? 14;
     this.keepTurns = options.keepTurns ?? 4;
     this.speculate = options.speculate ?? true;
+    this.cancelMode = options.cancelMode ?? 'rpc';
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
@@ -320,7 +333,7 @@ export class FrontedAgent implements AgentProvider {
     return this.commit(userText, answer.text, answer.firstTokenMs, dsh);
   }
 
-  /** 快车道胜出：dsh 的增量全部丢掉（请求照常跑完，别留下未处理的 rejection） */
+  /** 快车道胜出：**取消**在途的 dsh 那一轮，别白花钱、也别留幽灵历史 */
   private commit(
     userText: string,
     raw: string,
@@ -329,10 +342,22 @@ export class FrontedAgent implements AgentProvider {
   ): AgentReplyView {
     this.innerMode = 'drop';
     this.buffered.length = 0;
-    dsh?.then(
-      (view) => { this.log(`  快车道    dsh 后台答完但没播：${JSON.stringify(view.speech.slice(0, 40))}`); },
-      () => undefined,
-    );
+    if (dsh !== null) {
+      // 尽力而为：没有取消能力就只能让它跑完，不能影响本轮
+      try {
+        if (this.cancelMode === 'interrupt') {
+          this.inner.interruptTurn?.();
+        } else if (this.cancelMode === 'rpc') {
+          this.inner.cancelTurn?.();
+        }
+      } catch (error) {
+        this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);
+      }
+      dsh.then(
+        () => { this.log('  快车道    慢车道那一轮已作废'); },
+        () => undefined,
+      );
+    }
     const { emotion, rest } = parseEmotion(raw);
     const speech = cleanForSpeech(rest);
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);

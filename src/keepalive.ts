@@ -85,6 +85,9 @@ export function trackActivity(
     },
     ...(agent.setAnnouncer === undefined ? {} : { setAnnouncer: agent.setAnnouncer.bind(agent) }),
     ...(agent.attachLiveSink === undefined ? {} : { attachLiveSink: agent.attachLiveSink.bind(agent) }),
+    // 每个可选能力都必须显式透传 —— 漏一个就是静默降级（`keepalive.ts` 顶部踩过）
+    ...(agent.cancelTurn === undefined ? {} : { cancelTurn: agent.cancelTurn.bind(agent) }),
+    ...(agent.interruptTurn === undefined ? {} : { interruptTurn: agent.interruptTurn.bind(agent) }),
   };
 }
 

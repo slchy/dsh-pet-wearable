@@ -45,6 +45,14 @@ import { LiveGate, LiveTextRelay, LIVE_TOKEN_THRESHOLD, type LiveEvent, type Liv
  */
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+/**
+ * 取消在途一轮后，等 dsh 自己收尾的最长时间。
+ *
+ * 正常情况下 `session/cancel` 之后 dsh 立刻发 `session.status=idle`；这里只是兜底，
+ * 免得它不发时 `ask` 一路挂到 60 s。取 2 s —— 取消本身是一次 IPC，不需要更久。
+ */
+const CANCEL_GRACE_MS = 2_000;
+
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -244,6 +252,13 @@ export class DshSession {
   private onIdle: (() => void) | null = null;
   private sdkReady = false;
   /**
+   * 进程是不是在「一轮还没走完」时退出的。
+   *
+   * `close` 里必须把在途那一轮唤醒（它等的是 `idle`，不是 RPC），否则进程轰了
+   * 之后 `ask` 还要干等满 60 s。唤醒之后靠这个字段把真实原因抛出去。
+   */
+  private exitError: string | null = null;
+  /**
    * 后台任务完成后**自发**产生的汇报文本（不属于任何一轮）。
    *
    * dsh 的后台作业结算后会自己开一轮说结果（没有 `session/prompt`），这条回调
@@ -346,6 +361,55 @@ export class DshSession {
     return await this.run(text, null);
   }
 
+  /**
+   * 取消当前在途的一轮。**宿主侧能力** —— SDK 封装里没暴露，但协议里有：
+   * `session/cancel { sessionId } → { accepted }`，语义是「把取消请求交给活着的 Agent」。
+   * 没有在途提示词时它去取消自主工作，未知会话 id 是空操作，所以调用前自己确认真有在途。
+   *
+   * 用处：投机双轨 / 插话之后，慢车道那一轮的结果已经没人要了 —— 取消掉既省一次
+   * 调用的钱，也不会在会话历史里留下一条「用户没听过的回答」。
+   *
+   * 取消之后 dsh 自己会发 idle，但为防它不发，这里兜一个短定时器：超时就替等待者
+   * 收尾，免得 `ask` 一路挂到 60 s 超时。
+   */
+  cancelTurn(): void {
+    const sessionId = this.openSessionId ?? this.readSession();
+    const waiter = this.onIdle;
+    if (this.proc === null || sessionId === null || waiter === null) {
+      return;
+    }
+    void this.rpc('session/cancel', { sessionId }).then(
+      () => { this.log(`  取消    已请求取消 ${sessionId} 的在途一轮`); },
+      (e: Error) => { this.log(`  取消    ✗ ${e.message}`); },
+    );
+    setTimeout(() => {
+      if (this.onIdle === waiter) {
+        this.onIdle = null;
+        waiter();
+      }
+    }, CANCEL_GRACE_MS).unref?.();
+  }
+
+  /**
+   * 硬中断：`SIGINT` 给 dsh 子进程（等同 TUI 里 Ctrl-C）。
+   *
+   * **会杀掉进程**（实测 exit code=130），下一轮要重启并 resume，实测多花 ~2 s
+   * （正常一轮 800–1300 ms）。所以只在「这一轮肯定不要了、且短时间内不会再问」
+   * 时才划算 —— 调用方自己判断，默认不用。
+   */
+  interruptTurn(): void {
+    const proc = this.proc;
+    if (proc === null) {
+      return;
+    }
+    this.log('  取消    SIGINT（进程会退出，下一轮要重启）');
+    try {
+      proc.kill('SIGINT');
+    } catch {
+      // 已经退了
+    }
+  }
+
   /** 关掉常驻进程（有的话）。headless 模式无副作用。 */
   stop(): void {
     const proc = this.proc;
@@ -410,6 +474,7 @@ export class DshSession {
     this.turnUsage = null;
     this.turnStartedAt = started;
     this.firstTokenMs = null;
+    this.exitError = null;
     // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
     this.spontaneous.reset();
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
@@ -439,6 +504,11 @@ export class DshSession {
     }
 
     const answer = this.assistantText.trim();
+    if (this.exitError !== null) {
+      const reason = this.exitError;
+      this.exitError = null;
+      throw new DshError(reason);
+    }
     if (!answer) throw new DshError('sdk 没有返回任何文本');
 
     return {
@@ -485,6 +555,15 @@ export class DshSession {
       // 没收到 shutdown 就退出，说明崩了；挂起的请求全部失败
       for (const [, p] of this.pending) p.reject(new DshError(`sdk 进程退出（code=${code}）`));
       this.pending.clear();
+      // **在途那一轮也要收敛**：`close` 只 reject 了 RPC，而一轮真正等的是
+      // `session.status=idle`。不唤醒它，进程轰了之后 `ask` 还会干等满 60 s
+      // （实测 SIGINT 杀掉后挂了 62302 ms）。
+      this.exitError = `sdk 进程退出（code=${code}）`;
+      const waiter = this.onIdle;
+      if (waiter !== null) {
+        this.onIdle = null;
+        waiter();
+      }
       this.log(`[sdk] 进程退出 code=${code}`);
     });
 

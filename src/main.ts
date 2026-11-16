@@ -511,6 +511,12 @@ async function main(): Promise<void> {
         timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
         // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
         speculate: process.env['FAST_LANE_SPECULATE'] !== '0',
+        // 胜出后怎么处置在途的慢车道那一轮：rpc（默认，当前 SDK 运行时未放行）/
+        // interrupt（SIGINT，会重启，多花 ~2 s）/ off
+        cancelMode: ((): 'rpc' | 'interrupt' | 'off' => {
+          const mode = process.env['FAST_LANE_CANCEL'];
+          return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
+        })(),
         maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
         log: (line) => { console.log(line); },
       });
