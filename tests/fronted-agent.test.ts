@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { FrontedAgent, isFastCandidate, isStatusQuestion } from '../src/fronted-agent.ts';
+import { trackActivity } from '../src/keepalive.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
 
 interface FakeInner {
@@ -32,6 +33,22 @@ function fakeInner(): FakeInner {
     attachLiveSink: (next) => { sink = next; },
   };
   return { agent, calls, push: (text) => { sink?.(text); } };
+}
+
+/** 内层（dsh）慢吞吞的：用来测「那一轮还在飞的时候取消」 */
+function slowInner(ms: number): FakeInner {
+  const inner = fakeInner();
+  return {
+    agent: {
+      ...inner.agent,
+      reply: async (text, image, note) => {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+        return inner.agent.reply(text, image, note);
+      },
+    },
+    calls: inner.calls,
+    push: inner.push,
+  };
 }
 
 /** 把若干 token 拼成一条 SSE 响应（DeepSeek 兼容格式） */
@@ -273,7 +290,7 @@ test('不投机时绝不动手取消：dsh 里在跑的可能是后台任务的�
 });
 
 test('取消模式 interrupt 走硬中断而不是 rpc', async () => {
-  const inner = fakeInner();
+  const inner = slowInner(200);
   let rpc = 0;
   let hard = 0;
   const wrapped: AgentProvider = {
@@ -319,7 +336,7 @@ test('投机：快车道让位时不取消（那一轮正是我们要的结果�
 });
 
 test('取消抛错不能影响本轮', async () => {
-  const inner = fakeInner();
+  const inner = slowInner(200);
   const wrapped: AgentProvider = {
     ...inner.agent,
     cancelTurn: () => { throw new Error('IPC 挂了'); },
@@ -327,6 +344,33 @@ test('取消抛错不能影响本轮', async () => {
   const agent = agentWith(wrapped, async () => sse(['我在呢。']));
   const reply = await agent.reply('你好呀');
   assert.equal(reply.speech, '我在呢。');
+});
+
+test('投机那一轮已经有结果了，就不许再发取消（否则杀的是下一轮）', async () => {
+  const inner = fakeInner();
+  let cancelled = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    // dsh 秒回：快模型还没吐第一个字，这一轮就已经结束了
+    reply: async (text, image, note) => inner.agent.reply(text, image, note),
+  };
+  // 快模型慢吞吞：3 个 token × 80 ms，首字也要 80 ms
+  const agent = agentWith(wrapped, async () => slowSse(['我', '在', '呢。'], 80) as never);
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('你好呀');
+  assert.equal(cancelled, 0, '那一轮早就答完了，取消会落到下一轮头上');
+});
+
+test('后台任务状态也要透传给外层（trackActivity 不能漏）', () => {
+  const base: AgentProvider = {
+    name: 'x',
+    reply: async () => ({ text: '', speech: '' }),
+    taskStatus: () => '后台任务：无',
+  };
+  const tracked = trackActivity(base, { inflight: 0, last: 0 });
+  assert.equal(tracked.taskStatus?.(), '后台任务：无');
 });
 
 test('攒满上限的闲聊轮次，下次委派时补进 dsh 的注记', async () => {
@@ -367,7 +411,7 @@ test('后台任务事实进的是系统消息，不是用户话术', async () =>
   const system = payload.messages.find((m) => m.role === 'system')?.content ?? '';
   const user = payload.messages.find((m) => m.role === 'user')?.content ?? '';
   assert.match(system, /sleep 20/, '事实要在系统消息里给模型');
-  assert.match(system, /照那条事实说/, '还要告诉它别编');
+  assert.match(system, /不要委派/, '还要告诉它问进度别委派');
   assert.equal(user, '好了吗', '用户话术原样，不能把事实混进去');
 });
 

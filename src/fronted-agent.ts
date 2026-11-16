@@ -277,6 +277,8 @@ export class FrontedAgent implements AgentProvider {
   private readonly buffered: string[] = [];
   /** 本轮投机起的 dsh 是否已经被掐掉（只掐一次） */
   private innerCancelled = false;
+  /** 投机那一轮是不是已经有结果了 —— 有结果就绝不能再发取消（否则杀的是下一轮） */
+  private innerDone = false;
 
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
@@ -355,7 +357,12 @@ export class FrontedAgent implements AgentProvider {
       // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
       this.innerMode = 'buffer';
       this.innerCancelled = false;
+      this.innerDone = false;
       dsh = this.startInner(userText, image, note);
+      dsh.then(
+        () => { this.innerDone = true; },
+        () => { this.innerDone = true; },
+      );
     }
 
     let emitted = '';
@@ -421,7 +428,7 @@ export class FrontedAgent implements AgentProvider {
    * 已经推给 TTS 的字收不回来，最坏也只是白跑一次生成。
    */
   private cancelInner(): void {
-    if (this.innerCancelled) {
+    if (this.innerCancelled || this.innerDone) {
       return;
     }
     this.innerCancelled = true;

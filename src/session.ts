@@ -259,6 +259,8 @@ export class DshSession {
   private readonly handshaking = new SingleFlight<void>();
   /** 轮次串行队列的尾巴（`ask` 排队用，见 `ask` 的注释） */
   private turns: Promise<void> = Promise.resolve();
+  /** 当前在途那一轮是不是**被我们主动取消**的（是的话收成空答复，不抛错） */
+  private cancelRequested = false;
   /**
    * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
    * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
@@ -405,6 +407,9 @@ export class DshSession {
     if (this.proc === null || sessionId === null || waiter === null) {
       return;
     }
+    // 取消是**故意的**：被取消的那一轮不该以异常收场（上层根本没法处理「用户不要了」
+    // 这种事，抛出去只会变成一条未捕获的 rejection，把整个进程带走）
+    this.cancelRequested = true;
     if (this.cancelSupported === false) {
       // 补丁没打（比如 dsh 刚升级过）。不假装成功，也不硬 SIGINT 杀进程 —— 只等它自己说完
       this.log('  取消    ✗ 宿主没有 session/cancel，这一轮取消不了');
@@ -548,12 +553,16 @@ export class DshSession {
     }
 
     const answer = this.assistantText.trim();
+    const cancelled = this.cancelRequested;
+    this.cancelRequested = false;
     if (this.exitError !== null) {
       const reason = this.exitError;
       this.exitError = null;
       throw new DshError(reason);
     }
-    if (!answer) throw new DshError('sdk 没有返回任何文本');
+    // 被我们主动取消的那一轮：正常收尾成空答复，**不能抛** —— 上层没人在等一个
+    // 「用户不要了」的异常，抛出去就是未捕获的 rejection（实测把 bench harness 打死）
+    if (!answer && !cancelled) throw new DshError('sdk 没有返回任何文本');
 
     return {
       text: answer,
