@@ -7,10 +7,11 @@ import { test } from 'node:test';
 import { EMOTION_STYLES } from '../src/mimo.ts';
 import { BASE_STYLE, EMOTION_LABELS, EMOTIONS, parseEmotion, styleFor } from '../src/emotion.ts';
 
-test('七个标签都能认出来，并剥掉标签', () => {
+test('八个标签都能认出来，并剥掉标签', () => {
   const cases: Array<[string, string]> = [
     ['[开心] 是只橘猫哥哥！', 'happy'],
     ['[得意] 嘿嘿，那当然啦', 'proud'],
+    ['[惊讶] 真的假的', 'surprised'],
     ['[平静] 三点二十。', 'calm'],
     ['[担心] 哥哥，都一点了', 'worried'],
     ['[委屈] 好嘛，那我安静一点', 'sulk'],

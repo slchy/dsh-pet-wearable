@@ -158,6 +158,7 @@ export const BASE_STYLE =
 export const EMOTION_STYLES: Record<Emotion, string> = {
   happy: '语调上扬，节奏轻快，带笑意。',
   proud: '尾音拖长一点，带小骄傲，像在等着被夸。',
+  surprised: '语调突然拔高，前半句快、后面带一点留白。',
   calm: '语速放稳，干脆利落。',
   worried: '语速放慢，音量放低，声音柔一点。',
   sulk: '音调略低，带一点鼻音和拖腔，但不哭腔。',

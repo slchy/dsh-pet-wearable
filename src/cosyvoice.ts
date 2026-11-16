@@ -62,6 +62,7 @@ export const COSYVOICE_SAMPLE_RATE = 24_000;
 export const EMOTION_PROSODY: Record<Emotion, { readonly rate: number; readonly pitch: number }> = {
   happy: { rate: 1.00, pitch: 1.00 },
   proud: { rate: 1.12, pitch: 1.10 },
+  surprised: { rate: 1.05, pitch: 1.18 },
   calm: { rate: 1.00, pitch: 1.00 },
   worried: { rate: 0.95, pitch: 0.97 },
   sulk: { rate: 0.88, pitch: 0.90 },
@@ -75,8 +76,7 @@ export const EMOTION_PROSODY: Record<Emotion, { readonly rate: number; readonly 
  * **必须是这个固定句式，结尾句号不能省**。实测（`cosyvoice-v3-flash` + `longanhuan`）：
  * - `你说话的情感是<值>。` —— 7 个值全部有效：
  *   neutral / happy / surprised / angry / sad / fearful / disgusted
- *   （本项目用到 6 个：neutral / happy / fearful / sad / angry / disgusted；
- *    surprised 目前没有对应情绪，留着备查）
+ *   本项目 8 个情绪映射到这 7 个值（`得意` 借 `happy`，靠 rate/pitch 区分）
  * - `你正在进行<场景>，你说话的情感是<值>。` → 428
  * - `你说话的角色是<角色>，你说话的情感是<值>。` → 428
  *
@@ -86,6 +86,7 @@ export const EMOTION_PROSODY: Record<Emotion, { readonly rate: number; readonly 
 export const EMOTION_INSTRUCTIONS: Record<Emotion, string> = {
   happy: '你说话的情感是happy。',
   proud: '你说话的情感是happy。',
+  surprised: '你说话的情感是surprised。',
   calm: '你说话的情感是neutral。',
   worried: '你说话的情感是fearful。',
   sulk: '你说话的情感是sad。',
