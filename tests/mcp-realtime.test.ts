@@ -153,7 +153,7 @@ test('get_weather 把 j1 解析成能念的一句话', async () => {
   await withUpstream(async (urls) => {
     const result = await withServer(
       { REALTIME_WEATHER_URL: urls.weather, REALTIME_MARKET_URL: urls.market },
-      async (server) => server.call('get_weather'),
+      async (server) => server.call('get_weather', { city: '杭州' }),
     );
     const text = result.content[0]?.text ?? '';
     assert.ok(text.includes('18 度'), `应当念出现场温度，实际「${text}」`);
@@ -173,6 +173,19 @@ test('带 city 时按城市查', async () => {
       seen.some((url) => url.includes(encodeURIComponent('杭州'))),
       `上游应当收到城市名，实际请求 ${seen.join(' ')}`,
     );
+  });
+});
+
+test('不知道城市时先问一句，不要按服务器 IP 猜', async () => {
+  // 按 IP 猜出来的是机房所在地。答错一个城市的天气，比多问一句糟得多。
+  await withUpstream(async (urls, seen) => {
+    const result = await withServer(
+      { REALTIME_WEATHER_URL: urls.weather, REALTIME_MARKET_URL: urls.market },
+      async (server) => server.call('get_weather'),
+    );
+    assert.equal(result.isError, undefined);
+    assert.ok((result.content[0]?.text ?? '').includes('问一句'), '应当把话递回去让模型问城市');
+    assert.deepEqual(seen, [], '不知道城市就不该去查上游');
   });
 });
 

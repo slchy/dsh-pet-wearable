@@ -182,7 +182,8 @@
         failOnStartupError: false
     # 报时间 / 天气 / 股价。这三件事原来是 `bash + curl` 顺手干的，主对话不挂
     # bash 之后必须有个毫秒级的正式出口 —— 派子代理去查天气，用户要多等几秒。
-    # 默认城市由 `REALTIME_CITY` 环境变量给；没配就按上游的来源 IP 猜。
+    # 城市不设默认值（`REALTIME_CITY` 留空）：按服务器 IP 猜出来的是机房所在地，
+    # 念给哥听是确定性的错。他没说过城市时，工具会把话递回去让模型问一句。
     - id: mcp-realtime
       name: '@deepseek-ai/dsh-mcp-client'
       config:

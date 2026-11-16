@@ -18,7 +18,7 @@ import process from 'node:process';
 const WEATHER_BASE = process.env.REALTIME_WEATHER_URL ?? 'https://wttr.in';
 const MARKET_BASE = process.env.REALTIME_MARKET_URL ?? 'https://qt.gtimg.cn';
 const TZ = process.env.REALTIME_TZ ?? 'Asia/Shanghai';
-/** 默认城市。没配就走上游按来源 IP 猜——猜错比查不到更糟，所以部署时应显式设置。 */
+/** 可选：钉死一个默认城市。**默认不设** —— 城市应该来自哥说的话，猜出来的会是机房所在地。 */
 const CITY = process.env.REALTIME_CITY ?? '';
 const TIMEOUT_MS = 6000;
 
@@ -35,12 +35,12 @@ const TOOLS = [
     name: 'get_weather',
     description:
       '查天气：现在多少度、今天最高最低、要不要带伞。'
-      + '用户问「今天天气怎么样」「外面冷不冷」「明天要带伞吗」时调用。'
-      + '不知道在哪个城市就省略 city，用默认城市。',
+      + '用户问「今天天气怎么样」「外面冷不冷」「要带伞吗」时调用。'
+      + 'city 填哥说过的城市；他没说过又没听出是哪儿，就先问一句，别猜。',
     inputSchema: {
       type: 'object',
       properties: {
-        city: { type: 'string', description: '城市名，例如「杭州」。省略则用默认城市。' },
+        city: { type: 'string', description: '城市名，例如「杭州」。' },
       },
       additionalProperties: false,
     },
@@ -157,8 +157,10 @@ async function callTime() {
 
 async function callWeather(args) {
   const city = String(args?.city ?? CITY).trim();
-  const path = city ? `/${encodeURIComponent(city)}` : '/';
-  const url = `${WEATHER_BASE}${path}?format=j1&lang=zh`;
+  // 不猜城市：按服务器 IP 猜出来的是机房所在地，念给哥听是**确定性的错**。
+  // 没城市就把话递回去让模型问一句，比答错一个城市的天气强。
+  if (!city) return '还不知道哥在哪个城市 —— 先问一句他在哪个城市，拿到城市再查。';
+  const url = `${WEATHER_BASE}/${encodeURIComponent(city)}?format=j1&lang=zh`;
   const text = (await getText(url)).toString('utf8');
   return weatherText(JSON.parse(text));
 }
