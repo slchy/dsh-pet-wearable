@@ -44,7 +44,7 @@ interface Rig {
 }
 
 /** `innerMs`：dsh 多久才给出答复（回执窗口的长度） */
-function rig(innerMs: number): Rig {
+function rig(innerMs: number, opts: { receiptChunks?: number; chunkGapMs?: number } = {}): Rig {
   const started = Date.now();
   const sends: Array<{ at: number; bytes: number }> = [];
   const calls: string[] = [];
@@ -64,7 +64,16 @@ function rig(innerMs: number): Rig {
   const tts: TtsProvider = {
     name: 'fake',
     sampleRate: 24_000,
-    async* synthesize() { yield CHUNK; },
+    async* synthesize() {
+      // 回执默认是一块；要测「插话后还在往下发」就给多块 + 块间间隔
+      const count = opts.receiptChunks ?? 1;
+      for (let i = 0; i < count; i += 1) {
+        if (i > 0 && (opts.chunkGapMs ?? 0) > 0) {
+          await new Promise((resolve) => { setTimeout(resolve, opts.chunkGapMs); });
+        }
+        yield CHUNK;
+      }
+    },
     async* synthesizeStream() { yield CHUNK; },
   };
   const downlink: DownlinkSink = {
@@ -143,6 +152,97 @@ test('已经出过声就不再回执', async () => {
       r.runtime.runner.speakReceipt('再说一句。'),
       false,
       '这一轮已经出声了，回执没有意义',
+    );
+  } finally {
+    r.dispose();
+  }
+});
+
+test('回执出声期间开口算插话（回执进 speaking，不留 thinking）', async () => {
+  const r = rig(1_500);
+  try {
+    r.runtime.dispatch({ type: 'utterance', text: '帮我查一下订单' });
+    await wait(120);
+    assert.ok(r.sends.length > 0, `回执应当已经出声，实际：${JSON.stringify(r.logs)}`);
+    assert.equal(
+      r.runtime.core.fsm.state,
+      'speaking',
+      `回执是用户听得见的声音，状态必须进 speaking 才可打断，实际 ${r.runtime.core.fsm.state}`,
+    );
+    assert.ok(
+      r.runtime.core.fsm.speakingIsReceiptOnly,
+      '这段 speaking 只是回执，真回答还没开始',
+    );
+
+    // 用户听完「我看看」不想要了，直接开口
+    r.runtime.dispatch({ type: 'partial', text: '不用了' });
+    assert.equal(
+      r.runtime.core.fsm.state,
+      'listening',
+      `插话应当成立并回到 listening，实际 ${r.runtime.core.fsm.state}`,
+    );
+    assert.ok(
+      r.calls.includes('audio.stop'),
+      `插话要清掉设备里还在念的回执，实际调用：${JSON.stringify(r.calls)}`,
+    );
+
+    // 被作废的那一轮不该再出声（否则会盖掉用户的新一句）
+    const before = r.sends.length;
+    await wait(1_800);
+    assert.equal(
+      r.sends.length,
+      before,
+      `插话后作废轮的答案不该再下发，实际又多发了 ${r.sends.length - before} 块`,
+    );
+  } finally {
+    r.dispose();
+  }
+});
+
+test('插话后回执立刻停发（不能接着在用户说话时播）', async () => {
+  // 4 块、块间 80 ms：插话发生时合成还在跑
+  const r = rig(3_000, { receiptChunks: 4, chunkGapMs: 80 });
+  try {
+    r.runtime.dispatch({ type: 'utterance', text: '帮我查一下订单' });
+    await wait(120);
+    assert.ok(r.sends.length > 0, `回执应当已经出声，实际：${JSON.stringify(r.logs)}`);
+    assert.equal(r.runtime.core.fsm.state, 'speaking');
+
+    r.runtime.dispatch({ type: 'partial', text: '不用了' });
+    const sentAtBargeIn = r.sends.length;
+    await wait(400);
+    assert.equal(
+      r.sends.length,
+      sentAtBargeIn,
+      `插话后不该再发回执音频，实际又多发了 ${r.sends.length - sentAtBargeIn} 块`
+      + `（audio.stop 只清设备缓冲，合成循环不掐就会接着播）：${JSON.stringify(r.logs)}`,
+    );
+    assert.equal(r.runtime.core.fsm.state, 'listening');
+  } finally {
+    r.dispose();
+  }
+});
+
+test('回执自然播完：退回 thinking，不推进轮次', async () => {
+  const r = rig(1_500);
+  try {
+    r.runtime.dispatch({ type: 'utterance', text: '帮我查一下订单' });
+    await wait(120);
+    assert.equal(r.runtime.core.fsm.state, 'speaking');
+    const ticketNo = r.runtime.core.fsm.turn;
+
+    // CHUNK 是 0.5 s，播完就该退回 thinking（答案还在路上）
+    await wait(700);
+    assert.equal(
+      r.runtime.core.fsm.state,
+      'thinking',
+      `回执播完要回 thinking 继续等答案，实际 ${r.runtime.core.fsm.state}`,
+    );
+    assert.equal(r.runtime.core.fsm.turn, ticketNo, '回执不该推进轮次号');
+    assert.equal(
+      r.runtime.core.fsm.speakingIsReceiptOnly,
+      false,
+      '回执结束标志要清掉',
     );
   } finally {
     r.dispose();

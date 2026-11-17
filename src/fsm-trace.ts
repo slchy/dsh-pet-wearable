@@ -74,14 +74,18 @@ const DEFAULT_BARGE_STOP_WITHIN_MS = 500;
  * `DialogFsm` 允许的转移。
  *
  * 直接照抄 `dialog-fsm.ts` 的调用点：`beginTurn` / `beginAwaitShot` / `abortAwaitShot` /
- * `audioStarted` / `audioDone` / `requestEnd` / `bargeIn` / `close`。
- * 多一条少一条这里都会红 —— 这正是「状态轮转是否可靠」要看的。
+ * `audioStarted` / `receiptStarted` / `receiptEnded` / `audioDone` / `requestEnd` /
+ * `bargeIn` / `close`。多一条少一条这里都会红 —— 这正是「状态轮转是否可靠」要看的。
+ *
+ * `speaking → thinking` 只来自 `receiptEnded()`：委派轮的回执在 `thinking` 期间
+ * 出声，靠进 `speaking` 才可打断（见 `DialogFsm` 顶部约束 1）。真回答的音频
+ * 结束走的是 `audioDone`，落点是 `listening` / `ending`，不会到 `thinking`。
  */
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   listening: ['thinking', 'awaiting_shot', 'ending', 'closed'],
   awaiting_shot: ['thinking', 'listening', 'ending', 'closed'],
   thinking: ['speaking', 'listening', 'ending', 'closed'],
-  speaking: ['listening', 'ending', 'closed'],
+  speaking: ['listening', 'thinking', 'ending', 'closed'],
   ending: ['closed'],
   closed: [],
 };

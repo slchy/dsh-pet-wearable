@@ -190,6 +190,15 @@ export class TurnRunner {
   /** 这一轮回执（「我看看。」）。回答一出第一个字节就掐掉 */
   private receipt: { text: string; sentBytes: number; firstChunkAt: number; cancelled: boolean; ephemeral: boolean } | null = null;
   private receiptPlaying = false;
+  /**
+   * 回执音频缓存：文案是固定的那几句，没有理由每轮都去服务端现合成。
+   *
+   * 真机实测（2026-11-17，v2 设备）：回执首块 321–342 ms 全是合成时间，而回执
+   * 总共只有 0.65 s 音频 —— 首块那 300 ms 等于把「开轮 → 听见声音」白白拖长，
+   * 还会在答案来得快时被硬切成半句（第 6 轮 agent 890 ms 就到，回执播到 569 ms
+   * 被掐，「我看看」只剩「我看」）。缓存之后首块≈0，整句在答案到达前就能播完。
+   */
+  private readonly receiptCache = new Map<string, { readonly rate: number; readonly chunks: readonly Buffer[] }>();
   /** 本轮是否已经下发过真正的回答音频（回执只在这是 false 时有意义） */
   private firstAudioSeen = false;
 
@@ -224,7 +233,7 @@ export class TurnRunner {
       const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
       this.log(
         `  ${ephemeral ? '回执' : '旁白'}    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
-        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
+        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${Math.round(firstChunkAtMs)}ms`}）`,
       );
       // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
       const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
@@ -253,6 +262,29 @@ export class TurnRunner {
     if (this.receiptPlaying || this.canned !== null || this.firstAudioSeen) {
       return false;
     }
+    // 回执是真出声：状态进 `speaking`，用户这时开口才算插话（见 DialogFsm.receiptStarted）。
+    // 进不去说明这一轮已经不在等答案（被插话作废 / 已收尾）—— 那就别出声了。
+    if (!this.options.fsm.receiptStarted()) {
+      return false;
+    }
+    // 立刻通知：档案要记下这段 `speaking`，话筒归属也别等下一帧才对齐
+    this.options.onState?.();
+    const rate = this.options.tts.sampleRate;
+    const cached = this.receiptCache.get(text);
+    if (cached !== undefined && cached.rate === rate) {
+      // 命中：立刻整句下发，不等服务端。首块 0 ms —— 这是缓存的意义所在。
+      this.log(`  回执    ${JSON.stringify(text)}（缓存）`);
+      this.receiptPlaying = true;
+      const current = { text, sentBytes: 0, firstChunkAt: 0, cancelled: false, ephemeral: true };
+      this.receipt = current;
+      for (const chunk of cached.chunks) {
+        current.sentBytes += chunk.length;
+        this.options.onDownlinkChunk?.(chunk);
+        this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
+      }
+      void this.holdReceipt(current);
+      return true;
+    }
     this.log(`  回执    ${JSON.stringify(text)}`);
     this.receiptPlaying = true;
     const current = { text, sentBytes: 0, firstChunkAt: -1, cancelled: false, ephemeral: true };
@@ -260,6 +292,7 @@ export class TurnRunner {
     void (async () => {
       const startedAt = this.options.clock.now();
       let firstChunkAtMs = -1;
+      const collected: Buffer[] = [];
       for await (const chunk of this.options.tts.synthesize(text)) {
         if (current.cancelled) {
           this.log('  回执    被正式回答顶掉，停止下发');
@@ -269,21 +302,36 @@ export class TurnRunner {
           firstChunkAtMs = this.options.clock.now() - startedAt;
           current.firstChunkAt = this.options.clock.now();
         }
+        collected.push(chunk);
         current.sentBytes += chunk.length;
         this.options.onDownlinkChunk?.(chunk);
         this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       }
-      const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
+      // 合成成功才进缓存：中途被顶掉的那次是残缺的，不能存
+      if (!current.cancelled && collected.length > 0) {
+        this.receiptCache.set(text, { rate, chunks: collected });
+      }
+      const seconds = pcm16DurationMs(current.sentBytes, rate) / 1000;
       this.log(
         `  回执    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
-        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
+        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${Math.round(firstChunkAtMs)}ms`}）`,
       );
-      const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
-      while (this.options.clock.now() < until && !current.cancelled) {
-        await this.wait(PLAYBACK_POLL_MS);
-      }
+      await this.holdReceipt(current);
     })();
     return true;
+  }
+
+  /** 回执下发完之后，按音频时长占住「还在说」的状态，直到播完或被顶掉。 */
+  private async holdReceipt(current: { sentBytes: number; cancelled: boolean }): Promise<void> {
+    const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
+    const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
+    while (this.options.clock.now() < until && !current.cancelled) {
+      await this.wait(PLAYBACK_POLL_MS);
+    }
+    // 回执这一段结束了：状态回到 `thinking`（答案还在路上）。
+    // 被顶掉时上面已经调过一次，这里再调也是幂等的。
+    this.options.fsm.receiptEnded();
+    this.options.onState?.();
   }
 
   /**
@@ -353,6 +401,13 @@ export class TurnRunner {
     // 带着票据说清楚要取消哪一轮 —— 迟到的取消由 session 层按代次丢弃。
     const offInvalidate = fsm.onInvalidate((reason) => {
       this.log(`  取消    ${reason === 'bargeIn' ? '插话' : '连接结束'} → 取消在途请求（第 ${ticket.no} 轮）`);
+      // 回执也要停：`audio.stop` 只是清掉设备已经收到的缓冲，合成循环还在往下发，
+      // 不掐掉就会在用户说话时接着播（试过：用户一开口「我看看」又从头上响一遍）。
+      if (this.receipt !== null && !this.receipt.cancelled) {
+        this.receipt.cancelled = true;
+        this.receiptPlaying = false;
+        this.log('  回执    插话中止，停止下发');
+      }
       try {
         agent.cancelTurn?.(ticket);
       } catch (error) {
@@ -384,6 +439,8 @@ export class TurnRunner {
             this.receipt.cancelled = true;
             this.log('  回执    被正式回答顶掉');
             this.options.sendCall?.({ op: 'audio.stop' });
+            // 回执那段 `speaking` 到此为止；紧接着 `audioStarted` 会重新进入 speaking
+            fsm.receiptEnded();
           }
           fsm.audioStarted(ticket);
           this.options.onState?.();

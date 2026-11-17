@@ -29,6 +29,8 @@
  *   speaking  ──bargeIn()────────────────────────────▶ listening（代次 +1）
  *   任意状态  ──断连 / 致命错误─────────────────────▶ closed
  *
+ *   thinking  ──receiptStarted()（回执出声）──▶ speaking ──receiptEnded()──▶ thinking
+ *
  *   listening ──说「看清细节」──▶ awaiting_shot ──拿到高清图──▶ thinking
  *                                     │  ▲
  *                                     │  └── 手机回报「相册就绪」（顺带播提示语，状态不变）
@@ -43,6 +45,11 @@
  * 1. **只有 `speaking` 能被打断**。`thinking` 期间用户说话不算插话 ——
  *    否则 TTS 首块到达前那 ~1 s 里的一句正常话会打断掉还没出声的回复
  *    （实测：回放 0 字节被中断）。
+ *    判据是**有没有声音**，不是「有没有在等模型」：委派轮那句「我看看」
+ *    （见 `TurnRunner.speakReceipt`）在 `thinking` 期间就已经出声，用户听完
+ *    然后说「不用了」是明确的插话。所以回执要把状态推进 `speaking`
+ *    （{@link DialogFsm.receiptStarted}），播完再退回 `thinking`
+ *    （{@link DialogFsm.receiptEnded}，靠 `_receiptOnly` 跟真回答区分）。
  * 2. **`speaking` 覆盖整段播放**，直到音频真的播完才离开。不是「TTS 生成结束」
  *    就结束（实测：13 轮只成功打断 1 次）。
  * 3. **插话即作废排队轮次**。一轮 = dsh 2–5 s + 播放 5–20 s，用户在此期间说的
@@ -111,6 +118,13 @@ export class DialogFsm {
   private _gen = 0;
   /** 模型已经要求结束：等这段音频播完再走 `ending` */
   private _endAfterSpeech = false;
+  /**
+   * 当前这段 `speaking` 只是回执在响（真回答的音频还没开始）。
+   *
+   * 回执发生在 `thinking` 期间，但它确实是用户听得见的声音，所以状态要进
+   * `speaking` 才能被插话打断；播完再退回 `thinking` 等答案。
+   */
+  private _receiptOnly = false;
   /**
    * 日志出口。
    *
@@ -233,9 +247,50 @@ export class DialogFsm {
     if (this.isStale(t) || !this.isCurrent(t)) {
       return;
     }
+    // 真音频接管了这段 `speaking`：回执那一段到此结束
+    this._receiptOnly = false;
     if (this._state === 'thinking') {
       this.transition('speaking', '首块音频已下发');
     }
+  }
+
+  /**
+   * 回执开始出声：`thinking → speaking`。
+   *
+   * 为什么要进 `speaking` 而不是留在 `thinking`：本类的第 1 条规矩是
+   * **「能不能打断由状态定」**（见顶部说明）。回执是用户真能听见的声音，
+   * 留在 `thinking` 就等于告诉全系统「这段不可打断」—— 用户听完「我看看」
+   * 开口说「不用了」，会被当成同一句的下文合并，而不是插话。
+   *
+   * 它和真正的回答音频共用 `speaking`，靠 {@link _receiptOnly} 区分：
+   * 回执自然播完回 `thinking`（答案还在路上），被音频接管则由 `audioStarted` 清标志。
+   *
+   * @returns 有没有真的进 `speaking`；`false` = 这一轮已经不在等答案（被插话作废 /
+   *   已收尾），这时候不该出声
+   */
+  receiptStarted(): boolean {
+    if (this._state !== 'thinking') {
+      return false;
+    }
+    this._receiptOnly = true;
+    this.transition('speaking', '回执出声（可打断）');
+    return true;
+  }
+
+  /** 回执这段 `speaking` 结束：回 `thinking` 继续等答案。不动代次。 */
+  receiptEnded(): void {
+    if (!this._receiptOnly) {
+      return;
+    }
+    this._receiptOnly = false;
+    if (this._state === 'speaking') {
+      this.transition('thinking', '回执播完，继续等答案');
+    }
+  }
+
+  /** 这段 `speaking` 是不是只有回执（真音频还没开始） */
+  get speakingIsReceiptOnly(): boolean {
+    return this._receiptOnly;
   }
 
   /**
@@ -251,6 +306,7 @@ export class DialogFsm {
     }
     this._gen += 1;
     this._endAfterSpeech = false;
+    this._receiptOnly = false;
     this.transition('listening', `插话「${why}」→ 代次 ${this._gen}`);
     for (const cb of [...this.invalidateListeners]) {
       cb('bargeIn');
@@ -266,6 +322,10 @@ export class DialogFsm {
    */
   audioDone(t: TurnTicket): void {
     if (this.isStale(t) || !this.isCurrent(t)) {
+      return;
+    }
+    // 回执那段 `speaking` 不是本轮音频，别拿它的结束去推进轮次
+    if (this._receiptOnly) {
       return;
     }
     this.transition(this._endAfterSpeech ? 'ending' : 'listening', '本轮音频结束');

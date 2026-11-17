@@ -79,12 +79,34 @@ test('开了没有结束、也没有断连', () => {
   assert.ok(r.violations.some((v) => v.rule === 'turn.unclosed'), JSON.stringify(r.violations));
 });
 
-test('白名单外转移：speaking → thinking', () => {
+test('白名单外转移：speaking → awaiting_shot', () => {
   const r = checkTrace(trace([
     ...healthyTurn(0).filter(([t]) => t < 3400),
-    [1500, 'dialog.state', { from: 'speaking', to: 'thinking' }],
+    [1500, 'dialog.state', { from: 'speaking', to: 'awaiting_shot' }],
   ]));
   assert.ok(r.violations.some((v) => v.rule === 'state.whitelist'), JSON.stringify(r.violations));
+});
+
+test('回执的 speaking → thinking 不算违规', () => {
+  // 委派轮：开轮后先回执出声（thinking → speaking），播完退回 thinking 等答案，
+  // 答案到了再进 speaking。这条链是真机行为，审计器不该把它判成非法转移。
+  const r = checkTrace(trace([
+    [0, 'asr.sentence', { text: '帮我查一下订单。' }],
+    [100, 'turn.start', { text_len: 7 }],
+    [120, 'dialog.state', { from: 'listening', to: 'thinking' }],
+    [400, 'dialog.state', { from: 'thinking', to: 'speaking' }],
+    [1100, 'dialog.state', { from: 'speaking', to: 'thinking' }],
+    [1800, 'llm.first', { ms: 1700 }],
+    [2000, 'tts.first', { ms: 200 }],
+    [2000, 'dialog.state', { from: 'thinking', to: 'speaking' }],
+    [4000, 'turn.end', { interrupted: false, audio_s: 2 }],
+    [4010, 'dialog.state', { from: 'speaking', to: 'listening' }],
+  ]));
+  assert.deepEqual(
+    r.violations.filter((v) => v.rule.startsWith('state.')),
+    [],
+    `回执的状态链符合设计，不该报违规：${JSON.stringify(r.violations)}`,
+  );
 });
 
 test('closed 之后还在转移 / 还开新轮', () => {
