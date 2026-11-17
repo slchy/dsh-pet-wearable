@@ -41,7 +41,22 @@ export interface UtteranceAssemblerOptions {
   /** 判为「没说完」时再多等这么久 */
   readonly extendMs: number;
   /** 最多延长几次 */
+  /** 一轮最多延长几次（**总预算**，四种原因共用） */
   readonly maxExtensions: number;
+  /**
+   * 其中**「判停说没说完」**这一类最多延长几次（ms 由 `extendMs` 定）。
+   *
+   * 为什么要单列一个上限：`p < threshold` 那条分支**不参考任何文本信号**
+   * （用户在不在出字、结尾像不像没说完），只按 p 再等一拍。而侧车给的 p
+   * 是噪声 —— 同一段音频两次回放，同一句从 `0.549` 变成 `0.189`，
+   * 后者连等 5 拍 2.4 s。真机实测 4 次延长（1600 ms）才收下是常态。
+   *
+   * 那三拍文本判据（`partialGraceMs` / 短片段 / `unfinishedWaitMs`）是**防抢话和
+   * 并句的安全闸**，不该被这个病理拖着一起收紧 —— 所以它们仍走 `maxExtensions`。
+   *
+   * 缺省与 `maxExtensions` 相同（= 不改变旧行为）。
+   */
+  readonly maxUnsureExtensions?: number;
   /** 没有判停器时的固定合并窗口（旧行为） */
   readonly fallbackWindowMs: number;
   /** 概率门限 */
@@ -237,6 +252,13 @@ export class UtteranceAssembler {
   /** `predictAtMs` 的定时器 */
   private predictTimer: NodeJS.Timeout | null = null;
   private extensions = 0;
+  /**
+   * 其中「判停说没说完」用掉了几次。
+   *
+   * 和 {@link extensions} 分开记：那三类文本判据是防抢话/并句的安全闸，
+   * 不该被判停低分的病理拖着一起收紧（见 `maxUnsureExtensions`）。
+   */
+  private unsureExtensions = 0;
   /** 这一句是否已经为「结尾像没说完」等过一拍（只等一次） */
   private unfinishedWaited = false;
   /** 上一次真正收下一轮的时刻，用来判断「短碎片是不是紧跟其后」 */
@@ -495,6 +517,7 @@ export class UtteranceAssembler {
     this.seq += 1;
     this.prediction = null;
     this.extensions = 0;
+    this.unsureExtensions = 0;
     this.unfinishedWaited = false;
     const text = this.pendingText.trim();
     this.pendingText = '';
@@ -553,6 +576,9 @@ export class UtteranceAssembler {
     if (
       probability >= this.options.threshold
       || this.extensions >= this.options.maxExtensions
+      // 「判停说没说完」有自己的上限：侧车给的 p 是噪声，不能让它把总预算
+      // （2.8 s）吃干净，也不能让它拖累那三条文本判据的额度
+      || this.unsureExtensions >= (this.options.maxUnsureExtensions ?? this.options.maxExtensions)
     ) {
       // 文本判据：音频说完了，但用户还在出字 —— 这时候收下就是抢话。
       // 只在还有 extension 额度时生效，避免无限等。
@@ -609,6 +635,7 @@ export class UtteranceAssembler {
     }
 
     this.extensions += 1;
+    this.unsureExtensions += 1;
     this.options.log(
       `  判停    ${shown} → 没说完，再等 ${this.options.extendMs} ms`,
     );

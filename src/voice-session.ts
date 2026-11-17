@@ -174,6 +174,8 @@ export interface VoiceSessionOptions {
     readonly quietMs: number;
     readonly extendMs: number;
     readonly maxExtensions: number;
+    /** 「判停说没说完」单独的上限，见 `UtteranceAssemblerOptions.maxUnsureExtensions` */
+    readonly maxUnsureExtensions?: number;
     readonly threshold: number;
     /** 结尾「像没说完」时再多等一拍，见 `UtteranceAssemblerOptions.unfinishedWaitMs` */
     readonly unfinishedWaitMs?: number;
@@ -529,6 +531,9 @@ class VoiceConnection {
       quietMs: smartTurnOptions?.quietMs ?? 0,
       extendMs: smartTurnOptions?.extendMs ?? 0,
       maxExtensions: smartTurnOptions?.maxExtensions ?? 0,
+      ...(smartTurnOptions?.maxUnsureExtensions === undefined
+        ? {}
+        : { maxUnsureExtensions: smartTurnOptions.maxUnsureExtensions }),
       fallbackWindowMs: ASSEMBLER_FALLBACK_WINDOW_MS,
       threshold: smartTurnOptions?.threshold ?? 1,
       ...(smartTurnOptions?.unfinishedWaitMs === undefined

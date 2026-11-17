@@ -764,6 +764,11 @@ async function main(): Promise<void> {
           // 的兜底，而我们原来只有 3×400=1.2 s —— 触发点比人家快、兜底却只有一半，
           // 用户说半句停下来想一下就会被强制收下。7×400 ≈ 2.8 s，对齐业界。
           maxExtensions: envNumber('SMART_TURN_MAX_EXT', 7),
+          // 「判停说没说完」单独一个上限：那条分支不看任何文本信号，只按 p 再等
+          // 一拍，而 p 是噪声（同一段音频两次回放，同一句 0.549 vs 0.189）。
+          // 真机实测要 4 拍（1600 ms）才收下；这里收到 2 拍（800 ms），
+          // 仍能覆盖正常换气 200–400 ms。另三类文本判据不受影响，照旧吃 7 的额度。
+          maxUnsureExtensions: envNumber('SMART_TURN_MAX_UNSURE', 2),
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
           // 结尾像「还有下文」（数字串/井号/连词）时再多等一拍。见
           // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，

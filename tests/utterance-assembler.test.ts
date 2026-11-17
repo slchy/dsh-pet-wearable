@@ -568,3 +568,43 @@ test('判停每次决定都报一条：p 与「还要等多久」要落进档案
   assert.equal(facts.at(-1)!.action, 'accept');
   assert.equal(facts.at(-1)!.waitMs, 0);
 });
+
+test('判停低分有独立预算：unsure 到上限就收下，不占文本判据的额度', async () => {
+  // 侧车的 p 是噪声（同一音频两次回放，同一句 0.549 vs 0.189），低分那条分支
+  // 又完全不看文本信号 —— 所以它必须有自己的上限，否则一句话能把 2.8 s 总预算
+  // 吃干净，而 grace/短片段/结尾像没说完那三条安全闸也跟着没额度可用。
+  const facts: Array<{ action: string; why?: string }> = [];
+  let round = 0;
+  const { assembler, utterances } = (() => {
+    const utterances: Array<{ text: string; at: number }> = [];
+    const a = new UtteranceAssembler({
+      quietMs: 0,
+      extendMs: 20,
+      maxExtensions: 7,
+      maxUnsureExtensions: 2,
+      fallbackWindowMs: 0,
+      threshold: 0.5,
+      recentMaxBytes: 16_000,
+      predict: async () => {
+        round += 1;
+        // 永远说「没说完」—— 只有上限能把它停下来
+        return 0.01;
+      },
+      onUtterance: (text) => { utterances.push({ text, at: 0 }); },
+      onJudge: (f) => { facts.push(f); },
+      log: () => {},
+    });
+    return { assembler: a, utterances };
+  })();
+  try {
+    assembler.notePartial('你好');
+    assembler.addSentence('你好。');
+    await delay(300);
+  } finally {
+    assembler.dispose();
+  }
+  const unsure = facts.filter((f) => f.why === 'unsure');
+  assert.equal(unsure.length, 2, `应该只再等 2 拍就收下，实际 ${unsure.length} 拍`);
+  assert.ok(utterances.length === 1, '最后必须收下这一轮，不能把话吞掉');
+  assert.ok(facts.some((f) => f.action === 'accept'), '该有一条 accept');
+});
