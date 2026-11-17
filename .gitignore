@@ -4,6 +4,8 @@ dist/
 
 # 凭据与运行产物：真凭据一律不入库（模板见 .env.example）
 .env
+.env.*
+!.env.example
 tokens.txt
 tmp/
 
@@ -34,3 +36,6 @@ packages/dsh-voice-web/lib/
 
 # 本地跑服务时的临时日志
 _*.log
+
+# 运维记录：含真实主机/证书/设备等信息，不进公开仓。历史里已提交过，按要求不重写历史。
+docs/OPS-RECORD.md
