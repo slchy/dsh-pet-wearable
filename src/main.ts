@@ -18,10 +18,7 @@ import { pathToFileURL } from 'node:url';
 import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
-import { AssemblyError, buildAgent, buildStt, buildTts, loadAuthenticator, loadTls, type AgentBundle } from './assembly.ts';
-import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
-import { FrontedAgent } from './fronted-agent.ts';
-import { MemoryFile } from './memory-file.ts';
+import { AssemblyError, buildAgent, buildStt, buildTts, loadAuthenticator, loadTls, openAnnounceStore, wireAgent, type AgentBundle } from './assembly.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 import { SmartTurn } from './smart-turn.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
@@ -306,15 +303,7 @@ async function main(): Promise<void> {
 
   let agent: AgentProvider | null = null;
   let dshSession: DshSession | null = null;
-  /**
-   * 离线时的后台汇报队列。放 `~/.voice-agent/` 旁边（和会话 id 一个目录），
-   * 路径可用 `MIAI_ANNOUNCE_FILE` 覆盖；空串 = 不持久化。
-   */
-  const announceStore = AnnounceStore.open({
-    file: process.env['MIAI_ANNOUNCE_FILE'] ?? join(homedir(), '.voice-agent', 'announce.jsonl'),
-    maxItems: envNumber('MIAI_ANNOUNCE_MAX', DEFAULT_ANNOUNCE_MAX),
-    log: (line) => { console.log(line); },
-  });
+  const announceStore = openAnnounceStore((line) => { console.log(line); });
   try {
     ({ agent, dsh: dshSession } = await buildAgent(agentSpec, {
       workDir,
@@ -335,99 +324,22 @@ async function main(): Promise<void> {
   }
 
   /**
-   * 前缀保活。
+   * 快车道 / 保活 / 记忆 / 活动跟踪。
    *
-   * 空闲久了 DeepSeek 的前缀缓存会过期（实测：4.7 小时仍热，23 小时凉），凉了之后
-   * **当天第一次开口**要多等 1–3 秒重算整段前缀。这里在空闲时发一条极短请求把前缀
-   * 焐热，代价是一天几次几乎免费的调用。
-   *
-   * 只在真的用 dsh 时才有意义：别的 provider 没有「前缀缓存」这回事。
-   * `KEEPALIVE_MINUTES=0` 关掉。
+   * 为什么单独一个函数：同一套接线插件那边也要用。第一版插件只调了 `buildAgent`，
+   * 整个快车道漏在外面 —— 语音栈照样跑，但每句都退化成等完整 dsh。
    */
   let stopKeepalive: () => void = () => {};
-  if (dshSession && agent) {
-    // 快车道：短句纯闲聊直接答，其余零开销交给 dsh。放在 `trackActivity` **里面**，
-    // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
-    const fastKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
-    const fastOff = process.env['FAST_LANE'] === '0';
-    const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md');
-    const memoryFile = new MemoryFile(memoryPath);
-
-    // **投机的前置条件**：宿主得能取消在途那一轮。
-    // 没有 `session/cancel` 时，快车道命中会在 dsh 那边留下一轮「用户没听过的回答」
-    // （白花钱 + 幽灵历史），所以探测失败就退回串行 —— 串行压根不提前发 dsh。
-    const wantSpeculate = process.env['FAST_LANE_SPECULATE'] !== '0';
-    let canCancel = false;
-    if (wantSpeculate) {
-      canCancel = await dshSession.probeCancelSupport(20_000);
-      console.log(canCancel
-        ? '快车道    投机=开（宿主支持 session/cancel，命中时可作废在途那一轮）'
-        : '快车道    投机=关 → 退回串行（宿主没有 session/cancel，作废不了在途那一轮）');
-    }
-    const speculate = wantSpeculate && canCancel;
-
-    if (fastOff || fastKey === '') {
-      console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
-    } else {
-      agent = new FrontedAgent({
-        inner: agent,
-        apiKey: fastKey,
-        model: process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat',
-        ...(process.env['FAST_LANE_BASE_URL'] === undefined
-          ? {}
-          : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
-        timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
-        // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
-        // 前置条件：宿主必须能取消在途那一轮（启动时探测，见上面的 `canCancel`）。
-        speculate,
-        // 胜出后怎么处置在途的慢车道那一轮：rpc（默认，当前 SDK 运行时未放行）/
-        // interrupt（SIGINT，会重启，多花 ~2 s）/ off
-        cancelMode: ((): 'rpc' | 'interrupt' | 'off' => {
-          const mode = process.env['FAST_LANE_CANCEL'];
-          return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
-        })(),
-        maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
-        // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
-        prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
-        // 中间结果投机：比定稿再往前提 p50 731 ms，但文本是猜的（定稿确认是前缀才认领）
-        partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
-        // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
-        // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
-        hedge: envNumber('FAST_LANE_HEDGE', 2),
-        // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
-        taskStatus: () => dshSession.taskStatus(),
-        // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），
-        // 按这句话挑几条进提示词，不全塞（4 KB ≈ 1.5k token）
-        memory: (text: string) => memoryFile.relevant(text),
-        log: (line) => { console.log(line); },
-      });
-      console.log(
-        `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
-        + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`,
-      );
-      // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
-      // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
-      console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
-    }
-    const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
-    const activity = newActivityState(Date.now());
-    const trackedAgent = trackActivity(agent, activity);
-    agent = trackedAgent;
-    console.log(keepaliveMinutes > 0
-      ? `保活      空闲 ${keepaliveMinutes} 分钟发一次前缀保活（KEEPALIVE_MINUTES=0 关闭）\n`
-      : '保活      关（KEEPALIVE_MINUTES=0）\n');
-    stopKeepalive = startKeepalive({
-      clock: systemClock,
-      intervalMs: keepaliveMinutes * 60_000,
-      idleFor: () => Date.now() - activity.last,
-      isBusy: () => activity.inflight > 0,
-      ping: async () => {
-        const started = Date.now();
-        await trackedAgent.reply(KEEPALIVE_PROMPT);
-        console.log(`  [keepalive] 完成 ${Date.now() - started} ms`);
-      },
+  if (agent !== null) {
+    const wired = await wireAgent({
+      agent,
+      dsh: dshSession,
+      workDir,
+      announceStore,
       log: (line) => { console.log(line); },
     });
+    agent = wired.agent;
+    stopKeepalive = wired.stop;
     process.on('exit', () => { stopKeepalive(); });
   }
 

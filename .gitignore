@@ -31,3 +31,6 @@ packages/dsh-voice-web/demo/main.js
 # 不进 git（发包时由 prepack 重新同步，tarball 里是实体内容）。
 packages/dsh-voice-web/src/voice/
 packages/dsh-voice-web/lib/
+
+# 本地跑服务时的临时日志
+_*.log

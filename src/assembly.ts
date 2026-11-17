@@ -1,26 +1,29 @@
 /**
- * 三个可替换件（STT / TTS / agent）与两份启动凭据（TLS / 设备 token）的装配。
+ * 三个可替换件（STT / TTS / agent）与两份启动凭据（TLS / 设备 token）的装配，
+ * 外加 agent 起来之后必须接上的那几层（快车道 / 保活 / 记忆 / 活动跟踪）。
  *
  * 原先这些都长在 `main.ts` 里。抽出来的原因是**同一套装配有两个调用方**：
  * CLI（`main.ts`）和 dsh 插件（`packages/dsh-voice-web` 的 driver，真进程内起语音栈）。
- * 留在 `main.ts` 里就只能复制一份，然后两边慢慢漂。
+ * 留在 `main.ts` 里就只能复制一份，然后两边慢慢漂 —— 实际已经漂过一次：
+ * 插件第一版只接了 `buildAgent`，把整个快车道漏在了外面。
  *
  * 与 `main.ts` 的差异只有一处：启动期配置错误在这里**抛 {@link AssemblyError}**，
  * 不再直接 `process.exit`。插件跑在宿主进程里，把宿主一起带走是不行的。
  * CLI 接住之后仍然走原来的「打一行说明 + 退出码 2」。
- *
- * 剩下的旋钮（前缀保活、快车道、宠物环）不在这里 —— 它们要把 agent、MemoryFile、
- * AnnounceStore 串起来，属于编排，仍旧留在各自的调用方。
  */
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { VoiceAgent } from './agent.ts';
-import type { AnnounceStore } from './announce-store.ts';
+import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { cosyVoiceTts } from './cosyvoice.ts';
 import { EMOTIONS } from './emotion.ts';
+import { FrontedAgent } from './fronted-agent.ts';
+import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
+import { MemoryFile } from './memory-file.ts';
 import { BASE_STYLE, DEFAULT_TTS_VOICE, mimoTts } from './mimo.ts';
 import {
   cannedStt,
@@ -34,6 +37,14 @@ import {
 import { DshSession } from './session.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { describeTokenProblem, readTokenFile, tokenFilePath, TokenGate } from './tokens.ts';
+
+/** 环境变量取值，没给或不是数就用默认。两个调用方共用同一套解析。 */
+export function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
 /** 启动期配置错误：调用方接住之后决定是退出进程还是拒绝加载插件。 */
 export class AssemblyError extends Error {
@@ -185,6 +196,133 @@ export async function buildAgent(
     return { agent: new VoiceAgent(session, dsh.log, announceStore), dsh: session };
   }
   return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
+}
+
+/**
+ * 离线时的后台汇报队列。放 `~/.voice-agent/` 旁边（和会话 id 一个目录），
+ * 路径可用 `MIAI_ANNOUNCE_FILE` 覆盖；空串 = 不持久化。
+ */
+export function openAnnounceStore(log: (line: string) => void): AnnounceStore | null {
+  return AnnounceStore.open({
+    file: process.env['MIAI_ANNOUNCE_FILE'] ?? join(homedir(), '.voice-agent', 'announce.jsonl'),
+    maxItems: envNumber('MIAI_ANNOUNCE_MAX', DEFAULT_ANNOUNCE_MAX),
+    log,
+  });
+}
+
+/** 接好之后拿到的 agent，外加收摊函数（保活定时器）。 */
+export interface WiredAgent {
+  readonly agent: AgentProvider;
+  stop(): void;
+}
+
+/**
+ * agent 起来之后必须接上的那几层，顺序有讲究：
+ *
+ * 1. `FrontedAgent`（快车道）包在**里面**，`trackActivity` 包在外面 ——
+ *    这样快车道答的那几轮也算「有活动」，用户一直闲聊时不会被判空闲。
+ * 2. 保活用包好的 agent 发请求，否则它绕过快车道、也绕过活动跟踪。
+ *
+ * 少了这一整段，语音栈照样能跑，但端到端会退化到「每句都等完整 dsh」：
+ * 中间结果投机、静音 100 ms 起跑、TTS 提前合成的窗口、对冲、短句直答全都没了。
+ */
+export async function wireAgent(options: {
+  readonly agent: AgentProvider;
+  readonly dsh: DshSession | null;
+  readonly workDir: string;
+  readonly announceStore: AnnounceStore | null;
+  readonly log: (line: string) => void;
+}): Promise<WiredAgent> {
+  let agent = options.agent;
+  let stopKeepalive: () => void = () => {};
+  const { dsh, log } = options;
+
+  if (dsh !== null) {
+    // 快车道：短句纯闲聊直接答，其余零开销交给 dsh。
+    const fastKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
+    const fastOff = process.env['FAST_LANE'] === '0';
+    const memoryPath = process.env['MEMORY_FILE'] ?? join(options.workDir, 'MEMORY.md');
+    const memoryFile = new MemoryFile(memoryPath);
+
+    // **投机的前置条件**：宿主得能取消在途那一轮。
+    // 没有 `session/cancel` 时，快车道命中会在 dsh 那边留下一轮「用户没听过的回答」
+    // （白花钱 + 幽灵历史），所以探测失败就退回串行 —— 串行压根不提前发 dsh。
+    const wantSpeculate = process.env['FAST_LANE_SPECULATE'] !== '0';
+    let canCancel = false;
+    if (wantSpeculate) {
+      canCancel = await dsh.probeCancelSupport(20_000);
+      log(canCancel
+        ? '快车道    投机=开（宿主支持 session/cancel，命中时可作废在途那一轮）'
+        : '快车道    投机=关 → 退回串行（宿主没有 session/cancel，作废不了在途那一轮）');
+    }
+    const speculate = wantSpeculate && canCancel;
+
+    if (fastOff || fastKey === '') {
+      log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
+    } else {
+      agent = new FrontedAgent({
+        inner: agent,
+        apiKey: fastKey,
+        model: process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat',
+        ...(process.env['FAST_LANE_BASE_URL'] === undefined
+          ? {}
+          : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
+        timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
+        // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
+        // 前置条件：宿主必须能取消在途那一轮（启动时探测，见上面的 `canCancel`）。
+        speculate,
+        // 胜出后怎么处置在途的慢车道那一轮：rpc（默认，当前 SDK 运行时未放行）/
+        // interrupt（SIGINT，会重启，多花 ~2 s）/ off
+        cancelMode: ((): 'rpc' | 'interrupt' | 'off' => {
+          const mode = process.env['FAST_LANE_CANCEL'];
+          return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
+        })(),
+        maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
+        // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
+        prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
+        // 中间结果投机：比定稿再往前提 p50 731 ms，但文本是猜的（定稿确认是前缀才认领）
+        partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
+        // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
+        // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
+        hedge: envNumber('FAST_LANE_HEDGE', 2),
+        // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
+        taskStatus: () => dsh.taskStatus(),
+        // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），
+        // 按这句话挑几条进提示词，不全塞（4 KB ≈ 1.5k token）
+        memory: (text: string) => memoryFile.relevant(text),
+        log,
+      });
+      log(
+        `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
+        + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`,
+      );
+      // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
+      // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
+      log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
+    }
+
+    const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
+    const activity = newActivityState(Date.now());
+    const trackedAgent = trackActivity(agent, activity);
+    agent = trackedAgent;
+    log(keepaliveMinutes > 0
+      ? `保活      空闲 ${keepaliveMinutes} 分钟发一次前缀保活（KEEPALIVE_MINUTES=0 关闭）`
+      : '保活      关（KEEPALIVE_MINUTES=0）');
+    stopKeepalive = startKeepalive({
+      clock: systemClock,
+      intervalMs: keepaliveMinutes * 60_000,
+      idleFor: () => Date.now() - activity.last,
+      isBusy: () => activity.inflight > 0,
+      ping: async () => {
+        const started = Date.now();
+        await trackedAgent.reply(KEEPALIVE_PROMPT);
+        log(`  [keepalive] 完成 ${Date.now() - started} ms`);
+      },
+      log,
+    });
+  }
+
+  return { agent, stop: () => { stopKeepalive(); } };
 }
 
 /** 证书从文件读，路径只走环境变量 —— 部署细节不进源码。 */

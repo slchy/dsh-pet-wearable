@@ -16,22 +16,22 @@ import { join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
 import { startWebBridge, type WebBridge } from './bridge.ts'
-import { AssemblyError, buildAgent, buildStt, buildTts, loadAuthenticator, loadTls } from './voice/assembly.ts'
+import {
+  AssemblyError,
+  buildAgent,
+  buildStt,
+  buildTts,
+  envNumber,
+  loadAuthenticator,
+  loadTls,
+  openAnnounceStore,
+  wireAgent,
+} from './voice/assembly.ts'
 import { checkBindSafety } from './voice/bind-policy.ts'
 import { SmartTurn } from './voice/smart-turn.ts'
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice/voice-session.ts'
 import type { AgentProvider } from './voice/providers.ts'
 import type { DshSession } from './voice/session.ts'
-
-/** 与 `main.ts` 的 `envNumber` 同义：环境变量给了就用，没给用默认 */
-function envNumber(name: string, fallback: number): number {
-  const raw = process.env[name]
-  if (raw === undefined || raw === '') {
-    return fallback
-  }
-  const value = Number(raw)
-  return Number.isFinite(value) ? value : fallback
-}
 
 export const name = 'voice-web'
 
@@ -123,29 +123,48 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
     const voice: { stop: (() => void) | null } = { stop: null }
     let dshSession: DshSession | null = null
     let smartTurn: SmartTurn | null = null
+    let stopWired: () => void = () => {}
 
     try {
-      const report = (line: string): void => { logger.info(line) }
+      // 运维看的是这一路：与 CLI 一致打到 stdout。`logger` 的输出在 dsh 里看不到，
+      // 而「快车道开没开」「投机有没有生效」「保活多少分钟」必须能一眼确认 ——
+      // 这几行恰恰是判断"线接没接上"的唯一凭据。
+      const report = (line: string): void => { console.log(line) }
       const tls = loadTls(report)
       const authenticate = loadAuthenticator(report)
       const stt = await buildStt(config.stt, sttCreds())
       const tts = await buildTts(config.tts)
+      const workDir = config.workDir === '' ? process.cwd() : config.workDir
+      // 与 CLI 同一个队列：任务结果离线时先存着，重连后补播
+      const announceStore = openAnnounceStore(report)
       const bundle = await buildAgent(
         config.agent,
         {
-          workDir: config.workDir === '' ? process.cwd() : config.workDir,
+          workDir,
           useSdk: process.env['MIAI_DSH_SDK'] === '1',
           provider: process.env['MIAI_DSH_PROVIDER'] ?? 'deepseek-official',
           model: process.env['MIAI_DSH_MODEL'] ?? 'deepseek-flash',
           log: report,
         },
-        null,
+        announceStore,
       )
       dshSession = bundle.dsh
-      const agent = bundle.agent
-      if (agent === null) {
+      if (bundle.agent === null) {
         throw new Error(`agent=${config.agent} 没有产出 agent，语音栈起来也没人接话`)
       }
+
+      // 快车道 / 保活 / 记忆 / 活动跟踪。与 CLI 逐字同一套 —— 少了这一整段，
+      // 语音栈照样能跑，但每句都退化成等完整 dsh：中间结果投机、静音 100 ms 起跑、
+      // TTS 提前合成的窗口、对冲、短句直答全都没了。
+      const wired = await wireAgent({
+        agent: bundle.agent,
+        dsh: dshSession,
+        workDir,
+        announceStore,
+        log: report,
+      })
+      stopWired = wired.stop
+      const agent = wired.agent
 
       // 判停侧车与 CLI 同一套环境变量。少了它 web 会退回固定合并窗口，
       // 判停明显变差 —— 那不是"兼容性差异"，是功能缺失。
@@ -258,6 +277,7 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       await bridge?.close()
       voice.stop?.()
       smartTurn?.stop()
+      stopWired()
       dshSession?.stop()
       if (error instanceof AssemblyError) {
         throw new Error(`voice-web: ${error.message}`)
@@ -271,6 +291,7 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       await bridge?.close()
       voice.stop?.()
       smartTurn?.stop()
+      stopWired()
       dshSession?.stop()
     }
   }, 'voice-web')
