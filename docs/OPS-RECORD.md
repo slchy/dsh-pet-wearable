@@ -3,23 +3,49 @@
 **这是一份「已经核对过的事实清单」，不是设计文档。** 每个 agent / 接手的人开工前先读这一节，
 别靠上下文记忆——本项目已经出现过多次「把 bench 的临时做法当成历史协议」这类错误。
 
-最后核对：**2026-11-16**（服务器实测，命令见文末「怎么重新核对」）。
+最后核对：**2026-11-17**（服务器实测，命令见文末「怎么重新核对」）。
+
+2026-11-17 这次核对的具体结果（免得下次又从零猜）：
+服务 `active`，启动于 2026-11-18 00:19:02 CST，`NRestarts=0`；生产代码 = `dda6418`（§2.2）；
+7 天内 **0 轮**真实对话；7 天内 2 次 `流式 ✗ 合成失败: Please ensure input text is valid.`
+（有兜底，回退整段合成，但那一轮首块会变慢）；`~/miai-archive` 21 份 / 256 K；
+`~/miai-vectors` **空**、`~/miai-vectors-synth` 3 份；另有 1 次
+`✗ 帧长异常 1330205776（上限 65536）` —— 有非协议数据打到 63993，服务拒了，但暴露面值得留意。
 
 > 约定：真实主机地址与密钥**不写进文档**，只写它们在哪里。需要时去读对应文件。
 
 ---
 
-## 1. 两个仓，边界不要混
+## 1. 两个仓、两个包 —— 是**两张表**，别当成一张
+
+### 1.1 两个 **git 仓**
 
 | 仓 | 管什么 | 关键路径 |
 |---|---|---|
-| `dsh-pet-wearable`（云端） | harness（STT / 判停 / TTS / dsh 驱动）、部署脚本、**bench** | `src/`、`mcp/`、`bench/`、`docs/` |
-| `Miaiglassses2grokbot`（客户端） | 眼镜侧 protobuf、App（Kotlin）、配对与部署入口 | `sdk/`、`client/`、`scripts/` |
+| `dsh-pet-wearable`（云端） | harness（STT / 判停 / TTS / dsh 驱动）、**bench** | `src/`、`mcp/`、`bench/`、`docs/` |
+| `Miaiglassses2grokbot`（客户端） | 眼镜侧 protobuf、App（Kotlin）、配对、**部署入口** | `sdk/`、`client/`、`scripts/` |
 
 - **bench 在 `dsh-pet-wearable/bench/`**，不在客户端仓。
+- **部署脚本一个都不在云端仓**：`deploy_cloud.py` 在
+  `Miaiglassses2grokbot/scripts/`（`HOST` / `KEY` / `REMOTE` 都在里面）。
+  在云端仓里找它是找不到的 —— 已经因为这个误判过「不知道生产在哪台机器」。
 - 客户端侧的 Gradle App 在 `sdk/sample`（Kotlin/Compose）。`client/` 下的 Java
-  （`Session.java` / `MainStream.java` 等）是**旧 app_process 管线**，已被取代——
+  （`Session.java` / `MainStream.java` 等）是**旧 app_process 管线**，已被取代 ——
   查「现在怎么连云端」不要去那儿找答案。
+
+### 1.2 两个 **npm 包**（都是 dsh 插件，平级，互不依赖）
+
+| 包 | 位置 | 插件名 | 内容 | 依赖对方 |
+|---|---|---|---|---|
+| `dsh-pet-wearable` | **仓根**（仓名同时是包名） | `pet-wearable` | 协议层 + 语音栈 | 无 |
+| `dsh-voice-web` | `packages/dsh-voice-web/` | `voice-web` | **语音栈副本** + web 兼容（WS 桥 + 浏览器端） | 无 |
+
+- **包② 不是包① 的子组件**，它是另一个独立插件；能自包含是因为
+  `packages/dsh-voice-web/src/voice/` 里有一份**同步副本**（`scripts/sync-voice.mjs`
+  从仓根 `src/` 复制，**不进 git**，`prepack` / `typecheck` 自动刷新）。
+  这是当初刻意选的「不依赖、复制一份」，代价是两边依赖清单要手动对齐。
+- 混这两张表最常见的后果：以为 `dsh-voice-web` 是 `dsh-pet-wearable` 的一部分，
+  于是找不到它的部署路径 / 以为改仓根 `src/` 等于改了包②（**不会**，要重跑 sync）。
 
 ## 2. 服务器
 
@@ -33,6 +59,52 @@
 
 **关键行为**：改完 `src/` 只是把文件传上去，跑的还是内存里的旧代码；要生效必须重启。
 排查「我的改动没生效」先看 `systemctl show miai-harness -p ActiveEnterTimestamp`。
+
+### 2.1 `deploy_cloud.py` 到底同步什么
+
+```python
+ITEMS = ["src", "mcp", "tools", "tests", "smart_turn", "scripts",
+         "package.json", "tsconfig.json", "README.md"]
+```
+
+- **`packages/` 不在清单里** → `dsh-voice-web`（以及将来任何 `packages/*`）**走正常部署永远到不了生产**。
+  要上生产必须先改这个 `ITEMS`，并想清楚端口 / TLS / 来源白名单。
+- `.env`、`docs`、`models`、`node_modules`、`tmp` **一律不同步**。
+  `.env` 不同步是故意的：本地那份是调试用的，推上去会盖掉服务器上的真实凭据。
+- 目录按**整棵替换**（删了再拷），文件直接覆盖。只用 `scp -r` 是覆盖、不删除，
+  本地已删的测试文件会留在服务器上，于是服务器在跑**已经不存在的功能**的断言。
+- 重启前有前置检查（`0.0.0.0` 要求 `MIAI_TOKENS` + `MIAI_TLS_KEY` + `MIAI_TLS_CERT` 齐备、
+  `tokens.txt` 不许有弱 token 或 32 位 hex），不满足就**拦住不部署** ——
+  否则一次部署等于把现网停掉。
+
+### 2.2 生产跑的是哪个版本：只能按内容比对
+
+`~/miai-cloud` **不是 git 仓**（是拷过去的），所以没有 `git log` 可看。
+
+```bash
+# 文件清单（2026-11-17 实测 78 个，与 dda6418 逐一对应）
+cd ~/miai-cloud/src && find . -name '*.ts' -printf '%P\n' | sort | wc -l
+# 特征判定：某次重构有没有上生产
+grep -c "from './assembly.ts'" main.ts      # 0 = 抽装配层之前
+grep -c onListening voice-session.ts        # 0 = 同上
+grep -c VOICE_SPECULATE_MS main.ts          # 1 = dda6418 及之后
+```
+
+2026-11-17 核对结果：生产 = **精确等于 `dda6418`**（78 个 `.ts` 与本地该提交逐一对应，`Compare-Object` 零差异）。
+也就是说本地之后的所有改动（抽 `assembly.ts`、`onListening`、整个 `packages/dsh-voice-web`）
+**都还没上生产**。将来从新 HEAD 部署会把这批核心文件改动带上真机链路，必须重启后实测。
+
+### 2.3 文档漂移：`--tts` 到底是什么
+
+`deploy_cloud.py` 头部注释写的是 `--tts mimo`，而**实际 unit 是 `--tts cosyvoice`**：
+
+```
+ExecStart=/usr/local/bin/node /home/slchy/miai-cloud/src/main.ts --listen 63993 --host 0.0.0.0 \
+  --stt aliyun --tts cosyvoice --agent dsh --dsh-sdk --work-dir /home/slchy/voice-workspace
+```
+
+以 `systemctl cat miai-harness` 为准。**所有延迟数字（TTS 首块 330 ms 等）都是 cosyvoice 测的**，
+配成 mimo 测出来的不是同一个东西。
 
 ## 3. 密钥与环境变量
 
@@ -235,6 +307,11 @@ switch，没把它放进来；最新的 `@deepseek-ai/dsh-sdk-jsonrpc-server@0.0
 ```bash
 # 服务与启动时间
 systemctl is-active miai-harness; systemctl show miai-harness -p ActiveEnterTimestamp --value
+# 生产跑的是哪个版本（~/miai-cloud 不是 git 仓，只能按内容/特征比对，见 §2.2）
+cd ~/miai-cloud/src && find . -name '*.ts' -printf '%P\n' | sort | wc -l
+grep -c "from './assembly.ts'" main.ts; grep -c onListening voice-session.ts
+# 实际启动命令（以它为准，别信 deploy_cloud.py 的头部注释）
+systemctl cat miai-harness | grep ExecStart
 # env 键名
 grep -oE '^[A-Z_]+' ~/miai-cloud/.env | tr '\n' ' '
 # 档案与向量
