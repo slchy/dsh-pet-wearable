@@ -17,6 +17,14 @@ export interface TurnContext {
   readonly ticket: TurnTicket;
 }
 
+/**
+ * 为什么这一轮没让快车道答。
+ *
+ * 只用于挑回执话术（`task` 是「我看看」、`timeout` 是「嗯，我想想」这类），
+ * 不参与任何决策。
+ */
+export type DelegateReason = 'task' | 'delegate' | 'timeout' | 'empty' | 'error';
+
 /** 给 Agent 的图片附件（与 `session.ts` 的 `ImageAttachment` 同构）。 */
 export interface AgentImage {
   readonly mimeType: string;
@@ -108,6 +116,15 @@ export interface AgentProvider {
    * 汇报的语气标签在这里就被截掉了 —— 模型写 `[开心]跑完了`，播出来还是平静。
    */
   setAnnouncer?(cb: ((speech: string, emotion?: string) => void) | null): void;
+  /**
+   * 可选能力：**这一轮交给慢车道了**，编排层可以给用户一句回执（「我看看。」）。
+   *
+   * 快车道判定自己答不了（本地判据否决 / 暗号 / 超时 / 空答复）时叫一次。
+   * 真机上这类轮次从停嘴到出声是 1.8–2.9 s，中间一片安静，用户会以为没听见。
+   *
+   * 只在**这一轮还没出声**时才有意义，编排层自己看票据与在途状态决定要不要说。
+   */
+  setDelegateHook?(cb: ((reason: DelegateReason) => void) | null): void;
 }
 
 /** STT 会话：一次连接一个，流式喂 PCM。 */

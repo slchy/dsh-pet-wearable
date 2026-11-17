@@ -28,7 +28,7 @@ import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { TurnTicket, DialogState } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
 import { announceInterruptionNote, interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
-import type { AgentProvider, TtsProvider } from '../providers.ts';
+import type { AgentProvider, DelegateReason, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
 import type { ImageAttachment } from '../session.ts';
 import type { DownlinkSink } from '../transport.ts';
@@ -45,6 +45,22 @@ const TAIL_TTL_MS = 120_000;
  * 换气的地方插进来 —— 实测最难受的不是慢两秒，是「它抢在我说完之前开口」。
  */
 const ANNOUNCE_QUIET_MS = 800;
+
+/**
+ * 交给慢车道时给用户的一句回执。
+ *
+ * 真机实测（2026-11-16，v2 设备）：交给 dsh 的轮次从停嘴到出声 1.8–2.9 s，中间
+ * 一片安静；而快车道命中的是 1.0–2.0 s。这段空白用一句话填上，比让用户以为没听见好。
+ *
+ * 只有**四个字**（一句 4.8 字/秒 ≈ 0.83 s）：太长了答案就得等它，反而更慢。
+ */
+const RECEIPTS: Record<DelegateReason, string> = {
+  task: '我看看。',
+  delegate: '我看看。',
+  timeout: '嗯，我想想。',
+  empty: '嗯，我想想。',
+  error: '我看看。',
+};
 
 /** 播报时怎么开麦。设备没有 `listen.start` 就不给这个。 */
 export interface AnnounceMic {
@@ -211,6 +227,7 @@ export class DialogRuntime {
       // 设备能报 `played` 就以设备为准（估算是**下限**，回执只能延后）
       deviceReportsPlayed: options.caps.played,
       onState: () => { this.notifyState(); },
+      sendCall: (call) => { options.env.call(call); },
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),
       ...(options.onDownlinkChunk === undefined ? {} : { onDownlinkChunk: options.onDownlinkChunk }),
       ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
@@ -222,6 +239,16 @@ export class DialogRuntime {
         void this.flushAnnounce();
       },
       log: options.log,
+    });
+
+    // 委派轮的回执：快车道判出「这轮答不了」时补一句，填掉 1.8–2.9 s 的安静。
+    // 挂在 `DialogRuntime` 而不是 `voice-session`：轮次在这里，判断「这一轮还要不要说话」
+    // 只有它做得了（票据在 `TurnRunner` 里）。
+    options.agent.setDelegateHook?.((reason) => {
+      if (this.disposed) {
+        return;
+      }
+      this.runner.speakReceipt(RECEIPTS[reason]);
     });
   }
 

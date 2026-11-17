@@ -16,6 +16,7 @@ import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
 import type { DownlinkSink } from './transport.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
+import type { DeviceCall } from './devices/primitives.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { remainingSpeech } from './interrupted-tail.ts';
 import { SentencePump } from './sentence-pump.ts';
@@ -85,6 +86,12 @@ export interface TurnRunnerOptions {
    * 没有这个钩子，`onDialogState` 只知道 `listening` 一个状态，话筒永远不会被释放。
    */
   readonly onState?: () => void;
+  /**
+   * 给设备发一条控制指令（目前只用来 `audio.stop`）。
+   *
+   * 回执被正式回答顶掉时必须先清掉设备播放队列，否则「我看看」和答案会叠在一起。
+   */
+  readonly sendCall?: (call: DeviceCall) => void;
   /**
    * 挂/摘「流式增量」的钩子。
    *
@@ -180,6 +187,11 @@ export class TurnRunner {
   private playedSeen = false;
   /** 正在等的这一轮（`null` = 没有在途轮次；回执要绑在它上面） */
   private playingTicket: TurnTicket | null = null;
+  /** 这一轮回执（「我看看。」）。回答一出第一个字节就掐掉 */
+  private receipt: { text: string; sentBytes: number; firstChunkAt: number; cancelled: boolean; ephemeral: boolean } | null = null;
+  private receiptPlaying = false;
+  /** 本轮是否已经下发过真正的回答音频（回执只在这是 false 时有意义） */
+  private firstAudioSeen = false;
 
   /**
    * 播一句**系统旁白**（不是模型的回答）。
@@ -188,17 +200,17 @@ export class TurnRunner {
    * 所以旁白**不改状态机**，只借同一条 TTS 通道说话；它和本轮回答通过
    * {@link speechChain} 串行，两段音频不会撞在一起。
    */
-  speakCanned(text: string, emotion?: string): Promise<void> {
+  speakCanned(text: string, emotion?: string, ephemeral = false): Promise<void> {
     // 新的一条旁白：上一条的残留作废（它已经被这条取代了，再补播就是重复）
     this.cannedResidue = null;
-    const current = { text, emotion, sentBytes: 0, firstChunkAt: -1, cancelled: false };
+    const current = { text, emotion, sentBytes: 0, firstChunkAt: -1, cancelled: false, ephemeral };
     this.canned = current;
     const run = async (): Promise<void> => {
       const startedAt = this.options.clock.now();
       let firstChunkAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(text, emotion)) {
         if (current.cancelled) {
-          this.log('  旁白    被打断，停止下发');
+          this.log(ephemeral ? '  回执    被正式回答顶掉，停止下发' : '  旁白    被打断，停止下发');
           return;
         }
         if (firstChunkAtMs < 0) {
@@ -211,7 +223,7 @@ export class TurnRunner {
       }
       const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
       this.log(
-        `  旁白    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
+        `  ${ephemeral ? '回执' : '旁白'}    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
         + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
       );
       // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
@@ -223,6 +235,55 @@ export class TurnRunner {
     const next = this.speechChain.then(run, run);
     this.speechChain = next.catch(() => undefined);
     return next;
+  }
+
+  /**
+   * 「这一轮交给慢车道了」的回执。
+   *
+   * 与旁白的区别只有三点，都为了**不拖慢真正的回答**：
+   * - **不排 `speechChain`**：排进去的话本轮 TTS 要等它播完才开始（`run` 里的流式分支
+   *   开头就 `await this.speechChain`），等于用回执换来更晚的答案
+   * - 不在残句里留底：它本来就不是「用户没听完的内容」，留底会让下一轮收到
+   *   「刚才那条汇报只念了一半」的假注记
+   * - 回答一来就掐断，并且先给设备发 `audio.stop` 清掉缓冲，避免两句叠在一起
+   *
+   * @returns 有没有真的开始说（`false` = 这一轮已经出声/已被作废，没必要回执）
+   */
+  speakReceipt(text: string): boolean {
+    if (this.receiptPlaying || this.canned !== null || this.firstAudioSeen) {
+      return false;
+    }
+    this.log(`  回执    ${JSON.stringify(text)}`);
+    this.receiptPlaying = true;
+    const current = { text, sentBytes: 0, firstChunkAt: -1, cancelled: false, ephemeral: true };
+    this.receipt = current;
+    void (async () => {
+      const startedAt = this.options.clock.now();
+      let firstChunkAtMs = -1;
+      for await (const chunk of this.options.tts.synthesize(text)) {
+        if (current.cancelled) {
+          this.log('  回执    被正式回答顶掉，停止下发');
+          return;
+        }
+        if (firstChunkAtMs < 0) {
+          firstChunkAtMs = this.options.clock.now() - startedAt;
+          current.firstChunkAt = this.options.clock.now();
+        }
+        current.sentBytes += chunk.length;
+        this.options.onDownlinkChunk?.(chunk);
+        this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
+      }
+      const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
+      this.log(
+        `  回执    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
+        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${firstChunkAtMs}ms`}）`,
+      );
+      const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
+      while (this.options.clock.now() < until && !current.cancelled) {
+        await this.wait(PLAYBACK_POLL_MS);
+      }
+    })();
+    return true;
   }
 
   /**
@@ -284,6 +345,9 @@ export class TurnRunner {
     // 之后设备不再发第二次，就只能等满上限。
     this.playedSeen = false;
     this.playingTicket = ticket;
+    this.receiptPlaying = false;
+    this.receipt = null;
+    this.firstAudioSeen = false;
 
     // **上游取消的唯一入口**：插话与连接结束都从 `DialogFsm.onInvalidate` 发出来。
     // 带着票据说清楚要取消哪一轮 —— 迟到的取消由 session 层按代次丢弃。
@@ -314,6 +378,13 @@ export class TurnRunner {
         if (firstChunkAtMs === 0) {
           firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
           firstAudioAtMs = this.options.clock.now();
+          this.firstAudioSeen = true;
+          // 回执还在念：先清掉设备缓冲再发这一块，否则两句会叠在一起
+          if (this.receipt !== null && !this.receipt.cancelled) {
+            this.receipt.cancelled = true;
+            this.log('  回执    被正式回答顶掉');
+            this.options.sendCall?.({ op: 'audio.stop' });
+          }
           fsm.audioStarted(ticket);
           this.options.onState?.();
           this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);

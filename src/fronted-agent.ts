@@ -39,7 +39,7 @@
  */
 import { cleanForSpeech } from './agent.ts';
 import { parseEmotion } from './emotion.ts';
-import type { AgentImage, AgentProvider, AgentReplyView, TurnContext } from './providers.ts';
+import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, TurnContext } from './providers.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
 /** 快模型说「这个我答不了」的唯一暗号 */
@@ -395,6 +395,8 @@ export class FrontedAgent implements AgentProvider {
     return null;
   }
   private sink: ((text: string) => void) | null = null;
+  /** 交给慢车道时叫一次：编排层据此给用户一句回执 */
+  private delegateHook: ((reason: DelegateReason) => void) | null = null;
   private innerMode: InnerMode = 'pass';
   private readonly buffered: string[] = [];
   /**
@@ -472,6 +474,27 @@ export class FrontedAgent implements AgentProvider {
     this.inner.setAnnouncer?.(cb);
   }
 
+  /**
+   * 编排层挂「这一轮交给慢车道了」的钩子。
+   *
+   * 只在快车道**真的让步**时叫（本地判据否决 / 暗号 / 超时 / 空答复），快车道胜出时不叫。
+   * 回调里不要做耗时的事：它在 `reply()` 的同步段里被调用。
+   */
+  setDelegateHook(cb: ((reason: DelegateReason) => void) | null): void {
+    this.delegateHook = cb;
+  }
+
+  private reportDelegate(reason: DelegateReason): void {
+    if (this.delegateHook === null) {
+      return;
+    }
+    try {
+      this.delegateHook(reason);
+    } catch (error) {
+      this.log(`  快车道    ✗ 回执钩子失败：${(error as Error).message}`);
+    }
+  }
+
   async reply(
     userText: string,
     image?: AgentImage,
@@ -489,7 +512,7 @@ export class FrontedAgent implements AgentProvider {
     // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
     if (this.lastDsh?.asked === true && looksLikeAnswer(userText)) {
       this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
-      return await this.delegate(userText, image, note, ticket);
+      return await this.delegate(userText, image, note, ticket, 'task');
     }
     // 像「长期事实」的一句话：**必须让 dsh 亲耳听到**。
     // 实测 dsh 只对「用户自己说的」话写记忆 —— 把它塞进系统注记里转述（试过 5 种措辞，
@@ -497,7 +520,7 @@ export class FrontedAgent implements AgentProvider {
     // 让 L2 用自己的判断决定记不记；L1 不替它写、也不替它猜。
     if (looksMemorable(userText)) {
       this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
-      return await this.delegate(userText, image, note, ticket);
+      return await this.delegate(userText, image, note, ticket, 'task');
     }
     const hasFacts = this.statusFacts !== undefined;
     // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
@@ -506,11 +529,11 @@ export class FrontedAgent implements AgentProvider {
       && (isFastCandidate(userText, this.maxChars)
         || (hasFacts && isStatusQuestion(userText)));
     if (!candidate) {
-      return await this.delegate(userText, image, note, ticket);
+      return await this.delegate(userText, image, note, ticket, 'task');
     }
     if (this.pending.length / 2 >= this.keepTurns) {
       this.log('  快车道    攒满上限，这一轮强制交给 dsh（顺便刷上下文）');
-      return await this.delegate(userText, image, note, ticket);
+      return await this.delegate(userText, image, note, ticket, 'task');
     }
 
     const startedAt = this.now();
@@ -547,14 +570,16 @@ export class FrontedAgent implements AgentProvider {
         dsh?.catch(() => undefined);
         return this.commit(userText, emitted, 0, dsh, ticket);
       }
-      return await this.abandon(dsh, userText, image, note, `✗ ${why}`, ticket);
+      // 超时和真报错分开：回执话术不一样（「嗯，我想想」vs「我看看」）
+      const reason: DelegateReason = why.includes('超时') ? 'timeout' : 'error';
+      return await this.abandon(dsh, userText, image, note, `✗ ${why}`, ticket, reason);
     }
 
     if (answer.delegated) {
-      return await this.abandon(dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`, ticket);
+      return await this.abandon(dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`, ticket, 'delegate');
     }
     if (cleanForSpeech(parseEmotion(answer.text).rest) === '') {
-      return await this.abandon(dsh, userText, image, note, '空答复', ticket);
+      return await this.abandon(dsh, userText, image, note, '空答复', ticket, 'empty');
     }
     return this.commit(userText, answer.text, answer.firstTokenMs, dsh, ticket);
   }
@@ -677,8 +702,10 @@ export class FrontedAgent implements AgentProvider {
     note: string | undefined,
     why: string,
     ticket: TurnTicket,
+    reason: DelegateReason,
   ): Promise<AgentReplyView> {
     this.log(`  快车道    ${why} → 交给 dsh`);
+    this.reportDelegate(reason);
     const promise = dsh ?? this.startInner(userText, image, note, ticket);
     this.innerMode = 'pass';
     const held = this.buffered.splice(0);
@@ -695,8 +722,10 @@ export class FrontedAgent implements AgentProvider {
     image: AgentImage | undefined,
     note: string | undefined,
     ticket: TurnTicket,
+    reason: DelegateReason,
   ): Promise<AgentReplyView> {
     this.innerMode = 'pass';
+    this.reportDelegate(reason);
     const answer = await this.startInner(userText, image, note, ticket);
     this.rememberDsh(answer.speech, userText);
     return answer;

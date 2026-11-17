@@ -87,6 +87,10 @@ export function trackActivity(
     ...(agent.attachLiveSink === undefined ? {} : { attachLiveSink: agent.attachLiveSink.bind(agent) }),
     // 每个可选能力都必须显式透传 —— 漏一个就是静默降级（`keepalive.ts` 顶部踩过）
     ...(agent.cancelTurn === undefined ? {} : { cancelTurn: agent.cancelTurn.bind(agent) }),
+    // 「交给慢车道了」的回执钩子：漏转发 = 委派轮永远没有回执（静默降级）
+    ...(agent.setDelegateHook === undefined
+      ? {}
+      : { setDelegateHook: agent.setDelegateHook.bind(agent) }),
     ...(agent.interruptTurn === undefined ? {} : { interruptTurn: agent.interruptTurn.bind(agent) }),
     ...(agent.taskStatus === undefined ? {} : { taskStatus: agent.taskStatus.bind(agent) }),
   };
