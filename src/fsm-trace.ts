@@ -244,19 +244,25 @@ export function checkTrace(input: readonly TraceEvent[], options: AuditOptions =
     // 「停嘴→首块」就会虚高到几秒（实测 5064 / 13757 ms），看起来像回退。
     // 后面的轮次记 null —— 缺仪表，不拿 0 或别人的时刻冒充。
     const stopCandidate = [...events]
-      .filter((e) => e.ev === 'gate.close' && e.t >= span.startAt - 30_000 && e.t <= span.startAt + 30_000)
+      // 窗口只留 8 s：真机实测「停嘴→开轮」最长 1.3 s，留 30 s 会把**上一段话**
+      // 的停嘴也算进来（τ² 那场出现过 20229 ms 的假报警）
+      .filter((e) => e.ev === 'gate.close' && e.t >= span.startAt - 8_000 && e.t <= span.startAt + 30_000)
       .map((e) => e.t - Number(e['gapMs'] ?? 0))
       .filter((t) => t <= span.startAt + 500)
       .pop();
-    let stopBefore: number | undefined;
-    if (stopCandidate !== undefined && !usedStops.has(stopCandidate)) {
-      stopBefore = stopCandidate;
-      usedStops.add(stopCandidate);
-    }
     // 触发这一轮的句子：必须是**开轮之前**那一句（开轮之后到的是被合并进来的后半句）
     const sentence = [...events]
       .filter((e) => e.ev === 'asr.sentence' && e.t <= span.startAt)
       .pop();
+    let stopBefore: number | undefined;
+    // 只有「这句刚说完就开的轮」才算：排队轮（用户第二句等上一轮念完）的
+    // `turn.start` 离它自己那句话好几秒，拿它算「停嘴→首块」等于把排队时间算进去，
+    // 数字会虚高到十几秒（τ² 那场 10 轮的档案上实测过）
+    const triggeredClosely = sentence !== undefined && span.startAt - sentence.t <= 1_500;
+    if (triggeredClosely && stopCandidate !== undefined && !usedStops.has(stopCandidate)) {
+      stopBefore = stopCandidate;
+      usedStops.add(stopCandidate);
+    }
     turns.push({
       no: span.no,
       startAt: span.startAt,

@@ -187,10 +187,21 @@ def audit_archive(archive_root: Path) -> int:
         print("    审计     ✗ 没找到本次的档案目录")
         return 2
     target = candidates[0]
-    repo = Path(__file__).resolve().parents[2]
-    checker = repo / "scripts" / "fsm-trace-check.ts"
-    if not checker.exists() or shutil.which("node") is None:
-        print(f"    审计     跳过（缺 {checker} 或 node）")
+    # 找审计器：部署时它在被测方仓库里（`$TAU2_DSH_DIR`，默认 `~/miai-cloud`）；
+    # 从本仓直接跑时就是 `bench/tau2/` 往上两级。**别只靠 parents[2]** ——
+    # 脚本被拷到 `~/miai-bench/ours/` 时那会算成 `~`（实测跳过过一次）。
+    candidates_repo = [
+        os.environ.get("TAU2_DSH_DIR") or "",
+        str(Path(__file__).resolve().parents[2]),
+        str(Path.home() / "miai-cloud"),
+    ]
+    checker: Path | None = None
+    for candidate in candidates_repo:
+        if candidate and (Path(candidate) / "scripts" / "fsm-trace-check.ts").exists():
+            checker = Path(candidate) / "scripts" / "fsm-trace-check.ts"
+            break
+    if checker is None or shutil.which("node") is None:
+        print(f"    审计     跳过（找不到 scripts/fsm-trace-check.ts 或 node；试过 {candidates_repo}）")
         return 0
     proc = subprocess.run(  # noqa: S603 —— 参数是我们自己拼的
         ["node", "--experimental-strip-types", str(checker), str(target)],
