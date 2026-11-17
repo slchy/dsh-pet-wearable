@@ -157,6 +157,14 @@ export class DialogRuntime {
   private disposed = false;
   /** 用户最后一次开口（中间结果也算）的时刻，用来判断「他是不是还在说」。 */
   private lastUserSpeechAt = Number.NEGATIVE_INFINITY;
+  /**
+   * 用户最后一整句（`sentence` / `utterance`）的时刻。
+   *
+   * 和 {@link lastUserSpeechAt} 分开：那个连 partial 也算，用来掐断正在念的旁白；
+   * 这个只认整句 —— 播报在开麦窗口里要不要让路，看的是「他真的说了一句」，
+   * 一个语气词的 partial 不该把一条汇报又推后 800 ms。
+   */
+  private lastUserSentenceAt = Number.NEGATIVE_INFINITY;
   /** 因为用户还在说话而推迟的那次播报检查。同一时刻只排一个。 */
   private announceRetry: Cancel | null = null;
   /**
@@ -234,6 +242,9 @@ export class DialogRuntime {
     // 所以 `bargeIn` 那条路对它不成立，**它是唯一能掐断播报的地方**。
     if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
       this.lastUserSpeechAt = this.options.clock.now();
+      if (event.type !== 'partial') {
+        this.lastUserSentenceAt = this.options.clock.now();
+      }
       // 只是「嗯」一声、或者 ASR 把一个语气词当成中间结果 —— 这不算打断。
       // 误判的代价不对称：打断错的代价是丢掉一整条后台汇报，不打断只是晚几百毫秒安静。
       if (!isBackchannelOnly(event.text)) {
@@ -463,6 +474,8 @@ export class DialogRuntime {
     const mic = this.options.env.announceMic;
     const { env } = this.options;
     this.announcing = true;
+    // 真的出声过没有 —— `onAnnounce` 的第二个参数是「刚出过声」，跳过的那条不算
+    let spokeAny = false;
     // 播报占的是 `announce`，不是 `reply`：它是后台汇报，不是对话层的一轮
     env.onAnnounce?.(true, false);
     try {
@@ -473,18 +486,31 @@ export class DialogRuntime {
         }
         // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动
         const speak = (text: string): Promise<void> => this.runner.speakCanned(text, item.emotion);
+        // 开麦这一段是异步的（最长 1.5 s），期间的整句记录用来判断要不要让路
+        const mark = this.options.clock.now();
         if (mic === undefined) {
           await speak(item.speech);
+          spokeAny = true;
         } else {
           // 设备能开麦就先开：播报一开口就能被插话（ADR-0001 §6）。超时照播。
-          await speakAnnouncement(item.speech, {
+          const result = await speakAnnouncement(item.speech, {
             listenStart: mic.listenStart,
             micOpenTimeoutMs: mic.micOpenTimeoutMs,
             listenMs: mic.listenMs,
             call: mic.call,
             awaitMicOpen: mic.awaitMicOpen,
+            // 开麦窗口里用户说了一整句就不念了。只看 `sentence`/`utterance`：
+            // 一个语气词的 partial 不值得把汇报再推后一轮
+            shouldSpeak: () => this.lastUserSentenceAt <= mark,
             speak,
           });
+          if (!result.spoke) {
+            // 排回**队首**：这条只是被推迟，不是被丢掉
+            this.announceQueue.unshift(item);
+            this.options.log('  播报    开麦期间用户说了一句 → 排回队首，等安静');
+            break;
+          }
+          spokeAny = true;
         }
         // 播报期间用户说话了：这条已经被 `cancelCanned` 掐断，剩下的留到下一轮结束
         if (
@@ -501,13 +527,13 @@ export class DialogRuntime {
         closeAnnounceMic({ listenStart: mic.listenStart, call: mic.call });
       }
       // 整批播完（队列空了、用户也没在说话）就没什么要处理的；
-      // 队列里还有货说明播报期间又来了新的 —— 得自己再排一次检查，
+      // 队列里还有货说明播报期间又来了新的（或被让路推迟了）—— 得自己再排一次检查，
       // 否则那一条会一直躺着等下一轮。
       if (this.announceQueue.length > 0) {
         this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS);
       }
       // `spoken: true`：播报出声算"最近出过声"，由 minGap 推迟下一次搭话（ADR-0001 §6）
-      env.onAnnounce?.(this.announceQueue.length > 0, true);
+      env.onAnnounce?.(this.announceQueue.length > 0, spokeAny);
     }
   }
 

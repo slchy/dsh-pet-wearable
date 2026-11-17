@@ -19,6 +19,7 @@
 | 判停中的文本 | `UtteranceAssembler`（`pending`） | 上层只在 `accept` 时拿到整句，拿不到半句 |
 | 快车道闸门 | `FrontedAgent.innerMode`（`pass` / `buffer` / `drop`） | dsh 的流式增量按闸门决定直通、缓冲还是丢弃 |
 | 宠物状态 | `PetSession.state`（`PetState`） | 纯函数 `brain.step` 产出；执行器无判断 |
+| 后台汇报什么时候开口 | `DialogRuntime.announceQueue` + 四道闸 | `queue.length > 0` → 宠物闸门 `floorFree` 不通过（`announcePending`），宠物自己不说话；`announce` 抢不动 `reply` |
 
 > 播放口径：**估算时长是下限，设备回执只能延后**。真机上见过设备在「最后一批字节收到」
 > 就报 `played`（4.58 s 音频 1 s 回执），按它收尾会把尾音那段插话窗口关掉。
@@ -266,6 +267,49 @@ stateDiagram-v2
 `commit` 之后 dsh 那一轮**一定**要接住 rejection：它被掐时经常以「清洗后没有可朗读的
 内容」收场，而 `commit`/`abandon` 挂得比「掐」晚，中间这段窗口里没人接就是进程级未捕获
 （线上真挂过一次，见 [fsm-align-report](fsm-align-report.md)）。
+
+## 5.5 播报队列 —— 后台任务的结论什么时候开口
+
+**持有**：`DialogRuntime.announceQueue`（+ `announcing`、`lastUserSpeechAt`、
+`lastUserSentenceAt`、单个 `announceRetry` 定时器）。
+**驱动**：`agent.setAnnouncer` → `enqueueAnnounce`；`onTurnFinished`；定时器重试。
+
+播报**不属于任何一轮**：走 `speakCanned` 的旁白通道，不占轮次票据、不改状态机。
+所以「等它该开口了」这件事只能自己判断，四道闸：
+
+| 闸 | 条件 | 不满足时 |
+|---|---|---|
+| `disposed` / `announcing` / 队列空 | — | 直接返回 |
+| 没有正题在跑 | `core.phase === 'listening'` | 返回，`onTurnFinished` 会再叫一次 |
+| 用户真的安静了 | `now - lastUserSpeechAt ≥ 800 ms` | `scheduleAnnounceRetry(800 - quietFor)`，**只排一个** |
+| 开麦窗口没被打断 | `lastUserSentenceAt ≤ mark`（开麦前记的时刻） | 排回**队首**，等下一轮 |
+
+第三条用 `lastUserSpeechAt`（连 partial 也算）是因为用户说话时 FSM 也是 `listening`
+（要等整句定稿才进 `thinking`），光看状态会在换气口插进去。第四条只看**整句**：
+开麦最长 1.5 s，而且用户已经在说时麦是立刻开的 —— 最该让路的时候反而最快开口；
+但一个语气词的 partial 不值得把汇报再推后一轮。
+
+已经念到一半被打断：旁白期间 FSM 停在 `listening`，`bargeIn` 对它不成立，所以只有
+`dispatch` 里那一次 `interruptCanned()`（非旁听句子才触发）。没念完的部分切成残句，
+下一轮作为系统注记交给模型自己判断补不补。**一个字都没发出去时不算残句** ——
+否则下一轮会把用户从没听过的整条汇报塞进回答里。
+
+```mermaid
+stateDiagram-v2
+    [*] --> 排队 : enqueueAnnounce
+    排队 --> 等正题 : phase != listening
+    排队 --> 等安静 : 用户 800ms 内出过声
+    等正题 --> 排队 : onTurnFinished
+    等安静 --> 排队 : 重试定时器到期
+    排队 --> 开麦 : 四道闸全过
+    开麦 --> 出声 : 麦开了且没说整句
+    开麦 --> 排队 : 说了整句（排回队首）
+    出声 --> 播放中
+    播放中 --> 排队 : 用户开口（interruptCanned，剩句交给下一轮）
+    播放中 --> 排队 : 队列还有下一条
+    播放中 --> 空闲 : 队列空了
+    空闲 --> [*]
+```
 
 ## 6 一轮对话的完整时序
 

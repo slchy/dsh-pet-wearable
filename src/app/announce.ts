@@ -19,16 +19,24 @@ export interface AnnounceDeps {
   readonly call: (call: DeviceCall) => void;
   /** 等首帧上行，最多 `timeoutMs`；`true` = 麦开了 */
   readonly awaitMicOpen: (timeoutMs: number) => Promise<boolean>;
+  /**
+   * 开麦之后、出声之前再看一眼。
+   *
+   * 开麦最长等 1.5 s，这段窗口里用户完全可能开始说话；而且他**已经在说**的时候
+   * 麦是立刻开的 —— 也就是最该压下去的时候反而最快开口。`false` = 这次不念。
+   */
+  readonly shouldSpeak?: () => boolean;
   readonly speak: (text: string) => Promise<void>;
 }
 
 /**
- * @returns `micOpened`：开麦成功 `true`、超时 `false`、设备不支持开麦 `null`
+ * @returns `micOpened`：开麦成功 `true`、超时 `false`、设备不支持开麦 `null`；
+ *   `spoke`：真的出声了（`false` = 开麦期间用户开口，调用方该把它排回队首）
  */
 export async function speakAnnouncement(
   text: string,
   deps: AnnounceDeps,
-): Promise<{ readonly micOpened: boolean | null }> {
+): Promise<{ readonly micOpened: boolean | null; readonly spoke: boolean }> {
   let micOpened: boolean | null = null;
   if (deps.listenStart) {
     deps.call({
@@ -37,8 +45,11 @@ export async function speakAnnouncement(
     });
     micOpened = await deps.awaitMicOpen(deps.micOpenTimeoutMs);
   }
+  if (deps.shouldSpeak !== undefined && !deps.shouldSpeak()) {
+    return { micOpened, spoke: false };
+  }
   await deps.speak(text);
-  return { micOpened };
+  return { micOpened, spoke: true };
 }
 
 /**

@@ -246,6 +246,12 @@ export class TurnRunner {
       ? 0
       : this.options.clock.now() - current.firstChunkAt;
     const heardMs = Math.min(sentMs, elapsedMs);
+    // **一个字都没发出去**：这不是「念了一半」，是全没念。记残句的后果是下一轮收到
+    // 「刚才那条后台汇报你只念了一半」的注记，模型会把用户从没听过的整条汇报
+    // 塞进回答里。合成首包那 ~300 ms 里被掐，只可能是这种情况。
+    if (current.sentBytes === 0) {
+      return;
+    }
     const rest = remainingSpeech(current.text, heardMs / 1000);
     if (rest !== '') {
       this.cannedResidue = {
