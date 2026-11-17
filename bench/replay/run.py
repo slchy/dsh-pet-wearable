@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """真机向量回放：把**某场真机会话录下的上行音频**原速重放一遍，逐轮对比。
 
-    python scripts/replay/run.py                       # 拿最新一场真机会话，回放前 3 轮
-    python scripts/replay/run.py --archive 20261116-005927-182.135.0.22_10021 --turns 0
-    python scripts/replay/run.py --list                # 列出可回放的会话
+    python bench/replay/run.py                        # 拿最新一场真机会话，回放前 3 轮
+    python bench/replay/run.py --archive <会话名> --turns 0
+    python bench/replay/run.py --list                 # 列出可回放的会话
 
 ## 为什么是它，而不是 E2E
 

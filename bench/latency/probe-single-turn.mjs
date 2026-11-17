@@ -70,8 +70,9 @@ const server = spawn(process.execPath, [
     MIAI_ARCHIVE_KEEP: '50',
     COSYVOICE_TRACE: '1',
     
-    // Windows 上 npm 的 .ps1/.cmd 垫片不是可执行映像，必须指到 .cmd
-    DSH_BIN: process.env['DSH_BIN'] ?? 'C:\\Users\\slchy\\AppData\\Roaming\\npm\\dsh.cmd',
+    // Windows 上 npm 的 .ps1/.cmd 垫片不是可执行映像，必须指到 .cmd。
+    // 路径因人而异，不写死：没设 DSH_BIN 就按 PATH 找（npm 全局 bin 通常在 PATH 里）。
+    DSH_BIN: process.env['DSH_BIN'] ?? 'dsh.cmd',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
