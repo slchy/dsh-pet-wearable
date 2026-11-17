@@ -438,6 +438,32 @@ class Connection {
 const STREAM_BATCH_CHARS = 10;
 
 /**
+ * 第一批的最小长度。
+ *
+ * 快车道的回答常常不到 10 个字（人设要求二十字以内），按 10 字门槛要等到
+ * `queue.close()` —— 也就是整段生成结束之后才开始合成，「边生成边合成」退化成
+ * 「等整段再合成」，短答反而比长答更慢。剥掉开头情绪标签之后只要有正文就先送一批。
+ */
+const FIRST_BATCH_CHARS = 2;
+
+/** 这一批够不够送：第一批只看有没有正文，之后按 {@link STREAM_BATCH_CHARS} 攒。 */
+export function streamBatchReady(batch: string, first: boolean): boolean {
+  return batch.length >= (first ? FIRST_BATCH_CHARS : STREAM_BATCH_CHARS);
+}
+
+/**
+ * 批尾是不是一个没闭合的标签（`[平静`）。
+ *
+ * 第一批门槛降到两个字之后，增量可能在标签中间断批（`[` / `平静` / `]`），
+ * 这时送出去会被当成正文念出来。等闭合括号到了再送。
+ */
+function hasUnclosedTag(batch: string): boolean {
+  const open = Math.max(batch.lastIndexOf('['), batch.lastIndexOf('【'));
+  const close = Math.max(batch.lastIndexOf(']'), batch.lastIndexOf('】'));
+  return open > close;
+}
+
+/**
  * 「数字 / 编号」里会出现的字符。
  *
  * 中文数字必须算进来：人设要求数字写成念法，实际送进 TTS 的是「六四一四室」，
@@ -636,8 +662,10 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         const flush = (raw: string, tail: boolean): void => {
           // 情绪标签 / markdown 不能进 TTS（会被念出来），逐批清洗；首批还要去掉开头的 [xxx]
           const clean = cleanForSpeech(first ? raw.replace(/^\s*\[[^\]]{1,8}\]/, '') : raw);
-          first = false;
           if (clean === '') return;
+          // 标志只在**真的送出一批**之后才落下：整批都是标签时不能把它吃掉，
+          // 否则下一批就会被当成「后续批次」，开头的标签会漏进 TTS
+          first = false;
           // 尾批也要打：短答（不足一批）只有这一次送文本，不打的话
           // `grep -c 送批` 是 0，和「一个字都没送」分不开
           if (tracing) console.log(`  TTS 送批 ${JSON.stringify(clean)}${tail ? '（尾）' : ''}`);
@@ -645,7 +673,8 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         };
         for await (const text of chunksIn) {
           batch += text;
-          if (batch.length < STREAM_BATCH_CHARS) continue;
+          if (!streamBatchReady(batch, first)) continue;
+          if (first && hasUnclosedTag(batch)) continue;
           const cut = splitStreamBatch(batch);
           batch = cut.keep;
           if (cut.send !== '') flush(cut.send, false);

@@ -200,7 +200,7 @@ export class DialogRuntime {
       downlink: options.downlink,
       fsm: this.core.fsm,
       playbackTailMs: options.playbackTailMs,
-      // 设备能报 `played` 就以设备为准（估算退化成上限）
+      // 设备能报 `played` 就以设备为准（估算是**下限**，回执只能延后）
       deviceReportsPlayed: options.caps.played,
       onState: () => { this.notifyState(); },
       ...(options.ttsGain === undefined ? {} : { ttsGain: options.ttsGain }),

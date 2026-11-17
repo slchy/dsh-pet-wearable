@@ -10,7 +10,7 @@ import { test } from 'node:test';
 
 import { WebSocketServer } from 'ws';
 
-import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch } from '../src/cosyvoice.ts';
+import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch, streamBatchReady } from '../src/cosyvoice.ts';
 import { EMOTIONS, type Emotion } from '../src/emotion.ts';
 import { TokenQueue } from '../src/token-queue.ts';
 
@@ -170,7 +170,13 @@ test('流式：不足一批的短答也要送出去，且开头的情绪标签�
     let bytes = 0;
     for await (const chunk of tts.synthesizeStream!(queue)) bytes += chunk.length;
     assert.ok(bytes > 0, '应当出声');
-    assert.deepEqual(server.texts, [['在，哥。']]);
+    // 第一批已经在「有正文」时就送了（不再等 10 字），所以按拼起来判断，
+    // 不假定分成几批 —— 要钉的是「一个字都不丢」和「标签没被念出来」
+    assert.equal(server.texts.flat().join(''), '在，哥。');
+    for (const batch of server.texts.flat()) {
+      assert.ok(!batch.includes('平静'), `情绪标签进了 TTS：${batch}`);
+      assert.ok(!batch.includes('[') && !batch.includes(']'), `方括号进了 TTS：${batch}`);
+    }
   } finally {
     await server.close();
   }
@@ -232,6 +238,15 @@ test('整段合成：正常念完的连接要复用（弃连接只发生在中�
   } finally {
     await server.close();
   }
+});
+
+test('分批门槛：第一批只要有正文就送，短答不再等整段', () => {
+  // 快车道的回答常常不到 10 个字；按 10 字门槛，它们要等到 queue.close()
+  // （整段生成结束）才开始合成，「边生成边合成」对短答完全不成立。
+  assert.equal(streamBatchReady('行', true), false, '一个字先攒着，等服务端有得合成');
+  assert.equal(streamBatchReady('行啊', true), true, '第一批两个正文字就送');
+  assert.equal(streamBatchReady('行啊', false), false, '后续批次仍按 10 字攒');
+  assert.equal(streamBatchReady('一二三四五六七八九十', false), true);
 });
 
 test('分批：数字不切开，数字前面的字不多等', () => {

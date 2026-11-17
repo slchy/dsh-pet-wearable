@@ -15,6 +15,7 @@ import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
 import type { DownlinkSink } from './transport.ts';
+import type { TurnTicket } from './dialog-fsm.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { remainingSpeech } from './interrupted-tail.ts';
 import { SentencePump } from './sentence-pump.ts';
@@ -164,13 +165,21 @@ export class TurnRunner {
    * 只在 `deviceReportsPlayed` 为真时有意义；由适配层收到设备 `played` 事件时调。
    * 用轮询标志而不是 promise：等待循环本来就在轮询，多一条 promise 只会多一处
    * 需要清理的悬挂引用。
+   *
+   * **只在有在途轮次时才算数**：线协议的 `played` 没有轮次字段，绑定发生在这里 ——
+   * 上一轮迟到的回执不能拿来结束这一轮。
    */
   devicePlayed(): void {
+    if (this.playingTicket === null) {
+      return;
+    }
     this.playedSeen = true;
   }
 
   /** 本轮是否已经收到设备的 `played` */
   private playedSeen = false;
+  /** 正在等的这一轮（`null` = 没有在途轮次；回执要绑在它上面） */
+  private playingTicket: TurnTicket | null = null;
 
   /**
    * 播一句**系统旁白**（不是模型的回答）。
@@ -264,6 +273,11 @@ export class TurnRunner {
     if (!ticket) {
       return null;
     }
+    // 回执标志按**轮次**清零：挪到这里而不是等待环入口，是因为合成期间
+    // （最后一批字节发出之前）到达的回执也得算数 —— 在入口清会把已经到的那次擦掉，
+    // 之后设备不再发第二次，就只能等满上限。
+    this.playedSeen = false;
+    this.playingTicket = ticket;
 
     // **上游取消的唯一入口**：插话与连接结束都从 `DialogFsm.onInvalidate` 发出来。
     // 带着票据说清楚要取消哪一轮 —— 迟到的取消由 session 层按代次丢弃。
@@ -427,8 +441,8 @@ export class TurnRunner {
           ? Math.max(this.options.playbackTailMs, this.options.playedGraceMs ?? PLAYED_GRACE_MS)
           : this.options.playbackTailMs;
         const capAt = estimateAt + graceMs;
-        this.playedSeen = false;
-        while (!fsm.isStale(ticket) && this.options.clock.now() < capAt) {
+        // 断连时 `close()` 不推进代次（它不动 `gen`），只看 `isStale` 会一直空等到上限
+        while (!fsm.isStale(ticket) && fsm.state !== 'closed' && this.options.clock.now() < capAt) {
           if (this.playedSeen && this.options.clock.now() >= estimateAt) {
             break;
           }
@@ -469,6 +483,7 @@ export class TurnRunner {
       return null;
     } finally {
       offInvalidate();
+      this.playingTicket = null;
       fsm.audioDone(ticket);
       this.options.onState?.();
       this.options.onTurnFinished();

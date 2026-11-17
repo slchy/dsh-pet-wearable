@@ -798,7 +798,8 @@ class VoiceConnection {
         this.app?.deviceEvent(event);
         return;
       case 'played':
-        // 设备说播完了：有 `played` 能力的设备靠它离开 speaking（时长估算只当上限）
+        // 设备说播完了：有 `played` 能力的设备靠它离开 speaking（时长估算是**下限**，
+        // 回执只能延后；真机上见过设备在最后一批字节收到时就回执）
         this.runner.devicePlayed();
         this.archive?.event(EVENTS.devicePlayed);
         return;
