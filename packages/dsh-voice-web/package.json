@@ -37,9 +37,12 @@
   "files": [
     "src"
   ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck"
+  },
   "dependencies": {
-    "dsh-pet-wearable": "file:../..",
-    "ws": "^8.23.0"
+    "@deepseek-ai/schemastery": "^3.19.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
@@ -47,7 +50,6 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.1.0",
     "@types/node": "^22.10.0",
-    "@types/ws": "^8.18.2",
     "typescript": "^5.7.0"
   }
 }
