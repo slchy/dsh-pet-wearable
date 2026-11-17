@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 判停组装层：**一句话被 ASR 切成两句**时不要拿后半截当一轮。
  *
  * 真机（2026-11-15）：用户问「…你是怎么答的？」，ASR 断成
@@ -546,6 +546,9 @@ test('判停每次决定都报一条：p 与「还要等多久」要落进档案
   let round = 0;
   const { assembler } = makeAssembler({
     maxExtensions: 1,
+    // 这里要验的是「低分那条分支怎么走」，所以把「刚收到中间结果」那条宽限关掉
+    // （它现在是独立判据，见下面那条 grace 的测试）
+    partialGraceMs: 0,
     predict: async () => {
       round += 1;
       // 第一次说「没说完」，第二次说「说完了」—— 逼出 extend 然后 accept
@@ -582,6 +585,8 @@ test('判停低分有独立预算：unsure 到上限就收下，不占文本判�
       extendMs: 20,
       maxExtensions: 7,
       maxUnsureExtensions: 2,
+      // 同上：只量 unsure 的预算，别让「刚收到中间结果」那条宽限插进来
+      partialGraceMs: 0,
       fallbackWindowMs: 0,
       threshold: 0.5,
       recentMaxBytes: 16_000,
@@ -672,4 +677,83 @@ test('判停快照裁掉尾巴上的静音（训练样本切在停嘴那一点�
   assert.ok(last !== undefined, '判停器应该被调用');
   const ms = (last as Buffer).length / 32;
   assert.ok(ms >= 280 && ms <= 320, `快照应当只剩 200 ms 语音 + 100 ms 余量（实际 ${ms} ms）`);
+});
+
+test('判停说没说完时，新到的中间结果照样能拦住收下', async () => {
+  // 真机（2026-11-17 22:10）：用户一口气说完「…对吗？那句。台词的经典是台词是什么来着？」，
+  // 判停给 0.007 —— 它判对了（话没说完）。但「没说完」那条分支只看 p、不看文本，
+  // 于是 ASR 的「台词的」明明已经到了，还是花光 unsure 预算强收下 → 半句成轮、
+  // 刚出声就被后半句打断作废。
+  const facts: Array<{ why?: string }> = [];
+  const utterances: string[] = [];
+  const assembler = new UtteranceAssembler({
+    quietMs: 0,
+    extendMs: 40,
+    maxExtensions: 7,
+    maxUnsureExtensions: 1,        // 只给 1 拍 unsure，逼出「花光预算」那条路
+    partialGraceMs: 200,
+    fallbackWindowMs: 0,
+    threshold: 0.5,
+    recentMaxBytes: 16_000,
+    predict: async () => 0.01,     // 永远「没说完」
+    onUtterance: (t) => { utterances.push(t); },
+    onJudge: (f) => { facts.push(f); },
+    log: () => {},
+  });
+  try {
+    assembler.addSentence('对吗？那句。');
+    await delay(20);
+    // 判停还在等的时候，ASR 又出了新字 —— 这是「用户还在说」的硬证据
+    assembler.notePartial('台词，');
+    await delay(150);
+  } finally {
+    assembler.dispose();
+  }
+  const grace = facts.filter((f) => f.why === 'grace');
+  assert.ok(grace.length >= 1, `新到的中间结果应当被记成 grace 延伸，实际 ${JSON.stringify(facts)}`);
+  assert.equal(utterances.length, 0, '有 fresh partial 时不该把话强收下');
+});
+
+test('裁静音的門限要比开门門限低一截，否则会把语音尾巴当静音裁掉', async () => {
+  // 真机（2026-11-17 22:10，v2 眼镜）：语音峰值只有 −32…−40 dBFS，而开门門限就是
+  // −40。拿开门門限当「静音」判据 → 最后几个音节被裁掉，判停看到半句话，
+  // 同一句 p 从 0.89 掉到 0.28，白等 800 ms。
+  const seen: Buffer[] = [];
+  const assembler = new UtteranceAssembler({
+    quietMs: 0,
+    extendMs: 30,
+    maxExtensions: 1,
+    fallbackWindowMs: 0,
+    threshold: 0.5,
+    recentMaxBytes: 16_000 * 4,
+    silenceDb: -40,                 // 开门門限（生产值）
+    silenceFloorOffsetDb: 20,       // → 裁静音用 −60
+    trailingTrimMs: 20,
+    predict: async (pcm) => { seen.push(pcm); return 0.99; },
+    onUtterance: () => {},
+    log: () => {},
+  });
+  try {
+    // 200 ms「响」（−20 dBFS），再 200 ms「轻但仍是语音」（−50 dBFS），再 600 ms 静音
+    for (let k = 0; k < 10; k += 1) {
+      const c = Buffer.alloc(640, 0);
+      for (let i = 0; i < 320; i += 1) c.writeInt16LE(3000, i * 2);
+      assembler.addAudio(c);
+    }
+    for (let k = 0; k < 10; k += 1) {
+      const c = Buffer.alloc(640, 0);
+      for (let i = 0; i < 320; i += 1) c.writeInt16LE(100, i * 2);
+      assembler.addAudio(c);
+    }
+    for (let k = 0; k < 30; k += 1) assembler.addAudio(Buffer.alloc(640, 0));
+    assembler.addSentence('嗯，对。');
+    await new Promise((r) => setTimeout(r, 60));
+  } finally {
+    assembler.dispose();
+  }
+  const last = seen.at(-1) as Buffer | undefined;
+  assert.ok(last !== undefined);
+  const ms = last.length / 32;
+  // 语音 400 ms + 20 ms 余量；若用 −40 判静音，那段 −50 的尾巴会被裁掉（只剩 ~220 ms）
+  assert.ok(ms >= 400, `轻的那 200 ms 也是语音，不该被裁掉（实际只留了 ${ms} ms）`);
 });

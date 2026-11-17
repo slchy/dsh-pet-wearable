@@ -740,3 +740,40 @@ test('事实不能混进待同步给 dsh 的注记', async () => {
   assert.ok(note.includes('用户: 你好呀'), note);
   assert.ok(!note.includes('sleep 20'), `注记里不该有后台事实：${note}`);
 });
+
+test('对冲：第 2 份赢的时候，插话取消必须掐得住它', async () => {
+  // 对冲是谁先拿回响应头谁赢 —— 实测第 1 份赢的概率约一半（10 轮 5:5）。
+  // 取消句柄原来存的是「第 0 份」的 controller，于是胜者是第 1 份时插话取消
+  // 打在已经作废的那个上，胜者该吐还吐（服务器上实测又吐了 1921 字节）。
+  const signals: AbortSignal[] = [];
+  let asked = 0;
+  const agent = agentWith(fakeInner().agent, (async (_url: string, init: RequestInit) => {
+    signals.push(init.signal as AbortSignal);
+    asked += 1;
+    if (asked === 1) {
+      // 第 1 份：响应头慢，落败
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return sse(['慢的那份。']);
+    }
+    // 第 2 份：立刻给响应头、但整句要几百毫秒才说完 —— 这一份是胜者
+    return slowSse(['我', '在', '呢', '。'], 120);
+  }) as unknown as typeof fetch, { hedge: 2 });
+  agent.attachLiveSink(() => {});
+
+  const reply = agent.reply('你好呀', undefined, undefined, { ticket: { no: 1, gen: 1 } });
+  await new Promise((resolve) => setTimeout(resolve, 80));            // 胜者已定、还在吐字
+  agent.cancelTurn({ no: 1, gen: 1 });
+  // 必须**这一趟还没收尾**就查：`ask()` 的 finally 里会 abortAll，等它跑完再断言
+  // 就什么都测不出来了（旧代码也是这么"绿"的）。
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const mid = [signals[0]!.aborted, signals[1]!.aborted];
+  await reply.catch(() => undefined);
+
+  assert.ok(signals.length >= 2, `对冲应当真的发了两份，实际 ${signals.length}`);
+  assert.equal(mid[0], true, '落败的那份要掐掉（省钱）');
+  assert.equal(
+    mid[1],
+    true,
+    '★ 胜出的那份也必须被取消掐住 —— 否则插话之后快模型还在生成、继续往 TTS 推字',
+  );
+});

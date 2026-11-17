@@ -479,7 +479,7 @@ export class FrontedAgent implements AgentProvider {
     readonly startedAt: number;
     readonly answer: Promise<FastAnswer>;
     readonly buffered: string[];
-    abort: AbortController | null;
+    abort: { abort(why: Error): void } | null;
     listener: ((text: string) => void) | null;
   } | null = null;
   /**
@@ -521,8 +521,14 @@ export class FrontedAgent implements AgentProvider {
   private localGen = 0;
   /** 已经发过取消的票据（`no:gen`，同一张只发一次） */
   private cancelledKey: string | null = null;
-  /** 快模型这一轮在途的 HTTP（插话时掐掉，别让它继续跑到超时） */
-  private askAbort: AbortController | null = null;
+  /**
+   * 一次快车道请求的取消句柄。**对冲时是一组**：`abort()` 掐掉全部候选。
+   *
+   * 不能只存「第 0 份」的 controller —— 对冲是谁先拿回响应头谁赢，实测第 1 份赢的
+   * 概率约一半（10 轮 5:5）。存第 0 份的话，胜者是第 1 份时插话取消打在已经作废的
+   * 那个上，胜者该吐还吐（探针实测又吐了 1921 字节），预跑「作废」同样掐不住。
+   */
+  private askAbort: { abort(why: Error): void } | null = null;
 
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
@@ -712,7 +718,7 @@ export class FrontedAgent implements AgentProvider {
       startedAt: this.now(),
       answer: null as unknown as Promise<FastAnswer>,
       buffered: [] as string[],
-      abort: null as AbortController | null,
+      abort: null as { abort(why: Error): void } | null,
       listener: null as ((chunk: string) => void) | null,
     };
     slot.answer = this.ask(text, slot.startedAt, (chunk) => {
@@ -781,10 +787,10 @@ export class FrontedAgent implements AgentProvider {
     this.log(`  快车道    预跑作废（${why}）`);
   }
 
-  private abortPrefetch(controller: AbortController | null): void {
+  private abortPrefetch(handle: { abort(why: Error): void } | null): void {
     // 已经被别的 `ask()` 顶替过就别动它 —— 那会掐掉正在服务的那一轮
-    if (controller !== null && this.askAbort === controller) {
-      controller.abort(new Error('预跑作废'));
+    if (handle !== null && this.askAbort === handle) {
+      handle.abort(new Error('预跑作废'));
     }
   }
 
@@ -1153,7 +1159,9 @@ export class FrontedAgent implements AgentProvider {
     const abortAll = (why: Error): void => {
       for (const c of controllers) c.abort(why);
     };
-    this.askAbort = controllers[0]!;
+    // 取消句柄是**整组**：插话时把还在跑的候选一起掐掉（见 `askAbort` 的注释）
+    const handle = { abort: abortAll };
+    this.askAbort = handle;
     // **两段超时**：首字之前卡住 = 模型不干活，早点让给 dsh；
     // 首字之后还在出字 = 正常，给足时间 —— 用一个固定总超时会把
     // 「五百多毫秒才说完」的正常答案一起掐掉（实测 10 条闲聊里 6 条被掐）。
@@ -1214,8 +1222,8 @@ export class FrontedAgent implements AgentProvider {
     } finally {
       clearTimeout(timer);
       abortAll(new Error('请求结束'));
-      // 只清自己那一个：两轮重叠时别把下一轮的请求从记录里抹掉
-      if (controllers.includes(this.askAbort as AbortController)) {
+      // 只清自己那一个：两轮重叠时别把下一轮的那组从记录里抹掉
+      if (this.askAbort === handle) {
         this.askAbort = null;
       }
     }

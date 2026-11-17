@@ -65,12 +65,22 @@ export interface UtteranceAssemblerOptions {
   /** 送给判停器的最近音频上限（字节） */
   readonly recentMaxBytes: number;
   /**
-   * 判停音频快照**尾部最多留多少静音**（ms）。
+   * 送给判停器的快照**尾部最多留多少静音**（ms）。
    *
-   * 官方训练样本切在停嘴那一点；尾巴上的静音会把 p 拉低（实测停嘴处 0.95、
-   * +300 ms 0.35、+800 ms 0.04）。见 `pcm16TrimTrailingSilence`。
+   * 官方约定是「音频顶到输入向量的末尾、零补在开头」。尾巴留静音等于把语音
+   * 从窗口末尾推开：同一句留 0 ms 时 p=0.95、留 800 ms 时 0.04。留多少在噪声里
+   * （21 轮离线扫描 0–20 ms 好于 100 ms，真机回放复现不出来），取小值只为方向正确。
    */
   readonly trailingTrimMs?: number;
+  /**
+   * 「这里算不算静音」的门限（dBFS），缺省比 {@link silenceDb} 低 20 dB。
+   *
+   * **不能直接用 {@link silenceDb}**：那个门限是「有没有人说话」的开门门槛
+   * （`VOICE_PEAK_DBFS`，默认 −40），而这台设备的语音峰值本身就只有 −32…−40 ——
+   * 拿它当「静音」判据会把**最后几个音节当静音裁掉**，判停看到的是半句话。
+   * （真机回放里正是这个：同一句 trim 门限用 −40 时 p 掉到 0.28，用 −60 时 0.89。）
+   */
+  readonly silenceFloorOffsetDb?: number;
   /** 判停器。返回 <0 表示不可用 */
   readonly predict?: (pcm: Buffer) => Promise<number>;
   /**
@@ -340,7 +350,13 @@ export class UtteranceAssembler {
    */
   private snapshot(): Buffer {
     const pcm = Buffer.concat(this.recentChunks);
-    return pcm16TrimTrailingSilence(pcm, this.options.silenceDb, this.options.trailingTrimMs ?? 0);
+    // 裁静音的门限要**比开门门槛低一截**：开门门槛（`silenceDb`，默认 −40）问的是
+    // 「有没有人说话」，而这台设备的语音峰值本身就在 −32…−40；拿它当静音判据会把
+    // 最后几个音节一起裁掉。−20 dB 的偏移对应噪声峰（实测 −69）与语音峰之间。
+    const floor = this.options.silenceDb === undefined
+      ? undefined
+      : this.options.silenceDb - (this.options.silenceFloorOffsetDb ?? 20);
+    return pcm16TrimTrailingSilence(pcm, floor, this.options.trailingTrimMs ?? 0);
   }
 
   /**
@@ -618,6 +634,29 @@ export class UtteranceAssembler {
       return;
     }
 
+    // 「判停还没吱声的这几十毫秒里又来了一条中间结果」= 硬证据：用户还在说。
+    //
+    // 这条必须在阈值的**外面**：真机上（2026-11-17 22:10 那场）用户把
+    // 「…对吗？那句。台词的经典是台词是什么来着？」一次说完，判停给了 0.007，
+    // 于是走的是「没说完」那条分支、只看 p 不看文本 —— 等第二拍时 ASR 的
+    // `台词的` 已经到了，照样被判「没说完」然后花光 unsure 预算强收下，
+    // 结果生成了一个半句轮次、刚出声就被用户后半句打断作废。
+    // 有 fresh partial 的时候不管 p 是多少都不该收。
+    const grace = this.options.partialGraceMs ?? 400;
+    const sincePartial = evaluatedAt - this.lastPartialAt;
+    if (grace > 0 && !this.usedPrefired
+      && sincePartial < grace && this.extensions < this.options.maxExtensions) {
+      this.extensions += 1;
+      this.options.log(
+        `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
+      );
+      this.reportJudge({
+        p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'grace',
+      });
+      this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
+      return;
+    }
+
     if (
       probability >= this.options.threshold
       || this.extensions >= this.options.maxExtensions
@@ -625,23 +664,6 @@ export class UtteranceAssembler {
       // （2.8 s）吃干净，也不能让它拖累那三条文本判据的额度
       || this.unsureExtensions >= (this.options.maxUnsureExtensions ?? this.options.maxExtensions)
     ) {
-      // 文本判据：音频说完了，但用户还在出字 —— 这时候收下就是抢话。
-      // 只在还有 extension 额度时生效，避免无限等。
-      const grace = this.options.partialGraceMs ?? 400;
-      const sincePartial = evaluatedAt - this.lastPartialAt;
-      if (grace > 0 && !this.usedPrefired
-        && sincePartial < grace && this.extensions < this.options.maxExtensions) {
-        this.extensions += 1;
-        this.options.log(
-          `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
-        );
-        this.reportJudge({
-          p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'grace',
-        });
-        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
-        return;
-      }
-
       if (this.shouldWaitForMore(this.pendingText)) {
         this.extensions += 1;
         const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);

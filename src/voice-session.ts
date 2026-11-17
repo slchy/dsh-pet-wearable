@@ -148,10 +148,12 @@ const ASSEMBLER_RECENT_SECONDS = 8;
 /**
  * 送给判停器的快照，尾部最多留多少毫秒静音。
  *
- * 官方训练样本切在停嘴那一点；多出来的静音会把 p 拉低，而 p 正是「要不要再等一拍」
- * 的依据（见 `pcm16TrimTrailingSilence`）。100 ms 是给尾音和清辅音留的余量。
+ * 官方约定是「音频顶到输入向量的末尾、零补在开头」。尾巴留静音等于把语音从窗口
+ * 末尾推开，p 会被拉低（同一句留 0 ms 时 0.95、留 800 ms 时 0.04）。留多少在
+ * **噪声里**：两场真机 21 轮的离线扫描 0–20 ms 略好于 100 ms（18/21 vs 15/21），
+ * 但真机回放复现不出来 —— 所以取小值只是方向正确，不是可测量的收益。
  */
-const ASSEMBLER_TRAILING_TRIM_MS = 100;
+const ASSEMBLER_TRAILING_TRIM_MS = 20;
 
 export interface VoiceSessionOptions {
   /** 监听端口 */
