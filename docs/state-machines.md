@@ -18,7 +18,7 @@
 | 播放进度 | `TurnRunner`（`playedSeen` + 设备 `played` 回执） | 决策「这一轮算说完了吗」只在 `TurnRunner` 内部；`DialogFsm` 只收 `audioDone(ticket)` 这一个结论 |
 | 判停中的文本 | `UtteranceAssembler`（`pending`） | 上层只在 `accept` 时拿到整句，拿不到半句 |
 | 快车道闸门 | `FrontedAgent.innerMode`（`pass` / `buffer` / `drop`） | dsh 的流式增量按闸门决定直通、缓冲还是丢弃 |
-| 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 只在还没出声时能说；答案的第一块一到就置 `cancelled` 并 `audio.stop`，不再有人读它 |
+| 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 只在还没出声时能说；答案的第一块一到就置 `cancelled` 并 `audio.stop`，不再有人读它。**出声期间它占着 `DialogFsm` 的 `speaking`**（`receiptStarted` / `receiptEnded`），所以那会儿用户开口算插话 |
 | 宠物状态 | `PetSession.state`（`PetState`） | 纯函数 `brain.step` 产出；执行器无判断 |
 | 后台汇报什么时候开口 | `DialogRuntime.announceQueue` + 四道闸 | `queue.length > 0` → 宠物闸门 `floorFree` 不通过（`announcePending`），宠物自己不说话；`announce` 抢不动 `reply` |
 
@@ -54,9 +54,13 @@
 | `listening` | 话筒在手，等用户说话 |
 | `awaiting_shot` | 已答应「拍张高清的」，等图到手再开这一轮 |
 | `thinking` | 一轮已开，等上游（dsh / 快车道）出结果 |
-| `speaking` | 首块音频已下发，正在播 |
+| `speaking` | **有声音在播**。可能是答案的首块音频，也可能只是委派轮的回执（靠 `_receiptOnly` 区分） |
 | `ending` | 要收尾了（模型说了再见），本轮播完就关 |
 | `closed` | 吸收态：连接已断，任何迟到回调都不得把状态拉回去 |
+
+> `speaking` 的含义是「**用户这会儿听得见东西**」，不是「答案开始了」。委派轮那句回执
+> （「我看看。」）也占这个状态 —— 判据是**有没有声音**，不是「有没有在等模型」，否则
+> 用户听完回执说「不用了」会被当成同一句的下文合并，而不是插话。
 
 ### 事件与转移
 
@@ -65,10 +69,12 @@
 | `beginTurn()` | `listening`、`awaiting_shot` | `thinking` | `no += 1`，发新票据；在 `ending`/`closed` 时返回 `null`，调用方放弃这一轮 |
 | `beginAwaitShot()` | `listening` | `awaiting_shot` | 不在 `listening` 时返回 `null` |
 | `abortAwaitShot()` | `awaiting_shot` | `listening` | 代次不变 |
-| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略 |
-| `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 迟到票据按 `{no, gen}` 丢弃 |
+| **`receiptStarted()`** | `thinking` | `speaking` | 置 `_receiptOnly`；不在 `thinking` 时返回 `false`（这一轮已被作废/已收尾，不该出声） |
+| **`receiptEnded()`** | `speaking`（且 `_receiptOnly`） | `thinking` | 幂等；不动代次。回执被真音频顶掉后调用它是空操作 |
+| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略；**清 `_receiptOnly`**（真音频接管） |
+| `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 迟到票据按 `{no, gen}` 丢弃；`_receiptOnly` 为真时**直接返回**（回执那段 `speaking` 不是本轮音频） |
 | `requestEnd()` | `listening`、`awaiting_shot` | `ending` | 在 `speaking`/`thinking` 只置标志，让告别语播完 |
-| `bargeIn(why)` | **仅** `speaking` | `listening` | `gen += 1`（作废排队轮次）→ 通知 `onInvalidate('bargeIn')` |
+| `bargeIn(why)` | **仅** `speaking`（含回执那段） | `listening` | `gen += 1`（作废排队轮次）→ 清 `_receiptOnly` → 通知 `onInvalidate('bargeIn')` |
 | `close()` | 任意 | `closed` | 通知 `onInvalidate('closed')` |
 
 票据 `{no, gen}` 是**唯一的轮次令牌**：`no` 每轮 +1，用来丢上一轮迟到的回调；
@@ -275,6 +281,18 @@ stateDiagram-v2
 播完才开工），答案的第一块一到就置 `cancelled` + `audio.stop`（否则两句叠在一起），
 也不进残句缓冲（它不是「用户没听完的内容」）。真机那轮的空白就是这么补的：dsh 轮
 `停嘴→首块 2934 ms`，回执在开轮后立刻出声。
+
+**回执要占 `speaking`**：说不出声的话，用户听完回执再开口，`SessionCore` 会把它当成
+「同一句的下文」合并进去（`thinking` 状态下的语音默认是追问/补充），于是「不用了」
+顶不掉这一轮。所以出声前先 `fsm.receiptStarted()`（`thinking → speaking` + 置
+`_receiptOnly`），那句话播完 `fsm.receiptEnded()`（`speaking → thinking`）。
+`_receiptOnly` 只有一个作用：让 `audioDone()` 知道这段 `speaking` 不是本轮答案的音频，
+**不要**据此把轮次推进到 `listening`。真答案首块一到，`audioStarted()` 会清掉这个标志，
+此后就是正常的一轮。回执期间用户开口 → `bargeIn()` 照常生效（`gen += 1` 掐掉 dsh），
+这就是「回执可被打断」。
+
+> 这两次转移**净变化为零**时 `notifyState` 会去重、不产生 `dialog.transition` 事件，
+> 但 `dialog.state` 事件里的 `why` 能区分（见 `docs/TOOLS.md` §12.1）。
 
 ## 5.5 播报队列 —— 后台任务的结论什么时候开口
 

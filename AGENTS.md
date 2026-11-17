@@ -160,10 +160,21 @@ done
 
 | 想知道 | 去看 |
 |---|---|
+| **全部（推荐从这里开始）** | `scripts/observe.ts <会话档案>` —— 事实源清单 + 分段 + 审计 + dsh 对齐 |
 | 一轮多久、卡在哪 | `scripts/latency-report.ts <会话档案>` |
 | agent 那几秒花在哪一步 | `scripts/dsh-timeline.ts <会话档案>`（对齐 dsh 自己的会话日志） |
 | 原始音频 / 电平 | 会话档案目录（`uplink.pcm` 是**放大前**的） |
 | 线上发生了什么 | `journalctl -u miai-harness` |
+
+工具清单、字段级说明、以及每个数字的**事实源归属**在 [docs/TOOLS.md](docs/TOOLS.md)。
+三条硬规矩：
+
+1. **裸说 `p50` / `p90` 只有一个意思**：闭嘴 → 出声。单段必须带名字（「② p50」），
+   模型层必须说「模型首字 p50」，两者不许相减、不许并列进同一张表。
+2. **一个事实只有一个源**：分段/状态/插话归本仓档案，step/工具/reasoning/job 归 dsh
+   自己的 session log（`turn.end.dsh_session` 指过去），不复制、不转录。
+3. **不要在这里加第二套统计**：分段唯一实现在 `src/latency-report.ts` 的
+   `computeTurns()`，统计唯一实现在 `summarize()`。
 
 `events.jsonl` 里的时间线是唯一能复算的东西 —— 改动前后要能比快慢，所以仪表
 （`gate.close` / `asr.sentence` / `tts.first` / `turn.end`）缺了要记 `null`，

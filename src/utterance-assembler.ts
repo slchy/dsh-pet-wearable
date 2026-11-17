@@ -16,8 +16,10 @@
  *
  * 所以一律先等 {@link UtteranceAssemblerOptions.quietMs}，再交给
  * {@link UtteranceAssemblerOptions.predict}（Smart Turn）看**音频本身**。
- * 它说没说完就再等一段，最多 {@link UtteranceAssemblerOptions.maxExtensions} 次，
- * 之后强制收下，避免模型不确定时永远不定稿。
+ * 它说没说完就再等一段：`p < threshold` 这一类最多
+ * {@link UtteranceAssemblerOptions.maxUnsureExtensions} 次，其余三种文本判据合计
+ * 最多 {@link UtteranceAssemblerOptions.maxExtensions} 次，然后强制收下，
+ * 避免模型不确定时永远不定稿。
  *
  * <h2>与静候窗重叠</h2>
  *
@@ -40,7 +42,6 @@ export interface UtteranceAssemblerOptions {
   readonly quietMs: number;
   /** 判为「没说完」时再多等这么久 */
   readonly extendMs: number;
-  /** 最多延长几次 */
   /** 一轮最多延长几次（**总预算**，四种原因共用） */
   readonly maxExtensions: number;
   /**

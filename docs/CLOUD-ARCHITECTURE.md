@@ -246,6 +246,10 @@ Node 事件循环（单线程）
 ```
 
 - 相位只有 6 个：`listening / awaiting_shot / thinking / speaking / ending / closed`。
+- `speaking` 的含义是**有声音在播**，不只是「答案的首块音频已下发」——委派轮那句回执
+  （「我看看。」）也占这个相位（`receiptStarted()` / `receiptEnded()` 进出，内部用
+  `_receiptOnly` 区分，真答案首块一到就被顶掉）。否则用户听完回执再开口，会被当成
+  同一句的下文合并、而不是插话。
 - 每轮发一张票据 `TurnTicket{no, gen}`：`no` 判"还是不是这一轮"，`gen` 判"是否已被插话作废"。
   打断只是**作废票据**，不靠布尔量四处透传 —— 这是把「五个互相牵制的布尔量」换成一个状态机的直接原因。
 - `awaiting_shot` 是高清照独有的相位：这期间既不算"在听"也不算"在说"，

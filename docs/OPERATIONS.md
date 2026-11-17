@@ -207,11 +207,15 @@ MIAI_ARCHIVE_KEEP=20                     # 保留多少个会话目录
 ## 延迟报告
 
 ```bash
+node scripts/observe.ts <会话目录>               # 一把梭：事实源清单 + 分段 + 审计 + dsh 对齐
 node scripts/latency-report.ts <会话目录>        # 逐轮"用户说完 → 听到第一个字"分解
 node scripts/latency-report.ts <root> --all     # 每个会话各出一份
 ```
 
-纯读，不改档案。分段口径与缺仪表语义见 [`src/latency-report.ts`](../src/latency-report.ts)。
+纯读，不改档案。`p50` / `p90` 在本项目**只有一个意思**：闭嘴 → 出声（用户停止说话到第一块
+音频下发），别拿它和单段数字并列。分段口径与缺仪表语义见
+[`src/latency-report.ts`](../src/latency-report.ts)，字段级说明见
+[TOOLS.md](TOOLS.md) §12.1。
 
 ## 待补播
 
@@ -225,6 +229,9 @@ node scripts/latency-report.ts <root> --all     # 每个会话各出一份
 **估算是下限，回执只能延后**（真机上见过设备在「最后一批字节收到」就回执，比真实播完早
 1–3 s，按它收尾会把尾音那段插话窗口关掉）。没有这个能力的设备仍按时长估算
 （`audioSeconds + playbackTailMs`）。
+
+回执（委派轮那句「我看看。」）虽然也占 `speaking`，但**不走这条**：它只要播完就
+`receiptEnded()` 回到 `thinking`，不等设备回执（`audioDone` 在 `_receiptOnly` 时直接返回）。
 
 两种情况的上限都是「估算 + 余量」，事件丢了不会把一轮挂死。改这块之前先看
 `src/turn-runner.ts` 里等待环的注释。

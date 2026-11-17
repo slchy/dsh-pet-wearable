@@ -124,22 +124,28 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 | L1/L2 共享记忆（快车道只读，`dsh` 唯一写者） | **已实现**（`MEMORY.md` + `remember` 工具） |
 | 主动开口状态机 | **已实现**，支持 `sim` 离线复现；独立进程需设 `PET_PROACTIVE=1` |
 | `dsh` 插件形态（`driver.ts`） | 入口与配置就绪，**语音链路尚未接线**，当前请使用独立进程形态 |
-| 首字延迟 | 闲聊（快车道命中）**停嘴→首块** p50 ≈ `1.3 s`、p90 ≈ `1.7 s`（`bench/replay` 同一份真机音频，2026-11-17 实测）；交给 `dsh` 的轮次另计 |
-| 委派轮回执 | **已实现**：判不出就补一句「我看看。」，答案一到顶掉（`setDelegateHook` → `TurnRunner.speakReceipt`） |
+| 首字延迟 | **闭嘴→出声**：真机快车道轮 p50 `1253` / p90 `2490`（n=5），交 `dsh` 的轮次 p50 `2896`（n=5）；同向量回放（n=6，现行代码）p50 `1915` / p90 `2344`。都是 2026-11-17 实测，明细见下面的对比表 |
+| 委派轮回执 | **已实现**：判不出就补一句（默认「我看看。」），答案一到顶掉（`setDelegateHook` → `TurnRunner.speakReceipt`）。回执期间状态进 `speaking`，**用户这时开口算插话**（`DialogFsm.receiptStarted`） |
 
 **延迟数字的口径**：**本项目说「p50 / p90」不加限定，一律指「闭嘴 → 出声」** —— 用户说完最后一个字 → 听到第一个字（`src/latency-report.ts` 的 `firstWordMs` = ①+②+③，含 ASR 判句、判停、模型首字、TTS 首包全段）。其余数字必须带限定词：单段叫「③ p50」，模型层叫「模型首字 p50」（`bench/fast_lane`，比前者少掉 ASR、判停、TTS 三段），**两个口径不能相减**。外部 API 抖动很大（见 `AGENTS.md`），**改动前后要比同一份用例**，不要拿不同输入的两场数字对比。
 
 回放前后对比（同一份源音频，同一条隔离 harness）：
 
-| 配置 | 停嘴→ASR | 出句→开轮 | 开轮→首块 | **停嘴→首块** |
+| 配置 | 停嘴→ASR | 出句→开轮 | 开轮→首块 | **闭嘴→出声** |
 |---|---|---|---|---|
 | 改前：`deepseek-chat` + 判停宽限 400 + 静候 150（源档案当时） | 572 | 151 | 1583 | **2306** |
-| 改后：`qwen-flash` + 宽限 150 + 静候 0 + 判停提前 + 预热 + 丢句首静音 | 373–403 | **2** | 900–1005 | **1367–1427**（单场）／**1408**（8 场汇总 p50） |
+| 中段：`qwen-flash` + 宽限 150 + 静候 0 + 判停提前 + 预热 + 丢句首静音 | 373–403 | **2** | 900–1005 | **1367–1427**（单场）／**1408**（8 场汇总 p50） |
+| 现行：上面全部 + **「判停说没说完」单列预算**（`SMART_TURN_MAX_UNSURE=2`） | 320–400 | 5–1500 | 700–1150 | **1915**（同向量 n=6） |
 
-改后那行的单场值是 2026-11-17 现行代码连跑 4 场的范围；**汇总 8 场 21 轮是 p50 1408 / p90 1652**，所以别拿单场最小值当结论 —— 8 场里模型首字（TTFT）从 314 摆到 588，光这一项就 ±270 ms，比任何一版代码改动都大。三条与模型无关的改动各管一段：
+**第一行和第三行是同一份源音频**（`20261117-183101-…_51313`）回放出来的；第二行的单场值也是，但那个 `1408` 是另外 8 场 21 轮的汇总。
+
+⚠️ **第三行比第二行大，不是退步**：`1408` 那批用的是别的向量，且 ② 靠判停「敢不敢收」抽签 —— 同一句在同一份音频上两次回放能差 2.3 s（见 `docs/TOOLS.md` §12）。**只有第三行能在今天复现**（`bench/replay/run.py --archive 20261117-183101-182.135.1.250_51313`）。同一份向量在第三行改动之前是 p50 `2888`，所以这一刀实降 ~970 ms。
+
+第二行那些单场值是 2026-11-17 连跑 4 场的范围，别拿最小值当结论 —— 8 场里模型首字（TTFT）从 314 摆到 588，光这一项就 ±270 ms，比任何一版代码改动都大。下面几条改动各管一段：
 
 - **判停宽限**（`SMART_TURN_PARTIAL_GRACE_MS`，400→150）：原来「音频停了但 ASR 还在出字」的防抢话闸**几乎每轮都触发**、每次白等一整拍 475 ms。收到 150 后仍挡得住正常 partial 间隔，回放里 ASR 逐字一致、轮数不变。② 由 622–625 降到 137–148。
-- **静候窗**（`SMART_TURN_QUIET_MS`，150→80）：定稿后再等一会儿，判停器看的是累积音频，不依赖这段长度。
+- **静候窗**（`SMART_TURN_QUIET_MS`，150→80→**0**）：定稿后再等一会儿。判停器看的是累积音频，不依赖这段长度，所以现在**不等了**（代码默认就是 0）。
+- **判停「再等一拍」单列预算**（`SMART_TURN_MAX_UNSURE`，缺省 2）：`p < threshold` 那条分支不看任何文本信号，只按 p 再等一拍，而侧车的 p 是噪声（同一段音频两次回放，同一句 0.549 vs 0.189）。真机实测要 4 拍（1600 ms）才收下是常态，于是把这类的上限压到 2 拍（800 ms，仍覆盖正常换气 200–400 ms），**grace / 短片段 / 结尾像没说完那三条防抢话和并句的安全闸不受影响**，照旧吃 `SMART_TURN_MAX_EXT`（7）的额度。同向量回放：② 1890→945，闭嘴→出声 p50 2888→1915。代价见 `docs/OPS-RECORD.md` §12.3 待办 1：1671 ms 的句内停顿会被拆成两轮。
 - **判停前起跑**（`FAST_LANE_PREFETCH=0` 可关）：句子定稿时文本已定，判停只决定要不要并下一段，所以那一刻就把这一句问出去。A/B（背靠背两场）：开轮→模型首字 **277 ms**（开）vs **500 ms**（关）。
 - **丢句首静音**：CosyVoice 第一块是「~120 ms 数字静音 + 起音」的混合块，按整块判静音会被语音拉高、静音跟着推给设备。现在块内按 5 ms 窗口裁（−45 dBFS 以下），下行开头静音 **146 ms → 11 ms**。
 - **中间结果投机**（`FAST_LANE_PARTIAL_SPECULATE=0` 可关）：ASR 的 partial 比定稿早 p50 **731 ms**（真机 47 轮），所以**静音那一刻**就拿最新那版先问出去。定稿到达时确认「它是定稿的前缀 + 覆盖 ≥60% 长度 + 没把数字截断」才认领，确认不了就作废、退回定稿后再问 —— 所以**不改正确性**，坏情况下只多花一次请求。合成音频单轮 A/B（同一份 PCM、背靠背两次）：③ 开轮→首块 **1036 → 838 ms**，认领时模型已经跑了 136 ms。为什么只在静音那一刻发、不是每版 partial 都发：收益在「答案赶在定稿前出来」就**饱和**了（模型首字 ~290 ms ≪ 731 ms），提前更多不省时间，只是多花钱；而且静音了才说明用户真停了，这一版离定稿最近，长度闸门才判得准。
@@ -156,6 +162,10 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 并段这条路是**用 TTS 造音频验的**（`bench/replay/README.md` 里有配方）：TTS 合成「你好呀」+205 ms 静音+「说」拼成一段上行，把 `SMART_TURN_THRESHOLD` 抬到 0.99 逼出判停的「没说完」分支 → 日志按顺序出现 `判停前先问出去 "你好呀。"` → `预跑作废（判停并了段…）` → `判停前先问出去 "你好呀。说。"` → 只答一次。默认阈值下这两段会被各自收成一轮（判停器判 0.98 说完），所以**并段本身不常发生**，它只是「判停说没说完」时的兜底。
 
+> 这条配方是在 `SMART_TURN_MAX_UNSURE` 之前验的。它现在仍然成立，因为配方自己把
+> `SMART_TURN_EXTEND_MS` 抬到了 2000 —— 「没说完」这一分支的墙钟上限是
+> `MAX_UNSURE × EXTEND_MS`（默认 2×400 ms）。只抬阈值不抬 `EXTEND_MS` 就等不到第二段。
+
 真机端到端（2026-11-16 01:46，v2 设备 `04:34:…`，9 轮，音频回放 + 会话档案逐轮对齐）：
 
 | 用户说 | 停嘴→开轮 | 开轮→首块 | **停嘴→首块** | 走的哪条 | 模型首字 | TTS 首块 |
@@ -169,9 +179,29 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 读法：**端到端 ≈ 判停收敛(350–600) + 开轮(150–1000) + 模型首字(500–800) + TTS 首块(290–580)**。快车道命中 4 轮 p50 ≈ `1.5 s`；交给 dsh 的那轮 `2934 ms` 正是「回执」要填的空白（首字超时要等 1200 ms 才判让位）。「停嘴」以 `gate.close.t − gapMs` 为准；`你把眼睛挂断一下。` 那轮会话结束得比 gate hold 还早，**缺仪表，不补估**。这张表是**改前**的基线，留着当对照；改后的数字见上面那张回放对比表。
 
-可调的旋钮（都在 `src/main.ts` 读环境变量，改完重启即可，不必重新编译）：`SMART_TURN_QUIET_MS`（定稿后静候，默认 80）、`SMART_TURN_PARTIAL_GRACE_MS`（判停宽限，默认 150）、`SMART_TURN_EXTEND_MS`（每次延长，默认 400）、`SMART_TURN_MAX_EXT`（延长上限，默认 7）；快车道侧 `FAST_LANE_MODEL` / `FAST_LANE_BASE_URL` / `FAST_LANE_API_KEY` / `FAST_LANE_HEDGE`（默认 2，对冲份数）/ `FAST_LANE_PREFETCH` / `FAST_LANE_PARTIAL_SPECULATE`；TTS 侧 `COSYVOICE_MODEL` / `COSYVOICE_VOICE` / `COSYVOICE_EMOTION_MODE`。
+可调的旋钮（都在 `src/main.ts` 读环境变量，改完重启即可，不必重新编译）。**下面写的数字就是代码里的默认值**；生产 `.env` 目前没有覆盖任何 `SMART_TURN_*` / `VOICE_*`，跑的都是这些缺省值。
 
-排查用可复算的日志脚本：`scripts/latency-report.ts` 逐轮分段统计，`scripts/dsh-timeline.ts` 对齐 `dsh` 会话日志拆解 Agent 内部耗时。**全仓脚本的路由表与口径归属见 [docs/TOOLS.md](./docs/TOOLS.md)** —— 算延迟/审计状态轮转之前先查那张表，别另写一个（踩过：手搓的分段脚本把 ② 算成 63543 ms）。
+判停（`UtteranceAssembler`）：
+
+| 变量 | 默认 | 管什么 |
+|---|---:|---|
+| `SMART_TURN_QUIET_MS` | 0 | 定稿后再静候多久才问判停 |
+| `SMART_TURN_PARTIAL_GRACE_MS` | 150 | 「音频完了但还在出字」时再等一拍 |
+| `SMART_TURN_EXTEND_MS` | 400 | 每次延长等多久 |
+| `SMART_TURN_MAX_EXT` | 7 | **总**延长预算（四种原因共用） |
+| `SMART_TURN_MAX_UNSURE` | 2 | 其中「判停说没说完」单独的上限 |
+| `SMART_TURN_THRESHOLD` | 0.5 | p 到多少算说完了 |
+| `SMART_TURN_UNFINISHED_MS` | 250 | 结尾像没说完（数字串/井号/连词）再等一拍 |
+
+上行与能量门：`VOICE_HOLD_MS`（2000，能量门静音多久关门 —— **必须远大于 ASR 的 `max_sentence_silence` 200**，否则句尾永远不来）、`VOICE_PEAK_DBFS`（−40）、`VOICE_PREROLL_MS`（800）、`VOICE_PAUSE_DETECT_MS`（200）、`VOICE_SPECULATE_MS`（100）、`MIC_GAIN` / `TTS_GAIN`。
+
+快车道：`FAST_LANE_MODEL` / `FAST_LANE_BASE_URL` / `FAST_LANE_API_KEY` / `FAST_LANE_TIMEOUT_MS`（1200，首字超时就判让位）/ `FAST_LANE_MAX_CHARS`（14）/ `FAST_LANE_HEDGE`（2，对冲份数）/ `FAST_LANE_PREFETCH` / `FAST_LANE_PARTIAL_SPECULATE` / `FAST_LANE_SPECULATE` / `FAST_LANE_CANCEL`。
+
+TTS：`COSYVOICE_MODEL` / `COSYVOICE_VOICE` / `COSYVOICE_EMOTION_MODE` / `COSYVOICE_URL`。
+
+档案与运维：`MIAI_ARCHIVE_KEEP`（20）/ `MIAI_ARCHIVE_MAX_MB`（80）/ `KEEPALIVE_MINUTES`（180）/ `MIAI_LEVEL_LOG`（0）。
+
+排查用可复算的日志脚本：一把梭是 `node --experimental-strip-types scripts/observe.ts <档案目录>`（事实源清单 + 分段 + 审计 + dsh 对齐），单点入口是 `scripts/latency-report.ts`（逐轮分段统计）和 `scripts/dsh-timeline.ts`（对齐 `dsh` 会话日志拆解 Agent 内部耗时）。**全仓脚本的路由表、字段级说明与口径归属见 [docs/TOOLS.md](./docs/TOOLS.md)** —— 算延迟/审计状态轮转之前先查那张表，别另写一个（踩过：手搓的分段脚本把 ② 算成 63543 ms）。
 
 **时序与状态轮转审计**（bench 的主要出口，不是任务做没做成）：`node --experimental-strip-types scripts/fsm-trace-check.ts <档案>` 审一份会话档案 —— 轮次是否配对、状态转移是否只走白名单、`tts.first` 是否落在 `speaking` 里、插话有没有真的发 `audio.stop`、停嘴到首块/单轮时长是否超预算。规则与依据见 [state-machines §5.8](./docs/state-machines.md)。`bench/replay` 和 τ² bench 跑完都会自动审一次。
 
@@ -208,6 +238,7 @@ npm run install-profile      # 拷到 ~/.dsh/profiles/sdk/cordis.patch.yml
 | 文档 | 内容说明 |
 |---|---|
 | [state-machines](./docs/state-machines.md) | **状态机一览（以代码为准）**：六台机器的状态/事件/驱动方、一轮完整时序、「唯一真相」表 |
+| [TOOLS](./docs/TOOLS.md) | **观测工具与口径**：我要回答什么→跑哪个、每个数字的唯一实现、档案字段级说明、踩过的坑 |
 | [fsm-align-report](./docs/fsm-align-report.md) | 状态机对齐的过程记录：每步改了什么、删了哪些状态、验收数据与未完成项 |
 | [OPS-RECORD](./docs/OPS-RECORD.md) | 运维事实与踩坑记录：双仓边界、密钥位置、端口、记忆契约 |
 | [ADR-0001](./docs/adr/0001-app-layer-and-pet.md) | 应用层与 pet 设计：端口、状态机、三张登记表及实施顺序（§6 话筒、§9 差异表已被上表取代） |
