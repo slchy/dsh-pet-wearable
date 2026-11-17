@@ -405,12 +405,16 @@ export class FrontedAgent implements AgentProvider {
    * 之间没有共同标尺 —— 快模型比 dsh 慢时，等它吐第一个字，自己那轮早答完、
    * 用户已经开了下一轮，取消落到下一轮头上（实测把 harness 打过一次）。
    */
-  /** 当前这一轮（最近一次 eply）的代次。取消时用它丢弃迟到的票据 */
+  /** 当前这一轮（最近一次 reply）的代次。取消时用它丢弃迟到的票据 */
   private currentGen = -1;
+  /** 当前这一轮的完整票据（`{no, gen}`）；迟到的取消靠它比对 */
+  private currentTicket: TurnTicket | null = null;
   /** 没有真票据时用的本地代次（单测 / 保活） */
   private localGen = 0;
-  /** 已经发过取消的代次（同一代次只发一次） */
-  private cancelledGen = -1;
+  /** 已经发过取消的票据（`no:gen`，同一张只发一次） */
+  private cancelledKey: string | null = null;
+  /** 快模型这一轮在途的 HTTP（插话时掐掉，别让它继续跑到超时） */
+  private askAbort: AbortController | null = null;
 
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
@@ -479,12 +483,13 @@ export class FrontedAgent implements AgentProvider {
     // 只是 session 层没有真票据可比对，会直接照办。
     const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
     this.currentGen = ticket.gen;
+    this.currentTicket = ticket;
     this.innerMode = 'pass';
     // dsh 上一条在问话，用户这句是短回话（好的/对/不用）—— 那是**对话里的回应**，
     // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
     if (this.lastDsh?.asked === true && looksLikeAnswer(userText)) {
       this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
-      return await this.delegate(userText, image, note);
+      return await this.delegate(userText, image, note, ticket);
     }
     // 像「长期事实」的一句话：**必须让 dsh 亲耳听到**。
     // 实测 dsh 只对「用户自己说的」话写记忆 —— 把它塞进系统注记里转述（试过 5 种措辞，
@@ -492,7 +497,7 @@ export class FrontedAgent implements AgentProvider {
     // 让 L2 用自己的判断决定记不记；L1 不替它写、也不替它猜。
     if (looksMemorable(userText)) {
       this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
-      return await this.delegate(userText, image, note);
+      return await this.delegate(userText, image, note, ticket);
     }
     const hasFacts = this.statusFacts !== undefined;
     // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
@@ -501,11 +506,11 @@ export class FrontedAgent implements AgentProvider {
       && (isFastCandidate(userText, this.maxChars)
         || (hasFacts && isStatusQuestion(userText)));
     if (!candidate) {
-      return await this.delegate(userText, image, note);
+      return await this.delegate(userText, image, note, ticket);
     }
     if (this.pending.length / 2 >= this.keepTurns) {
       this.log('  快车道    攒满上限，这一轮强制交给 dsh（顺便刷上下文）');
-      return await this.delegate(userText, image, note);
+      return await this.delegate(userText, image, note, ticket);
     }
 
     const startedAt = this.now();
@@ -514,7 +519,7 @@ export class FrontedAgent implements AgentProvider {
       // 先上闸再起跑：`inner.reply` 在第一个 await 之前是同步执行的，
       // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
       this.innerMode = 'buffer';
-      dsh = this.startInner(userText, image, note);
+      dsh = this.startInner(userText, image, note, ticket);
       // 先接住：快车道一开口就会掐掉这一轮，而它被掐时经常以 reject 收场（取消后没有
       // 可念的文本）。真正要用它的 `commit`/`abandon` 挂得比「掐」晚，中间这段窗口里
       // 的 rejection 是进程级的（线上真的这样挂过一次）。
@@ -542,14 +547,14 @@ export class FrontedAgent implements AgentProvider {
         dsh?.catch(() => undefined);
         return this.commit(userText, emitted, 0, dsh, ticket);
       }
-      return await this.abandon(dsh, userText, image, note, `✗ ${why}`);
+      return await this.abandon(dsh, userText, image, note, `✗ ${why}`, ticket);
     }
 
     if (answer.delegated) {
-      return await this.abandon(dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`);
+      return await this.abandon(dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`, ticket);
     }
     if (cleanForSpeech(parseEmotion(answer.text).rest) === '') {
-      return await this.abandon(dsh, userText, image, note, '空答复');
+      return await this.abandon(dsh, userText, image, note, '空答复', ticket);
     }
     return this.commit(userText, answer.text, answer.firstTokenMs, dsh, ticket);
   }
@@ -623,17 +628,42 @@ export class FrontedAgent implements AgentProvider {
    */
   private cancelInner(ticket: TurnTicket): void {
     // 迟到的取消：这一轮已经过去（又有新的 reply 开始了）→ 丢弃。
-    // 注意这里比的是**代次**，不是布尔量：代次是 DialogFsm 发的唯一轮次令牌。
-    if (ticket.gen !== this.currentGen || this.cancelledGen === ticket.gen) {
+    // 去重必须用**整张票据**：`gen` 只在插话时增加，连续两句闲聊的 `gen` 相同，
+    // 按 gen 去重会把这一轮的胜出取消吃掉（那时 dsh 就会白跑完一整轮）。
+    const key = `${ticket.no}:${ticket.gen}`;
+    if (ticket.gen !== this.currentGen || this.cancelledKey === key) {
       return;
     }
-    this.cancelledGen = ticket.gen;
+    this.cancelledKey = key;
     try {
       if (this.cancelMode === 'interrupt') {
         this.inner.interruptTurn?.();
       } else if (this.cancelMode === 'rpc') {
         this.inner.cancelTurn?.(ticket);
       }
+    } catch (error) {
+      this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 插话 / 断连：把这一轮的上游取消掉。
+   *
+   * `DialogFsm.onInvalidate` → `TurnRunner` → 这里。两层都要动：快模型的 HTTP 掐掉
+   * （不然它还要跑到首字 1200 ms / 整句 2800 ms 的超时），dsh 那一轮交给内层按票据取消。
+   *
+   * 没有这个方法时，`trackActivity` 不会转发 `cancelTurn`（它只在方法存在时透传），
+   * 结果就是「喇叭停了、dsh 还在说」。
+   */
+  cancelTurn(ticket?: TurnTicket): void {
+    const current = this.currentTicket;
+    if (ticket !== undefined
+      && (current === null || current.no !== ticket.no || current.gen !== ticket.gen)) {
+      return;
+    }
+    this.askAbort?.abort(new Error('插话取消'));
+    try {
+      this.inner.cancelTurn?.(ticket);
     } catch (error) {
       this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);
     }
@@ -646,9 +676,10 @@ export class FrontedAgent implements AgentProvider {
     image: AgentImage | undefined,
     note: string | undefined,
     why: string,
+    ticket: TurnTicket,
   ): Promise<AgentReplyView> {
     this.log(`  快车道    ${why} → 交给 dsh`);
-    const promise = dsh ?? this.startInner(userText, image, note);
+    const promise = dsh ?? this.startInner(userText, image, note, ticket);
     this.innerMode = 'pass';
     const held = this.buffered.splice(0);
     for (const text of held) {
@@ -661,11 +692,12 @@ export class FrontedAgent implements AgentProvider {
 
   private async delegate(
     userText: string,
-    image?: AgentImage,
-    note?: string,
+    image: AgentImage | undefined,
+    note: string | undefined,
+    ticket: TurnTicket,
   ): Promise<AgentReplyView> {
     this.innerMode = 'pass';
-    const answer = await this.startInner(userText, image, note);
+    const answer = await this.startInner(userText, image, note, ticket);
     this.rememberDsh(answer.speech, userText);
     return answer;
   }
@@ -690,6 +722,7 @@ export class FrontedAgent implements AgentProvider {
     userText: string,
     image: AgentImage | undefined,
     note: string | undefined,
+    ticket: TurnTicket,
   ): Promise<AgentReplyView> {
     const blocks: string[] = [];
     if (note !== undefined) {
@@ -704,9 +737,9 @@ export class FrontedAgent implements AgentProvider {
       this.log('  快车道    把缓冲的闲聊轮次补进 dsh 上下文');
     }
     if (blocks.length === 0) {
-      return this.inner.reply(userText, image, note);
+      return this.inner.reply(userText, image, note, { ticket });
     }
-    return this.inner.reply(userText, image, blocks.join('\n\n'));
+    return this.inner.reply(userText, image, blocks.join('\n\n'), { ticket });
   }
 
   /**
@@ -766,6 +799,7 @@ export class FrontedAgent implements AgentProvider {
   ): Promise<FastAnswer> {
     const doFetch = this.fetchImpl ?? fetch;
     const controller = new AbortController();
+    this.askAbort = controller;
     // **两段超时**：首字之前卡住 = 模型不干活，早点让给 dsh；
     // 首字之后还在出字 = 正常，给足时间 —— 用一个固定总超时会把
     // 「五百多毫秒才说完」的正常答案一起掐掉（实测 10 条闲聊里 6 条被掐）。
@@ -804,6 +838,10 @@ export class FrontedAgent implements AgentProvider {
     } finally {
       clearTimeout(timer);
       controller.abort();
+      // 只清自己那一个：两轮重叠时别把下一轮的请求从记录里抹掉
+      if (this.askAbort === controller) {
+        this.askAbort = null;
+      }
     }
   }
 }

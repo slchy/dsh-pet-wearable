@@ -74,10 +74,10 @@ export function trackActivity(
   return {
     name: agent.name,
     get sessionId() { return agent.sessionId ?? null; },
-    async reply(userText, image, note) {
+    async reply(userText, image, note, turn) {
       state.inflight += 1;
       try {
-        return await agent.reply(userText, image, note);
+        return await agent.reply(userText, image, note, turn);
       } finally {
         state.inflight -= 1;
         state.last = now();
