@@ -144,6 +144,8 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 排查用可复算的日志脚本：`scripts/latency-report.ts` 逐轮分段统计，`scripts/dsh-timeline.ts` 对齐 `dsh` 会话日志拆解 Agent 内部耗时。
 
+**时序与状态轮转审计**（bench 的主要出口，不是任务做没做成）：`node --experimental-strip-types scripts/fsm-trace-check.ts <档案>` 审一份会话档案 —— 轮次是否配对、状态转移是否只走白名单、`tts.first` 是否落在 `speaking` 里、插话有没有真的发 `audio.stop`、停嘴到首块/单轮时长是否超预算。规则与依据见 [state-machines §5.8](./docs/state-machines.md)。`bench/replay` 和 τ² bench 跑完都会自动审一次。
+
 ## 配置与部署
 
 两种形态的配置面不同，别混着看：

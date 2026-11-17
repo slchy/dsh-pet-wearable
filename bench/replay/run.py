@@ -133,6 +133,69 @@ def token_and_device() -> tuple[str, str]:
     return token.strip(), device.strip()
 
 
+# ---------------------------------------------------------------- 自起 harness
+#
+# 回放**不再打生产 63993**：那条连接也会在生产档案目录里生成一份档案，而
+# `MIAI_ARCHIVE_KEEP` 只留最近 20 个 —— 每回放一场就挤掉一份真实设备档案
+# （实测：21 个目录里 13 个是回放/bench 场）。这里起一个只服务本次回放的实例，
+# 档案、记忆、会话指针、播报队列全部关在自己目录里。
+#
+# 不隔离的后果逐条列在 `bench/tau2/run_voice.py::bench_env` 里，两边同一套规矩。
+
+
+def spawn_harness(port: int, bench_dir: str, repo: str) -> None:
+    """在服务器上起一个隔离的 harness，等到端口可连为止。"""
+    print(f"\n起隔离 harness：端口 {port}，目录 {bench_dir}（不碰生产 63993）")
+    ssh(
+        "set -e; "
+        f"cd {repo}; "
+        "set -a; . .env; set +a; "
+        f"mkdir -p {bench_dir}/archive; "
+        f"export MIAI_ARCHIVE_DIR={bench_dir}/archive; "
+        f"export MEMORY_FILE={bench_dir}/fastlane-memory.md; "
+        f"export VOICE_AGENT_SESSION={bench_dir}/session.json; "
+        f"export PHOTO_DIR={bench_dir}/photos; "
+        "export MIAI_ANNOUNCE_FILE=; "
+        # 收掉上一场：**按端口认进程，别用 `pkill -f '--listen <port>'`** ——
+        # 这条 ssh 命令自己的命令行里就含那串字，pkill 会把当前 shell 一起杀掉，
+        # 表现是「启动脚本悄悄什么都没做」（实测踩过）。
+        f"{kill_on_port(port)}; "
+        f": > {bench_dir}/harness.log; "
+        # 参数照抄生产的 ExecStart（`--agent dsh --dsh-sdk` 是必须的：流式识别
+        # 收到 SentenceEnd 就要接一轮对话，没 agent 直接退出）；`--stt/--tts`
+        # 走 .env 里的 MIAI_*，不在这里重复一遍配置
+        f"setsid node src/main.ts --listen {port} --host 127.0.0.1 --agent dsh --dsh-sdk "
+        f"--work-dir {bench_dir}/workspace >> {bench_dir}/harness.log 2>&1 & "
+        f"for i in $(seq 1 90); do ss -ltn 2>/dev/null | grep -q ':{port} ' && exit 0; sleep 1; done; "
+        f"tail -20 {bench_dir}/harness.log; exit 1",
+        timeout=150,
+    )
+    print("harness 已就绪")
+
+
+def kill_on_port(port: int) -> str:
+    """按监听端口找 PID 并杀掉（不按命令行匹配，避免误杀自己）。"""
+    return (
+        f"PID=$(ss -ltnp 2>/dev/null | grep ':{port} ' | grep -oP 'pid=\\K[0-9]+' | head -1); "
+        "[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null || true"
+    )
+
+
+def stop_harness(port: int) -> None:
+    """收尾：只杀本次回放起的那个实例（按端口认）。"""
+    try:
+        ssh(kill_on_port(port), timeout=60)
+    except RuntimeError:
+        pass  # 收尾失败不该盖住结果
+
+
+def bench_archives(bench_dir: str) -> list[str]:
+    out = ssh(f"ls -1dt {bench_dir}/archive/*/ 2>/dev/null | head -50 || true")
+    return [Path(line.strip().rstrip("/")).name for line in out.splitlines() if line.strip()]
+
+
+
+
 def parse(path: Path) -> list[dict]:
     """把事件流折成逐轮：①/②/③ + ASR 文本（与 `latency-report.ts` 同一套口径）。"""
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -207,6 +270,13 @@ def main() -> int:
                          "单次跑只能看到其中一个峰）")
     ap.add_argument("--port", default=PORT)
     ap.add_argument("--no-tls", action="store_true")
+    ap.add_argument("--spawn", dest="spawn", action="store_true", default=True,
+                    help="自己起一个**只服务本次回放**的 harness（默认）；不动生产 63993")
+    ap.add_argument("--no-spawn", dest="spawn", action="store_false",
+                    help="连已有的 harness（原来的行为，会往生产档案目录里写）")
+    ap.add_argument("--bench-port", type=int, default=8767, help="自起 harness 的端口")
+    ap.add_argument("--bench-dir", default="/tmp/miai-replay", help="自起 harness 的工作目录（含档案）")
+    ap.add_argument("--repo", default="$HOME/miai-cloud", help="服务器上本仓的路径")
     args = ap.parse_args()
 
     if not SSH_KEY.exists():
@@ -240,43 +310,70 @@ def main() -> int:
     before = parse(src_events)
     show("【源】真机当时", before)
 
+    # 回放默认**自己起一个隔离 harness**：不打生产端口，档案也不会挤掉真实设备的
+    if args.spawn:
+        spawn_harness(args.bench_port, args.bench_dir, args.repo)
+        host, port = "127.0.0.1", str(args.bench_port)
+        # 生产的 .env 里配了 TLS 证书，隔离实例沿用同一套（客户端本来就是 127.0.0.1 连）
+        tls = "" if args.no_tls else "--tls"
+        archive_root = f"{args.bench_dir}/archive"
+    else:
+        host, port, tls = args.host, str(args.port), "" if args.no_tls else "--tls"
+        archive_root = REMOTE_ARCHIVE
+
     turns = args.turns if args.turns > 0 else len(before)
     scp_up(HERE / "client.mjs", f"{REMOTE}:{REMOTE_CLIENT}")
     token, device = token_and_device()
-    tls = "" if args.no_tls else "--tls"
     # 在服务器上跑：`127.0.0.1` 时音频不出机器，①/③ 里没有公网往返
     cmd = (
         f"node {REMOTE_CLIENT} --vector {vector_path} --mode {args.mode} "
-        f"--host {shlex.quote(args.host)} --port {shlex.quote(str(args.port))} {tls} "
+        f"--host {shlex.quote(host)} --port {shlex.quote(port)} {tls} "
         f"--token {shlex.quote(token)} --device {shlex.quote(device)} "
         f"--turns {turns}"
     )
-    print(f"\n回放 {turns} 轮 → {args.host}:{args.port} …（源长度决定耗时，约 {turns * 6} s 起）")
+    print(f"\n回放 {turns} 轮 → {host}:{port} …（源长度决定耗时，约 {turns * 6} s 起）")
 
     runs: list[list[dict]] = []
-    for rep in range(max(1, args.repeat)):
-        before_list = list_archives()
-        out = ssh(cmd, timeout=600)
-        if args.repeat > 1:
-            print(f"\n--- 第 {rep + 1}/{args.repeat} 次 ---")
-        print("  " + "\n  ".join(out.strip().splitlines()[-4:]))
+    last = ""
+    try:
+        for rep in range(max(1, args.repeat)):
+            before_list = bench_archives(args.bench_dir) if args.spawn else list_archives()
+            out = ssh(cmd, timeout=600)
+            if args.repeat > 1:
+                print(f"\n--- 第 {rep + 1}/{args.repeat} 次 ---")
+            print("  " + "\n  ".join(out.strip().splitlines()[-4:]))
 
-        # 新档案 = 这次连接产生的（不在跑之前的列表里，且不是源档案）
-        candidates = [n for n in list_archives() if n not in before_list and n != source]
-        if not candidates:
-            raise SystemExit("没找到本次回放的档案 —— 连接可能没建立")
-        fresh = candidates[0]
-        new_events = OUT / f"replay-{fresh}.jsonl"
-        scp_down(f"{REMOTE}:{REMOTE_ARCHIVE}/{fresh}/events.jsonl", new_events)
-        rows = parse(new_events)
-        runs.append(rows)
-        last = fresh
+            # 新档案 = 这次连接产生的（不在跑之前的列表里，且不是源档案）
+            now = bench_archives(args.bench_dir) if args.spawn else list_archives()
+            candidates = [n for n in now if n not in before_list and n != source]
+            if not candidates:
+                raise SystemExit("没找到本次回放的档案 —— 连接可能没建立")
+            fresh = candidates[0]
+            new_events = OUT / f"replay-{fresh}.jsonl"
+            scp_down(f"{REMOTE}:{archive_root}/{fresh}/events.jsonl", new_events)
+            rows = parse(new_events)
+            runs.append(rows)
+            last = fresh
+    finally:
+        if args.spawn:
+            stop_harness(args.bench_port)
 
     after = runs[-1]
     show("【回放】这次", after)
 
     if not after:
         raise SystemExit("回放没有产生任何一轮 —— 音频没被识别？")
+
+    # 时序与状态轮转审计：这一场的**主要出口**。任务做没做成先不管，
+    # 这条链（停嘴 → 出句 → 开轮 → 首块 → 播完）和状态轮转必须自洽。
+    # `|| true`：有违规时审计器退出码是 1，但我们要的是把报告打出来。
+    audit = ssh(
+        f"cd {args.repo} && node --experimental-strip-types scripts/fsm-trace-check.ts "
+        f"{archive_root}/{last} || true",
+        timeout=120,
+    )
+    print("\n=== 时序 / 状态审计（回放这一场）")
+    print(audit.rstrip())
 
     print("\n=== 逐轮对比 ===")
     print(f"  {'轮':>3} {'①源→新':>14} {'②源→新':>14} {'③源→新':>14}  ASR")

@@ -319,6 +319,30 @@ stateDiagram-v2
     空闲 --> [*]
 ```
 
+## 5.8 怎么验证状态轮转真的对
+
+上面每节写的「转移条件」，代码里对不对不能靠读 —— 跑一场，看档案：
+
+```bash
+node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录 | events.jsonl>
+```
+
+审计器在 [`src/fsm-trace.ts`](../src/fsm-trace.ts)，判据全部来自本文件与代码里的既有事实：
+
+| 规则 | 违反时的意思 |
+|---|---|
+| `turn.nested` / `turn.orphanEnd` / `turn.unclosed` | 串行队列漏了，或者某轮被丢下 |
+| `state.whitelist` | 有人绕过 `transition` 改状态，或转移表被改动 |
+| `state.afterClose` | `closed` 之后还有活的东西在跑 |
+| `state.audioBeforeSpeaking` | 先出声后进 `speaking`（插话窗口会错位） |
+| `state.turnCovered` | 一轮里没见过 `thinking`/`speaking`（通知链断了，就是 P0-1 那类） |
+| `state.settledAfterTurn` | 一轮结束后没落回 `listening`/`ending` |
+| `barge.noAudioStop` | 被判插话却没发 `audio.stop`（喇叭停不下来） |
+| `turn.tooLong` / `timing.stopToFirst` | 挂住，或者用户等太久 |
+
+状态事件来自 `dialog.state`（`DialogRuntime.notifyState` 落档）。**老档案没有这个事件**时，
+状态那几条记「缺仪表」跳过 —— 与 `latency-report` 的 `null` 口径一致，不拿「没记录」冒充「没问题」。
+
 ## 6 一轮对话的完整时序
 
 ```mermaid

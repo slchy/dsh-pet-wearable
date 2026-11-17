@@ -28,6 +28,7 @@ import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { TurnTicket, DialogState } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
 import { announceInterruptionNote, interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
+import { EVENTS } from '../events.ts';
 import type { AgentProvider, DelegateReason, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
 import type { ImageAttachment } from '../session.ts';
@@ -292,6 +293,9 @@ export class DialogRuntime {
     }
     const previous = this.lastDialogState;
     this.lastDialogState = next;
+    // 落进档案：「状态轮转对不对」只能从这条时间线看出来。`turn.start` / `tts.first`
+    // 只说明快慢，说不出「这块音频是不是在 speaking 里发出去的」。
+    this.options.onEvent?.(EVENTS.dialogState, { from: previous, to: next });
     this.options.env.onDialogState?.(next, previous);
   }
 

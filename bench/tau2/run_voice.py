@@ -168,6 +168,38 @@ def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str, s
     raise RuntimeError(f"dsh 90s 内没监听 {port}")
 
 
+def audit_archive(archive_root: Path) -> int:
+    """跑完审一次时序与状态轮转。
+
+    **这是这个 bench 的主要出口**：reward 说明任务做没做成，审计说明这条链
+    （停嘴 → 出句 → 开轮 → 首块 → 播完）和状态轮转有没有一处不符合设计。
+    只审**最新**那一场（本次的连接）。
+    """
+    import shutil
+    import subprocess
+
+    candidates = sorted(
+        (p for p in archive_root.glob("*") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        print("    审计     ✗ 没找到本次的档案目录")
+        return 2
+    target = candidates[0]
+    repo = Path(__file__).resolve().parents[2]
+    checker = repo / "scripts" / "fsm-trace-check.ts"
+    if not checker.exists() or shutil.which("node") is None:
+        print(f"    审计     跳过（缺 {checker} 或 node）")
+        return 0
+    proc = subprocess.run(  # noqa: S603 —— 参数是我们自己拼的
+        ["node", "--experimental-strip-types", str(checker), str(target)],
+        capture_output=True, text=True, check=False,
+    )
+    print(proc.stdout.rstrip() or proc.stderr.rstrip())
+    return proc.returncode
+
+
 def write_policy_for_dsh(policy: str, language: str) -> Path | None:
     """把该域的政策写进 dsh 的 `MEMORY.md`。
 
@@ -307,6 +339,12 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(simulation.model_dump_json(indent=2), encoding="utf-8")
     print(f"    结果写入 {out}")
+
+    # **时序与状态轮转审计**：这才是这个 bench 的主要出口。reward 说明任务做没做成，
+    # 但「停嘴 → 出句 → 开轮 → 首块 → 播完」和 `listening → thinking → speaking →
+    # listening` 有没有一处不符合设计，只有档案能回答。
+    # 不参与退出码：reward=0 且审计干净，是「这题难」；审计有违规才是「链路坏了」。
+    audit_rc = audit_archive(work_dir / "archive")
     return 0 if reward else 1
 
 

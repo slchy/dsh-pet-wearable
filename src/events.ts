@@ -44,6 +44,14 @@ export const EVENTS = {
   llmFirst: 'llm.first',
   /** 一轮结束。带 `dsh_session` 时可与 dsh 自己的会话档案对齐 */
   turnEnd: 'turn.end',
+  /**
+   * 状态机的一次转移（`from` → `to`）。
+   *
+   * 轮次的四段时序（停嘴 → ASR → 开轮 → 首块）只能说明「快不快」，
+   * 「状态轮转对不对」得看这条：`tts.first` 有没有落在 `speaking` 里、
+   * 一轮结束后有没有回到 `listening`、`closed` 之后有没有人把状态拉回去。
+   */
+  dialogState: 'dialog.state',
 
   // ---- 设备与下行 ----
   /** v2 设备自报能力 */
