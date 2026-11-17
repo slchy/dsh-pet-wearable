@@ -130,9 +130,30 @@ ASR 逐字一致 4/4 轮。
 它不触发时 ② 就是 149–151，和改前完全一样，说明状态机本身不引入可测延迟。
 ③ 与合计每一轮都更快。
 
+## 补正：只读审计抓到的接线缺口（11-16 晚）
+
+外部只读审计（基准 `67c97ec`）实测了**生产装配**，抓到三处「单测绿、生产没接上」。
+我逐条对着代码验过，全部成立 —— 前一步的工作有一半是死代码：
+
+| 断点 | 事实 | 修法 |
+|---|---|---|
+| P0-1 | `TurnRunner` 里没有状态回调；`notifyState` 只在 `dispatch` 末尾与 `onTurnFinished` 调，后者时状态已回 `listening`、`lastDialogState` 也是 `listening` → 去重吞掉 → `release('reply')` 永不执行，第一句之后话筒一直停在 `reply`（宠物 `floorFree` 不成立、`announce` 抢不动） | `TurnRunnerOptions.onState` 在三次转移后通知 |
+| P0-2 | `FrontedAgent` 没有 `cancelTurn`，`trackActivity` 只在方法存在时透传 → 外层是 `undefined` → 插话只停喇叭，dsh 继续跑 | `FrontedAgent.cancelTurn` + abort 快模型 HTTP |
+| P0-3 | `trackActivity.reply` 与 `startInner` 都只有三参 → `DshSession.activeTicket` 恒 `null` → 为「迟到取消别杀下一轮」写的 `{no,gen}` 比对在生产没有输入 | 票据贯通 `delegate` / `abandon` / `startInner` |
+| 连锁 | `cancelInner` 按 `gen` 去重，而 `gen` 只在插话时 +1 → 票据一旦接通，同一代第二次快车道胜出就不会取消 dsh | 改成按 `no:gen` 去重 |
+
+引出的两条结构性改动（审计 P1）：`playedSeen` 从等待环入口挪到轮次开头、回执绑在途轮次、
+断连不再空等到上限；CosyVoice 第一批门槛从 10 字降到「有正文就送」，短答不再等整段合成。
+
+新增 `tests/wiring-floor-cancel.test.ts`：按生产装配（`AppSession` + `DialogRuntime`、
+`trackActivity(FrontedAgent(...))`）跑，改前两条都红。
+
+审计里我不同意的一处：P1-3「`playedSeen` 清零会让每轮多等 3 s」被放大了 —— 真机回执在
+最后一批字节发出之后 1 s 才到，落不到清零之前；这个坑只在「合成期就回执」时成立。
+写法该修（拿布尔量当锁存器），影响幅度不是它写的那样。
+
 ## 没做完 / 没做的
 
-| 项 | 原因 |
 |---|---|
 | 共享对话日志（快车道 ↔ dsh） | 按任务要求只留设计草稿：[shared-conversation-log](design/shared-conversation-log.md) |
 | 真机 `played` 回执验证 | **已验**（11-17 01:46 那台 v2 设备会上报），发现语义问题按上面的办法处理；v1 设备仍走估算 |

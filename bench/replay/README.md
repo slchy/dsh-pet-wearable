@@ -3,9 +3,9 @@
 把**真机会话录下来的上行音频**原速喂回云端，逐轮对比 ASR 与延迟。
 
 ```
-python scripts/replay/run.py --list                       # 看有哪些向量/档案
-python scripts/replay/run.py --archive <会话名> --turns 3   # 回放前 3 轮
-python scripts/replay/run.py                              # 用向量库里最新的一份
+python bench/replay/run.py --list                       # 看有哪些向量/档案
+python bench/replay/run.py --archive <会话名> --turns 3   # 回放前 3 轮
+python bench/replay/run.py                              # 用向量库里最新的一份
 ```
 
 ## 为什么是它（而不是 E2E）
@@ -39,7 +39,7 @@ E2E（手机喇叭 + 麦克风）只在两种情况下用：没有历史录音�
 也可以只钉不跑：
 
 ```
-python scripts/replay/run.py --pin --archive <会话名>
+python bench/replay/run.py --pin --archive <会话名>
 ```
 
 ## 量什么

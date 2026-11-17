@@ -16,17 +16,28 @@
 | 话筒归谁 | `AppSession.floor`（`FloorArbiter.owner`） | `floor.busy` / `floor.owner`；宠物经 `PetWorld.floorBusy` 与 `floorTaken` 输入得知 |
 | 当前轮次 | `DialogFsm`（`ticket()` → `{no, gen}`） | 上游取消、迟到回调一律拿票据比对（`isStale` / `isCurrent`） |
 | 播放进度 | `TurnRunner`（`playedSeen` + 设备 `played` 回执） | 决策「这一轮算说完了吗」只在 `TurnRunner` 内部；`DialogFsm` 只收 `audioDone(ticket)` 这一个结论 |
-
-> 播放口径：**估算时长是下限，设备回执只能延后**。真机上见过设备在「最后一批字节收到」
-> 就报 `played`（4.58 s 音频 1 s 回执），按它收尾会把尾音那段插话窗口关掉。
 | 判停中的文本 | `UtteranceAssembler`（`pending`） | 上层只在 `accept` 时拿到整句，拿不到半句 |
 | 快车道闸门 | `FrontedAgent.innerMode`（`pass` / `buffer` / `drop`） | dsh 的流式增量按闸门决定直通、缓冲还是丢弃 |
 | 宠物状态 | `PetSession.state`（`PetState`） | 纯函数 `brain.step` 产出；执行器无判断 |
+
+> 播放口径：**估算时长是下限，设备回执只能延后**。真机上见过设备在「最后一批字节收到」
+> 就报 `played`（4.58 s 音频 1 s 回执），按它收尾会把尾音那段插话窗口关掉。
 
 > 「话筒」这条有三个历史坑，都已经收进 `FloorArbiter`：①`user` 不可抢占，所以
 > `userFinal()` 里直接 `claim('reply')` 永远失败，话筒会卡死在 `user`（改用
 > `handoff('user','reply')`）；②`AppSession.speaker` 曾是一份影子状态，与仲裁器重复；
 > ③`syncFloor()` 曾试图「同步」两者，但它只是恒等式，什么都没做。②③已删除。
+
+### 接线检查清单
+
+「唯一真相」成立的前提是**包装层不吞东西**。2026-11-16 的只读审计抓到三处断点，
+当时单测全绿、生产没接上，所以这三条各要有一条按生产装配跑的测试：
+
+| 断点 | 现状 | 测试 |
+|---|---|---|
+| `beginTurn` / `audioStarted` / `audioDone` 都在 `TurnRunner.run` 里发生，`DialogRuntime.dispatch` 看不到 | `TurnRunnerOptions.onState` 在这三次转移后各回调一次，`DialogRuntime` 接到 `notifyState()` | `tests/wiring-floor-cancel.test.ts` 第一条 |
+| `trackActivity` 只在方法存在时透传，内层没有 `cancelTurn` 就整条断面 | `FrontedAgent.cancelTurn` 存在；`trackActivity.reply` 原样透传第四参 `turn` | 同文件第二条 |
+| 票据在 `FrontedAgent` 内部换成 `localGen` 就丢了 | `delegate` / `abandon` / `startInner` 都带票据，`inner.reply(..., { ticket })` | 同文件第二条 |
 
 ## 1 DialogFsm —— 一轮对话的生命周期
 
@@ -87,8 +98,13 @@ stateDiagram-v2
 ## 2 FloorArbiter —— 话筒
 
 **持有**：`AppSession.floor`（`src/app/session.ts`），无论宠物开不开都建。
-**驱动**：`AppSession.onDialogState(state)`（生产）、`turnStart()`/`turnEnd()`（模拟器与直接调用方）、
-`PetSession`（宠物经端口申请，不直接仲裁）。
+**驱动**：`TurnRunner.onState`（每轮的三次转移后回调）→ `DialogRuntime.notifyState` →
+`AppSession.onDialogState(state)`；`turnStart()`/`turnEnd()` 留给模拟器与直接调用方；
+`PetSession` 只管申请，不参与仲裁。
+
+> `notifyState` 有去重（状态没变就不回调），所以**必须**在那三次转移之后各通知一次。
+> 只在 `dispatch` 末尾和 `onTurnFinished` 通知时，一轮从头到尾只看到 `listening` 一个状态，
+> `release('reply')` 永远不执行 —— 这是审计抓到的 P0-1。
 
 状态就是「谁占着」：`null | user | reply | announce | pet | reflex`。
 

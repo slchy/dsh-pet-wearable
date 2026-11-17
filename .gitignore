@@ -18,6 +18,8 @@ tmp/
 !*.pem.example
 __pycache__/
 bench/**/*.json
+# 快车道的用例是测试数据，不是输出 —— 干净克隆要能跑 --offline
+!bench/fast_lane/cases.json
 bench/e2e/out/
 bench/replay/out/
 bench/e2e/mictap/out/

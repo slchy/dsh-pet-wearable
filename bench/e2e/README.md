@@ -1,6 +1,6 @@
 # 端到端自动化测试（不接眼镜）—— **备用**
 
-> **先用真机向量回放：`scripts/replay/`。** 它更真（真机真录的口音/噪声/停顿）、
+> **先用真机向量回放：`bench/replay/`。** 它更真（真机真录的口音/噪声/停顿）、
 > 更快、可反复跑、能逐段对比。只有两种情况回到这里：
 > 1. 手上没有可用的历史录音（新装环境、刚清过档案）；
 > 2. 要验**声学通路**本身（喇叭真的出声了吗、麦克风真的收音了吗）。
@@ -12,12 +12,12 @@
 → 空气 → 手机麦克风录下来 → 当上行 PCM 喂回云端 → ASR → agent → TTS → 手机喇叭播回复。
 
 ```
-python scripts/e2e/run.py                 # 默认 4 条话术（闲聊 / 鼓励 / 算数 / 问时间）
-python scripts/e2e/run.py --only 3        # 只跑第 3 条
+python bench/e2e/run.py                 # 默认 4 条话术（闲聊 / 鼓励 / 算数 / 问时间）
+python bench/e2e/run.py --only 3        # 只跑第 3 条
 ```
 
 跑完打印一张表（说完→首音 / dsh / TTS 首块 / 回复长度 / ASR 重叠率 / 通过与否），
-明细在 `scripts/e2e/out/summary.json`，每条的素材和录音在 `scripts/e2e/out/<n>-<slug>/`。
+明细在 `bench/e2e/out/summary.json`，每条的素材和录音在 `bench/e2e/out/<n>-<slug>/`。
 
 ## 为什么要这么绕
 
@@ -32,7 +32,7 @@ python scripts/e2e/run.py --only 3        # 只跑第 3 条
 
 **麦克风不能用 `app_process` 录。** 录音权限检查走 `AttributionSource`（包名 + AppOps），
 `app_process` 没有包身份 —— 拿 root 也一样被静音（实测 `uid:0, silenced 1`）。
-所以有一个 37 行的最小 APK：`scripts/e2e/mictap/`，首次运行时自动编译安装。
+所以有一个 37 行的最小 APK：`bench/e2e/mictap/`，首次运行时自动编译安装。
 
 ## 文件
 
@@ -63,5 +63,5 @@ python scripts/e2e/run.py --only 3        # 只跑第 3 条
 进程级一份、启动时预热（实测 239 ms 加载一次），连接断开不销毁。要量多轮也可以：
 
 ```
-node scripts/e2e/client.mjs --pcm a.pcm,b.pcm ...   # 一条连接连说两段
+node bench/e2e/client.mjs --pcm a.pcm,b.pcm ...   # 一条连接连说两段
 ```

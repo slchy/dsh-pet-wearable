@@ -1,0 +1,27 @@
+[
+  { "text": "你好呀", "label": "chitchat" },
+  { "text": "我可想你了", "label": "chitchat" },
+  { "text": "你是谁呀", "label": "chitchat" },
+  { "text": "谢谢你", "label": "chitchat" },
+  { "text": "晚安", "label": "chitchat" },
+  { "text": "你真可爱", "label": "chitchat" },
+  { "text": "我好累啊", "label": "chitchat", "note": "情绪回应，不需要工具" },
+  { "text": "今天心情不错", "label": "chitchat" },
+  { "text": "别闹了", "label": "chitchat" },
+  { "text": "你叫什么名字", "label": "chitchat" },
+
+  { "text": "帮我查一下订单", "label": "task", "note": "本地判据就该挡（帮我/查）" },
+  { "text": "今天天气怎么样", "label": "task", "note": "本地判据挡（怎么）" },
+  { "text": "看看这张图", "label": "task", "note": "本地判据挡（看）" },
+  { "text": "念一下这条消息", "label": "task", "note": "本地判据挡（念）" },
+  { "text": "导航回家", "label": "task", "note": "本地判据挡（导航）" },
+  { "text": "记一下我明天要开会", "label": "task", "note": "本地判据挡（记一下）" },
+  { "text": "刚才我说了什么", "label": "task", "note": "要回想历史，本地判据挡（刚才）" },
+  { "text": "订单号是W8665881", "label": "task", "note": "含字母数字，本地判据挡" },
+
+  { "text": "几点了", "label": "task", "note": "本地判据放行 → 必须靠快模型自己说 DELEGATE" },
+  { "text": "外面下雨吗", "label": "task", "note": "本地判据放行 → 靠模型判" },
+  { "text": "我饿了", "label": "chitchat", "note": "放行且可以闲聊答，不该委派" },
+  { "text": "有点冷", "label": "chitchat", "note": "同上" },
+  { "text": "我很难过", "label": "chitchat", "note": "情绪，快车道该接" }
+]

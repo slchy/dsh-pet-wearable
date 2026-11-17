@@ -77,8 +77,9 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 
 ### 宠物环（主动开口）
 
-**默认关。** 不设 `PET_PROACTIVE=1` 时 `aliyun-session.ts` 里 `this.app` 是 `null`，
-`AppSession` / `PetBrain` **根本不会构造** —— 只剩下对话环。启动日志会明说：
+**默认关。** `AppSession` **总是构造**（它持有话筒仲裁 `FloorArbiter`，对话环自己要用）；
+关掉的只是 `PetSession`（`PET_PROACTIVE=1` 才建）—— 也就是「不会主动开口」。
+类名是 `VoiceConnection`（`src/voice-session.ts`），没有 `aliyun-session.ts` 这个文件。启动日志会明说：
 
 ```
 宠物环   开（主动开口）：心跳每 30000 ms，离场 300000 ms 后重戴会打招呼
@@ -218,8 +219,12 @@ node scripts/latency-report.ts <root> --all     # 每个会话各出一份
 （`MIAI_ANNOUNCE_FILE` 可改，条数上限 `MIAI_ANNOUNCE_MAX` 默认 20），下次连上第一条就补播。
 语义是**至少一次**：崩溃在播放中途会重复播一句，比丢一句好。
 
-## 播放时长是估算
+## 播放进度：估算 + 设备回执
 
-`turn-runner` 用 `audioSeconds + playbackTailMs` 之后 sleep 轮询，服务器不知道设备真正播到
-哪。"它什么时候觉得自己说完了"建在这个估算上。改成真回执之前，任何依赖"设备已播完"的
-时序（比如紧接着挂断）都要按估算的误差留余量。
+设备在 `Hello` 里声明了 `played` 能力时，`turn-runner` 等设备的回执再离开 `speaking`；
+**估算是下限，回执只能延后**（真机上见过设备在「最后一批字节收到」就回执，比真实播完早
+1–3 s，按它收尾会把尾音那段插话窗口关掉）。没有这个能力的设备仍按时长估算
+（`audioSeconds + playbackTailMs`）。
+
+两种情况的上限都是「估算 + 余量」，事件丢了不会把一轮挂死。改这块之前先看
+`src/turn-runner.ts` 里等待环的注释。
