@@ -63,6 +63,10 @@ REMOTE_ARCHIVE = "~/miai-archive"
 # 踩过一次 —— 回放一场真机会话把唯一那份 12 轮向量挤掉了，工具吃掉了自己的输入。
 # 所以第一次用到某场档案时先 `cp -r` 进向量库，之后永远从向量库读。
 REMOTE_VECTORS = "~/miai-vectors"
+# 合成素材单独一个库：**真机和 TTS/装置造出来的东西不能混**。
+# 两边的数字没有可比性（合成音没有真实口音、噪声、停顿，ASR 的 partial 也短得多），
+# 混在一个库里就会出现「拿合成回放当基准，还以为是真机」—— 已经踩过。
+REMOTE_SYNTH = "~/miai-vectors-synth"
 REMOTE_CLIENT = "/tmp/miai-replay-client.mjs"
 
 
@@ -109,23 +113,53 @@ def list_archives() -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def list_vectors() -> list[str]:
-    out = ssh(f"ls -t {REMOTE_VECTORS} 2>/dev/null || true")
+def source_kind(name: str) -> str:
+    """这份素材是谁的：`real`（真机 mSBC 上行）还是 `synth`（bench 适配器 / TTS 合成）。
+
+    判据看 `meta.json`：**真机一定是 mSBC**（`uplinkCodec=msbc`、`uplink.sbc` 非空、
+    `remote` 是公网或内网地址）；bench 适配器没有 mSBC 编码器，走 PCM16 + 回环地址。
+
+    为什么非要分：两边的数字没有可比性 —— 合成音没有真实口音、噪声、停顿，ASR 的
+    partial 也短得多（实测短句只出 1–2 个字，够不到投机门槛）。混在一起就会出现
+    「拿合成回放当基准，还写进文档说这是真机」—— 已经踩过。
+    """
+    txt = ssh(
+        f'for f in {REMOTE_VECTORS}/{name}/meta.json {REMOTE_SYNTH}/{name}/meta.json '
+        f'{REMOTE_ARCHIVE}/{name}/meta.json; do if [ -f "$f" ]; then cat "$f"; break; fi; done'
+    ).strip()
+    if not txt:
+        raise SystemExit(f"没有 {name} 的 meta.json（先用 --list 看看）")
+    try:
+        meta = json.loads(txt)
+    except json.JSONDecodeError:
+        raise SystemExit(f"{name} 的 meta.json 读不了")
+    if str(meta.get("uplinkCodec") or "") == "msbc":
+        return "real"
+    return "synth"
+
+
+def vectors_dir(kind: str) -> str:
+    return REMOTE_VECTORS if kind == "real" else REMOTE_SYNTH
+
+
+def list_vectors(kind: str = "real") -> list[str]:
+    out = ssh(f"ls -t {vectors_dir(kind)} 2>/dev/null || true")
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def pin_vector(name: str) -> str:
-    """把一场档案固定进向量库（已有就跳过），返回向量库里的路径。"""
-    if name in list_vectors():
-        return f"{REMOTE_VECTORS}/{name}"
+def pin_vector(name: str, kind: str) -> str:
+    """把一场档案固定进**对应来源**的向量库（已有就跳过），返回库里的路径。"""
+    root = vectors_dir(kind)
+    if name in list_vectors(kind):
+        return f"{root}/{name}"
     if name not in list_archives():
-        raise SystemExit(f"向量库和档案里都没有 {name}（先用 --list 看看）")
+        raise SystemExit(f"档案里没有 {name}（先用 --list 看看）")
     ssh(
-        f"mkdir -p {REMOTE_VECTORS} && cp -r {REMOTE_ARCHIVE}/{name} {REMOTE_VECTORS}/{name} "
-        f"&& ls -l {REMOTE_VECTORS}/{name}"
+        f"mkdir -p {root} && cp -r {REMOTE_ARCHIVE}/{name} {root}/{name} "
+        f"&& ls -l {root}/{name}"
     )
-    print(f"  已钉进向量库：{REMOTE_VECTORS}/{name}")
-    return f"{REMOTE_VECTORS}/{name}"
+    print(f"  已钉进{'真机' if kind == 'real' else '合成'}向量库：{root}/{name}")
+    return f"{root}/{name}"
 
 
 def token_and_device() -> tuple[str, str]:
@@ -305,18 +339,27 @@ def main() -> int:
         raise SystemExit(f"没有 ssh key：{SSH_KEY}")
 
     archives = list_archives()
-    vectors = list_vectors()
+    real_vectors = list_vectors("real")
+    synth_vectors = list_vectors("synth")
     pcm_paths = [p.strip() for p in args.pcm.split(',') if p.strip()]
     if args.list:
-        print(f"向量库 {REMOTE_VECTORS}（{len(vectors)} 份，回放只从这里读）")
-        for name in vectors:
-            print(f"  ✓ {name}")
-        print(f"\n档案 {REMOTE_ARCHIVE}（{len(archives)} 份，会被滚动删除）")
+        for kind, root, names in (
+            ("真机", REMOTE_VECTORS, real_vectors),
+            ("合成", REMOTE_SYNTH, synth_vectors),
+        ):
+            print(f"{kind}向量库 {root}（{len(names)} 份）")
+            for name in names:
+                print(f"  ✓ {name}")
+        print(f"\n档案 {REMOTE_ARCHIVE}（{len(archives)} 份，会被滚动删除；"
+              f"末尾标 real/synth 的是来源）")
         for name in archives:
-            mark = "  ✓" if name in vectors else "   "
-            print(f"{mark} {name}")
+            try:
+                kind = "real" if source_kind(name) == "real" else "synth"
+            except SystemExit:
+                kind = "?"
+            print(f"   [{kind:5}] {name}")
         return 0
-    if not archives and not vectors and not pcm_paths:
+    if not archives and not pcm_paths:
         raise SystemExit("服务器上没有任何档案")
 
     if pcm_paths:
@@ -324,15 +367,29 @@ def main() -> int:
         source = "(pcm)"
         before: list[dict] = []
         vector_path = ""
-        print(f"--pcm 模式：{len(pcm_paths)} 段，无源档案可比")
+        print("--pcm 模式：造出来的音频，**不是真机素材**，结果不能混进真机基准")
     else:
-        source = args.archive or (vectors[0] if vectors else archives[0])
-        print(f"源档案 {source}  （向量库 {len(vectors)} 份 / 档案 {len(archives)} 份）")
+        # 不给 --archive 时只从**真机**库里挑；空就说清楚，绝不自作主张退到合成库
+        if args.archive:
+            source = args.archive
+            kind = source_kind(source)
+        elif real_vectors:
+            source = real_vectors[0]
+            kind = "real"
+        else:
+            raise SystemExit(
+                f"真机向量库 {REMOTE_VECTORS} 是空的。\n"
+                f"  合成库 {REMOTE_SYNTH} 里有 {len(synth_vectors)} 份，要跑得显式指定："
+                f"--archive <名字>\n"
+                f"  真机素材要靠真设备说话录出来（`MIAI_ARCHIVE_KEEP` 会滚掉，记得 --pin）"
+            )
+        label = "真机 mSBC" if kind == "real" else "合成/回放（PCM16，**不能当基准**）"
+        print(f"源档案 {source}   来源={label}")
 
         if args.pin:
-            pin_vector(source)
+            pin_vector(source, kind)
             return 0
-        vector_path = pin_vector(source) if source not in vectors else f"{REMOTE_VECTORS}/{source}"
+        vector_path = pin_vector(source, kind)
 
         OUT.mkdir(parents=True, exist_ok=True)
         src_events = OUT / f"source-{source}.jsonl"
