@@ -154,3 +154,23 @@ test('FAST_LANE_PREFETCH=0 就完全不预跑（A/B 对照用）', () => {
   withSwitch.prefetch('你好呀');
   assert.equal(asked, 0, '关了就不该发请求');
 });
+
+test('并段的真实顺序：短句先起跑，长句到来时顶掉它，只答一次', async () => {
+  const asked: string[] = [];
+  const agent = makeAgent(async (_url, init) => {
+    const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const last = body.messages[body.messages.length - 1]?.content ?? '';
+    asked.push(last);
+    return sse([`[平静]答的是${last}`]);
+  });
+
+  // 真机顺序：addSentence 两次 → prefetch 两次 → 最后 reply 一次（文本是并完的）
+  agent.prefetch('谢谢你');
+  agent.prefetch('谢谢你啦');
+  const reply = await agent.reply('谢谢你啦');
+
+  assert.deepEqual(asked, ['谢谢你', '谢谢你啦'], '短句那次被顶掉，长句重新起跑');
+  assert.equal(reply.speech, '答的是谢谢你啦', '用户只会听到并完的那一句');
+});

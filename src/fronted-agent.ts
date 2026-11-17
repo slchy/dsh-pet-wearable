@@ -547,7 +547,14 @@ export class FrontedAgent implements AgentProvider {
     if (!isFastCandidate(text, this.maxChars)) return;
     if (this.pending.length / 2 >= this.keepTurns) return;
 
-    this.dropPrefetch('换一句');
+    // 并段走的是**这一条**：新一句（更长的累积文本）到来时把旧的顶掉。
+    // 所以日志要写清是哪种情况，别让「判停并了段」那句永远打不出来。
+    const prev = this.prefetched;
+    this.dropPrefetch(
+      prev !== null && text.startsWith(prev.text)
+        ? `判停并了段，改用 ${JSON.stringify(text)} 重新起跑`
+        : '换一句',
+    );
     const slot = {
       text,
       startedAt: this.now(),
@@ -592,7 +599,7 @@ export class FrontedAgent implements AgentProvider {
     if (slot.text !== userText) {
       this.abortPrefetch(slot.abort);
       this.log(
-        `  快车道    判停并了段，预跑作废（${JSON.stringify(slot.text)} → ${JSON.stringify(userText)}）`,
+        `  快车道    文本对不上，预跑作废（${JSON.stringify(slot.text)} → ${JSON.stringify(userText)}）`,
       );
       return null;
     }

@@ -296,6 +296,9 @@ def main() -> int:
     ap.add_argument("--bench-port", type=int, default=8767, help="自起 harness 的端口")
     ap.add_argument("--bench-dir", default="/tmp/miai-replay", help="自起 harness 的工作目录（含档案）")
     ap.add_argument("--repo", default="$HOME/miai-cloud", help="服务器上本仓的路径")
+    ap.add_argument("--pcm", default="",
+                    help="改用**服务器上**的 PCM16 16k 文件（逗号分隔，每个算一轮）代替向量回放。"
+                         "用来验造出来的音频，比如「一句话被切成两段」——配方见 README")
     args = ap.parse_args()
 
     if not SSH_KEY.exists():
@@ -303,6 +306,7 @@ def main() -> int:
 
     archives = list_archives()
     vectors = list_vectors()
+    pcm_paths = [p.strip() for p in args.pcm.split(',') if p.strip()]
     if args.list:
         print(f"向量库 {REMOTE_VECTORS}（{len(vectors)} 份，回放只从这里读）")
         for name in vectors:
@@ -312,22 +316,29 @@ def main() -> int:
             mark = "  ✓" if name in vectors else "   "
             print(f"{mark} {name}")
         return 0
-    if not archives and not vectors:
+    if not archives and not vectors and not pcm_paths:
         raise SystemExit("服务器上没有任何档案")
 
-    source = args.archive or (vectors[0] if vectors else archives[0])
-    print(f"源档案 {source}  （向量库 {len(vectors)} 份 / 档案 {len(archives)} 份）")
+    if pcm_paths:
+        # 造出来的音频（`--pcm`）：没有源档案可对账，只出审计和这一场的时序
+        source = "(pcm)"
+        before: list[dict] = []
+        vector_path = ""
+        print(f"--pcm 模式：{len(pcm_paths)} 段，无源档案可比")
+    else:
+        source = args.archive or (vectors[0] if vectors else archives[0])
+        print(f"源档案 {source}  （向量库 {len(vectors)} 份 / 档案 {len(archives)} 份）")
 
-    if args.pin:
-        pin_vector(source)
-        return 0
-    vector_path = pin_vector(source) if source not in vectors else f"{REMOTE_VECTORS}/{source}"
+        if args.pin:
+            pin_vector(source)
+            return 0
+        vector_path = pin_vector(source) if source not in vectors else f"{REMOTE_VECTORS}/{source}"
 
-    OUT.mkdir(parents=True, exist_ok=True)
-    src_events = OUT / f"source-{source}.jsonl"
-    scp_down(f"{REMOTE}:{vector_path}/events.jsonl", src_events)
-    before = parse(src_events)
-    show("【源】真机当时", before)
+        OUT.mkdir(parents=True, exist_ok=True)
+        src_events = OUT / f"source-{source}.jsonl"
+        scp_down(f"{REMOTE}:{vector_path}/events.jsonl", src_events)
+        before = parse(src_events)
+        show("【源】真机当时", before)
 
     # 回放默认**自己起一个隔离 harness**：不打生产端口，档案也不会挤掉真实设备的
     if args.spawn:
@@ -343,9 +354,14 @@ def main() -> int:
     turns = args.turns if args.turns > 0 else len(before)
     scp_up(HERE / "client.mjs", f"{REMOTE}:{REMOTE_CLIENT}")
     token, device = token_and_device()
+    if pcm_paths:
+        target = f"--pcm {shlex.quote(','.join(pcm_paths))}"
+        turns = len(pcm_paths)
+    else:
+        target = f"--vector {vector_path} --mode {args.mode}"
     # 在服务器上跑：`127.0.0.1` 时音频不出机器，①/③ 里没有公网往返
     cmd = (
-        f"node {REMOTE_CLIENT} --vector {vector_path} --mode {args.mode} "
+        f"node {REMOTE_CLIENT} {target} "
         f"--host {shlex.quote(host)} --port {shlex.quote(port)} {tls} "
         f"--token {shlex.quote(token)} --device {shlex.quote(device)} "
         f"--turns {turns}"
@@ -395,6 +411,8 @@ def main() -> int:
     print(audit.rstrip())
 
     print("\n=== 逐轮对比 ===")
+    if not before:
+        print("  （`--pcm` 模式没有源档案可比：看上面审计与 `last.json` 的 runs）")
     print(f"  {'轮':>3} {'①源→新':>14} {'②源→新':>14} {'③源→新':>14}  ASR")
     same = 0
     for i in range(min(len(before), len(after))):
@@ -406,7 +424,8 @@ def main() -> int:
               f" {cell(s['a2']) + '→' + cell(n['a2']):>14}"
               f" {cell(s['a3']) + '→' + cell(n['a3']):>14}  {mark} {(n['asr'] or '')[:24]}")
     print(f"\nASR 逐字一致 {same}/{min(len(before), len(after))} 轮"
-          f"（源 {len(before)} 轮 / 回放 {len(after)} 轮）")
+          f"（源 {len(before)} 轮 / 回放 {len(after)} 轮）" if before
+          else f"\n回放 {len(after)} 轮（`--pcm` 模式，无源可比）")
 
     if args.repeat > 1:
         print(f"\n=== {args.repeat} 次的分布 ===")
