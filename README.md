@@ -171,7 +171,7 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 可调的旋钮（都在 `src/main.ts` 读环境变量，改完重启即可，不必重新编译）：`SMART_TURN_QUIET_MS`（定稿后静候，默认 80）、`SMART_TURN_PARTIAL_GRACE_MS`（判停宽限，默认 150）、`SMART_TURN_EXTEND_MS`（每次延长，默认 400）、`SMART_TURN_MAX_EXT`（延长上限，默认 7）；快车道侧 `FAST_LANE_MODEL` / `FAST_LANE_BASE_URL` / `FAST_LANE_API_KEY` / `FAST_LANE_HEDGE`（默认 2，对冲份数）/ `FAST_LANE_PREFETCH` / `FAST_LANE_PARTIAL_SPECULATE`；TTS 侧 `COSYVOICE_MODEL` / `COSYVOICE_VOICE` / `COSYVOICE_EMOTION_MODE`。
 
-排查用可复算的日志脚本：`scripts/latency-report.ts` 逐轮分段统计，`scripts/dsh-timeline.ts` 对齐 `dsh` 会话日志拆解 Agent 内部耗时。
+排查用可复算的日志脚本：`scripts/latency-report.ts` 逐轮分段统计，`scripts/dsh-timeline.ts` 对齐 `dsh` 会话日志拆解 Agent 内部耗时。**全仓脚本的路由表与口径归属见 [docs/TOOLS.md](./docs/TOOLS.md)** —— 算延迟/审计状态轮转之前先查那张表，别另写一个（踩过：手搓的分段脚本把 ② 算成 63543 ms）。
 
 **时序与状态轮转审计**（bench 的主要出口，不是任务做没做成）：`node --experimental-strip-types scripts/fsm-trace-check.ts <档案>` 审一份会话档案 —— 轮次是否配对、状态转移是否只走白名单、`tts.first` 是否落在 `speaking` 里、插话有没有真的发 `audio.stop`、停嘴到首块/单轮时长是否超预算。规则与依据见 [state-machines §5.8](./docs/state-machines.md)。`bench/replay` 和 τ² bench 跑完都会自动审一次。
 

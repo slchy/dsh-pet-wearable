@@ -182,24 +182,36 @@ for (let i = 1; i <= REPEATS; i += 1) {
   const evPath = join(ARCHIVE, dir, 'events.jsonl');
   if (!existsSync(evPath)) { console.log(`第 ${i} 轮：没有 events.jsonl`); continue; }
   const events = readFileSync(evPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  // 档案的事件名在 `ev` 字段（`{t, ev, at, ...}`）。这里原来找的是
+  // `event`/`type`/`e`，一个都命中不了，于是每一项都印成「—」—— 看着像"没仪表"，
+  // 其实仪表齐全。别按名字猜，照 `events.ts` 的写法读。
   const at = (name) => {
-    const e = events.find((x) => (x.event ?? x.type ?? x.e) === name);
-    return e?.t ?? e?.time ?? e?.ts ?? null;
+    const e = events.find((x) => x.ev === name);
+    return e?.t ?? null;
   };
   const gate = at('gate.close');
   const asr = at('asr.sentence');
   const turn = at('turn.start');
   const llm = at('llm.first');
   const ttsFirst = at('tts.first');
-  const f = (v) => (v === null ? '  —' : String(v).padStart(4));
+  // 停嘴时刻要用 `gate.close - gapMs` 还原：`gate.close` 是在静音窗口走满之后才写的，
+  // 它减掉 `holdMs` 也不等于停嘴（真机实测窗口能被拉长到 2 s 以上）。
+  const gateEvent = events.find((x) => x.ev === 'gate.close');
+  const stoppedAt = gate === null ? null : gate - Number(gateEvent?.gapMs ?? 0);
+  const f = (v) => (v === null ? '  —' : String(Math.round(v)).padStart(4));
   console.log(
     `第 ${i} 轮  ${dir}\n`
-    + `  ① 说完→定稿 ${f(asr !== null && gate !== null ? asr - gate : null)} ms   `
+    + `  ① 说完→定稿 ${f(asr !== null && stoppedAt !== null ? asr - stoppedAt : null)} ms   `
     + `② 定稿→开轮 ${f(turn !== null && asr !== null ? turn - asr : null)} ms   `
     + `③ 开轮→首块 ${f(ttsFirst !== null && turn !== null ? ttsFirst - turn : null)} ms`
     + `  （模型首字 ${f(llm !== null && turn !== null ? llm - turn : null)} ms）`,
   );
-  results.push({ a1: asr - gate, a2: turn - asr, a3: ttsFirst - turn, llm: llm - turn });
+  results.push({
+    a1: asr - stoppedAt,
+    a2: turn - asr,
+    a3: ttsFirst - turn,
+    llm: llm - turn,
+  });
   if (before + 1 > 4 && i < REPEATS) {
     // 会话已建立，下一轮直接复用；这里只留在同一连接外，简化处理
   }

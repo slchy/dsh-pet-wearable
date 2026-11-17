@@ -1,0 +1,248 @@
+# 项目脚本标定
+
+仓库里 `scripts/` `bench/` `tools/` 加起来几十个脚本，每个都只回答一个问题。
+这份文件干三件事：
+
+1. **路由**：手上有个问题，该跑哪一个（§1）
+2. **口径归属**：一个数字只允许有一个实现，别处必须复用它（§2）
+3. **标定值**：跑对了应该看到什么数量级（§7）
+
+## 0. 两条硬规矩
+
+**① 先查 §1，再动手。** 手搓一个新脚本去算已有的口径，是本仓最常见的自伤 ——
+算出来的数字通常还错（§6 第 1 条就是活例）。
+
+**② 新探针一律放 `bench/`。** `scripts/deploy_cloud.py` 的 `ITEMS` 只同步
+`src mcp tools tests smart_turn scripts package.json tsconfig.json README.md`
+九项，`bench/` 不在里面。往 `scripts/` 里塞一次性探针，等于把它推上生产服务器。
+
+---
+
+## 1. 路由表：我要回答什么 → 跑哪个
+
+| 我想知道 | 跑这个 | 读什么 |
+|---|---|---|
+| 一轮卡在哪、用户等了几秒 | `scripts/latency-report.ts <档案目录>` | ①②③ 分段 + 首字 p50/p90 vs 预算 |
+| 这条链有没有一处不符合设计 | `scripts/fsm-trace-check.ts <档案>` | 违规列表（退出码 0/1） |
+| `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
+| 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
+| 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比 |
+| 不接眼镜、全自动跑几条话术 | `bench/e2e/run.py`（手机当喇叭+话筒） | 说完→首音 / 通过与否 |
+| 判停侧车为什么不敢收 | `bench/latency/probe-single-turn.mjs` + 档案 | 判停 p 值逐次变化 |
+| CosyVoice 首包多少 / 要几个字才开跑 | `bench/latency/probe-cosyvoice-firstbatch.mts` | 首批字数 × 首块时间 |
+| 快车道会不会答错本该交给 `dsh` 的 | `bench/fast_lane/run.ts` | 误拦截率（>0 退出码 1） |
+| 换哪家快模型首字更短 | `bench/fast_lane/probe_models.mjs` | 逐模型首 token |
+| ASR 握手 40000002 / 权限到底缺哪个 | `scripts/nls-check.mjs` | 各接口交叉验证 |
+| 上行音频被切碎了没有 | `scripts/env-dump.py <uplink.pcm>` | 逐窗能量包络 |
+| 识别出字速度合理吗（幻觉判据） | `scripts/speed-check.py` | 字/秒（中文 3–5，>8 可疑） |
+| 上行 mSBC 损失了多少高频 | `scripts/hf-compare.py` | 对下行 24 kHz 比频谱斜率 |
+| 云端链路通不通（不碰真机） | `tools/fake-phone.ts`（v1）/ `tools/fake-v2-device.ts`（v2） | 退出码 0 = 收到下行 Audio |
+| τ² 任务跑得好不好 | `bench/tau2/run_voice.py` | reward + 时序审计 |
+
+---
+
+## 2. 口径归属：一个数字只有一个实现
+
+**档案分段（① ② ③ ④）**
+
+| | |
+|---|---|
+| 唯一实现 | [`src/latency-report.ts`](../src/latency-report.ts) 的 `computeTurns()` |
+| CLI | `node --experimental-strip-types scripts/latency-report.ts <档案目录> [--all]` |
+| 测试 | [`tests/latency-report.test.ts`](../tests/latency-report.test.ts) |
+
+```text
+gate.close ──①──▶ asr.sentence ──②──▶ turn.start ──③──▶ tts.first ──④──▶ turn.end
+```
+
+- ① `silenceToAsr` = `asr.sentence.t − (gate.close.t − gapMs)`
+  **别直接减 `gate.close.t`。** 能量门要等 `gapMs`（真机 2.0–2.1 s）走满才记，
+  而 `asr.sentence` 常常记在它**之前** 300–400 ms。
+- ② `asrToTurn` 定稿 → 开跑（同进程排队 / 等判停收口）
+- ③ `turnToAudio` 开跑 → 首块音频。**含 `dsh` 模型首字**，不是纯 TTS
+- ④ `playbackMs` 播放，不算延迟
+- `firstWordMs = ①+②+③`，预算 `FIRST_WORD_BUDGET_MS = 1200`
+
+**状态轮转与时序审计**
+
+| | |
+|---|---|
+| 唯一实现 | [`src/fsm-trace.ts`](../src/fsm-trace.ts) 的 `checkTrace()` |
+| CLI | `node --experimental-strip-types scripts/fsm-trace-check.ts <events.jsonl｜档案目录> [...]`（`--json` 给脚本吃） |
+| 测试 | [`tests/fsm-trace.test.ts`](../tests/fsm-trace.test.ts) |
+| 预算 | 单轮 `45 s`、停嘴→首块 `15 s`、插话后 `audio.stop` 必须落在 `±500 ms` |
+
+状态白名单直接照抄 `DialogFsm` 的调用点。加一条转移必须同时改
+`ALLOWED` 和它的测试 —— 目前 `speaking → thinking` 只有 `receiptEnded()`
+一个来源（委派轮回执出声，见 `DialogFsm` 顶部约束 1）。
+
+**`dsh` 内部耗时**
+
+| | |
+|---|---|
+| 唯一实现 | [`scripts/dsh-timeline.ts`](../scripts/dsh-timeline.ts) |
+| CLI | `node --experimental-strip-types scripts/dsh-timeline.ts <会话目录> [--dsh-root ~/.dsh/sessions] [--verbose]` |
+
+**τ² 侧的分段**（`bench/tau2/segment_split.py`）是**另一套实现**，因为它多一段
+客户端首帧、锚点是客户端打点而不是 `gate.close`。两套不能混着比。
+
+---
+
+## 3. 延迟与分段
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/latency-report.ts` | 档案 → 逐轮 ①②③④（**默认入口**） |
+| `scripts/fsm-trace-check.ts` | 档案 → 状态轮转违规 |
+| `scripts/dsh-timeline.ts` | Miai 档案 × dsh session log 同轴对齐 |
+| `bench/tau2/segment_split.py` | 客户端打点 + 档案，五段（含 ⑤TTS首块→客户端首帧） |
+| `bench/tau2/lat_summary.py` | 合并 `/tmp/tau2-lat-*.json` 出 p50/p90/p95，折真机体感 |
+| `bench/tau2/reply_breakdown.py` | ③ 拆成模型侧 `dsh_ms` 与 TTS 握手 `tts_first_ms` |
+| `bench/tau2/open_latency.py` | 按答复长度分桶看「τ² 任务是不是让模型开口更晚」 |
+| `bench/latency/probe-single-turn.mjs` | 起生产形态服务端跑一整轮，读档案 —— 本地没有判停侧车，②只作参考 |
+| `bench/latency/analyze-real-archive.mjs` | 真机档案速览（含「等关门」列）。**只用于看 ②，段口径以 `latency-report.ts` 为准** |
+
+`bench/latency/` 下其余四个是 TTS 专项探针（见 §5）。
+
+## 4. 真机回放与端到端
+
+| 脚本 | 作用 |
+|---|---|
+| `bench/replay/run.py` | 把某场真机会话的上行音频原速重放，逐轮对比。`--list` 列可回放的场次，`--archive <名字>` 指定 |
+| `bench/replay/client.mjs` | 线协议客户端，自报 `pcm16` 直接送解码后 PCM（回放没有 mSBC 可编） |
+| `bench/e2e/run.py` | 真机全自动：**不接眼镜**，手机当喇叭和话筒 |
+| `bench/e2e/synth.mjs` | 在服务器上用线上同一条 TTS 合成「用户会说的话」 |
+| `bench/e2e/mictap/build.py` | 打 MicTap APK（手机录 PCM 用；`app_process` 那条路会被 audioserver 静音） |
+
+**为什么优先 `replay` 而不是 `e2e`**：`replay` 输入是同一份音频，跨次可比；
+`e2e` 每轮内容不同，只能看"通不通"。
+
+## 5. TTS / 下行
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/probe-cosyvoice.mjs` | CosyVoice 首包拆解（DashScope `api-ws/v1/inference`） |
+| `scripts/probe-cosyvoice-warm.mjs` | 同一连接连跑 N 个 task，看稳态首包 |
+| `scripts/probe-aliyun-tts.mjs` | NLS `SpeechSynthesizer` 首包（另一家，换供应商时比） |
+| `scripts/probe-tts-latency.mts` | 首包里有多少是「重新建连」（undici keep-alive 4 s） |
+| `bench/latency/probe-cosyvoice-firstbatch.mts` | **首批几个字才开跑** |
+| `bench/latency/probe-cosyvoice-taskid.mjs` | 回执里有没有 `task_id`（决定能不能分槽） |
+| `bench/latency/probe-cosyvoice-two-tasks.mjs` | 同连接连跑两个 task 什么时候能开第二个 |
+| `bench/latency/probe-token-cadence.mts` | 流式模型第 8 / 第 20 个 token 各要多久 |
+
+注意 `scripts/` 下这四个是**历史探针**，跑起来要 `.env` 里的 `ALIYUN_*` /
+`DASHSCOPE_API_KEY`。新写的放 `bench/latency/`。
+
+## 6. ASR / 上行音频
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/aliyun-probe.mjs` | NLS 实时识别连通性（喂 pcm/sbc，`--rate` 改采样率） |
+| `scripts/nls-check.mjs` | 权限交叉验证（握手 40000002 时定位是权限还是别的） |
+| `scripts/probe-nls-vocab.mjs` | `customization_id` / `vocabulary_id` 真被解码时用了吗 |
+| `scripts/asr-ab.mjs` | 同一段音频 16 kHz vs 8 kHz 识别对比 |
+| `scripts/env-dump.py` | 逐窗能量包络：非语音段是不是数字静音、语音段有没有碎片 |
+| `scripts/speed-check.py` | 字/秒（判断"音频问题 vs 模型幻觉"最硬的定量指标） |
+| `scripts/hf-compare.py` | 上行 mSBC 对下行 24 kHz 的频谱斜率 |
+| `scripts/sbc-sync-test.py` | ffmpeg 解 mSBC 是否依赖 syncword（HFP 用 0xAD 不是 0x9C） |
+| `scripts/push-sbc.mjs` | 把 mSBC 按实时速率推给本地 harness，收下行 |
+
+## 7. 快车道
+
+| 脚本 | 作用 |
+|---|---|
+| `bench/fast_lane/run.ts` | 误拦截率 / 命中率 / 两条路径延迟。`--runs N` 看方差，`--offline` 假 fetch 只验 harness |
+| `bench/fast_lane/probe_models.mjs` | 逐供应商量首 token |
+| `bench/fast_lane/cases.json` | 用例（`chitchat` / `task`） |
+
+误拦截 > 0 → 退出码 1，可以当门禁用。
+
+## 8. `dsh` / agent 侧
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/probe-dsh-events.mjs` | 把 SDK 的所有 JSON-RPC 通知原样打出来 |
+| `scripts/probe-stream-shape.mjs` | 长回答时 `assistant/message` 推几次（能不能做流式 TTS 的决定性证据） |
+| `scripts/probe-api-speed.sh` | 裸 DeepSeek API 的 TTFT + token/s（判断慢在模型还是 dsh 层） |
+| `scripts/probe-announce.mjs` | 「后台 job 结算 → 播报」这条链路走不走得通 |
+| `scripts/patch-sdk-cancel.mjs` | 给 dsh SDK 补 `session/cancel`（`--check` 返回 0 = 已打） |
+| `scripts/install-profile-patch.mjs` | 把人设 patch 装进本机 dsh sdk profile（`npm run install-profile`） |
+
+## 9. τ²-bench
+
+| 脚本 | 作用 |
+|---|---|
+| `bench/tau2/run_voice.py` | 跑一题中文语音 τ²（被测方是 dsh，顾客是 Qwen realtime） |
+| `bench/tau2/harness_adapter.py` | 把 dsh 语音链路伪装成一台设备给 τ² |
+| `bench/tau2/bridge_server.py` | 把 τ² `Environment` 暴露成本地 HTTP，给 MCP 工具回程 |
+| `bench/tau2/mcp-tau2.mjs` | stdio MCP 代理，工具名 `mcp__tau2__<tool>` |
+| `bench/tau2/bench-lat-run.sh` | 跑一场 bench 后出「说完→首字节」p50/p90/p95 |
+| `bench/tau2/smoke_bridge.py` | 工具桥三段自测（建环境 / HTTP / MCP 代理） |
+| `bench/tau2/smoke_user.py` | 顾客能不能开口、能不能收音频与转写 |
+| `bench/tau2/probe_qwen.py` | 裸看 Qwen realtime 事件流（`session.update` 有没有被吃） |
+| `bench/tau2/qwen_realtime_user.py` | τ² 的模拟顾客（端到端全双工） |
+| `bench/sfe/fetch.py` | 下 SpeechFCEval 中文子集 |
+
+## 10. 设备模拟 / 运维
+
+| 脚本 | 作用 |
+|---|---|
+| `tools/fake-phone.ts` | 假 v1 手机，也是协议的最小实现（开源时给客户端作者当参照） |
+| `tools/fake-v2-device.ts` | 假 v2 设备：`CaptureImage` / 电量上报。`--host <服务器地址> --port <端口> --tls --token <hex>` |
+| `scripts/watch-tune.sh` | 两端日志同时抓、按时间对齐（本机或能 ssh 到 `<服务器地址>`） |
+| `scripts/env-dump.py` | 见 §6 |
+
+`npm run` 入口只有六个：`start` / `pair` / `sim` / `typecheck` / `test` / `install-profile`。
+其余一律直接 `node <路径>`。`.ts` / `.mts` 在 Node ≥ 22.18 上直接跑（类型擦除已默认开，
+本机 v24）；老版本要加 `--experimental-strip-types`，几个 .ts 脚本的头部注释里带着它，
+加上也无害。
+
+---
+
+## 11. 标定值（跑对了应该看到什么）
+
+**单轮档案分段**（2026-11-17，真机 `v2` 设备，8 轮，`--agent dsh --dsh-sdk`）：
+
+| 段 | p50 | p90 |
+|---|---:|---:|
+| ① 说完→定稿 | 336 | 447 |
+| ② 定稿→开轮 | 512 | 1900 |
+| ③ 开轮→首块 | 1127 | 1652 |
+| ↳ 其中模型首字 | 889 | 1343 |
+| ↳ 其中 TTS 首包（③−首字） | ~300 | ~500 |
+| **首字总延迟** | **2313** | **3688** |
+
+读法（**这三条比数字本身重要**）：
+
+1. **③ 里 80% 是 `dsh` 模型首字**，不是 TTS。看到 ③ 大先去 `reply_breakdown.py`
+   分锅，别直接怀疑 TTS —— TTS 首包一直稳在 300 ms 上下。
+2. **这批是 `dsh` 轮次**，和 README 里快车道 `停嘴→首块 p50 1.4 s` **不是同一口径**，
+   不能相减、不能对比。快车道的 ③ 见 `bench/fast_lane`。
+3. **② 大不等于排队**：`950–1900 ms` 的那几轮，`gate.close − asr.sentence`
+   同样是 `1643–1784 ms` —— 判停侧车不敢收，一直等到能量门走满 2 s 静音才被迫开轮
+   （判停 p 值只有 0.025–0.356；而「还在吗？」p=0.94，②只有 6 ms）。
+   用 `analyze-real-archive.mjs` 的「等关门」列一看就知道。
+
+**TTS 服务端**（CosyVoice）：task 建立 50–62 ms，首包 275–440 ms，
+**服务端要 ~8 个字符才开跑**（2 字要 901 ms），首批音频恒定 22 ms / 1040 B @ 24 kHz。
+
+**快车道模型**：整句 p50 346 / p90 455，首字 p50 259 / p90 360，误拦截 0/10。
+
+---
+
+## 12. 踩过的坑（别重现）
+
+1. **手搓分段脚本**（`bench/latency/analyze-real-archive.mjs` 第一版）：
+   轮次配对用了 `Array.find`，它给的是**最靠前**的那条定稿，于是第 2 轮配到第 1 轮的
+   句子，② 算出 `63543 ms`；`gate.close` 还往**前**找（实际它记在 `asr.sentence`
+   之后），① 全废。→ 档案分段只准用 `latency-report.ts`。
+2. **事件名猜错**：`probe-single-turn.mjs` 找 `event`/`type`/`e`，档案里是 `ev`，
+   于是 ①②③ 全印成 `—`，看着像"没仪表"，其实仪表齐全。
+3. **偶数样本中位**：`s[n/2]` 在 6 个样本时取第 4 个，系统性偏高（2835 vs 2313）。
+   偶数要取中间两个的均值。
+4. **两个口径的中位数相减得不到"开销"**（`lat_summary.py` 的教训）：曾经用
+   bench 2010 − 真机 1400 反推出 500 ms 的固定开销，那 600 ms 其实是 τ² 任务答复更长。
+5. **跨路径不可比**：真机上行是 mSBC（570 B / 75 ms），bench adapter 是 PCM16
+   （640 B / 20 ms）。同一条路径的改前/改后才可比。
+6. **快车道的 ③ 和 `dsh` 的 ③ 不能混**：前者是 `qwen-flash` 首字，后者是
+   `deepseek-flash` 一整轮 agent（含工具往返）。

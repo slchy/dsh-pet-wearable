@@ -39,3 +39,5 @@ _*.log
 
 # 运维记录：含真实主机/证书/设备等信息，不进公开仓。历史里已提交过，按要求不重写历史。
 docs/OPS-RECORD.md
+.probe-archive/
+.realturn/
