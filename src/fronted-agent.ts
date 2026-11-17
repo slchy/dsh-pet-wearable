@@ -225,6 +225,13 @@ export interface FastLaneOptions {
   /** 投机双轨：与 dsh 同时发（默认 true） */
   readonly speculate?: boolean;
   /**
+   * 判停前起跑：ASR 一句定稿就把这一句问出去（默认 true）。
+   *
+   * 留这个开关是为了**能 A/B**：这条路的收益只有一百多毫秒，混在「模型首字」
+   * 的自然抖动里根本看不出来，没有对照组就只能靠猜。
+   */
+  readonly prefetch?: boolean;
+  /**
    * 快车道胜出后怎么处置在途的慢车道那一轮。
    *
    * - `rpc`（默认）：发 `session/cancel`。当前 dsh 的 **SDK 运行时没放行**这个方法
@@ -379,6 +386,7 @@ export class FrontedAgent implements AgentProvider {
   private readonly maxChars: number;
   private readonly keepTurns: number;
   private readonly speculate: boolean;
+  private readonly prefetchEnabled: boolean;
   private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
   private readonly statusFacts: (() => string) | undefined;
   private readonly memory: ((userText: string) => readonly string[]) | undefined;
@@ -452,6 +460,7 @@ export class FrontedAgent implements AgentProvider {
     this.maxChars = options.maxChars ?? 14;
     this.keepTurns = options.keepTurns ?? 4;
     this.speculate = options.speculate ?? true;
+    this.prefetchEnabled = options.prefetch ?? true;
     this.cancelMode = options.cancelMode ?? 'rpc';
     this.statusFacts = options.taskStatus;
     this.memory = options.memory;
@@ -529,6 +538,7 @@ export class FrontedAgent implements AgentProvider {
    * 不抛错、不阻塞：所有失败都在 `reply()` 认领时才浮出来（那时才有人处理）。
    */
   prefetch(text: string): void {
+    if (!this.prefetchEnabled) return;
     if (this.apiKey === '') return;
     if (this.prefetched?.text === text) return;
     // 下面这几条与 `reply()` 里的一一对应：只要 `reply()` 会不走快车道，就不该预跑
@@ -561,18 +571,33 @@ export class FrontedAgent implements AgentProvider {
     this.log(`  快车道    判停前先问出去 ${JSON.stringify(text)}`);
   }
 
-  /** 认领预跑：文本一字不差才给，其余一律作废 */
+  /**
+   * 认领预跑：文本一字不差、且这一轮确实会走快车道才给，其余一律作废。
+   *
+   * 第二条（`usable`）不是优化，是**止损**：宿主的判据与这里不同源时，
+   * 预跑会在「根本不会走快车道」的轮次上白花一次调用。
+   */
   private takePrefetch(
     userText: string,
+    usable: boolean,
   ): { answer: Promise<FastAnswer>; attach: (sink: (text: string) => void) => void } | null {
     const slot = this.prefetched;
     if (slot === null) return null;
     this.prefetched = null;
-    if (slot.text !== userText) {
+    if (!usable) {
       this.abortPrefetch(slot.abort);
-      this.log(`  快车道    判停并了段，预跑作废（${JSON.stringify(slot.text)}）`);
+      this.log(`  快车道    这一轮不走快车道，预跑作废（${JSON.stringify(slot.text)}）`);
       return null;
     }
+    if (slot.text !== userText) {
+      this.abortPrefetch(slot.abort);
+      this.log(
+        `  快车道    判停并了段，预跑作废（${JSON.stringify(slot.text)} → ${JSON.stringify(userText)}）`,
+      );
+      return null;
+    }
+    const ranFor = this.now() - slot.startedAt;
+    this.log(`  快车道    认领预跑（已经跑了 ${ranFor.toFixed(0)} ms）`);
     return {
       answer: slot.answer,
       attach: (sink) => {
@@ -612,9 +637,26 @@ export class FrontedAgent implements AgentProvider {
     this.currentGen = ticket.gen;
     this.currentTicket = ticket;
     this.innerMode = 'pass';
+    const hasFacts = this.statusFacts !== undefined;
+    // 这几条判据原来各自 `return delegate(...)`，预跑就**留在原地没人管**：
+    // 白花一次模型调用，还可能被后面同文本的一轮认领到陈旧结果。
+    // 所以先把「这一轮会不会走快车道」算完，再一次性认领/作废。
+    const askedAnswer = this.lastDsh?.asked === true && looksLikeAnswer(userText);
+    const memorable = looksMemorable(userText);
+    // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
+    const candidate = this.apiKey !== ''
+      && image === undefined
+      && (isFastCandidate(userText, this.maxChars)
+        || (hasFacts && isStatusQuestion(userText)));
+    const overCap = this.pending.length / 2 >= this.keepTurns;
+    // 判停之前就已经问出去的那一轮：**文本一字不差**才认领，见 `prefetch()`
+    const pre = this.takePrefetch(
+      userText,
+      !askedAnswer && !memorable && candidate && !overCap,
+    );
     // dsh 上一条在问话，用户这句是短回话（好的/对/不用）—— 那是**对话里的回应**，
     // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
-    if (this.lastDsh?.asked === true && looksLikeAnswer(userText)) {
+    if (askedAnswer) {
       this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
       return await this.delegate(userText, image, note, ticket, 'task');
     }
@@ -622,27 +664,19 @@ export class FrontedAgent implements AgentProvider {
     // 实测 dsh 只对「用户自己说的」话写记忆 —— 把它塞进系统注记里转述（试过 5 种措辞，
     // 包括在 profile 里明确授权），一次都不写。所以这里的「提议」就是**把话交过去**，
     // 让 L2 用自己的判断决定记不记；L1 不替它写、也不替它猜。
-    if (looksMemorable(userText)) {
+    if (memorable) {
       this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
       return await this.delegate(userText, image, note, ticket, 'task');
     }
-    const hasFacts = this.statusFacts !== undefined;
-    // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
-    const candidate = this.apiKey !== ''
-      && image === undefined
-      && (isFastCandidate(userText, this.maxChars)
-        || (hasFacts && isStatusQuestion(userText)));
     if (!candidate) {
       return await this.delegate(userText, image, note, ticket, 'task');
     }
-    if (this.pending.length / 2 >= this.keepTurns) {
+    if (overCap) {
       this.log('  快车道    攒满上限，这一轮强制交给 dsh（顺便刷上下文）');
       return await this.delegate(userText, image, note, ticket, 'task');
     }
 
     const startedAt = this.now();
-    // 判停之前就已经问出去的那一轮：**文本一字不差**才认领，见 `prefetch()`
-    const pre = this.takePrefetch(userText);
     let emitted = '';
     let dsh: Promise<AgentReplyView> | null = null;
     /** 推给 TTS 的唯一出口：预跑攒下的字和后来的实时字都从这里走，顺序才不会乱 */

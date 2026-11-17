@@ -111,3 +111,46 @@ test('trackActivity 必须转发 prefetch（漏了就是每次白等判停）', 
   tracked.prefetch?.('你好呀');
   assert.ok(true);
 });
+
+test('预跑的判据要与 reply() 同源：长期事实那句压根不该起跑', () => {
+  let asked = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    fetchImpl: async () => { asked += 1; return sse(['[平静]不该用上。']); },
+    speculate: false,
+    log: () => {},
+  });
+  agent.prefetch('我叫小明');
+  assert.equal(asked, 0, '「我叫…」要交给 dsh 自己记，预跑纯属白花钱');
+});
+
+test('带图那一轮不走快车道：已起跑的预跑要作废，不能被认领', async () => {
+  let asked = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    fetchImpl: async () => { asked += 1; return sse(['[平静]不该用上。']); },
+    speculate: false,
+    log: () => {},
+  });
+  // 定稿时还没有图，按闲聊起跑
+  agent.prefetch('谢谢你');
+  const reply = await agent.reply('谢谢你', { mimeType: 'image/jpeg', data: 'AA==' });
+  assert.equal(reply.speech, '慢车道答复。', '带图一律交 dsh');
+  assert.equal(asked, 1, '只发了预跑那一次，没有第二次');
+});
+
+test('FAST_LANE_PREFETCH=0 就完全不预跑（A/B 对照用）', () => {
+  let asked = 0;
+  const withSwitch = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    fetchImpl: async () => { asked += 1; return sse(['在呢。']); },
+    speculate: false,
+    prefetch: false,
+    log: () => {},
+  });
+  withSwitch.prefetch('你好呀');
+  assert.equal(asked, 0, '关了就不该发请求');
+});
