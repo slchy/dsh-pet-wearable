@@ -655,8 +655,13 @@ export class FrontedAgent implements AgentProvider {
    */
   speculatePartial(text: string): void {
     if (!this.prefetchEnabled || !this.partialSpeculate) return;
+    const trace = process.env['FAST_LANE_TRACE'] === '1';
     // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱
-    if (stripPartialTail(text).length < SPEC_MIN_CHARS) return;
+    if (stripPartialTail(text).length < SPEC_MIN_CHARS) {
+      // tracer 上和「真的发出去了」区分开：「投机 静音…」那行是宿主打算投，这行才是结果
+      if (trace) this.log(`  快车道    投机跳过：中间结果太短 ${JSON.stringify(text)}`);
+      return;
+    }
     const prev = this.prefetched;
     if (prev !== null) {
       // 定稿后才起的那一趟文本是确定的，别用猜测顶掉它
@@ -671,7 +676,10 @@ export class FrontedAgent implements AgentProvider {
       }
     }
     if (this.speculateStarts >= 2) return;
-    if (!this.isPrefetchable(text)) return;
+    if (!this.isPrefetchable(text)) {
+      if (trace) this.log(`  快车道    投机跳过：不是快车道候选 ${JSON.stringify(text)}`);
+      return;
+    }
     this.speculateStarts += 1;
     this.startPrefetch(text, true);
   }

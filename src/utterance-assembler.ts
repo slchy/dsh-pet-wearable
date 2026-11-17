@@ -116,6 +116,18 @@ export interface UtteranceAssemblerOptions {
    */
   readonly silencePauseMs?: number;
   /**
+   * 静音持续多久就**先投机一次**（默认 100 ms，比 {@link silencePauseMs} 早）。
+   *
+   * 为什么要比判停更早：判停那 200 ms 是留给"判停器算概率"的，投机不需要等它 ——
+   * 投机只是拿中间结果先问出去，问早了顶多作废（有定稿闸门兜着），问晚了就白等。
+   *
+   * 提前这 100 ms 本身**不省端到端**（模型的 290 ms 早就跑得完 731 ms 的跑道），
+   * 它的用途是把「首字 → 认领」这个窗口从 241 ms 撑到 341 ms ——
+   * 只有撑到 TTS 首块（330–375 ms）之上，「提前合成音频」才有地方放。
+   * 设 0 关闭投机触发（`FAST_LANE_PARTIAL_SPECULATE=0` 也能关，那条在接收方）。
+   */
+  readonly speculateMs?: number;
+  /**
    * 一句定稿（文本已定、还没判定停）时通知一次。   *
    * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
    * 先在这上面起跑，省掉判停那 140 ms 纯等待；真并了下一段就换一句重问。
@@ -218,6 +230,9 @@ export class UtteranceAssembler {
   private lastVoicedAt = Number.NEGATIVE_INFINITY;
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
   private preFiredAt = Number.NEGATIVE_INFINITY;
+  /** 上一次投机的时刻 / 这一句已经投机几次（`addSentence` 归零） */
+  private specFiredAt = Number.NEGATIVE_INFINITY;
+  private specCount = 0;
   /** 本次判停用的是不是预跑那份（是就不必再执行「刚收到中间结果」那条宽限） */
   private usedPrefired = false;
   private disposed = false;
@@ -265,6 +280,62 @@ export class UtteranceAssembler {
       this.prediction = null;
       return;
     }
+    // 两条线拆开跑，阈值不同：
+    //   投机 100 ms —— 拿中间结果先问出去，等久了纯属白等
+    //   判停 200 ms —— 判停器看的是音频，跟 ASR 的静音窗对齐
+    this.maybeSpeculate(t);
+    this.maybePrefirePrediction(t);
+  }
+
+  /**
+   * 静音满 `speculateMs` 就把手上这版中间结果先问出去（投机）。
+   *
+   * 和判停预跑分开是因为**两者的等待理由完全不同**：判停要等够音频才敢判「说完了」，
+   * 投机只是猜，猜早了作废就是，猜晚了一无所得。
+   *
+   * 防呆：
+   * - **一段语音只投机一次**（`lastVoicedAt > specFiredAt`）。静音之后 ASR 还会补
+   *   一两版 partial，如果让它们重投机，等于把已经跑了 160 ms 的那一趟作废重来 ——
+   *   实测认领时"已经跑了 6 ms"，还不如不提前（踩过）；
+   * - 一句最多 2 次（`specCount`，`addSentence` 归零）—— 覆盖「说-停-说」的多段；
+   * - 触发过就记 `specFiredAt`，长时间静音不会反复烧模型。
+   */
+  private maybeSpeculate(t: number): void {
+    if (this.options.onPartial === undefined) {
+      return;
+    }
+    const pause = this.options.speculateMs ?? 100;
+    if (pause <= 0) {
+      return;
+    }
+    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
+      return;
+    }
+    if (t - this.lastVoicedAt < pause) {
+      return;
+    }
+    // 这段语音已经投机过了：后来补的 partial 不再顶掉在跑的那一趟
+    if (this.lastVoicedAt <= this.specFiredAt) {
+      return;
+    }
+    if (this.specCount >= 2) {
+      return;
+    }
+    const latest = this.lastPartialText;
+    if (latest === '') {
+      return;
+    }
+    this.specFiredAt = t;
+    this.specCount += 1;
+    this.options.log(
+      `  投机    静音 ${pause} ms → 交出中间结果（第 ${this.specCount}/2 次，判停还等 `
+        + `${this.options.silencePauseMs ?? 200} ms）`,
+    );
+    this.options.onPartial(this.pendingText + latest);
+  }
+
+  /** 静音满 `silencePauseMs` 就先把判停算掉，定稿时直接取用。 */
+  private maybePrefirePrediction(t: number): void {
     if (this.options.predict === undefined || this.prediction !== null) {
       return;
     }
@@ -278,17 +349,6 @@ export class UtteranceAssembler {
     }
     this.preFiredAt = t;
     this.options.log(`  判停    静音 ${pause} ms → 先跑一遍（不等 ASR 定稿）`);
-    // 同一刻把快车道也**先问出去**：静音那一刻手上这版中间结果，比定稿早 p50 731 ms
-    // （真机 47 轮），够模型答完。选这个时刻而不是「每来一版中间结果就发」有两个原因：
-    //   - 收益在「答案赶在定稿前出来」就**饱和**了（模型首字 ~290 ms ≪ 731 ms），
-    //     提前更多不省任何时间，只是多花钱；
-    //   - 静音了才说明用户真的停了，这一版离定稿最近，长度闸门（`isFastCandidate`）
-    //     才判得准 —— 句子中间猜出来的前缀常常比定稿短一截，问出去必然作废。
-    // 文本仍是猜的：认不认由定稿比对决定（`FrontedAgent.acceptsSpeculation`）。
-    const latest = this.lastPartialText;
-    if (latest !== '') {
-      this.options.onPartial?.(this.pendingText + latest);
-    }
     // 下一句定稿时会拿到 `seq + 1`，见 `addSentence`
     this.startPrediction(this.seq + 1, true);
   }
@@ -329,6 +389,8 @@ export class UtteranceAssembler {
     }
     this.unfinishedWaited = false;
     const seq = this.seq;
+    // 新的一句：投机的次数配额按句重置（下一段语音可以再投机两次）
+    this.specCount = 0;
     // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
     // 先把它交出去起跑，真并了下一段再换 —— 见 `VoiceSession` 的接线。
     this.options.onSentence?.(this.pendingText);

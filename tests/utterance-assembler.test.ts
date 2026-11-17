@@ -325,7 +325,7 @@ test('并了第二段就再通知一次，带完整累积文本', async () => {
   assert.deepEqual(seen, ['我想问', '我想问一下那个事'], '并段后要按新文本再通知，前面那句才作废');
 });
 
-test('中间结果只在**静音那一刻**交给投机，且带的是最新一版 + 已定稿的部分', async () => {
+test('中间结果在**静音那一刻**交给投机，且带的是最新一版 + 已定稿的部分', async () => {
   // 为什么不是「每来一版 partial 就发」：收益在「答案赶在定稿前出来」就饱和了
   // （模型首字 ~290 ms ≪ 停嘴→定稿 731 ms），提前更多不省时间，只是多花钱。
   const seen: string[] = [];
@@ -333,6 +333,7 @@ test('中间结果只在**静音那一刻**交给投机，且带的是最新一�
   const { assembler } = makeAssembler({
     silenceDb: -40,
     silencePauseMs: 40,
+    speculateMs: 40,
     now: () => clock,
     predict: async () => 0.99,
     onPartial: (text) => { seen.push(text); },
@@ -354,6 +355,92 @@ test('中间结果只在**静音那一刻**交给投机，且带的是最新一�
   for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
   await delay(30);
   assert.deepEqual(seen, ['你好我想', '你好呀。再']);
+});
+
+test('投机比判停预跑**更早**触发（100 vs 200），两条线各走各的', async () => {
+  const seen: string[] = [];
+  const fired: string[] = [];
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    speculateMs: 60,
+    silencePauseMs: 120,
+    now: () => clock,
+    predict: async () => 0.99,
+    onPartial: (text) => { seen.push(text); },
+    log: (line) => { fired.push(line); },
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  assembler.notePartial('你好我想问问');
+  // 静音 60 ms：只够投机，判停还要等
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.deepEqual(seen, ['你好我想问问'], '静音 60 ms 就该投机');
+  assert.ok(
+    !fired.some((line) => line.includes('判停') && line.includes('先跑一遍')),
+    '判停这时还不该跑（它要等 120 ms）',
+  );
+
+  // 静音 120 ms：判停也到点了
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.ok(
+    fired.some((line) => line.includes('判停') && line.includes('先跑一遍')),
+    '静音 120 ms 判停预跑要跟上',
+  );
+  assert.deepEqual(seen, ['你好我想问问'], '没有新 partial 就不该重复投机');
+});
+
+test('投机：静音期间补来的 partial**不许顶掉**在跑的那一趟', async () => {
+  const seen: string[] = [];
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    speculateMs: 40,
+    silencePauseMs: 200,
+    now: () => clock,
+    onPartial: (text) => { seen.push(text); },
+  });
+
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  assembler.notePartial('你好我想');
+  // 静音 40 ms → 投机
+  for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.deepEqual(seen, ['你好我想']);
+  // 静音期间 ASR 又补两版：不许重投机（重来等于把已经跑的作废）
+  assembler.notePartial('你好我想问问');
+  for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assembler.notePartial('你好我想问问你');
+  for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.deepEqual(seen, ['你好我想'], '后来的 partial 只用来过定稿闸门，不该重起跑');
+});
+
+test('一句话最多投机 2 次（ASR 能给 5–14 版，别变成请求风暴）', async () => {
+  const seen: string[] = [];
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    speculateMs: 40,
+    silencePauseMs: 200,
+    now: () => clock,
+    onPartial: (text) => { seen.push(text); },
+  });
+
+  const sayThenPause = (partial: string): void => {
+    for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+    assembler.notePartial(partial);
+    for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  };
+
+  sayThenPause('你');
+  sayThenPause('你好');
+  sayThenPause('你好我想');
+  sayThenPause('你好我想问问');
+  await delay(30);
+
+  assert.equal(seen.length, 2, '第 3、4 版不该再发');
+  assert.deepEqual(seen, ['你', '你好']);
 });
 
 // ---------------------------------------------------------------- 判停提前（与 ASR 静音窗并行）

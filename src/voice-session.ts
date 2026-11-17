@@ -210,6 +210,14 @@ export interface VoiceSessionOptions {
      * 我们也在数，`SentenceEnd` 到时判停概率已经算好了。设 0 关闭预判停。
      */
     readonly pauseDetectMs?: number;
+    /**
+     * 静音持续多久就**先投机一次**（默认 100 ms，比 {@link pauseDetectMs} 早）。
+     *
+     * 投机只是拿中间结果先猜，问早了作废、问晚了白等，所以不必等判停那 200 ms。
+     * 提前这 100 ms 本身不省端到端，它的用途是把「首字 → 认领」的窗口撑到能盖住
+     * TTS 首块（330–375 ms），见 `UtteranceAssemblerOptions.speculateMs`。设 0 关闭。
+     */
+    readonly speculateMs?: number;
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
@@ -541,6 +549,10 @@ class VoiceConnection {
       ...(options.gate.pauseDetectMs === undefined || options.gate.pauseDetectMs <= 0
         ? {}
         : { silencePauseMs: options.gate.pauseDetectMs }),
+      // 投机比判停更早（默认 100 ms）：猜错了作废就是，问晚了白等
+      ...(options.gate.speculateMs === undefined || options.gate.speculateMs <= 0
+        ? {}
+        : { speculateMs: options.gate.speculateMs }),
       onUtterance: (text) => {
         this.app?.userFinal(text);
         console.log('\n--- 本轮 ---');

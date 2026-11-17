@@ -783,6 +783,8 @@ async function main(): Promise<void> {
         prerollMs: envNumber('VOICE_PREROLL_MS', 800),
         // 静音多久就提前跑判停（和 ASR 的 max_sentence_silence 对齐）；0 = 关闭
         pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
+    // 投机要比判停早：它的用途是给「提前合成音频」腾窗口，不是省自己的时间
+    speculateMs: envNumber('VOICE_SPECULATE_MS', 100),
       },
       playbackTailMs: 600,
       /**
