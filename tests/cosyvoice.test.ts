@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CosyVoice provider 的**不联网**契约测试。
  *
  * 首包延迟要真连服务端才能测（见 `scripts/probe-cosyvoice.mjs`），这里只钉住
@@ -10,7 +10,7 @@ import { test } from 'node:test';
 
 import { WebSocketServer } from 'ws';
 
-import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch, streamBatchReady } from '../src/cosyvoice.ts';
+import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch, trimLeadingSilence, streamBatchReady } from '../src/cosyvoice.ts';
 import { EMOTIONS, type Emotion } from '../src/emotion.ts';
 import { TokenQueue } from '../src/token-queue.ts';
 
@@ -106,7 +106,7 @@ test('静音块判定：数字静音算静音，正常说话不算', () => {
  *   continue-task → 记下文本，回一块有声 PCM
  *   finish-task   → task-finished（可以拖一会儿，模拟「音频还没出完」）
  */
-async function fakeCosyVoice(options: { finishDelayMs?: number } = {}): Promise<{
+async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[] } = {}): Promise<{
   url: string;
   /** 每条连接收到的 continue-task 文本，按连接建立顺序 */
   texts: string[][];
@@ -133,7 +133,7 @@ async function fakeCosyVoice(options: { finishDelayMs?: number } = {}): Promise<
       if (msg.header.action === 'run-task') reply('task-started');
       if (msg.header.action === 'continue-task') {
         mine.push(msg.payload.input.text ?? '');
-        socket.send(loud);
+        for (const frame of options.frames ?? [loud]) socket.send(frame);
       }
       if (msg.header.action === 'finish-task') {
         const delay = options.finishDelayMs ?? 0;
@@ -296,4 +296,63 @@ test('流式：批次边界落在数字中间时，数字整个留到下一批',
   } finally {
     await server.close();
   }
+});
+
+test('句首静音一个字节都不发出去（用户听到的第一个字不该往后拖）', { timeout: 5000 }, async () => {
+  // CosyVoice 第一块就是 ~167 ms 数字静音（实测）。原来「攒着等有声块再补发」
+  // 会把这段先推给设备 —— 协议上首块时间没变，但用户听到声音的时刻往后拖了 167 ms。
+  const silence = Buffer.alloc(4800);                       // 100 ms @ 24 kHz 全零
+  const loud = Buffer.alloc(4800);
+  for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(Math.round(3000 * Math.sin(i / 20)), i);
+
+  const server = await fakeCosyVoice({ frames: [silence, silence, loud, silence, loud] });
+  try {
+    const tts = cosyVoiceTts({ apiKey: 'sk-test', url: server.url });
+    const queue = new TokenQueue();
+    queue.push('这一句要够长才会当成一批送出去。');
+    queue.close();
+
+    const got: Buffer[] = [];
+    for await (const chunk of tts.synthesizeStream!(queue)) got.push(chunk);
+
+    assert.equal(got.length, 3, '句首两块静音不能出现，句间那块要留');
+    assert.equal(isSilentChunk(got[0]!), false, '第一块必须是有声的');
+    assert.equal(isSilentChunk(got[1]!), true, '句间停顿要保留');
+    assert.equal(isSilentChunk(got[2]!), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('第一块横跨「静音 + 起音」时，块内也要裁掉开头的静音', { timeout: 5000 }, async () => {
+  // 服务端一块可能 167 ms：前 120 ms 是 −90 dBFS，后面直接跳到 −15 dBFS。
+  // 按整块判 `isSilentChunk` 会被语音拉高，静音就跟着推给设备了。
+  const sr = COSYVOICE_SAMPLE_RATE;
+  const silence = Buffer.alloc(Math.round(sr * 2 * 0.12));          // 120 ms 数字静音
+  const loud = Buffer.alloc(Math.round(sr * 2 * 0.05));
+  for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(Math.round(6000 * Math.sin(i / 20)), i);
+  const mixed = Buffer.concat([silence, loud]);
+
+  const server = await fakeCosyVoice({ frames: [mixed, loud] });
+  try {
+    const tts = cosyVoiceTts({ apiKey: 'sk-test', url: server.url });
+    const queue = new TokenQueue();
+    queue.push('这一句要够长才会当成一批送出去。');
+    queue.close();
+    const got: Buffer[] = [];
+    for await (const chunk of tts.synthesizeStream!(queue)) got.push(chunk);
+    // 第一块应该只剩「起音前 10 ms + 有声那 50 ms」
+    const expect = Math.round(sr * 2 * 0.06);
+    assert.ok(got[0]!.length <= expect, `第一块还剩 ${got[0]!.length} B，静音没裁干净`);
+    assert.equal(isSilentChunk(got[0]!), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('整块都很轻时不裁（宁可多播，也别削掉轻声开头）', () => {
+  const sr = COSYVOICE_SAMPLE_RATE;
+  const soft = Buffer.alloc(Math.round(sr * 2 * 0.1));
+  for (let i = 0; i < soft.length; i += 2) soft.writeInt16LE(Math.round(30 * Math.sin(i / 10)), i);
+  assert.equal(trimLeadingSilence(soft, sr).length, soft.length);
 });

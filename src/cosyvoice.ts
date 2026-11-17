@@ -154,6 +154,38 @@ interface RunTaskArgs {
 }
 
 /**
+ * 句首裁切：把第一块里开头的低电平样本削掉。
+ *
+ * 为什么不能只靠 {@link isSilentChunk}：那个判据是**按整块**算 RMS，而服务端吐的
+ * 第一块经常是「120 ms 数字静音 + 起始音」混在一起 —— 整块 RMS 被语音拉高，
+ * 静音就跟着推出去了。实测下行开头 146 ms 里前 120 ms 是 −90 dBFS、之后跳到
+ * −15 dBFS，用户听到的第一个字被整体推后。
+ *
+ * 按 5 ms 窗口找第一个超过门槛的位置，再往前留 10 ms 保护起音。整块都低于门槛
+ * 时**不动** —— 宁可多播一点，也别把轻声的开头削掉。
+ */
+export function trimLeadingSilence(chunk: Buffer, sampleRate: number, floorDb = -45): Buffer {
+  const winBytes = Math.max(2, Math.round(sampleRate * 0.005)) * 2;
+  const maxScan = Math.min(chunk.length, Math.round(sampleRate * 2 * 0.4));
+  for (let off = 0; off + 1 < maxScan; off += winBytes) {
+    const end = Math.min(off + winBytes, chunk.length);
+    let sum = 0;
+    let n = 0;
+    for (let i = off; i + 1 < end; i += 2) {
+      const s = chunk.readInt16LE(i);
+      sum += s * s;
+      n += 1;
+    }
+    const rms = Math.sqrt(sum / Math.max(1, n));
+    if (20 * Math.log10(Math.max(rms, 1e-9) / 32768) > floorDb) {
+      const keepFrom = Math.max(0, off - Math.round(sampleRate * 2 * 0.01));
+      return chunk.subarray(keepFrom);
+    }
+  }
+  return chunk;
+}
+
+/**
  * 一条可复用连接：串行跑 task，音频边收边吐。
  *
  * 一个 task 的完整生命周期是 run-task → continue-task → finish-task →
@@ -600,20 +632,27 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
       //
       // 静音块单独处理：**先攒着**，等后面出现有声块才补发（句间停顿要保留），
       // 流结束时剩下的直接丢弃（句尾静音没人想听）。
-      // 这样既不前瞻、也不加延迟 —— 静音块本身没有信息，晚一个块发出去无损。
+      //
+      // 但**句首的静音一个字节都不发**：CosyVoice 第一块就是 ~167 ms 底噪
+      // （实测 24 kHz / 167 ms，见 `probe-cosyvoice`），原来照发，等于用户多等
+      // 这么久才听到第一个字 —— 那段时间里设备在播数字静音。`voiced` 之前攒的
+      // 静音直接丢，之后才按上面的规则保留。
       const heldSilence: Buffer[] = [];
+      let voiced = false;
       for (;;) {
         if (chunks.length > 0) {
           const chunk = chunks.shift()!;
           if (isSilentChunk(chunk)) {
-            heldSilence.push(chunk);
+            if (voiced) heldSilence.push(chunk);
             continue;
           }
           if (heldSilence.length > 0) {
             yield Buffer.concat(heldSilence);
             heldSilence.length = 0;
           }
-          yield chunk;
+          voiced = true;
+          // 第一块里常夹着开头的数字静音（服务端一块可能横跨静音与起音），块内裁掉
+          yield trimLeadingSilence(chunk, sampleRate);
           continue;
         }
         if (finished) break;

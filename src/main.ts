@@ -729,10 +729,10 @@ async function main(): Promise<void> {
         ? {
           pythonPath: smartTurnPython,
           scriptPath: smartTurnScript,
-          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150 → 80：这一段同样是纯等待，
+          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150 → 80 → 40：这一段同样是纯等待，
           // 而判停器看的是**累积的最近音频**（`recentMaxBytes`），不依赖这段静默长度，
           // 所以缩短它不会让它判得更差。回放实测这一段整段进了首字延迟。
-          quietMs: envNumber('SMART_TURN_QUIET_MS', 80),
+          quietMs: envNumber('SMART_TURN_QUIET_MS', 40),
           extendMs: SMART_TURN_EXTEND_MS,
           // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
           // SmartTurn `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
