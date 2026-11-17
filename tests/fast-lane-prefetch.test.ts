@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { FrontedAgent } from '../src/fronted-agent.ts';
+import { FrontedAgent, acceptsSpeculation } from '../src/fronted-agent.ts';
 import { newActivityState, trackActivity } from '../src/keepalive.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
 
@@ -107,8 +107,14 @@ test('trackActivity 必须转发 prefetch（漏了就是每次白等判停）', 
   const agent = makeAgent(async () => sse(['[平静]在呢哥。']));
   const tracked = trackActivity(agent, newActivityState(Date.now()));
   assert.equal(typeof tracked.prefetch, 'function', '不转发 = 宿主调不到，静默降级');
+  assert.equal(
+    typeof tracked.speculatePartial,
+    'function',
+    '中间结果投机同样要转发，否则少抢 500–1200 ms 而且日志里一行都没有',
+  );
 
   tracked.prefetch?.('你好呀');
+  tracked.speculatePartial?.('你好呀你知');
   assert.ok(true);
 });
 
@@ -173,6 +179,105 @@ test('并段的真实顺序：短句先起跑，长句到来时顶掉它，只�
 
   assert.deepEqual(asked, ['谢谢你', '谢谢你啦'], '短句那次被顶掉，长句重新起跑');
   assert.equal(reply.speech, '答的是谢谢你啦', '用户只会听到并完的那一句');
+});
+
+// ---------------------------------------------------------------- 中间结果投机
+//
+// partial 比定稿早 p50 731 ms（真机 47 轮），拿它先问出去能藏在「等定稿」里。
+// 但 partial 在句末会大改（26% 的轮跟定稿连前缀关系都没有），所以定稿确认是
+// 前缀才认领 —— 这批用例钉的就是那道闸门。
+
+test('投机闸门：真机档案里的六种情形', () => {
+  const cases: Array<[string, string, boolean, string]> = [
+    ['你好，我想改一下订单', '你好，我想改一下订单的收货地址。', true, '前缀且覆盖 62%'],
+    ['喂，你好，我想改一下订单的收', '喂，你好，我想改一下订单的收货地址。', true, '带尾标点也要认'],
+    ['喂，', '喂，你好。', false, '太短（碎片问出去只会挨一句「你再说一遍」）'],
+    ['订单号是挺号W8665881', '订单号是#井号W8665881，我想改成…', false, 'ASR 改写：不是前缀'],
+    ['改成', '改成641室。', false, '是前缀但覆盖率 29%'],
+    ['对，我想改成6', '对，我想改成6414。', false, '数字被截断——看着合法，其实已经错了'],
+  ];
+  for (const [spec, final, want, why] of cases) {
+    assert.equal(acceptsSpeculation(spec, final), want, `${why}：${spec} → ${final}`);
+  }
+});
+
+test('投机：定稿确认是前缀 → 认那一趟，不再重复问模型', async () => {
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['[平静]', '在呢哥。']);
+  });
+
+  agent.speculatePartial('你好呀你知道吗');
+  assert.equal(asked, 1, '中间结果一到就该发出去');
+
+  agent.prefetch('你好呀你知道吗呢');
+  assert.equal(asked, 1, '定稿确认了这份投机，不该重问');
+
+  const reply = await agent.reply('你好呀你知道吗呢');
+  assert.equal(asked, 1, 'reply 认领同一趟');
+  assert.equal(reply.speech, '在呢哥。');
+});
+
+test('投机：定稿对不上 → 作废并按定稿重问', async () => {
+  const asked: string[] = [];
+  const agent = makeAgent(async (_url, init) => {
+    const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const last = body.messages[body.messages.length - 1]?.content ?? '';
+    asked.push(last);
+    return sse([`[平静]答的是${last}`]);
+  });
+
+  agent.speculatePartial('你好呀你知道吗');
+  agent.prefetch('喂喂喂喂喂喂');
+  const reply = await agent.reply('喂喂喂喂喂喂');
+
+  assert.deepEqual(asked, ['你好呀你知道吗', '喂喂喂喂喂喂'], '猜错了就退回定稿后再问');
+  assert.equal(reply.speech, '答的是喂喂喂喂喂喂');
+});
+
+test('投机：一句话最多起跑两次，中间结果被改写就收掉', async () => {
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['[平静]在呢哥。']);
+  });
+
+  agent.speculatePartial('你好呀你知道吗');
+  assert.equal(asked, 1);
+  // 越改越长：允许再起跑一次（文本更接近定稿）
+  agent.speculatePartial('你好呀你知道吗呢');
+  assert.equal(asked, 2);
+  // 第三次不许再发
+  agent.speculatePartial('你好呀你知道吗呢啊');
+  assert.equal(asked, 2, '一句话最多两次：ASR 能给 5–14 版中间结果');
+
+  // 被改写（不是变长）→ 收掉，且不重发
+  agent.speculatePartial('你好呀你知道吗呢啊嗯');
+  agent.speculatePartial('你号呀你知道吗呢啊嗯');
+  assert.equal(asked, 2, '改写说明 ASR 在纠错，早期那版大概率对不上定稿');
+});
+
+test('投机：太短的中间结果一个请求都不发', () => {
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['在呢。']);
+  });
+  for (const partial of ['喂', '喂，', '那。']) agent.speculatePartial(partial);
+  assert.equal(asked, 0);
+});
+
+test('投机：任务类句子同样不投机（与预跑同一组门槛）', () => {
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['不该被问到。']);
+  });
+  agent.speculatePartial('帮我查一下订单号');
+  assert.equal(asked, 0, '要工具的句子投机纯属白花钱');
 });
 
 // ---------------------------------------------------------------- 对冲

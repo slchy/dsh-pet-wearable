@@ -325,6 +325,37 @@ test('并了第二段就再通知一次，带完整累积文本', async () => {
   assert.deepEqual(seen, ['我想问', '我想问一下那个事'], '并段后要按新文本再通知，前面那句才作废');
 });
 
+test('中间结果只在**静音那一刻**交给投机，且带的是最新一版 + 已定稿的部分', async () => {
+  // 为什么不是「每来一版 partial 就发」：收益在「答案赶在定稿前出来」就饱和了
+  // （模型首字 ~290 ms ≪ 停嘴→定稿 731 ms），提前更多不省时间，只是多花钱。
+  const seen: string[] = [];
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    silencePauseMs: 40,
+    now: () => clock,
+    predict: async () => 0.99,
+    onPartial: (text) => { seen.push(text); },
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  assembler.notePartial('你好');
+  assert.deepEqual(seen, [], '还在说话，这时候猜出去只会作废');
+
+  assembler.notePartial('你好我想');
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.deepEqual(seen, ['你好我想'], '静音了才发，且要用最新那一版');
+
+  // 并段的第二段：已定稿的部分要接在前面，否则问出去是半句话
+  assembler.addSentence('你好呀。');
+  assembler.notePartial('再');
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.deepEqual(seen, ['你好我想', '你好呀。再']);
+});
+
 // ---------------------------------------------------------------- 判停提前（与 ASR 静音窗并行）
 //
 // ASR 要等 200 ms 静音才发 SentenceEnd，而判停器看的是音频 —— 那 200 ms 里音频

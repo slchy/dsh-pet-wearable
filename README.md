@@ -142,6 +142,7 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 - **静候窗**（`SMART_TURN_QUIET_MS`，150→80）：定稿后再等一会儿，判停器看的是累积音频，不依赖这段长度。
 - **判停前起跑**（`FAST_LANE_PREFETCH=0` 可关）：句子定稿时文本已定，判停只决定要不要并下一段，所以那一刻就把这一句问出去。A/B（背靠背两场）：开轮→模型首字 **277 ms**（开）vs **500 ms**（关）。
 - **丢句首静音**：CosyVoice 第一块是「~120 ms 数字静音 + 起音」的混合块，按整块判静音会被语音拉高、静音跟着推给设备。现在块内按 5 ms 窗口裁（−45 dBFS 以下），下行开头静音 **146 ms → 11 ms**。
+- **中间结果投机**（`FAST_LANE_PARTIAL_SPECULATE=0` 可关）：ASR 的 partial 比定稿早 p50 **731 ms**（真机 47 轮），所以**静音那一刻**就拿最新那版先问出去。定稿到达时确认「它是定稿的前缀 + 覆盖 ≥60% 长度 + 没把数字截断」才认领，确认不了就作废、退回定稿后再问 —— 所以**不改正确性**，坏情况下只多花一次请求。合成音频单轮 A/B（同一份 PCM、背靠背两次）：③ 开轮→首块 **1036 → 838 ms**，认领时模型已经跑了 136 ms。为什么只在静音那一刻发、不是每版 partial 都发：收益在「答案赶在定稿前出来」就**饱和**了（模型首字 ~290 ms ≪ 731 ms），提前更多不省时间，只是多花钱；而且静音了才说明用户真停了，这一版离定稿最近，长度闸门才判得准。
 - **TTS 对冲（试过，已回滚）**：同一句并发跑两路取先到的音频，端到端 **p50 反而慢 ~45 ms**（两批复现同向：关 982／981，开 1022／1032，每批 n=8）。单独量首包也只从 557 降到 536（对 p90 有效：640→566），没量到的部分补不回来 —— CosyVoice 的首包是**服务商侧共享容量排队**，双份只是抢同一个坑位。代价却是双份合成费 + 一套「落败那路怎么弃」的异步收尾（`gen.return()` 在生成器挂在 `await` 上时是排队的，只能靠关连接取消），不值得。LLM 那边能对冲出 −50 ms 是因为它抖在「哪台机器空着」。
 
 注意「停嘴→首块」量的是**协议首块**；裁掉句首静音之后它才等于「用户听到第一个字」——之前那 146 ms 设备是在播数字静音。
@@ -167,7 +168,7 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 读法：**端到端 ≈ 判停收敛(350–600) + 开轮(150–1000) + 模型首字(500–800) + TTS 首块(290–580)**。快车道命中 4 轮 p50 ≈ `1.5 s`；交给 dsh 的那轮 `2934 ms` 正是「回执」要填的空白（首字超时要等 1200 ms 才判让位）。「停嘴」以 `gate.close.t − gapMs` 为准；`你把眼睛挂断一下。` 那轮会话结束得比 gate hold 还早，**缺仪表，不补估**。这张表是**改前**的基线，留着当对照；改后的数字见上面那张回放对比表。
 
-可调的旋钮（都在 `src/main.ts` 读环境变量，改完重启即可，不必重新编译）：`SMART_TURN_QUIET_MS`（定稿后静候，默认 80）、`SMART_TURN_PARTIAL_GRACE_MS`（判停宽限，默认 150）、`SMART_TURN_EXTEND_MS`（每次延长，默认 400）、`SMART_TURN_MAX_EXT`（延长上限，默认 7）；快车道侧 `FAST_LANE_MODEL` / `FAST_LANE_BASE_URL` / `FAST_LANE_API_KEY` / `FAST_LANE_HEDGE`（默认 2，对冲份数）/ `FAST_LANE_PREFETCH`；TTS 侧 `COSYVOICE_MODEL` / `COSYVOICE_VOICE` / `COSYVOICE_EMOTION_MODE`。
+可调的旋钮（都在 `src/main.ts` 读环境变量，改完重启即可，不必重新编译）：`SMART_TURN_QUIET_MS`（定稿后静候，默认 80）、`SMART_TURN_PARTIAL_GRACE_MS`（判停宽限，默认 150）、`SMART_TURN_EXTEND_MS`（每次延长，默认 400）、`SMART_TURN_MAX_EXT`（延长上限，默认 7）；快车道侧 `FAST_LANE_MODEL` / `FAST_LANE_BASE_URL` / `FAST_LANE_API_KEY` / `FAST_LANE_HEDGE`（默认 2，对冲份数）/ `FAST_LANE_PREFETCH` / `FAST_LANE_PARTIAL_SPECULATE`；TTS 侧 `COSYVOICE_MODEL` / `COSYVOICE_VOICE` / `COSYVOICE_EMOTION_MODE`。
 
 排查用可复算的日志脚本：`scripts/latency-report.ts` 逐轮分段统计，`scripts/dsh-timeline.ts` 对齐 `dsh` 会话日志拆解 Agent 内部耗时。
 

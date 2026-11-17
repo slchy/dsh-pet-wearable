@@ -543,6 +543,8 @@ async function main(): Promise<void> {
         maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
         // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
         prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
+        // 中间结果投机：比定稿再往前提 p50 731 ms，但文本是猜的（定稿确认是前缀才认领）
+        partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
         // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
         // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
         hedge: envNumber('FAST_LANE_HEDGE', 2),

@@ -91,6 +91,16 @@ export interface AgentProvider {
    */
   prefetch?(text: string): void;
   /**
+   * 可选能力：**中间结果投机**。
+   *
+   * 宿主在 ASR 吐中间结果时调（比定稿早 p50 731 ms）。和 `prefetch` 的区别是
+   * **文本是猜的**：实现必须自己决定「认不认」，认不了就作废，不能把猜的结果当定稿播。
+   *
+   * 实现必须容忍「问了却没人来认领」，也不能每版中间结果都发一次请求
+   * （一句话能有 5–14 版）。
+   */
+  speculatePartial?(text: string): void;
+  /**
    * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
    *
    * 会杀掉进程，下一轮要重启并 resume（实测多花 ~2 s）。只在「这一轮肯定不要了、

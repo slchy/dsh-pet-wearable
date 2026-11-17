@@ -122,6 +122,14 @@ export interface UtteranceAssemblerOptions {
    * 只在**文本允许**的前提下才起跑，判据在接收方（`FrontedAgent.prefetch`）。
    */
   readonly onSentence?: (text: string) => void;
+  /**
+   * ASR 静音那一刻通知一次，`text` = 这一轮到目前为止的全文（已定稿部分 + 最新一版 partial）。
+   *
+   * 给快车道**投机**用：比定稿早 p50 731 ms（真机 47 轮），先拿它问出去，定稿确认
+   * 是前缀才认。文本是**猜的**（中间结果在句末会大改），所以这里只传文本、不做判断 ——
+   * 闸门在接收方（`FrontedAgent.speculatePartial` / `acceptsSpeculation`）。
+   */
+  readonly onPartial?: (text: string) => void;
   /** 一轮定稿 */
   readonly onUtterance: (text: string) => void;
   readonly log: (line: string) => void;
@@ -204,6 +212,8 @@ export class UtteranceAssembler {
   private lastUtteranceAt = Number.NEGATIVE_INFINITY;
   /** 最近一次 ASR 中间结果的时刻：用户还在出字的直接证据 */
   private lastPartialAt = Number.NEGATIVE_INFINITY;
+  /** 最近一次 ASR 中间结果的文本（原始，不含已定稿部分）—— 静音那一刻拿它投机 */
+  private lastPartialText = '';
   /** 最近一次「上行有声音」的时刻（本地静音检测，见 `silenceDb`） */
   private lastVoicedAt = Number.NEGATIVE_INFINITY;
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
@@ -268,6 +278,17 @@ export class UtteranceAssembler {
     }
     this.preFiredAt = t;
     this.options.log(`  判停    静音 ${pause} ms → 先跑一遍（不等 ASR 定稿）`);
+    // 同一刻把快车道也**先问出去**：静音那一刻手上这版中间结果，比定稿早 p50 731 ms
+    // （真机 47 轮），够模型答完。选这个时刻而不是「每来一版中间结果就发」有两个原因：
+    //   - 收益在「答案赶在定稿前出来」就**饱和**了（模型首字 ~290 ms ≪ 731 ms），
+    //     提前更多不省任何时间，只是多花钱；
+    //   - 静音了才说明用户真的停了，这一版离定稿最近，长度闸门（`isFastCandidate`）
+    //     才判得准 —— 句子中间猜出来的前缀常常比定稿短一截，问出去必然作废。
+    // 文本仍是猜的：认不认由定稿比对决定（`FrontedAgent.acceptsSpeculation`）。
+    const latest = this.lastPartialText;
+    if (latest !== '') {
+      this.options.onPartial?.(this.pendingText + latest);
+    }
     // 下一句定稿时会拿到 `seq + 1`，见 `addSentence`
     this.startPrediction(this.seq + 1, true);
   }
@@ -275,12 +296,13 @@ export class UtteranceAssembler {
   /**
    * ASR 中间结果到了 —— 用户还在说话。
    *
-   * 这**不是**用来拼文本的（中间结果会反复改写，拼起来是乱的），只当一个
-   * 「还在出字」的信号。以前这个信号只用来打断播放，判停完全看不到它，
-   * 于是「音频停顿 = 说完了」成了唯一判据。
+   * 这**不是**用来拼文本的（中间结果会反复改写，拼起来是乱的）。它有两个用途：
+   * 「还在出字」的信号（打断播放、判停宽限），以及给快车道**投机**攒素材
+   * （真正起跑在静音那一刻，见 `trackSilence`）。
    */
-  notePartial(_text: string): void {
+  notePartial(text: string): void {
     this.lastPartialAt = this.now();
+    this.lastPartialText = text;
   }
 
   /** 一句定稿的识别结果。 */

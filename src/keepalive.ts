@@ -95,6 +95,10 @@ export function trackActivity(
     ...(agent.taskStatus === undefined ? {} : { taskStatus: agent.taskStatus.bind(agent) }),
     // 判停前起跑：漏转发 = 每次多等判停那一拍，日志里连一行都不出（静默降级）
     ...(agent.prefetch === undefined ? {} : { prefetch: agent.prefetch.bind(agent) }),
+    // 中间结果投机：同样漏一条就静默降级（少抢 500–1200 ms）
+    ...(agent.speculatePartial === undefined
+      ? {}
+      : { speculatePartial: agent.speculatePartial.bind(agent) }),
   };
 }
 

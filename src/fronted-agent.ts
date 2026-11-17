@@ -241,6 +241,14 @@ export interface FastLaneOptions {
    */
   readonly prefetch?: boolean;
   /**
+   * 中间结果投机：拿 ASR 的 partial 先把这一句问出去（默认 true）。
+   *
+   * 比「定稿前起跑」再往前提 500–1200 ms，但**文本是猜的** —— partial 在句末会大改，
+   * 只有定稿确认它是前缀时才认领（见 `acceptsSpeculation`）。所以这条路**不改正确性**，
+   * 只多花一点请求钱：确认不了就作废，退回定稿后再问。
+   */
+  readonly partialSpeculate?: boolean;
+  /**
    * 快车道胜出后怎么处置在途的慢车道那一轮。
    *
    * - `rpc`（默认）：发 `session/cancel`。当前 dsh 的 **SDK 运行时没放行**这个方法
@@ -285,6 +293,51 @@ export function isFastCandidate(text: string, maxChars = 14): boolean {
     return false;
   }
   return !TASK_WORDS.some((word) => core.includes(word));
+}
+
+/**
+ * 中间结果最少几个字才值得投机。短于这个的一律是「喂，」「那。」这类碎片，
+ * 问出去必然是「你再说一遍」。
+ */
+const SPEC_MIN_CHARS = 6;
+
+/**
+ * 投机文本至少要覆盖定稿的多大比例。
+ *
+ * 0.6 这个值来自真机 47 轮：0.5 会认下「改成」→「改成641室。」（模型只会追问改成几号），
+ * 0.6 起在同样这批数据上**零误接受**，而命中率只从 51% 掉到 47%。
+ */
+const SPEC_MIN_COVERAGE = 0.6;
+
+/** 数字类字符：这一类被截断就会改变语义，见 `acceptsSpeculation` */
+const NUMERIC_CHAR = /[0-9０-９零一二三四五六七八九十百千万两]/;
+
+/** 中间结果尾部常挂着「，」这种分句符（ASR 边解码边补），比对前去掉 */
+function stripPartialTail(text: string): string {
+  return text.replace(/[\s，,。.、；;：:]+$/u, '');
+}
+
+/**
+ * 定稿是否确认这份投机文本 —— **这条路唯一的闸门**，错了就会答非所问。
+ *
+ * 三条判据，每条都对着一类真机上真实发生过的失败：
+ *
+ * 1. **必须是前缀**：ASR 在句末会大改（真机 26% 的轮，停嘴那一刻的 partial 跟定稿
+ *    连前缀关系都没有：`打印→答应`、`井号→挺号`、`省级→审计`）。非前缀一律不认。
+ * 2. **覆盖 ≥60% 长度**：「改成」→「改成641室。」前缀成立，但语义差远了。
+ * 3. **不能把数字截断**：`对，我想改成6` 对定稿 `…改成6414`。这是唯一一类
+ *    「看着合法、其实已经错了」的投机 —— 模型会追问「改成几号」，而用户已经说过。
+ */
+export function acceptsSpeculation(spec: string, final: string): boolean {
+  const s = stripPartialTail(spec);
+  if (s.length < SPEC_MIN_CHARS) return false;
+  if (!final.startsWith(s)) return false;
+  if (s.length < final.length * SPEC_MIN_COVERAGE) return false;
+  const tail = final.slice(s.length);
+  if (tail !== '' && NUMERIC_CHAR.test(s.slice(-1)) && NUMERIC_CHAR.test(tail[0]!)) {
+    return false;
+  }
+  return true;
 }
 
 interface FastAnswer {
@@ -396,6 +449,9 @@ export class FrontedAgent implements AgentProvider {
   private readonly keepTurns: number;
   private readonly speculate: boolean;
   private readonly prefetchEnabled: boolean;
+  private readonly partialSpeculate: boolean;
+  /** 投机已经起跑几次（同一条「越改越长」的链最多 2 次，别让 ASR 抖动变成请求风暴） */
+  private speculateStarts = 0;
   private readonly hedge: number;
   private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
   private readonly statusFacts: (() => string) | undefined;
@@ -411,7 +467,10 @@ export class FrontedAgent implements AgentProvider {
    * （这一轮还没开），字先攒着；`reply()` 认领时先补推再接着实时接。
    */
   private prefetched: {
-    readonly text: string;
+    /** 认领时拿来比对的文本：投机起跑时是**中间结果**，被定稿确认后改写成定稿 */
+    text: string;
+    /** 这一趟是用中间结果起的（还没被定稿确认） */
+    speculative: boolean;
     readonly startedAt: number;
     readonly answer: Promise<FastAnswer>;
     readonly buffered: string[];
@@ -471,6 +530,7 @@ export class FrontedAgent implements AgentProvider {
     this.keepTurns = options.keepTurns ?? 4;
     this.speculate = options.speculate ?? true;
     this.prefetchEnabled = options.prefetch ?? true;
+    this.partialSpeculate = options.partialSpeculate ?? true;
     this.hedge = Math.max(1, options.hedge ?? 1);
     this.cancelMode = options.cancelMode ?? 'rpc';
     this.statusFacts = options.taskStatus;
@@ -550,14 +610,78 @@ export class FrontedAgent implements AgentProvider {
    */
   prefetch(text: string): void {
     if (!this.prefetchEnabled) return;
-    if (this.apiKey === '') return;
     if (this.prefetched?.text === text) return;
-    // 下面这几条与 `reply()` 里的一一对应：只要 `reply()` 会不走快车道，就不该预跑
-    if (this.lastDsh?.asked === true && looksLikeAnswer(text)) return;
-    if (looksMemorable(text)) return;
-    if (!isFastCandidate(text, this.maxChars)) return;
-    if (this.pending.length / 2 >= this.keepTurns) return;
+    // 投机起跑的那一趟对上了定稿：**认它**。它已经跑了几百毫秒，从头再问等于
+    // 把投机白送的时间还回去。文本改写成定稿，后面 `takePrefetch` 按一字不差认领。
+    const prev = this.prefetched;
+    if (prev !== null && prev.speculative && acceptsSpeculation(prev.text, text)) {
+      this.speculateStarts = 0;
+      this.log(
+        `  快车道    投机被定稿确认（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}，`
+        + `已跑 ${(this.now() - prev.startedAt).toFixed(0)} ms）`,
+      );
+      prev.text = text;
+      // 定稿之后这一趟就是「预跑」了：再来更长的文本（判停并段）走原来的重问路径，
+      // 不能再用这段确认逻辑把它当成「还是同一句」
+      prev.speculative = false;
+      return;
+    }
+    this.speculateStarts = 0;
+    if (!this.isPrefetchable(text)) return;
+    this.startPrefetch(text, false);
+  }
 
+  /**
+   * 投机：拿 ASR 的**中间结果**先把这一句问出去（宿主在 `notePartial` 时调）。
+   *
+   * 收益来自 `①停嘴→定稿` 那一段：真机 47 轮里它 p50 = 731 ms，而中间结果在停嘴
+   * 那一刻有 47% 的概率已经是定稿的前缀（且覆盖 ≥60% 长度）。这段时间够模型答完。
+   *
+   * **不改正确性**：这份结果只在定稿确认「它确实是前缀」时才被认领
+   * （`acceptsSpeculation`），确认之前一个字节都不会下行；认不了就作废，
+   * 退回「定稿后再问」，和没做这件事完全一样。
+   *
+   * 为什么要限次：一句话 ASR 能给 5–14 版中间结果，每版都发就是十几倍请求。
+   * 只在「越改越长」时重来，且同一条链最多 2 次；中间结果被改写（不是变长）
+   * 就收掉 —— 那说明 ASR 在纠错，早期那版大概率跟定稿对不上。
+   */
+  speculatePartial(text: string): void {
+    if (!this.prefetchEnabled || !this.partialSpeculate) return;
+    // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱
+    if (stripPartialTail(text).length < SPEC_MIN_CHARS) return;
+    const prev = this.prefetched;
+    if (prev !== null) {
+      // 定稿后才起的那一趟文本是确定的，别用猜测顶掉它
+      if (!prev.speculative) return;
+      if (prev.text === text) return;
+      if (!text.startsWith(prev.text) || text.length <= prev.text.length) {
+        this.dropPrefetch(
+          `中间结果被改写（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}）`,
+        );
+        this.speculateStarts = 0;
+        return;
+      }
+    }
+    if (this.speculateStarts >= 2) return;
+    if (!this.isPrefetchable(text)) return;
+    this.speculateStarts += 1;
+    this.startPrefetch(text, true);
+  }
+
+  /**
+   * 这一句「值不值得先问出去」——`prefetch` 与 `speculatePartial` 共用同一组门槛，
+   * 分开写迟早两边不一致（一边预跑一边不认，白花钱）。
+   */
+  private isPrefetchable(text: string): boolean {
+    if (this.apiKey === '') return false;
+    if (this.lastDsh?.asked === true && looksLikeAnswer(text)) return false;
+    if (looksMemorable(text)) return false;
+    if (!isFastCandidate(text, this.maxChars)) return false;
+    if (this.pending.length / 2 >= this.keepTurns) return false;
+    return true;
+  }
+
+  private startPrefetch(text: string, speculative: boolean): void {
     // 并段走的是**这一条**：新一句（更长的累积文本）到来时把旧的顶掉。
     // 所以日志要写清是哪种情况，别让「判停并了段」那句永远打不出来。
     const prev = this.prefetched;
@@ -568,6 +692,7 @@ export class FrontedAgent implements AgentProvider {
     );
     const slot = {
       text,
+      speculative,
       startedAt: this.now(),
       answer: null as unknown as Promise<FastAnswer>,
       buffered: [] as string[],
@@ -586,7 +711,9 @@ export class FrontedAgent implements AgentProvider {
     // `ask()` 在第一个 await 之前同步设好了控制器，这里取到的就是这一趟的
     const controller = this.askAbort;
     this.prefetched = { ...slot, abort: controller };
-    this.log(`  快车道    判停前先问出去 ${JSON.stringify(text)}`);
+    this.log(
+      `${speculative ? '  快车道    中间结果先问出去' : '  快车道    判停前先问出去'} ${JSON.stringify(text)}`,
+    );
   }
 
   /**
@@ -652,6 +779,8 @@ export class FrontedAgent implements AgentProvider {
     // 没有票据的调用（单测、保活 ping）自己发一个本地代次 —— 去重照样成立，
     // 只是 session 层没有真票据可比对，会直接照办。
     const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
+    // 新一轮：投机的次数配额按轮算（上一轮用完不能让下一轮一直没法投机）
+    this.speculateStarts = 0;
     this.currentGen = ticket.gen;
     this.currentTicket = ticket;
     this.innerMode = 'pass';
