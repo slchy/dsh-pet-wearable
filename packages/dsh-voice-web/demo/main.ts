@@ -259,18 +259,20 @@ async function runProbe(): Promise<void> {
   const margin = GATE_DBFS - echoMax;
   mMargin.textContent = `${margin >= 0 ? '+' : ''}${margin.toFixed(1)} dB`;
 
+  // 三个阈值不是"能不能用"的分级 —— 链路的前提是**戴耳机**，
+  // 所以这项测量的用途是确认耳机真的生效了，而不是拿余量去调门限。
   if (echoMax <= -120) {
     mVerdict.dataset['level'] = 'tight';
     mVerdict.textContent = '播放期没收到任何上行数据 —— 麦克风可能没在工作。';
-  } else if (margin >= 15) {
+  } else if (margin >= 25) {
     mVerdict.dataset['level'] = 'ok';
-    mVerdict.textContent = `回波被压到门限以下 ${margin.toFixed(0)} dB，外放时不会被自己的声音打断。`;
-  } else if (margin >= 0) {
+    mVerdict.textContent = `回波比门限低 ${margin.toFixed(0)} dB —— 耳机生效了（或者是静音输出，别用 silent TTS 测）。`;
+  } else if (margin >= 10) {
     mVerdict.dataset['level'] = 'tight';
-    mVerdict.textContent = `余量只有 ${margin.toFixed(0)} dB，音量再大一点就会误触发。建议播放期抬门限。`;
+    mVerdict.textContent = `余量 ${margin.toFixed(0)} dB，勉强够。可能耳机漏音，或者戴得不够严。`;
   } else {
     mVerdict.dataset['level'] = 'bad';
-    mVerdict.textContent = '回波已越过门限 —— 会自激（它打断自己）。必须做播放期抬门限或半双工。';
+    mVerdict.textContent = '回波贴着门限 —— 大概率没戴耳机（外放），这个状态下它会被自己的声音触发。';
   }
   log(`回声测量：静默 ${fmtDb(noiseMax)} / 播放 ${fmtDb(echoMax)} / 余量 ${margin.toFixed(1)} dB`);
 }

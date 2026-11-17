@@ -77,6 +77,14 @@
     font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
   }
   .notice { font-size: 13px; color: var(--warn); }
+  .require {
+    display: flex; gap: .6rem; align-items: flex-start;
+    padding: .65rem .8rem; border-radius: .5rem; font-size: 13px; line-height: 1.5;
+    border: 1px solid color-mix(in srgb, var(--warn) 55%, transparent);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    color: var(--warn);
+  }
+  .require b { font-weight: 700; }
 </style>
 </head>
 <body>
@@ -85,6 +93,12 @@
     <h1>dsh-pet-voice <small>web</small></h1>
     <span class="pill" id="pill" data-state="idle">未开始</span>
   </header>
+
+  <div class="require">
+    <span>🎧</span>
+    <span><b>请戴耳机。</b>这条链路不做回声消除 —— 用外放时它自己的声音会被当成你在说话，
+      于是它一直打断自己。戴耳机之后声学回声路径就不存在了。</span>
+  </div>
 
   <div class="meter" aria-label="麦克风电平"><i id="level"></i></div>
 
@@ -96,11 +110,11 @@
   <div class="notice" id="notice" hidden></div>
 
   <section class="measure">
-    <h2>回声余量测量</h2>
+    <h2>回声余量（确认耳机是否真的生效）</h2>
     <div class="row"><span>静默期峰值</span><b id="m-noise">—</b></div>
     <div class="row"><span>播放期峰值</span><b id="m-echo">—</b></div>
     <div class="row"><span>对门限（−40 dBFS）</span><b id="m-margin">—</b></div>
-    <p class="verdict" id="m-verdict">开始对话后点「测回声余量」，期间请保持安静。</p>
+    <p class="verdict" id="m-verdict">戴好耳机后点「测回声余量」，期间请保持安静。</p>
     <div class="controls"><button id="probe" disabled>测回声余量</button></div>
   </section>
 
