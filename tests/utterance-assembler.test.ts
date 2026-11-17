@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 判停组装层：**一句话被 ASR 切成两句**时不要拿后半截当一轮。
  *
  * 真机（2026-11-15）：用户问「…你是怎么答的？」，ASR 断成
@@ -323,4 +323,99 @@ test('并了第二段就再通知一次，带完整累积文本', async () => {
   await delay(60);
 
   assert.deepEqual(seen, ['我想问', '我想问一下那个事'], '并段后要按新文本再通知，前面那句才作废');
+});
+
+// ---------------------------------------------------------------- 判停提前（与 ASR 静音窗并行）
+//
+// ASR 要等 200 ms 静音才发 SentenceEnd，而判停器看的是音频 —— 那 200 ms 里音频
+// 早就够了。所以静音一到就先把判停跑掉，SentenceEnd 到时直接取用。
+
+/** 一段「有声」PCM：20 ms、满量程的正弦，峰值远高于门限 */
+function voiced(ms = 20): Buffer {
+  const n = 16000 * 2 * ms / 1000;
+  const b = Buffer.alloc(n);
+  for (let i = 0; i < n; i += 2) b.writeInt16LE(Math.round(8000 * Math.sin(i / 20)), i);
+  return b;
+}
+const silent = (ms = 20): Buffer => Buffer.alloc(16000 * 2 * ms / 1000);
+
+test('静音一到就提前跑判停，定稿时不再问第二遍', async () => {
+  let calls = 0;
+  let clock = 1000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    silencePauseMs: 40,
+    now: () => clock,
+    predict: async () => { calls += 1; return 0.99; },
+  });
+
+  for (let i = 0; i < 10; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.equal(calls, 1, '静音够久就该先把判停跑掉');
+
+  assembler.addSentence('你好呀');
+  await delay(80);
+  assert.equal(utterances.length, 1, '照常定稿');
+  assert.equal(calls, 1, '概率已经算好，不该再问一遍判停器');
+});
+
+test('预跑之后又来声音 → 那份判停作废，定稿时重算', async () => {
+  let calls = 0;
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    silencePauseMs: 40,
+    now: () => clock,
+    predict: async () => { calls += 1; return 0.99; },
+  });
+
+  for (let i = 0; i < 10; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.equal(calls, 1);
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }   // 用户又说了
+  assembler.addSentence('你好呀');
+  await delay(80);
+  assert.equal(calls, 2, '音频变了，预跑的那份不能再用');
+});
+
+test('没说过话的长时间静音不预跑（别白烧判停器）', async () => {
+  let calls = 0;
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    silencePauseMs: 40,
+    now: () => clock,
+    predict: async () => { calls += 1; return 0.99; },
+  });
+
+  for (let i = 0; i < 20; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.equal(calls, 0);
+});
+
+test('ASR 的中间结果比预跑晚到，也不能把预跑作废', async () => {
+  // 实测 ASR 的 partial 比真实停嘴晚 98–140 ms：拿它当「用户还在说」的证据，
+  // 会把静音时就跑好的那份判停全废掉，等于没预跑。
+  let calls = 0;
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    silencePauseMs: 40,
+    now: () => clock,
+    predict: async () => { calls += 1; return 0.99; },
+  });
+
+  for (let i = 0; i < 10; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.equal(calls, 1);
+
+  clock += 30;
+  assembler.notePartial('你好');            // 迟到的中间结果（音频维度早已静音）
+  assembler.addSentence('你好呀');
+  await delay(80);
+  assert.equal(calls, 1, '音频没再变，预跑仍然有效');
 });

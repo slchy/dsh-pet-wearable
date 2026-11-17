@@ -203,6 +203,13 @@ export interface VoiceSessionOptions {
     readonly thresholdDbfs: number;
     readonly holdMs: number;
     readonly prerollMs: number;
+    /**
+     * 静音持续多久算「这段话说完了」——**只用来提前跑判停**，不关门、不断路。
+     *
+     * 默认 200 ms：和 ASR 的 `max_sentence_silence` 对齐，这样它开始数静音的时候
+     * 我们也在数，`SentenceEnd` 到时判停概率已经算好了。设 0 关闭预判停。
+     */
+    readonly pauseDetectMs?: number;
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
@@ -528,6 +535,12 @@ class VoiceConnection {
         : undefined,
       // 只在有判停器时才有意义（没有判停器就走固定窗口，没有往返可叠）
       ...(this.smartTurn ? { predictAtMs: ASSEMBLER_PREDICT_LEAD_MS } : {}),
+      // 静音一到就把判停跑掉，和 ASR 那 200 ms 静音窗并行 —— 出句时概率已经算好。
+      // 门槛用能量门那个（同一路放大后的波形、同一套设备标定）。
+      silenceDb: options.gate.thresholdDbfs,
+      ...(options.gate.pauseDetectMs === undefined || options.gate.pauseDetectMs <= 0
+        ? {}
+        : { silencePauseMs: options.gate.pauseDetectMs }),
       onUtterance: (text) => {
         this.app?.userFinal(text);
         console.log('\n--- 本轮 ---');

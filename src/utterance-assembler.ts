@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 句子 → 一轮话语（utterance）的合并与判停。
  *
  * <h2>职责</h2>
@@ -33,7 +33,7 @@
  *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
-import { pcm16DurationMs } from './pcm.ts';
+import { pcm16DurationMs, pcm16PeakDbfs } from './pcm.ts';
 
 export interface UtteranceAssemblerOptions {
   /** 句子结束后先静候这么久再判定 */
@@ -102,8 +102,21 @@ export interface UtteranceAssemblerOptions {
    */
   readonly partialGraceMs?: number;
   /**
-   * 一句定稿（文本已定、还没判定停）时通知一次。
+   * 本地静音判据：上行峰值低于这个 dBFS 就算「没在说话」。不设就不启用预判停。
    *
+   * 传**能量门那个门槛**（同一路放大后的波形、同一套设备标定），别另设一个。
+   */
+  readonly silenceDb?: number;
+  /**
+   * 静音持续多久就把判停请求**提前**发出去（默认 200 ms）。
+   *
+   * 动机：ASR 要靠 200 ms 静音才发 `SentenceEnd`，而那 200 ms 里音频已经全在手里了 ——
+   * 判停器完全可以这时候就跑。等 `SentenceEnd` 到了，概率早算好了，`出句→开轮`
+   * 那 118 ms 直接归零。见 {@link UtteranceAssembler.addAudio}。
+   */
+  readonly silencePauseMs?: number;
+  /**
+   * 一句定稿（文本已定、还没判定停）时通知一次。   *
    * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
    * 先在这上面起跑，省掉判停那 140 ms 纯等待；真并了下一段就换一句重问。
    * 只在**文本允许**的前提下才起跑，判据在接收方（`FrontedAgent.prefetch`）。
@@ -172,6 +185,14 @@ export class UtteranceAssembler {
   private prediction: {
     readonly seq: number;
     readonly startedAt: number;
+    /**
+     * 这一份是「静音一到就提前跑」的（见 `trackSilence`），不是给已经定稿的句子算的。
+     *
+     * 预跑的**新鲜度**由音频保证：之后只要又来声音，`trackSilence` 就把这份清掉。
+     * 所以它不受 `startedAt >= lastPartialAt` 那条约束 —— ASR 的中间结果本来就比
+     * 真实停嘴晚（实测晚 98–140 ms），拿它当「用户还在说」的证据会把预跑全废掉。
+     */
+    readonly pre: boolean;
     readonly probability: Promise<number>;
   } | null = null;
   /** `predictAtMs` 的定时器 */
@@ -183,6 +204,12 @@ export class UtteranceAssembler {
   private lastUtteranceAt = Number.NEGATIVE_INFINITY;
   /** 最近一次 ASR 中间结果的时刻：用户还在出字的直接证据 */
   private lastPartialAt = Number.NEGATIVE_INFINITY;
+  /** 最近一次「上行有声音」的时刻（本地静音检测，见 `silenceDb`） */
+  private lastVoicedAt = Number.NEGATIVE_INFINITY;
+  /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
+  private preFiredAt = Number.NEGATIVE_INFINITY;
+  /** 本次判停用的是不是预跑那份（是就不必再执行「刚收到中间结果」那条宽限） */
+  private usedPrefired = false;
   private disposed = false;
 
   constructor(options: UtteranceAssemblerOptions) {
@@ -202,6 +229,47 @@ export class UtteranceAssembler {
       const dropped = this.recentChunks.shift();
       this.recentBytes -= dropped?.length ?? 0;
     }
+    this.trackSilence(chunk);
+  }
+
+  /**
+   * 本地静音检测 → 把判停**提前**跑掉。
+   *
+   * ASR 要等 200 ms 静音才发 `SentenceEnd`，但判停器看的是音频 —— 那 200 ms 里
+   * 音频早就够了。所以「有声之后静下来 `silencePauseMs`」就先跑一次，
+   * `SentenceEnd` 到达时直接取用（`takeProbability` 的缓存）。
+   *
+   * 两条防呆：
+   * - 又来声音就把这份预跑作废（音频变了，那份快照里没有后半句）；
+   * - 一段语音只预跑一次，长时间静音不会反复烧判停器。
+   */
+  private trackSilence(chunk: Buffer): void {
+    const floor = this.options.silenceDb;
+    if (floor === undefined) {
+      return;
+    }
+    const t = this.now();
+    if (pcm16PeakDbfs(chunk) > floor) {
+      this.lastVoicedAt = t;
+      // 音频比快照长了：预跑的那份判停不再代表「用户说完没有」
+      this.prediction = null;
+      return;
+    }
+    if (this.options.predict === undefined || this.prediction !== null) {
+      return;
+    }
+    const pause = this.options.silencePauseMs ?? 200;
+    // 只在「这一轮说过话、且还没为这段语音预跑过」时动手
+    if (this.lastVoicedAt <= this.preFiredAt || this.lastVoicedAt <= this.lastUtteranceAt) {
+      return;
+    }
+    if (t - this.lastVoicedAt < pause) {
+      return;
+    }
+    this.preFiredAt = t;
+    this.options.log(`  判停    静音 ${pause} ms → 先跑一遍（不等 ASR 定稿）`);
+    // 下一句定稿时会拿到 `seq + 1`，见 `addSentence`
+    this.startPrediction(this.seq + 1, true);
   }
 
   /**
@@ -230,9 +298,13 @@ export class UtteranceAssembler {
       this.pendingText = this.pendingText ? this.pendingText + text : text;
     }
     this.cancelTimer();
-    // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿
+    // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿。
+    // **例外**是预跑（`trackSilence`）：那份快照本来就是给这一句的（seq 已经对上），
+    // 留着才能把「出句→开轮」那一段省掉。
     this.seq += 1;
-    this.prediction = null;
+    if (this.prediction !== null && this.prediction.seq !== this.seq) {
+      this.prediction = null;
+    }
     this.unfinishedWaited = false;
     const seq = this.seq;
     // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
@@ -265,9 +337,13 @@ export class UtteranceAssembler {
   }
 
   /** 取一份音频快照送进判停器。结果只对 `seq` 这一句、且之后没有新 partial 时有效。 */
-  private startPrediction(seq: number): void {
+  private startPrediction(seq: number, upcoming = false): void {
     const predict = this.options.predict;
-    if (this.disposed || predict === undefined || seq !== this.seq || this.prediction !== null) {
+    if (this.disposed || predict === undefined || this.prediction !== null) {
+      return;
+    }
+    // `upcoming`：这句还没定稿（ASR 的 `SentenceEnd` 还在路上），快照给的是下一句
+    if (!upcoming && seq !== this.seq) {
       return;
     }
     const pcm = Buffer.concat(this.recentChunks);
@@ -275,7 +351,7 @@ export class UtteranceAssembler {
     // 侧车可能抛（也可能同步抛）；两种都吞成「不可用」，否则这份提前发起的
     // promise 没人接，会变成 unhandledRejection
     const probability = Promise.resolve().then(() => predict(pcm)).catch(() => -1);
-    this.prediction = { seq, startedAt, probability };
+    this.prediction = { seq, startedAt, pre: upcoming, probability };
   }
 
   /**
@@ -291,7 +367,12 @@ export class UtteranceAssembler {
   ): Promise<number> {
     const ready = this.prediction;
     this.prediction = null;
-    if (ready !== null && ready.seq === seq && ready.startedAt >= this.lastPartialAt) {
+    const hit = ready !== null && ready.seq === seq
+      && (ready.pre || ready.startedAt >= this.lastPartialAt);
+    // 这一句的判停是「静音一到就提前跑」的：它看过音频静音，比 ASR 的 partial 更可信
+    // （实测 partial 比真实停嘴晚 98–140 ms），所以「刚收到中间结果就再等一拍」不必再执行
+    this.usedPrefired = hit && ready.pre;
+    if (hit) {
       return await ready.probability;
     }
     try {
@@ -373,7 +454,8 @@ export class UtteranceAssembler {
       // 只在还有 extension 额度时生效，避免无限等。
       const grace = this.options.partialGraceMs ?? 400;
       const sincePartial = evaluatedAt - this.lastPartialAt;
-      if (grace > 0 && sincePartial < grace && this.extensions < this.options.maxExtensions) {
+      if (grace > 0 && !this.usedPrefired
+        && sincePartial < grace && this.extensions < this.options.maxExtensions) {
         this.extensions += 1;
         this.options.log(
           `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,

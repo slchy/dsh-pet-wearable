@@ -729,10 +729,11 @@ async function main(): Promise<void> {
         ? {
           pythonPath: smartTurnPython,
           scriptPath: smartTurnScript,
-          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150 → 80 → 40：这一段同样是纯等待，
-          // 而判停器看的是**累积的最近音频**（`recentMaxBytes`），不依赖这段静默长度，
-          // 所以缩短它不会让它判得更差。回放实测这一段整段进了首字延迟。
-          quietMs: envNumber('SMART_TURN_QUIET_MS', 40),
+          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150 → 80 → 40 → 0：
+          // 有了「静音一到就预跑判停」（`VOICE_PAUSE_DETECT_MS`），`SentenceEnd` 到达时
+          // 概率早就算好了，这段静候只是白等 —— 回放实测 ② 从 113 → 41 ms，
+          // 把这里归零后只剩取缓存的那一下。
+          quietMs: envNumber('SMART_TURN_QUIET_MS', 0),
           extendMs: SMART_TURN_EXTEND_MS,
           // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
           // SmartTurn `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
@@ -756,6 +757,8 @@ async function main(): Promise<void> {
         thresholdDbfs: peakDbfs,
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
         prerollMs: envNumber('VOICE_PREROLL_MS', 800),
+        // 静音多久就提前跑判停（和 ASR 的 max_sentence_silence 对齐）；0 = 关闭
+        pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
       },
       playbackTailMs: 600,
       /**
