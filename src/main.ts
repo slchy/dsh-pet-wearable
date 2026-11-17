@@ -497,7 +497,7 @@ async function main(): Promise<void> {
   if (dshSession && agent) {
     // 快车道：短句纯闲聊直接答，其余零开销交给 dsh。放在 `trackActivity` **里面**，
     // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
-    const fastKey = process.env['DEEPSEEK_API_KEY']?.trim() ?? '';
+    const fastKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
     const fastOff = process.env['FAST_LANE'] === '0';
     const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md');
     const memoryFile = new MemoryFile(memoryPath);
@@ -516,7 +516,7 @@ async function main(): Promise<void> {
     const speculate = wantSpeculate && canCancel;
 
     if (fastOff || fastKey === '') {
-      console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 DEEPSEEK_API_KEY）'}`);
+      console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
     } else {
       agent = new FrontedAgent({
         inner: agent,
@@ -543,7 +543,10 @@ async function main(): Promise<void> {
         memory: (text: string) => memoryFile.relevant(text),
         log: (line) => { console.log(line); },
       });
-      console.log('快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）');
+      console.log(
+        `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
+        + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`,
+      );
       // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
       // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
       console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
@@ -719,10 +722,10 @@ async function main(): Promise<void> {
         ? {
           pythonPath: smartTurnPython,
           scriptPath: smartTurnScript,
-          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150：这一段同样是纯等待，
+          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150 → 80：这一段同样是纯等待，
           // 而判停器看的是**累积的最近音频**（`recentMaxBytes`），不依赖这段静默长度，
-          // 所以缩短它不会让它判得更差。
-          quietMs: envNumber('SMART_TURN_QUIET_MS', 150),
+          // 所以缩短它不会让它判得更差。回放实测这一段整段进了首字延迟。
+          quietMs: envNumber('SMART_TURN_QUIET_MS', 80),
           extendMs: SMART_TURN_EXTEND_MS,
           // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
           // SmartTurn `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
@@ -734,6 +737,11 @@ async function main(): Promise<void> {
           // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，
           // 数字组之间的换气会被当句尾，订单号被切成两句。
           unfinishedWaitMs: envNumber('SMART_TURN_UNFINISHED_MS', 250),
+          // 判停器说「说完了」之后，若这么久内还收到过中间结果，就再等一拍
+          // （防「音频停了、ASR 还在出字」的抢话）。真机上这段**几乎每轮都触发**，
+          // 一次 400 ms 直接进了首字延迟 —— 150 仍能挡住正常 partial 间隔，
+          // 回放实测（同为 6 轮）2 段从 622–625 ms 降到 150–152 ms。
+          partialGraceMs: envNumber('SMART_TURN_PARTIAL_GRACE_MS', 150),
         }
         : undefined,
       ...(smartTurnClient === null ? {} : { smartTurnClient }),

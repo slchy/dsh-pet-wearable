@@ -82,6 +82,7 @@ async function runCase(
   options: {
     apiKey: string;
     model: string;
+    baseUrl?: string;
     fetchImpl: typeof fetch;
     timeoutMs: number;
     totalMs: number;
@@ -94,6 +95,7 @@ async function runCase(
     inner: inner.agent,
     apiKey: options.apiKey,
     model: options.model,
+    ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
     fetchImpl: options.fetchImpl,
     timeoutMs: options.timeoutMs,
     totalMs: options.totalMs,
@@ -141,10 +143,14 @@ async function main(): Promise<number> {
   /** `--serial`：关掉投机，退回「先等快模型判定」 */
   const speculate = !process.argv.includes('--serial');
   const offline = process.argv.includes('--offline');
-  const apiKey = offline ? 'offline' : (process.env['DEEPSEEK_API_KEY'] ?? '').trim();
+  // `--key-env` / `--base-url`：同一份用例可以打**任意 OpenAI 兼容**的供应商，
+  // 换快模型时才有可比数据（不然只能拍脑袋）
+  const keyEnv = arg('key-env', 'DEEPSEEK_API_KEY') as string;
+  const baseUrl = arg('base-url');
+  const apiKey = offline ? 'offline' : (process.env[keyEnv] ?? '').trim();
 
   if (apiKey === '') {
-    console.error('缺 DEEPSEEK_API_KEY（或在服务器上跑，或用 --offline 只验 harness）');
+    console.error(`缺 ${keyEnv}（或在服务器上跑，或用 --offline 只验 harness）`);
     return 2;
   }
 
@@ -152,7 +158,15 @@ async function main(): Promise<number> {
   const rows: Row[] = [];
   for (const item of cases) {
     for (let i = 0; i < runs; i += 1) {
-      rows.push(await runCase(item, { apiKey, model, fetchImpl, timeoutMs, totalMs, speculate }));
+      rows.push(await runCase(item, {
+      apiKey,
+      model,
+      ...(baseUrl === undefined ? {} : { baseUrl }),
+      fetchImpl,
+      timeoutMs,
+      totalMs,
+      speculate,
+    }));
     }
   }
 
@@ -171,7 +185,7 @@ async function main(): Promise<number> {
     return row.verdict === 'fast' ? '✓ 快车道' : '✓ 委派';
   };
 
-  console.log(`\n模型 ${model}  每个 case ${runs} 遍  首字超时 ${timeoutMs} ms  `
+  console.log(`\n模型 ${model}${baseUrl === undefined ? '' : ` @ ${baseUrl}`}  每个 case ${runs} 遍  首字超时 ${timeoutMs} ms  `
     + `投机 ${speculate ? '开' : '关'}  共 ${rows.length} 条\n`);
   for (const row of rows) {
     console.log(

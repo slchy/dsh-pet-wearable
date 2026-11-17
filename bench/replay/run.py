@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -156,6 +157,9 @@ def spawn_harness(port: int, bench_dir: str, repo: str) -> None:
         f"export VOICE_AGENT_SESSION={bench_dir}/session.json; "
         f"export PHOTO_DIR={bench_dir}/photos; "
         "export MIAI_ANNOUNCE_FILE=; "
+        # 额外配置（A/B 实验用）：`MIAI_BENCH_ENV="K1=V1;K2=V2"`，只放行 KEY=VALUE 与分号，
+        # 免得把任意 shell 塞进这条 ssh 命令里。
+        f"{extra_env()} "
         # 收掉上一场：**按端口认进程，别用 `pkill -f '--listen <port>'`** ——
         # 这条 ssh 命令自己的命令行里就含那串字，pkill 会把当前 shell 一起杀掉，
         # 表现是「启动脚本悄悄什么都没做」（实测踩过）。
@@ -179,6 +183,21 @@ def kill_on_port(port: int) -> str:
         f"PID=$(ss -ltnp 2>/dev/null | grep ':{port} ' | grep -oP 'pid=\\K[0-9]+' | head -1); "
         "[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null || true"
     )
+
+
+def extra_env() -> str:
+    """`MIAI_BENCH_ENV="K1=V1;K2=V2"` → `export K1=V1; K2=V2;`，A/B 实验用。
+
+    只放行 `KEY=VALUE` 与分号：这条字符串会拼进 ssh 命令，宽松就等于把 shell 交给环境变量。
+    """
+    raw = os.environ.get("MIAI_BENCH_ENV", "").strip()
+    if not raw:
+        return ""
+    pairs = [p.strip() for p in raw.split(";") if p.strip()]
+    for p in pairs:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.:\-/]*", p):
+            raise SystemExit(f"MIAI_BENCH_ENV 里有一项不像 KEY=VALUE：{p!r}")
+    return "export " + " ".join(p + ";" for p in pairs) + " "
 
 
 def stop_harness(port: int) -> None:

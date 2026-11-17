@@ -177,6 +177,11 @@ export interface VoiceSessionOptions {
     readonly threshold: number;
     /** 结尾「像没说完」时再多等一拍，见 `UtteranceAssemblerOptions.unfinishedWaitMs` */
     readonly unfinishedWaitMs?: number;
+    /**
+     * 判停器说「说完了」后，若这么久内还收到过中间结果就再等一拍，
+     * 见 `UtteranceAssemblerOptions.partialGraceMs`。
+     */
+    readonly partialGraceMs?: number;
   };
   /**
    * 进程级共享的判停器客户端。
@@ -514,6 +519,9 @@ class VoiceConnection {
       ...(smartTurnOptions?.unfinishedWaitMs === undefined
         ? {}
         : { unfinishedWaitMs: smartTurnOptions.unfinishedWaitMs }),
+      ...(smartTurnOptions?.partialGraceMs === undefined
+        ? {}
+        : { partialGraceMs: smartTurnOptions.partialGraceMs }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       predict: this.smartTurn
         ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
