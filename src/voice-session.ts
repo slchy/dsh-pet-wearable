@@ -534,6 +534,11 @@ class VoiceConnection {
         console.log(`  文本    ${JSON.stringify(text)}`);
         this.dialog.dispatch({ type: 'utterance', text });
       },
+      // 句子定稿那一刻就让快车道起跑，把判停那一拍从关键路径上挪走。
+      // 判停若并了下一段，组装器会拿更长的文本再调一次；认领时按文本比对。
+      onSentence: (text) => {
+        this.options.agent.prefetch?.(text);
+      },
       log,
     });
 
@@ -542,6 +547,10 @@ class VoiceConnection {
       onSentence: (text, index) => { this.onSentence(text, index); },
       onError: (error) => { this.onAsrError(error); },
     });
+    // 设备刚连上、用户还没开口：把 TTS 那条 WebSocket 先建好（~170 ms 的
+    // TCP+TLS+Upgrade）。放在「这一轮开始」就太晚了 —— 那时用户已经在等。
+    // ASR 那侧不用在这里调：`stt.open()` 内部已经预取 token。
+    options.tts.warm?.();
 
     this.uplink = new UplinkPipeline({
       ffmpegPath: options.ffmpegPath,

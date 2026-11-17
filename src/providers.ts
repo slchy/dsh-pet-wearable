@@ -81,6 +81,16 @@ export interface AgentProvider {
    */
   cancelTurn?(ticket?: TurnTicket): void;
   /**
+   * 可选能力：**判停之前先问出去**。
+   *
+   * 一句 ASR 定稿时文本就定了，判停器随后只决定要不要并下一段 —— 这中间那一拍
+   * 是纯等待。给了这个能力，宿主会在定稿那一刻调一次；`reply()` 拿到**一字不差**
+   * 的同一句话时认领结果，文本变了就丢掉重问。
+   *
+   * 实现必须容忍「问了却没人来认领」（用户插话、判停并段、进程退出）。
+   */
+  prefetch?(text: string): void;
+  /**
    * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
    *
    * 会杀掉进程，下一轮要重启并 resume（实测多花 ~2 s）。只在「这一轮肯定不要了、
@@ -156,6 +166,14 @@ export interface TtsProvider {
   readonly name: string;
   /** 输出采样率。**必须由 provider 声明**，不要在宿主里另配一份。 */
   readonly sampleRate: number;
+  /**
+   * 可选能力：**预建连接**。
+   *
+   * TTS 是进程级单例，连接在第一次合成时才懒建（冷连接 ~590 ms vs 复用 ~350 ms，
+   * 差的那 ~170 ms 是 TCP+TLS+Upgrade）。宿主在设备连上时调一次，把这笔钱挪到
+   * 「用户还没开口」的空窗里。失败必须自己咽掉，下次合成会重建。
+   */
+  warm?(): void;
   /**
    * 边生成边合成（可选）：文本块一进来就送服务端，首包与模型生成重叠。
    * 没实现就退回 {@link synthesize} 整段合成。

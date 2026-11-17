@@ -291,3 +291,36 @@ test('判停器抛错按「不可用」处理，照常收下这一轮', async ()
 
   assert.equal(utterances.length, 1, '判停器坏了也不能吞掉用户的话');
 });
+
+// ---------------------------------------------------------------- 定稿即通知
+//
+// 判停之前文本就定了，快车道要靠这个通知提前起跑（省掉判停那一拍）。
+
+test('一句定稿就通知一次，文本与本轮累积一致', async () => {
+  const seen: string[] = [];
+  const { assembler } = makeAssembler({ onSentence: (text) => { seen.push(text); } });
+
+  assembler.addSentence('你好呀');
+  assert.deepEqual(seen, ['你好呀'], '文本定稿就该通知，不等判停');
+
+  await delay(60);
+  assert.deepEqual(seen, ['你好呀'], '定稿只通知一次，收下不再重复');
+});
+
+test('并了第二段就再通知一次，带完整累积文本', async () => {
+  const seen: string[] = [];
+  // 判停器在第二段到来前一直说「没说完」，好让两段并成一轮
+  let done = false;
+  const { assembler } = makeAssembler({
+    onSentence: (text) => { seen.push(text); },
+    predict: async () => (done ? 0.99 : 0.1),
+  });
+
+  assembler.addSentence('我想问');
+  await delay(60);
+  done = true;
+  assembler.addSentence('一下那个事');
+  await delay(60);
+
+  assert.deepEqual(seen, ['我想问', '我想问一下那个事'], '并段后要按新文本再通知，前面那句才作废');
+});

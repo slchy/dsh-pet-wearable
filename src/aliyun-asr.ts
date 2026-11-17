@@ -35,6 +35,17 @@ export interface AliyunToken {
   expireAtSec: number;
 }
 
+/**
+ * token 缓存。**一个进程一份**（由 `aliyunStt` 的闭包持有）。
+ *
+ * 放在这里的原因：`open()` 每台设备连一次就 new 一个 `AliyunAsr`，缓存若是实例字段，
+ * 每台设备的**第一句话**都要付一次 `CreateToken`（实测 334 / 170 / 147 / 134 ms），
+ * 而那件事发生在**用户已经开口、VAD 刚激活**的时候 —— 全在关键路径上。
+ */
+export interface TokenCache {
+  token: AliyunToken | null;
+}
+
 export interface AliyunAsrOptions {
   akId: string;
   akSecret: string;
@@ -49,6 +60,11 @@ export interface AliyunAsrOptions {
    * 纯时序问题就没法写单测。
    */
   tokenProvider?: () => Promise<AliyunToken>;
+  /**
+   * 进程级 token 缓存。`aliyunStt()` 会传进来一份共享的；
+   * 单测/直接构造时可以不给，那就自建一份（只在实例内有效）。
+   */
+  cache?: TokenCache;
   /** 一句结束后判定「说完了」所需的静音时长（毫秒） */
   maxSentenceSilenceMs?: number;
   /**
@@ -110,7 +126,7 @@ export async function createToken(
   return { id, expireAtSec: expire };
 }
 
-interface TokenCache {
+interface TokenCacheInternal {
   token: AliyunToken | null;
 }
 
@@ -125,7 +141,7 @@ export class AliyunAsr {
   private ws: WebSocket | null = null;
   private taskId: string | null = null;
   private ready = false;
-  private readonly cache: TokenCache = { token: null };
+  private readonly cache: TokenCache;
   private readonly log: (line: string) => void;
   /** 缓冲区：WebSocket 未 ready 时先攒着，别丢音频 */
   private backlog: Buffer[] = [];
@@ -149,7 +165,19 @@ export class AliyunAsr {
 
   constructor(opts: AliyunAsrOptions) {
     this.opts = opts;
+    this.cache = opts.cache ?? { token: null };
     this.log = opts.log ?? (() => {});
+  }
+
+  /**
+   * 预取 token（不建 WebSocket）。
+   *
+   * 由 `aliyunStt.open()` 在**设备连上那一刻**调 —— 用户还没开口，这段网络时间
+   * 白拿。不建 WS 是因为空连接会被服务端判 `IDLE_TIMEOUT`（见 `feed()`）：
+   * 连接必须在真有音频时才开。
+   */
+  async warm(): Promise<void> {
+    await this.token();
   }
 
   get isReady(): boolean {
@@ -441,16 +469,23 @@ export function aliyunStt(
   creds: Omit<AliyunAsrOptions, 'onSentence' | 'onPartial' | 'onError' | 'log'>,
   log?: (line: string) => void,
 ): SttProvider {
+  // **进程级** token 缓存：token 24 h 有效，一台设备一句就重换一次纯属浪费，
+  // 而且那一发恰好落在「用户已经开口」的时刻（实测 334 / 170 / 147 / 134 ms）。
+  const cache: TokenCache = { token: null };
   return {
     name: `aliyun:${creds.region}`,
     open: (handlers) => {
       const asr = new AliyunAsr({
         ...creds,
+        cache,
         onSentence: handlers.onSentence,
         onPartial: handlers.onPartial,
         onError: handlers.onError,
         log,
       });
+      // 设备刚连上、用户还没开口：先把 token 取回来。
+      // 失败什么都不影响 —— `feed()` 建连时会再取一次，退化成原来的懒加载。
+      void asr.warm().catch((e: Error) => { log?.(`[asr] 预取 token 失败: ${e.message}`); });
       return {
         feed: (pcm) => { asr.feed(pcm); },
         hangup: () => { asr.hangup(); },

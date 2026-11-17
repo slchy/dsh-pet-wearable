@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 阿里云实时识别的**连接状态机**。
  *
  * 这些用例防的是同一类事故：连接明明已经不能用了，状态里却还写着「好着」，
@@ -18,7 +18,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { AliyunAsr, type AliyunAsrOptions } from '../src/aliyun-asr.ts';
+import { AliyunAsr, aliyunStt, type AliyunAsrOptions } from '../src/aliyun-asr.ts';
 
 /** 够用的 WebSocket 替身：手动驱动 open/message/close。 */
 class FakeWs {
@@ -204,4 +204,50 @@ test('热词表：只有配置了真 ID 才下发 vocabulary_id', async () => {
 
   const withVocab = await startParams({ vocabularyId: 'voc-123' });
   assert.equal(withVocab['vocabulary_id'], 'voc-123');
+});
+
+// ---------------------------------------------------------------- 预热
+//
+// token 缓存必须是**进程级**的：`open()` 每台设备 new 一个实例，缓存若跟着实例走，
+// 每台设备的**第一句话**都要付一次 `CreateToken`（实测 334 / 170 / 147 / 134 ms），
+// 而那一发恰好发生在「用户已经开口」的时候。
+
+test('token 缓存跨实例复用：第二台设备不再换 token', async () => {
+  let calls = 0;
+  const provider = async (): Promise<{ id: string; expireAtSec: number }> => {
+    calls += 1;
+    return { id: `tok${calls}`, expireAtSec: Math.floor(Date.now() / 1000) + 3600 };
+  };
+  const stt = aliyunStt(
+    { akId: 'ak', akSecret: 'sk', appkey: 'appkey', region: 'cn-shanghai', tokenProvider: provider },
+  );
+
+  const handlers = { onSentence: () => {}, onPartial: () => {}, onError: () => {} } as never;
+  const first = stt.open(handlers);
+  await tick();
+  const second = stt.open(handlers);
+  await tick();
+  first.close();
+  second.close();
+
+  assert.equal(calls, 1, 'token 24 h 有效，换第二台设备不该再换一次');
+});
+
+test('open() 就把 token 取回来 —— 别等 feed() 那一刻', async () => {
+  let calls = 0;
+  const stt = aliyunStt({
+    akId: 'ak', akSecret: 'sk', appkey: 'appkey', region: 'cn-shanghai',
+    tokenProvider: async () => {
+      calls += 1;
+      return { id: 'tok', expireAtSec: Math.floor(Date.now() / 1000) + 3600 };
+    },
+  });
+  FakeWs.instances = [];
+
+  const session = stt.open({ onSentence: () => {}, onPartial: () => {}, onError: () => {} } as never);
+  await tick();
+
+  assert.equal(calls, 1, '设备刚连上就该把 token 拿好，用户开口时只剩建链');
+  assert.equal(FakeWs.instances.length, 0, '只预取 token，不建空连接（会被服务端判 IDLE_TIMEOUT）');
+  session.close();
 });

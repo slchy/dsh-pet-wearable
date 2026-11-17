@@ -56,18 +56,19 @@ const DELEGATE = '[[DELEGATE]]';
  *
  * **实时事实类必须在这里挡**（2026-11-17 换 `qwen-flash` 时抓到）：天气、时间、新闻
  * 这些「设备不可能知道、模型只可能编」的问题，交给模型自律不可靠 —— `deepseek-chat`
- * 会老实委派，`qwen-flash` 张口就编了「外面下雨了，哥你带伞没？」。这一层的代价是
- * 多花 690 ms，编造的代价是用户带伞出门。所以它们进词表，不再靠模型判断。
+ * 会老实委派，`qwen-flash` 张口就编（「外面下雨了，哥你带伞没？」/「眼镜上显示是三点十五。」）。
+ * 这一层的代价是多花 690 ms，编造的代价是用户带伞出门。所以它们进词表，不再靠模型判断。
  */
 const TASK_WORDS: readonly string[] = [
   '查', '搜', '拍', '看', '打开', '帮我', '帮我看', '哪', '怎么', '多少', '为什么',
   '这个', '那个', '刚才', '记住', '记一下', '订单', '地址', '电话', '文件', '日志',
   '导航', '提醒', '设置', '翻译', '总结', '念', '读', '找',
   // 实时事实（模型只能编，必须有工具才准）
-  // 只收「模型在**真提示词**下也编」的：实测 qwen-flash 对「外面下雨吗」直接答
-  // 「外面下雨了，哥你带伞没？」。而「几点了」两个模型都会委派，就别挡 ——
-  // 挡了就是白花 1.8 s 走一趟 dsh（见 fronted-agent.test.ts 同名用例）。
-  '天气', '下雨', '下雪', '气温', '几度', '温度', '新闻', '股价', '比分', '汇率', '路况',
+  // `qwen-flash` 在这类问题上张口就编，实测两次不同日期都中招：
+  //   「外面下雨吗」→「外面下雨了，哥你带伞没？」
+  //   「几点了」   →「眼镜上显示是三点十五。」
+  // 本地挡住只多花一趟 dsh，编的代价是用户照做。
+  '天气', '下雨', '下雪', '气温', '几度', '温度', '几点', '新闻', '股价', '比分', '汇率', '路况',
 ];
 
 const SYSTEM_PROMPT = [
@@ -386,6 +387,20 @@ export class FrontedAgent implements AgentProvider {
   private readonly log: (line: string) => void;
   private readonly pending: string[] = [];
   /**
+   * 判停之前先问出去的那一轮（见 {@link prefetch}）。
+   *
+   * `buffered` 是已经吐出来、还没人接的字：预跑时 TTS 的接收方还没建立
+   * （这一轮还没开），字先攒着；`reply()` 认领时先补推再接着实时接。
+   */
+  private prefetched: {
+    readonly text: string;
+    readonly startedAt: number;
+    readonly answer: Promise<FastAnswer>;
+    readonly buffered: string[];
+    readonly abort: AbortController | null;
+    listener: ((text: string) => void) | null;
+  } | null = null;
+  /**
    * 对话窗口：两条通道（快车道自己答的 + dsh 答的）都在这里，按时间顺序。
    *
    * 为什么自己攒而不是问 dsh：语音链路里多一次查询就是多一轮往返；而这些话
@@ -504,6 +519,86 @@ export class FrontedAgent implements AgentProvider {
     }
   }
 
+  /**
+   * 判停之前先把这一句问出去（宿主在 ASR 定稿时调，见 `UtteranceAssembler.onSentence`）。
+   *
+   * 只做一件事：**把纯等待变成重叠**。文本此刻已经定了；判停器随后说「并下一段」
+   * 的话，`reply()` 拿到的就是更长的另一句，这条预跑自然不被认领 ——
+   * 所以这里的判断要和 `reply()` 里的门槛**同源**，否则会白花钱。
+   *
+   * 不抛错、不阻塞：所有失败都在 `reply()` 认领时才浮出来（那时才有人处理）。
+   */
+  prefetch(text: string): void {
+    if (this.apiKey === '') return;
+    if (this.prefetched?.text === text) return;
+    // 下面这几条与 `reply()` 里的一一对应：只要 `reply()` 会不走快车道，就不该预跑
+    if (this.lastDsh?.asked === true && looksLikeAnswer(text)) return;
+    if (looksMemorable(text)) return;
+    if (!isFastCandidate(text, this.maxChars)) return;
+    if (this.pending.length / 2 >= this.keepTurns) return;
+
+    this.dropPrefetch('换一句');
+    const slot = {
+      text,
+      startedAt: this.now(),
+      answer: null as unknown as Promise<FastAnswer>,
+      buffered: [] as string[],
+      abort: null as AbortController | null,
+      listener: null as ((chunk: string) => void) | null,
+    };
+    slot.answer = this.ask(text, slot.startedAt, (chunk) => {
+      if (slot.listener !== null) {
+        slot.listener(chunk);
+        return;
+      }
+      slot.buffered.push(chunk);
+    });
+    // 预跑出来的 promise 可能永远没人认领（插话/并段）：接住，别让它变成进程级 rejection
+    slot.answer.catch(() => undefined);
+    // `ask()` 在第一个 await 之前同步设好了控制器，这里取到的就是这一趟的
+    const controller = this.askAbort;
+    this.prefetched = { ...slot, abort: controller };
+    this.log(`  快车道    判停前先问出去 ${JSON.stringify(text)}`);
+  }
+
+  /** 认领预跑：文本一字不差才给，其余一律作废 */
+  private takePrefetch(
+    userText: string,
+  ): { answer: Promise<FastAnswer>; attach: (sink: (text: string) => void) => void } | null {
+    const slot = this.prefetched;
+    if (slot === null) return null;
+    this.prefetched = null;
+    if (slot.text !== userText) {
+      this.abortPrefetch(slot.abort);
+      this.log(`  快车道    判停并了段，预跑作废（${JSON.stringify(slot.text)}）`);
+      return null;
+    }
+    return {
+      answer: slot.answer,
+      attach: (sink) => {
+        // 先把预跑期间攒下的字补推出去，再切成实时 —— 顺序反了会乱序
+        for (const chunk of slot.buffered) sink(chunk);
+        slot.buffered.length = 0;
+        slot.listener = sink;
+      },
+    };
+  }
+
+  private dropPrefetch(why: string): void {
+    const slot = this.prefetched;
+    if (slot === null) return;
+    this.prefetched = null;
+    this.abortPrefetch(slot.abort);
+    this.log(`  快车道    预跑作废（${why}）`);
+  }
+
+  private abortPrefetch(controller: AbortController | null): void {
+    // 已经被别的 `ask()` 顶替过就别动它 —— 那会掐掉正在服务的那一轮
+    if (controller !== null && this.askAbort === controller) {
+      controller.abort(new Error('预跑作废'));
+    }
+  }
+
   async reply(
     userText: string,
     image?: AgentImage,
@@ -546,7 +641,20 @@ export class FrontedAgent implements AgentProvider {
     }
 
     const startedAt = this.now();
+    // 判停之前就已经问出去的那一轮：**文本一字不差**才认领，见 `prefetch()`
+    const pre = this.takePrefetch(userText);
+    let emitted = '';
     let dsh: Promise<AgentReplyView> | null = null;
+    /** 推给 TTS 的唯一出口：预跑攒下的字和后来的实时字都从这里走，顺序才不会乱 */
+    const push = (text: string): void => {
+      emitted += text;
+      // 推出去的第一个字就是「这一轮归快车道」的判决书 —— 退回 dsh 会播两遍，
+      // 所以这一刻就把在途的 dsh 那一轮掐掉，别等它把整段答完再取消。
+      // 只有真开了投机才动手：不投机时 dsh 里在跑的是**别的**轮次（比如后台任务
+      // 的旁白），取消它等于把旁白吞了。
+      if (dsh !== null) this.cancelInner(ticket);
+      this.sink?.(text);
+    };
     if (this.speculate) {
       // 先上闸再起跑：`inner.reply` 在第一个 await 之前是同步执行的，
       // 顺序反了的话 dsh 抢先推的增量会绕过缓冲直接进 TTS。
@@ -559,18 +667,14 @@ export class FrontedAgent implements AgentProvider {
       dsh.catch(() => undefined);
     }
 
-    let emitted = '';
     let answer: FastAnswer;
     try {
-      answer = await this.ask(userText, startedAt, (text) => {
-        emitted += text;
-        // 推出去的第一个字就是「这一轮归快车道」的判决书 —— 退回 dsh 会播两遍，
-        // 所以这一刻就把在途的 dsh 那一轮掐掉，别等它把整段答完再取消。
-        // 只有真开了投机才动手：不投机时 dsh 里在跑的是**别的**轮次（比如后台任务
-        // 的旁白），取消它等于把旁白吞了。
-        if (dsh !== null) this.cancelInner(ticket);
-        this.sink?.(text);
-      });
+      if (pre !== null) {
+        pre.attach(push);
+        answer = await pre.answer;
+      } else {
+        answer = await this.ask(userText, startedAt, push);
+      }
     } catch (error) {
       const why = (error as Error).message;
       // 已经开闸 = 有字推给了 TTS，这时候再退回 dsh 会把同一句话播两遍

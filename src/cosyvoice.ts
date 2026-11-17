@@ -637,6 +637,16 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
   return {
     name: `cosyvoice:${voice}`,
     sampleRate,
+    /**
+     * 预建连接（TCP+TLS+Upgrade，实测 ~170 ms）。
+     *
+     * 由宿主在**设备连上那一刻**调：用户还没开口，这段时间白拿。`run-task` 不能提前
+     * —— 那要绑定具体的 task（~60 ms，只能到这一轮开始时再发）。失败什么都不影响，
+     * 下一次 `acquire()` 会重建。
+     */
+    warm() {
+      void acquire().catch(() => { /* 预热失败按懒加载处理 */ });
+    },
     synthesize(text: string, emotion?: string) {
       return pump((connNow, onChunk) => connNow.run(
         { text, emotion: asEmotion(emotion) },

@@ -113,7 +113,10 @@ test('判据：闲聊候选 vs 任务请求', () => {
 
 test('「什么」不进任务词 —— 它会把「你叫什么名字」一起挡掉', () => {
   assert.equal(isFastCandidate('你叫什么名字'), true);
-  assert.equal(isFastCandidate('几点了'), true, '要事实的问题交给快模型自己判委派');
+  assert.equal(isFastCandidate('你好呀今天'), true);
+  // 「几点了」**不再**放行：`qwen-flash` 会直接编一个时间（实测两场都中招）。
+  // 要事实的问题留给 dsh，它有工具。
+  assert.equal(isFastCandidate('几点了'), false, '实时事实类（含时间）必须本地挡住');
 });
 
 test('任务类请求完全不问快模型', async () => {
@@ -467,8 +470,8 @@ test('暗号前面带了情绪标签也不许播出去', async () => {
   );
   agent.attachLiveSink((t) => emitted.push(t));
 
-  const reply = await agent.reply('几点了');
-  assert.equal(fastCalls, 1, '「几点了」会进快车道，由模型自己判委派');
+  const reply = await agent.reply('你叫什么名字');
+  assert.equal(fastCalls, 1, '闲聊句会进快车道，暗号由模型判');
   assert.equal(reply.speech, '慢车道答复。');
   assert.deepEqual(emitted, [], '标签和暗号一个字都不能推给 TTS');
 });

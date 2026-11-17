@@ -101,6 +101,14 @@ export interface UtteranceAssemblerOptions {
    * 设 0 关闭这条判据（只信音频，回到旧行为）。
    */
   readonly partialGraceMs?: number;
+  /**
+   * 一句定稿（文本已定、还没判定停）时通知一次。
+   *
+   * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
+   * 先在这上面起跑，省掉判停那 140 ms 纯等待；真并了下一段就换一句重问。
+   * 只在**文本允许**的前提下才起跑，判据在接收方（`FrontedAgent.prefetch`）。
+   */
+  readonly onSentence?: (text: string) => void;
   /** 一轮定稿 */
   readonly onUtterance: (text: string) => void;
   readonly log: (line: string) => void;
@@ -227,6 +235,9 @@ export class UtteranceAssembler {
     this.prediction = null;
     this.unfinishedWaited = false;
     const seq = this.seq;
+    // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
+    // 先把它交出去起跑，真并了下一段再换 —— 见 `VoiceSession` 的接线。
+    this.options.onSentence?.(this.pendingText);
     const delay = this.options.predict
       ? this.options.quietMs
       : this.options.fallbackWindowMs;
