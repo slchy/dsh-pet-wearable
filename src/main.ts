@@ -405,7 +405,26 @@ function loadDotEnv(): void {
   }
 }
 
+/**
+ * `MIAI_LOG_TS=1`：给每一行日志加一个进程启动以来的毫秒时间戳。
+ *
+ * 只在排查时开 —— 平时日志的格式有人 grep，加前缀会连累所有既有脚本。
+ * 有了它能一次把「本轮开始 → 首字 → 送批 → 首包 → 下行首块」对齐到毫秒，
+ * 否则只能拿几个孤立的分段数互相猜（③ 里就有 300–400 ms 一直是这么猜没的）。
+ */
+function installLogClock(): void {
+  if (process.env['MIAI_LOG_TS'] !== '1') {
+    return;
+  }
+  const origin = performance.now();
+  const raw = console.log.bind(console);
+  console.log = (...args: unknown[]) => {
+    raw(`+${(performance.now() - origin).toFixed(0).padStart(6, '0')}ms`, ...args);
+  };
+}
+
 async function main(): Promise<void> {
+  installLogClock();
   loadDotEnv();
   const argv = process.argv.slice(2);
 

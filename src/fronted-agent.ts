@@ -465,6 +465,11 @@ export class FrontedAgent implements AgentProvider {
    *
    * `buffered` 是已经吐出来、还没人接的字：预跑时 TTS 的接收方还没建立
    * （这一轮还没开），字先攒着；`reply()` 认领时先补推再接着实时接。
+   *
+   * **必须是同一个对象**：`ask()` 的回调闭包捕获的是创建时的那个 slot，认领时如果
+   * 换成一份拷贝（`{ ...slot }`），`listener` 就只装在拷贝上，闭包里的原对象永远是
+   * `null` —— 于是认领之后的增量继续往 `buffered` 里堆，没人再取，TTS 拿到空文本，
+   * 每一轮都退回整段合成（实测白付 300–500 ms）。
    */
   private prefetched: {
     /** 认领时拿来比对的文本：投机起跑时是**中间结果**，被定稿确认后改写成定稿 */
@@ -474,7 +479,7 @@ export class FrontedAgent implements AgentProvider {
     readonly startedAt: number;
     readonly answer: Promise<FastAnswer>;
     readonly buffered: string[];
-    readonly abort: AbortController | null;
+    abort: AbortController | null;
     listener: ((text: string) => void) | null;
   } | null = null;
   /**
@@ -555,6 +560,9 @@ export class FrontedAgent implements AgentProvider {
    * 而投机要挡的正是「dsh 早于快模型判定就开口」那一段。
    */
   attachLiveSink(sink: ((text: string) => void) | null): void {
+    if (process.env['FAST_LANE_TRACE'] === '1') {
+      this.log(`  快车道    [trace] attachLiveSink ${sink === null ? 'null（摘掉）' : '装上'}`);
+    }
     this.sink = sink;
     if (sink === null) {
       this.innerMode = 'pass';
@@ -710,7 +718,10 @@ export class FrontedAgent implements AgentProvider {
     slot.answer.catch(() => undefined);
     // `ask()` 在第一个 await 之前同步设好了控制器，这里取到的就是这一趟的
     const controller = this.askAbort;
-    this.prefetched = { ...slot, abort: controller };
+    // **同一个对象**，不能 `{ ...slot }`：`ask()` 的闭包捕获的是 `slot`，
+    // 换成拷贝会让后面的增量认不出 listener（见字段注释）
+    slot.abort = controller;
+    this.prefetched = slot;
     this.log(
       `${speculative ? '  快车道    中间结果先问出去' : '  快车道    判停前先问出去'} ${JSON.stringify(text)}`,
     );
@@ -828,6 +839,9 @@ export class FrontedAgent implements AgentProvider {
     let dsh: Promise<AgentReplyView> | null = null;
     /** 推给 TTS 的唯一出口：预跑攒下的字和后来的实时字都从这里走，顺序才不会乱 */
     const push = (text: string): void => {
+      if (process.env['FAST_LANE_TRACE'] === '1' && emitted === '') {
+        this.log(`  快车道    [trace] 首个增量推出（sink ${this.sink === null ? '未装' : '已装'}）`);
+      }
       emitted += text;
       // 推出去的第一个字就是「这一轮归快车道」的判决书 —— 退回 dsh 会播两遍，
       // 所以这一刻就把在途的 dsh 那一轮掐掉，别等它把整段答完再取消。

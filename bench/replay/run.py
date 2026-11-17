@@ -220,9 +220,13 @@ def kill_on_port(port: int) -> str:
 
 
 def extra_env() -> str:
-    """`MIAI_BENCH_ENV="K1=V1;K2=V2"` → `export K1=V1; K2=V2;`，A/B 实验用。
+    """`MIAI_BENCH_ENV="K1=V1;K2=V2"` → `export K1=V1 K2=V2;`，A/B 实验用。
 
     只放行 `KEY=VALUE` 与分号：这条字符串会拼进 ssh 命令，宽松就等于把 shell 交给环境变量。
+
+    **必须是一个 export 带多个赋值**。写成 `export K1=V1; K2=V2;` 只有第一个进了环境，
+    后面的只是当前 shell 的变量 —— 子进程（node）看不到，实验静默失效
+    （踩过：三变量那次只有第一个生效，查了半天「为什么 trace 没打」）。
     """
     raw = os.environ.get("MIAI_BENCH_ENV", "").strip()
     if not raw:
@@ -231,7 +235,7 @@ def extra_env() -> str:
     for p in pairs:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.:\-/]*", p):
             raise SystemExit(f"MIAI_BENCH_ENV 里有一项不像 KEY=VALUE：{p!r}")
-    return "export " + " ".join(p + ";" for p in pairs) + " "
+    return "export " + " ".join(pairs) + "; "
 
 
 def stop_harness(port: int) -> None:

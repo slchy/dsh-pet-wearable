@@ -69,6 +69,35 @@ test('预跑先吐出来的字在认领时补推，不丢也不乱序', async ()
   assert.equal(seen.join(''), '[平静]我在呢。', '缓冲的字必须按原顺序补推给 TTS（标签由 TTS 侧清洗）');
 });
 
+test('预跑认领**之后**才到的增量也要接到 TTS（不能只补历史那些）', async () => {
+  // 这条钉的是「prefetch 的 slot 被换成了拷贝」那个 bug：`ask()` 的闭包捕获的是原对象，
+  // 认领时若 `{ ...slot }`，listener 只装在拷贝上，后来的增量全堆进 buffered 没人取 ——
+  // TTS 收到空文本、每轮退回整段合成，白付 300–500 ms。旧测试因为「答案在认领前就吐完」漏了它。
+  const agent = makeAgent(async () => {
+    const enc = new TextEncoder();
+    const pieces = ['[平静]', '我在', '呢。'];
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const piece of pieces) {
+          controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`));
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+        controller.enqueue(enc.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  });
+
+  const seen: string[] = [];
+  agent.attachLiveSink((text) => { seen.push(text); });
+  agent.prefetch('你好呀');
+  const reply = await agent.reply('你好呀');
+
+  assert.equal(reply.speech, '我在呢。');
+  assert.equal(seen.join(''), '[平静]我在呢。', '认领后逐字到达的增量必须实时推给 TTS');
+});
+
 test('判停并了段：预跑作废，按并完的新文本重问', async () => {
   const asked: string[] = [];
   const agent = makeAgent(async (_url, init) => {
