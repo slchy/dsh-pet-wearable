@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 云端 harness：设备音频流 → 解码 → 判停 → 一轮 → TTS → 下发。
  *
  * STT / TTS / agent 都是**注入的**（见 `providers.ts`），这里只做装配：
@@ -18,225 +18,52 @@ import { pathToFileURL } from 'node:url';
 import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
-import { aliyunStt } from './aliyun-asr.ts';
-import { cosyVoiceTts } from './cosyvoice.ts';
-import { mimoTts } from './mimo.ts';
-import { EMOTIONS } from './emotion.ts';
-import { BASE_STYLE, DEFAULT_TTS_VOICE } from './mimo.ts';
-import {
-  cannedStt,
-  echoAgent,
-  noopStt,
-  silentTts,
-  type AgentProvider,
-  type SttProvider,
-  type TtsProvider,
-} from './providers.ts';
-import { DshSession } from './session.ts';
+import { AssemblyError, buildAgent, buildStt, buildTts, loadAuthenticator, loadTls, type AgentBundle } from './assembly.ts';
 import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
 import { FrontedAgent } from './fronted-agent.ts';
 import { MemoryFile } from './memory-file.ts';
-import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 import { SmartTurn } from './smart-turn.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
-import {
-  describeTokenProblem,
-  readTokenFile,
-  tokenFilePath,
-  TokenGate,
-} from './tokens.ts';
+import type { AgentProvider } from './providers.ts';
+import type { DshSession } from './session.ts';
 import { sleep } from './util.ts';
 /**
- * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` 工厂（或 default）。
+ * 启动期配置错误：说清楚是哪一项、该怎么改，然后退出。
  *
- * 这是 `cloud/` 唯一的扩展点 —— 换厂商不用改本文件，也不用 fork。将来开源时
- * 别人照这个签名写自己的模块即可（见 `docs/BACKLOG.md` B-004）。
+ * 装配在 `assembly.ts`，那里抛 `AssemblyError` 而**不是** `process.exit` ——
+ * 同一份装配也跑在 dsh 插件里，插件把宿主进程一起带走是不行的。
+ * 退出只发生在 CLI 这一层。
  */
-async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
-  const isPath = /^[./]/.test(spec) || /^[A-Za-z]:[\\/]/.test(spec);
-  const url = isPath ? pathToFileURL(resolve(spec)).href : spec;
-  const mod = (await import(url)) as Record<string, unknown>;
-  const factory = (mod.default ?? mod[exportName]) as (() => T) | undefined;
-  if (typeof factory !== 'function') {
-    throw new Error(`${spec} 必须导出 ${exportName}() 工厂（或 default 导出工厂）`);
-  }
-  return factory();
-}
-
-/** `--stt aliyun|noop|canned|<path>` */
-async function buildStt(
-  spec: string,
-  creds: {
-    akId: string; akSecret: string; appkey: string; region: string;
-    maxSentenceSilenceMs: number; vocabularyId?: string;
-  },
-): Promise<SttProvider> {
-  if (spec === 'noop') return noopStt();
-  if (spec === 'canned') return cannedStt();
-  if (spec === 'aliyun') {
-    return aliyunStt(creds, (line) => { console.log(`  [asr] ${line}`); });
-  }
-  return loadProvider<SttProvider>(spec, 'stt');
-}
-
-/** `--tts cosyvoice|mimo|silent|<path>` */
-async function buildTts(spec: string): Promise<TtsProvider> {
-  if (spec === 'silent') return silentTts(24_000);
-  if (spec === 'cosyvoice') {
-    if (!process.env['DASHSCOPE_API_KEY']) {
-      throw new Error('DASHSCOPE_API_KEY 未设置（CosyVoice 用的是 DashScope API key，不是阿里云 AK/SK）');
-    }
-    // 情绪表达有两档，见 `cosyvoice.ts` 顶部；模式由 COSYVOICE_EMOTION_MODE 选：
-    //   prosody（默认）：rate/pitch 缩放，系统音色可用，最省延迟
-    //   instruction：自由指令，只有复刻/设计音色吃，首包多 ~90 ms
-    // 系统音色配 instruction 会被服务端拒（428）。
-    return cosyVoiceTts({
-      apiKey: process.env['DASHSCOPE_API_KEY'],
-      url: process.env['COSYVOICE_URL'],
-      model: process.env['COSYVOICE_MODEL'],
-      voice: process.env['COSYVOICE_VOICE'],
-      useInstruction: process.env['COSYVOICE_EMOTION_MODE'] === 'instruction',
-    });
-  }
-  if (spec === 'mimo') {
-    if (!process.env['MIMO_API_KEY']) {
-      throw new Error('MIMO_API_KEY 未设置（用 --tts silent 可跳过 TTS）');
-    }
-    // 风格提示词：MiMo 的 TTS 是「聊天式」的 —— 风格放进 user 消息，要念的文本放进
-    // assistant 消息。基础音色 + 五种情绪的变体都由 `emotion.ts` 提供，可用环境变量覆盖。
-    return mimoTts({
-      voice: process.env['MIMO_TTS_VOICE'] ?? DEFAULT_TTS_VOICE,
-      baseStyle: process.env['MIMO_TTS_STYLE'] ?? BASE_STYLE,
-      // 每个情绪一个可选覆盖；key 从单一事实来源来，加情绪不用改这里
-      overrides: Object.fromEntries(
-        Object.keys(EMOTIONS).map((key) => [
-          key,
-          process.env[`MIMO_TTS_STYLE_${key.toUpperCase()}`],
-        ]),
-      ),
-    });
-  }
-  return loadProvider<TtsProvider>(spec, 'tts');
-}
-
-interface AgentBundle {
-  readonly agent: AgentProvider | null;
-  /** dsh 专用：进程句柄要留着，退出时 stop() */
-  readonly dsh: DshSession | null;
-}
-
-/** `--agent dsh|echo|none|<path>` */
-async function buildAgent(
-  spec: string,
-  dsh: { workDir: string; useSdk: boolean; provider: string; model: string; log: (line: string) => void },
-  announceStore: AnnounceStore | null,
-): Promise<AgentBundle> {
-  if (spec === 'none' || spec === '') {
-    return { agent: null, dsh: null };
-  }
-  if (spec === 'echo') {
-    return { agent: echoAgent(), dsh: null };
-  }
-  if (spec === 'dsh') {
-    const session = new DshSession({
-      workDir: dsh.workDir,
-      program: process.env['DSH_BIN'],
-      mode: dsh.useSdk ? 'sdk' : 'headless',
-      patch: process.env['DSH_PATCH'],
-      provider: dsh.provider,
-      model: dsh.model,
-      log: (l: string) => { console.log(`  [session] ${l}`); },
-    });
-
-    /**
-     * 流式文本：只在**真的超过门槛**时才出声。
-     *
-     * 现在只打日志 —— 把"插件 → 侧通道 → 门槛"这条链先验证到位，再接 TTS。
-     * 这条日志本身就是仪表：`释放前 N 字` 出现说明这一轮是长回答，没出现说明
-     * 整段不到 20 token（走原来的整段路径）。
-     */
-    session.onLive = (event) => {
-      if (event.type === 'start') {
-        const chars = [...event.text].length;
-        console.log(
-          `  流式    释放前 ${chars} 字：${JSON.stringify(event.text.slice(0, 40))}`,
-        );
-      } else if (event.type === 'end') {
-        console.log(
-          `  流式    ${event.streaming ? '流式' : '整段'}交付 ${event.tokens} token`,
-        );
-      }
-    };
-
-    return { agent: new VoiceAgent(session, dsh.log, announceStore), dsh: session };
-  }
-  return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
-}
-
-/** 证书从文件读，路径只走环境变量 —— 部署细节不进源码。 */
-function loadTls(): { key: Buffer; cert: Buffer } | undefined {
-  const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
-  const certPath = process.env['MIAI_TLS_CERT'] ?? '';
-  if (!keyPath || !certPath) {
-    // 只给一半是配错了，不是「没配」—— 静默降级成明文会让人以为已经加密了
-    if (keyPath || certPath) {
-      const given = keyPath ? 'MIAI_TLS_KEY' : 'MIAI_TLS_CERT';
-      const absent = keyPath ? 'MIAI_TLS_CERT' : 'MIAI_TLS_KEY';
-      fail(`只给了 ${given}，缺 ${absent}：TLS 要么两个都给，要么都不给`);
-    }
-    return undefined;
-  }
-  try {
-    const cert = readFileSync(certPath);
-    // 到期检查：过期的证书服务端照常启动、照常监听，只是每一次握手都失败 ——
-    // 客户端只看到「连不上」，日志里一个字都没有。所以在这里喊出来。
-    for (const line of expiryWarning(cert) ?? []) {
-      console.warn(`  ${line}`);
-    }
-    return { key: readFileSync(keyPath), cert };
-  } catch (error) {
-    fail(`TLS 证书读不到：${(error as Error).message}`);
-  }
-}
-
-/** 启动期配置错误：说清楚是哪一项、该怎么改，然后退出。 */
 function fail(message: string): never {
   console.error(`\n启动失败：${message}\n`);
   process.exit(2);
 }
 
-/**
- * 设备鉴权：`MIAI_TOKENS` 指向一个文件，每行 `token` 或 `token:deviceId`。
- *
- * - 不配就**不鉴权**（只可能用于本机地址 —— 由 `bind-policy.ts` 把关）
- * - 配了就必须首帧 `Hello`，且 token 要过强度校验（见 `tokens.ts`）
- * - 文件变了自动重读，**吊销不必重启进程**
- * - 写了 `token:deviceId` 就是真绑定：`Hello.deviceId` 对不上同样拒绝
- */
-function loadAuthenticator(log: (line: string) => void): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
-  const path = process.env['MIAI_TOKENS'] ?? '';
-  if (!path.trim()) return undefined;
-
-  const resolved = tokenFilePath(path);
-  // 启动时就报出弱/错 token，别等到设备连上来才发现「配了等于没配」
-  const { entries, bad } = readTokenFile(resolved);
-  for (const item of bad) {
-    fail(
-      `${resolved} 第 ${item.line} 行不合格：${describeTokenProblem(item.raw, item.problem)}\n`
-      + '（要重新发一个：node src/pair.ts new --device <id>）',
-    );
+/** 把装配层的异常转成「打一行说明 + 退出码 2」，与抽出去之前的行为一致。 */
+function assemble<T>(run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    if (error instanceof AssemblyError) {
+      fail(error.message);
+    }
+    throw error;
   }
-  if (entries.length === 0) {
-    fail(`${resolved} 里没有任何可用的 token`);
-  }
+}
 
-  const gate = new TokenGate(resolved, log);
-  console.log(`鉴权      ${entries.length} 个设备 token（来自 ${resolved}，改动会自动重读）`);
-  return (hello) => typeof hello.token === 'string' && gate.match(hello.token, hello.deviceId) !== null;
+async function assembleAsync<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof AssemblyError) {
+      fail(error.message);
+    }
+    throw error;
+  }
 }
 
 // ------------------------------------------------------------------ 入口
@@ -661,15 +488,15 @@ async function main(): Promise<void> {
       : '(外部/内置实现，无需凭据)';
     console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
-    const stt = await buildStt(resolvedStt, {
+    const stt = await assembleAsync(() => buildStt(resolvedStt, {
       akId,
       akSecret,
       appkey,
       region,
       maxSentenceSilenceMs: sentenceSilenceMs,
       ...(vocabularyId ? { vocabularyId } : {}),
-    });
-    const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
+    }));
+    const tts = await assembleAsync(() => buildTts(ttsSpec === '' ? 'mimo' : ttsSpec));
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
 
     const smartTurnPython = process.env['SMART_TURN_PYTHON'] ?? '';
@@ -822,8 +649,8 @@ async function main(): Promise<void> {
         : envNumber('MIAI_HQ_ARM_TIMEOUT_MS', 15_000) + envNumber('MIAI_HQ_SHUTTER_TIMEOUT_MS', 25_000),
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
       announceStore,
-      tls: loadTls(),
-      authenticate: loadAuthenticator((line) => { console.log(line); }),
+      tls: assemble(() => loadTls()),
+      authenticate: assemble(() => loadAuthenticator((line) => { console.log(line); })),
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
       serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
       // 主动开口默认关：开着它会自己说话，得人明确要

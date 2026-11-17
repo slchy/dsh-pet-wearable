@@ -299,6 +299,14 @@ export interface VoiceSessionOptions {
    * 很烦；`--serve` 就是给它准备的。
    */
   readonly serve?: boolean;
+
+  /**
+   * 监听成功后回调：实际端口 + 收摊函数。
+   *
+   * 插件形态必须用它 —— `serve: true` 的服务器一旦起来就没有别的出口，
+   * 卸载时不停掉会一直占着端口。
+   */
+  readonly onListening?: (info: { readonly port: number; readonly stop: () => void }) => void;
 }
 
 /**
@@ -314,6 +322,7 @@ export async function runVoiceServer(options: VoiceSessionOptions): Promise<numb
     authenticate: options.authenticate,
     idleTimeoutMs: options.idleTimeoutMs,
     singleConnection: options.serve !== true,
+    ...(options.onListening === undefined ? {} : { onListening: options.onListening }),
     log: (line) => { console.log(line); },
     onConnection: (conn) => { handshake(conn, options); },
   });

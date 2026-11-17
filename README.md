@@ -61,7 +61,7 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 | 包 | 内容 | 与包①的关系 |
 |---|---|---|
 | `dsh-pet-wearable`（仓根） | 协议层 + 语音栈 | — |
-| [packages/dsh-voice-web](./packages/dsh-voice-web) | web 兼容：WebSocket 桥 + 浏览器采集/播放 | 复用包①的语音栈 |
+| [packages/dsh-voice-web](./packages/dsh-voice-web) | web 兼容：WS 桥 + 浏览器采集/播放 | 自带一份语音栈副本（`scripts/sync-voice.mjs` 生成，不进 git） |
 
 ## 系统架构
 

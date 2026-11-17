@@ -39,8 +39,10 @@
     "src"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.browser.json",
+    "sync:voice": "node ../../scripts/sync-voice.mjs",
+    "typecheck": "npm run sync:voice && tsc --noEmit && tsc --noEmit -p tsconfig.browser.json",
     "demo:build": "esbuild demo/main.ts --bundle --format=esm --outfile=demo/main.js",
+    "prepack": "npm run sync:voice",
     "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
