@@ -196,16 +196,22 @@ class Connection {
   private readonly ws: WebSocket;
   private readonly ready: Promise<void>;
   private closed = false;
-  /** 当前 task 的音频接收回调；空闲时为 null */
+  /**
+   * 当前 task 的音频接收回调；空闲时为 null。
+   *
+   * 二进制音频帧**不带 task_id**（服务端只在 JSON 回执里带），而连接同时又只跑
+   * 一个 task，所以这一路仍然是单槽。
+   */
   private sink: ((chunk: Buffer) => void) | null = null;
-  private settle: ((error: Error | null) => void) | null = null;
+  /** `task-started` 的等待者，按 task_id 分槽 */
+  private readonly startedWaiters = new Map<string, () => void>();
+  /** 等 `task-finished` / `task-failed` 的等待者，按 task_id 分槽 */
+  private readonly settleWaiters = new Map<string, (error: Error | null) => void>();
   private failure: Error | null = null;
   /** 探针时刻（`COSYVOICE_TRACE=1` 时才有意义） */
   private traceSentAt = 0;
   private traceStartedAt = 0;
   private traceFirstAt: number | null = null;
-  /** `task-started` 到达时叫醒 `runFeed` */
-  private startedSettle: (() => void) | null = null;
 
   constructor(url: string, apiKey: string) {
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
@@ -216,11 +222,11 @@ class Connection {
     // 连接级 error 在 open 之后还要继续接住，否则会变成未处理异常
     this.ws.on('error', (error: Error) => {
       this.failure = new CosyVoiceError(`连接异常: ${error.message}`);
-      this.settle?.(this.failure);
+      this.failAll(this.failure);
     });
     this.ws.on('close', () => {
       this.closed = true;
-      this.settle?.(this.failure ?? new CosyVoiceError('连接已关闭'));
+      this.failAll(this.failure ?? new CosyVoiceError('连接已关闭'));
     });
     this.ws.on('message', (data, isBinary) => {
       if (isBinary) {
@@ -231,28 +237,71 @@ class Connection {
         return;
       }
       const message = JSON.parse(String(data)) as {
-        header?: { event?: string; error_message?: string; error_code?: string };
+        header?: { event?: string; task_id?: string; error_message?: string; error_code?: string };
       };
       const event = message.header?.event;
+      // 回执都带 task_id（实测 task-started / result-generated / task-finished 全带）。
+      // 万一带不上就退回「settle 掉所有等待者」—— 连接同时又只有一个 task，不会错配。
+      const taskId = message.header?.task_id;
       if (event === 'task-started') {
         this.traceStartedAt = performance.now();
-        this.startedSettle?.();
-        this.startedSettle = null;
+        this.wakeStarted(taskId);
       }
       if (event === 'task-finished') {
         this.sink = null;
-        this.settle?.(null);
-        this.settle = null;
+        this.settleTask(taskId, null);
         return;
       }
       if (event === 'task-failed') {
         const detail = message.header?.error_message ?? message.header?.error_code ?? '未知错误';
         this.failure = new CosyVoiceError(`合成失败: ${detail}`);
         this.sink = null;
-        this.settle?.(this.failure);
-        this.settle = null;
+        this.settleTask(taskId, this.failure);
       }
     });
+  }
+
+  /** 叫醒某个 task 的 `task-started` 等待者；没有 task_id 时叫醒所有（只可能有一个） */
+  private wakeStarted(taskId: string | undefined): void {
+    if (taskId !== undefined) {
+      const waiter = this.startedWaiters.get(taskId);
+      if (waiter !== undefined) {
+        this.startedWaiters.delete(taskId);
+        waiter();
+      }
+      return;
+    }
+    for (const [id, waiter] of this.startedWaiters) {
+      this.startedWaiters.delete(id);
+      waiter();
+    }
+  }
+
+  /** 结束某个 task 的 `settle` 等待者；没有 task_id 时结束所有 */
+  private settleTask(taskId: string | undefined, error: Error | null): void {
+    if (taskId !== undefined) {
+      const waiter = this.settleWaiters.get(taskId);
+      if (waiter !== undefined) {
+        this.settleWaiters.delete(taskId);
+        waiter(error);
+      }
+      return;
+    }
+    for (const [id, waiter] of this.settleWaiters) {
+      this.settleWaiters.delete(id);
+      waiter(error);
+    }
+  }
+
+  /** 连接断了：所有等待者一起失败，别留下永远等不到的 promise */
+  private failAll(error: Error): void {
+    for (const [id] of this.startedWaiters) {
+      this.startedWaiters.delete(id);
+    }
+    for (const [id, waiter] of this.settleWaiters) {
+      this.settleWaiters.delete(id);
+      waiter(error);
+    }
   }
 
   get isUsable(): boolean {
@@ -260,7 +309,7 @@ class Connection {
   }
 
   get isIdle(): boolean {
-    return this.isUsable && this.sink === null && this.settle === null;
+    return this.isUsable && this.sink === null && this.settleWaiters.size === 0;
   }
 
   async open(): Promise<void> {
@@ -308,7 +357,7 @@ class Connection {
     };
     const prosody = EMOTION_PROSODY[args.emotion];
     this.sink = probed;
-    const done = new Promise<Error | null>((resolve) => { this.settle = resolve; });
+    const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
 
     this.ws.send(JSON.stringify({
       header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
@@ -355,11 +404,17 @@ class Connection {
   }
 
   /**
-   * 边生成边合成的 task：`feed` 每来一段文本就 `send` 一次（对应一次
-   * `continue-task`），`feed` 返回后自动 `finish-task`。
+   * 边生成边合成的 task：`batches` 每来一段文本就 `continue-task` 一次，
+   * 取完之后自动 `finish-task`。
    *
    * 为什么值得这么麻烦：实测 task 建立只要 62 ms，**首包合成要 281 ms**。
    * 那 281 ms 只能靠把文本提前送上去、和模型生成重叠，而不是靠连接复用（早就复用了）。
+   *
+   * **必须先拿到第一段文本再 run-task**：服务端对一个「开了却没有任何正文」的 task
+   * 会回 `task-failed: Please ensure input text is valid.`。以前这里是先 run-task
+   * 再喂文本，于是只要文本来得稍慢（或这条流一个字都没放出来），就会白跑一个 task、
+   * 报错、再退回整段合成 —— 生产 7 天约 2 次，本地必现，单轮多花 300–600 ms。
+   * 调用方（`synthesizeStream`）也把「取不到文本」当正常收尾，不再抛。
    */
   async runFeed(
     emotion: Emotion,
@@ -367,11 +422,18 @@ class Connection {
     model: string,
     voice: string,
     useInstruction: boolean,
-    feed: (send: (text: string) => void) => Promise<void>,
+    batches: AsyncIterable<string>,
     onChunk: (chunk: Buffer) => void,
   ): Promise<void> {
     if (!this.isIdle) {
       throw new CosyVoiceError('连接正忙');
+    }
+    const iterator = batches[Symbol.asyncIterator]();
+    // 先取第一段文本：取不到就**根本不开 task**（见方法注释里的空 task 问题）。
+    // 但要抛出来让调用方走兜底 —— 否则这一轮正文就是哑的。
+    const first = await iterator.next();
+    if (first.done === true) {
+      throw new CosyVoiceError('流式无正文（侧通道一个字都没放出来）');
     }
     const taskId = hex32();
     const prosody = EMOTION_PROSODY[emotion];
@@ -398,7 +460,7 @@ class Connection {
       }
       onChunk(chunk);
     };
-    const done = new Promise<Error | null>((resolve) => { this.settle = resolve; });
+    const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
 
     this.ws.send(JSON.stringify({
       header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
@@ -435,10 +497,18 @@ class Connection {
       // `Please ensure input text is valid.`（实测踩过，看起来像文本有问题，其实是时序）
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, 3000);
-        this.startedSettle = () => { clearTimeout(timer); resolve(); };
+        // 按 task_id 注册：回执与正文在同一条连接上先后跑，共用一个槽位会让
+        // 前一个 task 的 task-started 落到后一个头上，于是后者在自己的 task
+        // 尚未 started 时就送文本，服务端报上面那个错（生产 7 天 2 次）。
+        this.startedWaiters.set(taskId, () => { clearTimeout(timer); resolve(); });
       });
-      this.startedSettle = null;
-      await feed(send);
+      this.startedWaiters.delete(taskId);
+      send(first.value);
+      for (;;) {
+        const next = await iterator.next();
+        if (next.done === true) break;
+        send(next.value);
+      }
     } catch (error) {
       feedError = error instanceof Error ? error : new CosyVoiceError(String(error));
     }
@@ -705,20 +775,26 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
      */
     synthesizeStream(chunksIn: AsyncIterable<string>, emotion?: string) {
       const tracing = process.env['COSYVOICE_TRACE'] === '1';
-      const feed = async (send: (text: string) => void): Promise<void> => {
+      /**
+       * 把模型吐的文本增量攒成「一批一批要送进 TTS 的正文」。
+       *
+       * 做成生成器而不是「回调里 send」，是为了让 `runFeed` 能**先拿到第一批
+       * 再决定要不要开 task** —— 一个字都没有时开 task 会被服务端判为非法输入。
+       */
+      const batches = async function* (): AsyncGenerator<string> {
         let batch = '';
         let first = true;
-        const flush = (raw: string, tail: boolean): void => {
+        const clean = (raw: string, tail: boolean): string | null => {
           // 情绪标签 / markdown 不能进 TTS（会被念出来），逐批清洗；首批还要去掉开头的 [xxx]
-          const clean = cleanForSpeech(first ? raw.replace(/^\s*\[[^\]]{1,8}\]/, '') : raw);
-          if (clean === '') return;
+          const text = cleanForSpeech(first ? raw.replace(/^\s*\[[^\]]{1,8}\]/, '') : raw);
+          if (text === '') return null;
           // 标志只在**真的送出一批**之后才落下：整批都是标签时不能把它吃掉，
           // 否则下一批就会被当成「后续批次」，开头的标签会漏进 TTS
           first = false;
           // 尾批也要打：短答（不足一批）只有这一次送文本，不打的话
           // `grep -c 送批` 是 0，和「一个字都没送」分不开
-          if (tracing) console.log(`  TTS 送批 ${JSON.stringify(clean)}${tail ? '（尾）' : ''}`);
-          send(clean);
+          if (tracing) console.log(`  TTS 送批 ${JSON.stringify(text)}${tail ? '（尾）' : ''}`);
+          return text;
         };
         for await (const text of chunksIn) {
           batch += text;
@@ -726,9 +802,15 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
           if (first && hasUnclosedTag(batch)) continue;
           const cut = splitStreamBatch(batch);
           batch = cut.keep;
-          if (cut.send !== '') flush(cut.send, false);
+          if (cut.send !== '') {
+            const ready = clean(cut.send, false);
+            if (ready !== null) yield ready;
+          }
         }
-        if (batch !== '') flush(batch, true);
+        if (batch !== '') {
+          const ready = clean(batch, true);
+          if (ready !== null) yield ready;
+        }
       };
       return pump((connNow, onChunk) => connNow.runFeed(
         asEmotion(emotion),
@@ -736,7 +818,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         model,
         voice,
         useInstruction,
-        feed,
+        batches(),
         onChunk,
       ));
     },

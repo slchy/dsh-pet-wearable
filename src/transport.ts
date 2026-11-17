@@ -339,16 +339,6 @@ export interface TransportOptions {
    * 多设备时改 false 并把连接表交给业务层 —— 这正是把这层独立出来的原因之一。
    */
   readonly singleConnection?: boolean;
-  /**
-   * 监听成功后回调，把**实际绑定的端口**与一个收摊函数交出去。
-   *
-   * 端口交给它是为了 `port: 0`（让系统选一个空闲口）：调用方要连上去就必须知道
-   * 真实端口，而 `options.port` 这时还是 0。
-   *
-   * 收摊函数是给**长驻形态**准备的 —— 插件卸载、测试收尾都得能停下来，
-   * 否则 `serve: true` 的服务器一旦起来就再没有出口。
-   */
-  readonly onListening?: (info: { readonly port: number; readonly stop: () => void }) => void;
   readonly log: (line: string) => void;
   /** 连接建立：在这里 `conn.bind(...)` 登记业务回调。 */
   onConnection(conn: Connection): void;
@@ -414,13 +404,10 @@ export async function runTransport(options: TransportOptions): Promise<number> {
     server.listen(options.port, host, () => {
       const scheme = options.tls ? 'tls' : 'tcp';
       const auth = options.authenticate ? '需要 Hello 鉴权' : '不鉴权';
-      const bound = server.address();
-      const port = typeof bound === 'object' && bound !== null ? bound.port : options.port;
-      options.log(`监听 ${scheme}://${host}:${port}（${auth}）`);
+      options.log(`监听 ${scheme}://${host}:${options.port}（${auth}）`);
       if (host === '127.0.0.1') {
-        options.log(`手机侧先执行： adb reverse tcp:${port} tcp:${port}`);
+        options.log(`手机侧先执行： adb reverse tcp:${options.port} tcp:${options.port}`);
       }
-      options.onListening?.({ port, stop: () => { finish(0); } });
     });
   });
 }

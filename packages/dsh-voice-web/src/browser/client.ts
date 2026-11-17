@@ -79,6 +79,11 @@ function capabilities(): Record<string, unknown> {
   };
 }
 
+/** 下行原语是不是指定的那个 `op`。非对象、非字符串一律不算。 */
+function isOp(json: unknown, op: string): boolean {
+  return typeof json === 'object' && json !== null && (json as { op?: unknown }).op === op;
+}
+
 export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
   let socket: WebSocket | null = null;
   let context: AudioContext | null = null;
@@ -116,11 +121,19 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
       return;
     }
     if (type === DownstreamFrameType.Call) {
+      let json: unknown = null;
       try {
-        emit({ type: 'call', json: JSON.parse(decodeText(payload)) });
+        json = JSON.parse(decodeText(payload));
       } catch {
-        emit({ type: 'call', json: null });
+        // 不是 JSON 就当空原语，别把整条连接搞崩
       }
+      // v2 的打断信号是 `Call {"op":"audio.stop"}`（v1 时代才是 `Control: stop`，
+      // 见 wire-v1.ts 的映射）。这里必须自己认：浏览器是 v2 设备，服务端不会再
+      // 为它发 `Control: stop`，漏掉这一步就会在用户插话后继续把已排队的回答播完。
+      if (isOp(json, 'audio.stop')) {
+        playback?.stop();
+      }
+      emit({ type: 'call', json });
     }
   };
 

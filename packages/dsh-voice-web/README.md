@@ -48,6 +48,34 @@ web       http://127.0.0.1:8767/   ← 浏览器打开这个地址
 
 页面里的 WS 地址由 `location` 推出（同端口、`https` → `wss`），换机器换端口都不用改代码。
 
+### 启动前必须 `export` 的两个键
+
+`DSH_BIN` 与 `DSH_PATCH` **不能写进 `.env`** —— dsh 会拒绝启动：
+
+```
+dsh: .env sets "DSH_PATCH", which only the launching environment may set
+```
+
+在起进程的那个 shell 里 export（每次新开终端都要重来一次，这正是它不该进 `.env` 的原因）：
+
+```powershell
+$env:DSH_BIN  = 'C:\Users\<你>\AppData\Roaming\npm\dsh.cmd'   # 指向 .cmd 垫片，不是 .ps1
+$env:DSH_PATCH = 'C:/dsh-pet-wearable/mcp/camera.yml'
+dsh --profile voice
+```
+
+少了 `DSH_BIN` 的症状是 `[sdk] 启动失败：spawn dsh ENOENT`（快车道还在，但每句都退化成等完整 dsh）；少了 `DSH_PATCH` 则起不来。
+
+## 打断：v2 发的是 `Call`，不是 `Control`
+
+服务端对 v1 设备发 `Control: stop`，对 **v2 设备（浏览器就是 v2）发的是 `Call {"op":"audio.stop"}`** —— 见 `src/voice/devices/wire-v1.ts` 里那个 `audio.stop → 'stop'` 的翻译，v1 才有这一层。语义写在 `src/voice/devices/primitives.ts`：*「立刻停止播放并清空播放队列（插话）」*。
+
+所以浏览器客户端必须自己认 `audio.stop` 去 `playback.stop()`。只处理 `Control: stop` 的后果很隐蔽：***一切都正常，只是用户插话之后，已经排进队列的回答还会继续播完***。
+
+`Control: end_session` 仍然走 `Control`（收尾），两条路都处理。
+
+**本地「立即静音」只清本地队列**：服务端不知道你按了按钮（上游没有取消原语），同一轮的后续音频还会继续下发，于是过一百毫秒左右又响起来。真正让服务端停下来的是**你开口说话** —— 打断是服务端听出来的，不是按钮告诉它的。
+
 ## 浏览器这边的硬约束
 
 | 约束 | 说明 |
