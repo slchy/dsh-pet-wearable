@@ -295,7 +295,14 @@ export class DialogRuntime {
     this.lastDialogState = next;
     // 落进档案：「状态轮转对不对」只能从这条时间线看出来。`turn.start` / `tts.first`
     // 只说明快慢，说不出「这块音频是不是在 speaking 里发出去的」。
-    this.options.onEvent?.(EVENTS.dialogState, { from: previous, to: next });
+    //
+    // `why` 不能省：`thinking → speaking` 既可能是首块音频，也可能是回执出声
+    // （`DialogFsm.receiptStarted`），两者对延迟和打断的含义相反。
+    this.options.onEvent?.(EVENTS.dialogState, {
+      from: previous,
+      to: next,
+      why: this.core.fsm.lastTransitionReason,
+    });
     this.options.env.onDialogState?.(next, previous);
   }
 

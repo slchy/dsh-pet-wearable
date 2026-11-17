@@ -23,12 +23,30 @@
 `src mcp tools tests smart_turn scripts package.json tsconfig.json README.md`
 九项，`bench/` 不在里面。往 `scripts/` 里塞一次性探针，等于把它推上生产服务器。
 
+**④ 每个事实只有一个源，观测工具自动去那儿取，绝不复制。** 复制一份 = 多一份要维护，
+而且两份的时钟对不上（dsh 的日志是 epoch ms，我们的档案是相对会话开始的毫秒）。
+
+| 事实 | 唯一源 | 谁去取 |
+|---|---|---|
+| ①②③④ 分段、停嘴时刻、缺仪表 | 本仓会话档案 `events.jsonl` | `latency-report.ts` |
+| 状态轮转、插话有没有停音频 | 同上 | `fsm-trace-check.ts` |
+| 一轮内部（step / 工具调用 / reasoning） | **dsh 自己的 session log** | `dsh-timeline.ts` |
+| 后台作业 / 子代理的状态转移 | **同上**（`job/registered`、`job/settled`、`subagent/catalog`） | 同上 |
+
+最后一行是重点：**dsh 的日志已经够全了，不要往档案里再抄一遍 `job.*`**。
+`dsh-timeline.ts` 靠 `turn.end.dsh_session` 自动定位那份日志，并把两份按同一时间轴摆好
+（找不到 id 时退回「时间重叠最多 + 轮次数对得上」的那个）。
+
+一把梭：`node scripts/observe.ts <会话目录>` —— 依次跑分段、审计、dsh 对齐，
+头部先列这场会话有哪些源可用。缺源就说缺源、跳过那一段，**不拿别的源里的数顶上**。
+
 ---
 
 ## 1. 路由表：我要回答什么 → 跑哪个
 
 | 我想知道 | 跑这个 | 读什么 |
 |---|---|---|
+| **一场会话的全部事实**（分段 + 审计 + dsh 内部） | `scripts/observe.ts <档案目录>` | 三节输出；头部先列有哪些源可用 |
 | 一轮卡在哪、用户等了几秒 | `scripts/latency-report.ts <档案目录>` | ①②③ 分段 + 首字 p50/p90 vs 预算 |
 | 这条链有没有一处不符合设计 | `scripts/fsm-trace-check.ts <档案>` | 违规列表（退出码 0/1） |
 | `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
@@ -102,9 +120,10 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/latency-report.ts` | 档案 → 逐轮 ①②③④（**默认入口**） |
+| `scripts/observe.ts` | **单入口**：分段 + 审计 + dsh 对齐，头部列出这场会话有哪些事实源可用 |
+| `scripts/latency-report.ts` | 档案 → 逐轮 ①②③④（**分段口径的唯一实现**） |
 | `scripts/fsm-trace-check.ts` | 档案 → 状态轮转违规 |
-| `scripts/dsh-timeline.ts` | Miai 档案 × dsh session log 同轴对齐 |
+| `scripts/dsh-timeline.ts` | Miai 档案 × dsh session log 同轴对齐（**一轮内部/工具/作业的唯一源**） |
 | `bench/tau2/segment_split.py` | 客户端打点 + 档案，五段（含 ⑤TTS首块→客户端首帧） |
 | `bench/tau2/lat_summary.py` | 合并 `/tmp/tau2-lat-*.json` 出 p50/p90/p95，折真机体感 |
 | `bench/tau2/reply_breakdown.py` | ③ 拆成模型侧 `dsh_ms` 与 TTS 握手 `tts_first_ms` |

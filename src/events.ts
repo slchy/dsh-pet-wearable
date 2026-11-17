@@ -50,8 +50,22 @@ export const EVENTS = {
    * 轮次的四段时序（停嘴 → ASR → 开轮 → 首块）只能说明「快不快」，
    * 「状态轮转对不对」得看这条：`tts.first` 有没有落在 `speaking` 里、
    * 一轮结束后有没有回到 `listening`、`closed` 之后有没有人把状态拉回去。
+   *
+   * **`why` 是必须的**：同一个 `thinking → speaking` 既可能是「首块音频下发」，
+   * 也可能是「委派轮的回执出声」（见 `DialogFsm.receiptStarted`）。没有 `why`
+   * 就分不出来，而这两件事对着延迟/打断的含义完全相反 —— 前者表示答案开始了，
+   * 后者只是填补安静，真答案还在路上。
    */
   dialogState: 'dialog.state',
+
+  /**
+   * 判停器的一次决定（`UtteranceAssembler` 写）。
+   *
+   * `② 定稿→开轮` 这个数字在档案里一直是个黑盒：它可能只有 1 ms（判停当场收下），
+   * 也可能 2400 ms（判停连说六次「没说完」，每拍等 400 ms）。不看 `p` 就分不清
+   * 是「在等设备静音窗」还是「排队」，而这两种原因的修法完全相反。
+   */
+  judge: 'judge.decide',
 
   // ---- 设备与下行 ----
   /** v2 设备自报能力 */
@@ -71,6 +85,7 @@ export const EVENTS = {
 
   // ---- 后台汇报 ----
   announce: 'announce',
+  /** 补播：连上时把离线期间攒下的汇报一次性放出来 */
   announceReplay: 'announce.replay',
 
   // ---- 宠物 ----

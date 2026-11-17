@@ -537,3 +537,34 @@ test('ASR 的中间结果比预跑晚到，也不能把预跑作废', async () =
   await delay(80);
   assert.equal(calls, 1, '音频没再变，预跑仍然有效');
 });
+
+test('判停每次决定都报一条：p 与「还要等多久」要落进档案', async () => {
+  // ② 定稿→开轮 在档案里一直是个黑盒：1 ms 和 2400 ms 都可能是这个数。
+  // 不看 p 就分不清「判停不敢收」（连说六次没说完，每拍 400 ms）和「排队」——
+  // 真机实测同一句完整问句 p 从 0.083 一路掉到 0.008，白等 2400 ms。
+  const facts: Array<{ p: number; waitMs: number; action: string; why?: string }> = [];
+  let round = 0;
+  const { assembler } = makeAssembler({
+    maxExtensions: 1,
+    predict: async () => {
+      round += 1;
+      // 第一次说「没说完」，第二次说「说完了」—— 逼出 extend 然后 accept
+      return round === 1 ? 0.02 : 0.98;
+    },
+    onJudge: (fact) => { facts.push(fact); },
+  });
+  try {
+    assembler.notePartial('你好');
+    assembler.addSentence('你好。');
+    await delay(200);
+  } finally {
+    assembler.dispose();
+  }
+  assert.ok(facts.length >= 2, `该至少报两条（extend + accept），实际 ${JSON.stringify(facts)}`);
+  assert.equal(facts[0]!.action, 'extend');
+  assert.equal(facts[0]!.why, 'unsure');
+  assert.ok(facts[0]!.p < 0.5, `低分要原样报出来，实际 ${facts[0]!.p}`);
+  assert.ok(facts[0]!.waitMs > 0, 'extend 必须说清还要等多久');
+  assert.equal(facts.at(-1)!.action, 'accept');
+  assert.equal(facts.at(-1)!.waitMs, 0);
+});

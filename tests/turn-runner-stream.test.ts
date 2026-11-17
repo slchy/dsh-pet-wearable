@@ -38,6 +38,8 @@ interface Rig {
   /** 整段合成那条路收到的文本 */
   readonly whole: string[];
   readonly events: string[];
+  /** 事件的载荷，`turn.end.path` / `delegate` 只能从这里看 */
+  readonly payloads: Array<{ name: string; data: Record<string, unknown> }>;
   readonly logs: string[];
   run(): Promise<TurnResult | null>;
 }
@@ -53,6 +55,8 @@ function rig(options: {
   const streamed: string[] = [];
   const whole: string[] = [];
   const events: string[] = [];
+  /** 事件的载荷（`turn.end` 的 `path` / `delegate` 只能从这里看） */
+  const payloads: Array<{ name: string; data: Record<string, unknown> }> = [];
   const logs: string[] = [];
   let sink: ((text: string) => void) | null = null;
 
@@ -89,12 +93,15 @@ function rig(options: {
     downlink: { sendAudio: () => {}, sendControl: () => {} },
     fsm: new DialogFsm(() => {}),
     playbackTailMs: 0,
-    onEvent: (name) => { events.push(name); },
+    onEvent: (name, data) => {
+      events.push(name);
+      payloads.push({ name, data: data ?? {} });
+    },
     onTurnFinished: () => {},
     onLiveAvailable: (next) => { sink = next; },
     log: (line) => { logs.push(line); },
   });
-  return { streamed, whole, events, logs, run: () => runner.run('你好') };
+  return { streamed, whole, events, payloads, logs, run: () => runner.run('你好') };
 }
 
 test('流式：增量一路送到 TTS，出声，不走整段合成', async () => {
@@ -164,4 +171,31 @@ test('模型挂了、流式也跟着失败：这一轮失败，但不能留下�
   } finally {
     process.off('unhandledRejection', onUnhandled);
   }
+});
+
+test('turn.end 记下这一轮是谁答的：path=fast', async () => {
+  // 编排层分不出「预跑被认领」和「qwen 现场回」—— 两者的 dsh_ms 都可能只有几十毫秒
+  // （真机：`还在吗？` 343 ms 是快车道，`我怎么说？` 662 ms 是 dsh）。只能由 agent 报。
+  const r = rig({ deltas: ['[平静]在呢。'], reply: { text: '[平静]在呢。', speech: '在呢。', path: 'fast' } });
+  await r.run();
+  const end = r.payloads.filter((p) => p.name === 'turn.end').at(-1);
+  assert.ok(end, '该有一条 turn.end');
+  assert.equal(end.data['path'], 'fast', `实际：${JSON.stringify(end.data)}`);
+  assert.equal(end.data['delegate'], undefined, '快车道胜出的轮次不该有 delegate');
+});
+
+test('turn.end 记下交给 dsh 的原因：本地闸(task) 与模型让位(delegate) 分得开', async () => {
+  const r = rig({
+    deltas: [],
+    reply: { text: '[平静]好的。', speech: '好的。', path: 'dsh', delegate: 'task' },
+  });
+  await r.run();
+  const end = r.payloads.filter((p) => p.name === 'turn.end').at(-1);
+  assert.ok(end, '该有一条 turn.end');
+  assert.equal(end.data['path'], 'dsh');
+  assert.equal(
+    end.data['delegate'],
+    'task',
+    '本地判据挡住的轮次记 task；快模型自己让位记 delegate —— 两者在日志里长得一样，只能靠这个分',
+  );
 });

@@ -144,9 +144,28 @@ export interface UtteranceAssemblerOptions {
   readonly onPartial?: (text: string) => void;
   /** 一轮定稿 */
   readonly onUtterance: (text: string) => void;
+  /**
+   * 判停器每做一次决定就报一条（落进档案的 `judge.decide`）。
+   *
+   * 为什么必须落档：`② 定稿→开轮` 这个数字在档案里一直是黑盒。它可能 1 ms
+   * （当场收下），也可能 2400 ms（连说六次「没说完」，每拍 400 ms）。
+   * 不看 `p` 就分不清是「判停不敢收」还是「排队」—— 修法完全相反。
+   */
+  readonly onJudge?: (fact: JudgeFact) => void;
   readonly log: (line: string) => void;
   /** 可注入时钟，测试用 */
   readonly now?: () => number;
+}
+
+/** 判停器的一次决定 */
+export interface JudgeFact {
+  /** 「说完了」的概率；负数 = 判停器不可用（故障） */
+  readonly p: number;
+  /** 这次决定还要再等多久（ms）；收下 / 故障时为 0 */
+  readonly waitMs: number;
+  readonly action: 'accept' | 'extend' | 'error';
+  /** 为什么还要等（只有 `extend` 有） */
+  readonly why?: 'grace' | 'short' | 'unfinished' | 'unsure';
 }
 
 /** 判定一次的结果，便于日志与测试断言 */
@@ -526,6 +545,7 @@ export class UtteranceAssembler {
     if (probability < 0) {
       // 判停器出问题就退回保守策略：宁可多合成一轮，也别把用户的话吞掉
       this.options.log(`  判停    ${shown} → 判停器不可用，直接结束本轮`);
+      this.reportJudge({ p: probability, waitMs: 0, action: 'error' });
       this.flush();
       return;
     }
@@ -544,6 +564,9 @@ export class UtteranceAssembler {
         this.options.log(
           `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
         );
+        this.reportJudge({
+          p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'grace',
+        });
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
         return;
       }
@@ -554,6 +577,7 @@ export class UtteranceAssembler {
         this.options.log(
           `  判停    ${shown} → 太短且紧跟前一轮，再等 ${wait} ms`,
         );
+        this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'short' });
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
         return;
       }
@@ -572,10 +596,14 @@ export class UtteranceAssembler {
         this.options.log(
           `  判停    ${shown} → 结尾像没说完（…${JSON.stringify(this.pendingText.slice(-8))}），再等 ${unfinishedWait} ms`,
         );
+        this.reportJudge({
+          p: probability, waitMs: unfinishedWait, action: 'extend', why: 'unfinished',
+        });
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, unfinishedWait);
         return;
       }
       this.options.log(`  判停    ${shown} → 收下这一轮`);
+      this.reportJudge({ p: probability, waitMs: 0, action: 'accept' });
       this.flush();
       return;
     }
@@ -584,7 +612,13 @@ export class UtteranceAssembler {
     this.options.log(
       `  判停    ${shown} → 没说完，再等 ${this.options.extendMs} ms`,
     );
+    this.reportJudge({ p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'unsure' });
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
+  }
+
+  /** 判停决定落档（见 {@link UtteranceAssemblerOptions.onJudge}）。没有出口就算了 */
+  private reportJudge(fact: JudgeFact): void {
+    this.options.onJudge?.(fact);
   }
 
   /**

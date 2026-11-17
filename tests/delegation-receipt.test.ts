@@ -40,6 +40,8 @@ interface Rig {
   readonly sends: Array<{ readonly at: number; readonly bytes: number }>;
   readonly calls: string[];
   readonly logs: string[];
+  /** 落进档案的事件（`dialog.state.why` / `turn.end.path` 只能从这里看） */
+  readonly payloads: Array<{ name: string; data: Record<string, unknown> }>;
   dispose: () => void;
 }
 
@@ -49,6 +51,7 @@ function rig(innerMs: number, opts: { receiptChunks?: number; chunkGapMs?: numbe
   const sends: Array<{ at: number; bytes: number }> = [];
   const calls: string[] = [];
   const logs: string[] = [];
+  const payloads: Array<{ name: string; data: Record<string, unknown> }> = [];
   const inner: AgentProvider = {
     name: 'dsh',
     reply: async (): Promise<AgentReplyView> => {
@@ -91,6 +94,7 @@ function rig(innerMs: number, opts: { receiptChunks?: number; chunkGapMs?: numbe
     photoTimeoutMs: 1_000,
     confirmTimeoutMs: 1_000,
     playbackTailMs: 0,
+    onEvent: (name, data) => { payloads.push({ name, data: data ?? {} }); },
     env: {
       call: (call) => { calls.push(call.op); return true; },
       assemble: () => {},
@@ -98,7 +102,10 @@ function rig(innerMs: number, opts: { receiptChunks?: number; chunkGapMs?: numbe
     },
     log: (line) => { logs.push(line); },
   });
-  return { runtime, sends, calls, logs, dispose: () => { runtime.dispose(); } };
+  return {
+    runtime, sends, calls, logs, payloads,
+    dispose: () => { runtime.dispose(); },
+  };
 }
 
 const wait = async (ms: number): Promise<void> => {
@@ -303,5 +310,36 @@ test('快车道胜出：不说话，直接给答案', async () => {
     );
   } finally {
     runtime.dispose();
+  }
+});
+
+test('档案里能分出「回执出声」和「答案出声」：dialog.state 带 why，turn.end 带 path', async () => {
+  // 没有 why 的话，`thinking → speaking` 在档案里只是个状态名 —— 回执和真答案
+  // 长得一样，而两者对「什么时候开始出声」的含义差 ~1 s。
+  const r = rig(1_500);
+  try {
+    r.runtime.dispatch({ type: 'utterance', text: '帮我查一下订单' });
+    await wait(200);
+    const toSpeaking = r.payloads.filter(
+      (p) => p.name === 'dialog.state' && p.data['to'] === 'speaking',
+    );
+    assert.ok(toSpeaking.length > 0, `该有进入 speaking 的事件，实际 ${JSON.stringify(r.payloads)}`);
+    assert.match(
+      String(toSpeaking[0]!.data['why']),
+      /回执/,
+      `第一次进 speaking 是回执，why 必须写明；实际 ${JSON.stringify(toSpeaking[0]!.data)}`,
+    );
+
+    await wait(600);
+    // `turn.end` 要等 dsh 那一轮（1.5 s）+ 播放结束；轮询而不是拍脑袋等固定时长
+    for (let i = 0; i < 80 && !r.payloads.some((p) => p.name === 'turn.end'); i += 1) {
+      await wait(50);
+    }
+    const end = r.payloads.filter((p) => p.name === 'turn.end').at(-1);
+    assert.ok(end, `该有一条 turn.end，实际 ${JSON.stringify(r.payloads.map((p) => p.name))}`);
+    assert.equal(end.data['path'], 'dsh', '交给慢车道的轮次要记 path=dsh');
+    assert.equal(end.data['delegate'], 'task', '本地判据挡住的轮次记 task');
+  } finally {
+    r.dispose();
   }
 });

@@ -46,6 +46,22 @@ export interface AgentReplyView {
    * 据此换语调。缺省按 `calm` 处理。
    */
   readonly emotion?: string;
+  /**
+   * 这条回复是谁给的：`fast`（快车道小模型）还是 `dsh`（慢车道 agent）。
+   *
+   * 必须由 agent 自己报，编排层猜不出来 —— 快车道预跑被认领的轮次 `dsh_ms` ≈ 0，
+   * 而 qwen 现场回的轮次是 200–660，`dsh` 是 885–1342，**三段有重叠**
+   * （真机：`还在吗？` 343 ms 是快车道，`我怎么说？` 662 ms 是 dsh）。
+   */
+  readonly path?: 'fast' | 'dsh';
+  /**
+   * 交给慢车道的原因（只有 `path === 'dsh'` 时有意义）。
+   *
+   * `task` = 本地判据直接挡（含任务词/数字/太长，**没有调快模型**）；
+   * `delegate` = 快模型自己回的 `[[DELEGATE]]`；`timeout` / `empty` / `error` = 快车道没成。
+   * 没有它，「这一轮为什么走 dsh」在日志里和「本地闸挡住」长得一模一样。
+   */
+  readonly delegate?: DelegateReason;
 }
 
 /**

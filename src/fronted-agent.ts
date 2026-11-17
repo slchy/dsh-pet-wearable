@@ -922,7 +922,9 @@ export class FrontedAgent implements AgentProvider {
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
     this.remember(userText, speech);
     this.log(`  快车道    ${firstTokenMs} ms 首字（流式） ：${JSON.stringify(speech)}`);
-    return { text: raw, speech, firstTokenMs, emotion };
+    // `path` 必须由这里报：编排层分不出「预跑被认领」和「qwen 现场回」——
+    // 两者的 `dsh_ms` 都可能是几十毫秒。
+    return { text: raw, speech, firstTokenMs, emotion, path: 'fast' };
   }
 
   /**
@@ -1030,7 +1032,7 @@ export class FrontedAgent implements AgentProvider {
     }
     const answer = await promise;
     this.rememberDsh(answer.speech, userText);
-    return answer;
+    return { ...answer, path: 'dsh', delegate: reason };
   }
 
   private async delegate(
@@ -1044,7 +1046,7 @@ export class FrontedAgent implements AgentProvider {
     this.reportDelegate(reason);
     const answer = await this.startInner(userText, image, note, ticket);
     this.rememberDsh(answer.speech, userText);
-    return answer;
+    return { ...answer, path: 'dsh', delegate: reason };
   }
 
   /** 记下 dsh 最后说的话（快模型下一轮要看：它在问什么、答案是什么） */

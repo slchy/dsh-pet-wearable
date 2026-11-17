@@ -18,6 +18,7 @@
 import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
 import type { AnnounceStore } from './announce-store.ts';
+import type { DelegateReason } from './providers.ts';
 import { parseEmotion, stripEmotionTags } from './emotion.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
@@ -97,6 +98,10 @@ export interface AgentReply extends AskResult {
   speech: string;
   /** 情绪 key（`happy` / `proud` / `calm` / `worried` / `sulk`） */
   emotion: string;
+  /** 这条回复是谁给的（见 `AgentReplyView.path`）。`VoiceAgent` 永远是 `dsh` */
+  path?: 'fast' | 'dsh';
+  /** 交给慢车道的原因（`VoiceAgent` 自己不会产生，由 `FrontedAgent` 覆盖） */
+  delegate?: DelegateReason;
 }
 
 export class VoiceAgent {
@@ -207,7 +212,7 @@ export class VoiceAgent {
       + ` ctx=${usage?.contextTokens ?? '?'}`
       + this.compactionHint(usage?.contextTokens),
     );
-    return { ...r, speech, emotion };
+    return { ...r, speech, emotion, path: 'dsh' };
   }
 
   /**

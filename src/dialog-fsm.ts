@@ -126,6 +126,14 @@ export class DialogFsm {
    */
   private _receiptOnly = false;
   /**
+   * 最近一次转移的**原因**（`transition` 的 `why`）。
+   *
+   * 必须能读出来：`thinking → speaking` 既可能是「首块音频下发」也可能是
+   * 「回执出声」，两者对延迟/打断的含义相反。只写 console 的话，档案里就分不出来
+   * （`DialogRuntime.notifyState` 靠它给事件补 `why`）。
+   */
+  private _lastWhy = '';
+  /**
    * 日志出口。
    *
    * 注意：**不能**写成构造函数参数属性 `constructor(private readonly log: ...)`。
@@ -143,6 +151,11 @@ export class DialogFsm {
 
   get state(): DialogState {
     return this._state;
+  }
+
+  /** 最近一次转移的原因，给档案补 `why` 用（见 {@link _lastWhy}） */
+  get lastTransitionReason(): string {
+    return this._lastWhy;
   }
 
   /** 本轮编号，从 1 开始 */
@@ -369,5 +382,6 @@ export class DialogFsm {
     }
     this.log(`  状态    ${this._state} → ${to}   (${why})`);
     this._state = to;
+    this._lastWhy = why;
   }
 }

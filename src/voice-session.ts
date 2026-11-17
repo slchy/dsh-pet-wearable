@@ -538,6 +538,9 @@ class VoiceConnection {
         ? {}
         : { partialGraceMs: smartTurnOptions.partialGraceMs }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
+      // 判停的每次决定都落档：`② 定稿→开轮` 在档案里一直是黑盒，1 ms 和 2400 ms
+      // 都可以是这个数，不看 p 分不清「判停不敢收」和「排队」。
+      onJudge: (fact) => { this.archive?.event(EVENTS.judge, { ...fact }); },
       predict: this.smartTurn
         ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
         : undefined,

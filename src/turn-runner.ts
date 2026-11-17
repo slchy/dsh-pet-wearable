@@ -23,7 +23,7 @@ import { SentencePump } from './sentence-pump.ts';
 import { TokenQueue } from './token-queue.ts';
 import { cleanForSpeech } from './agent.ts';
 import { parseEmotion } from './emotion.ts';
-import type { AgentProvider, TtsProvider } from './providers.ts';
+import type { AgentProvider, DelegateReason, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
 /**
@@ -424,6 +424,10 @@ export class TurnRunner {
     let firstChunkAtMs = 0;
     let agentLatencyMs = 0;
     let speech = '';
+    /** 这一轮是谁答的（`AgentReplyView.path`），档案里要落下来 */
+    let replyPath: 'fast' | 'dsh' | undefined;
+    /** 交给 dsh 的原因（只有 `path === 'dsh'` 时有） */
+    let delegateReason: DelegateReason | undefined;
 
     try {
       const agentStartedAt = this.options.clock.now();
@@ -511,6 +515,8 @@ export class TurnRunner {
         queue?.close();
       }
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
+      replyPath = reply.path;
+      delegateReason = reply.delegate;
       if (reply.firstTokenMs !== undefined) {
         // 模型开口的时刻。和 TTS 首块分开记，才看得出"等生成"占了多少
         this.options.onEvent?.(EVENTS.llmFirst, { ms: reply.firstTokenMs });
@@ -562,6 +568,8 @@ export class TurnRunner {
         `TURN n=${ticket.no} text_len=${text.length} dsh_ms=${agentLatencyMs}`
         + ` tts_first_ms=${firstChunkAtMs === 0 ? -1 : firstChunkAtMs}`
         + ` audio_s=${audioSeconds.toFixed(2)}`
+        + (replyPath === undefined ? '' : ` path=${replyPath}`)
+        + (delegateReason === undefined ? '' : ` delegate=${delegateReason}`)
         + (interrupted ? ' barge_in=1' : ''),
       );
 
@@ -597,6 +605,11 @@ export class TurnRunner {
         heard_s: Number(heardSeconds.toFixed(2)),
         dsh_ms: agentLatencyMs,
         tts_first_ms: firstChunkAtMs === 0 ? -1 : firstChunkAtMs,
+        // 这一轮是谁答的。没有它，档案里分不出快车道和 dsh —— `dsh_ms` 两组重叠，
+        // 只能靠 console 的 `快车道` 行反推（而且「模型自己让位」和「本地闸挡住」
+        // 在日志里长得一模一样）。
+        ...(replyPath === undefined ? {} : { path: replyPath }),
+        ...(delegateReason === undefined ? {} : { delegate: delegateReason }),
         // 记下 dsh 的会话 id，事后才能把这一段和 dsh 自己的 step/tool 轨迹对齐
         ...(this.options.agent.sessionId ? { dsh_session: this.options.agent.sessionId } : {}),
       });
