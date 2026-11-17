@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-voice-web demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 14px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 46rem; margin: 2rem auto; padding: 0 1rem;
+  }
+  h1 { font-size: 1.25rem; margin-bottom: .25rem; }
+  p.hint { margin-top: 0; opacity: .7; }
+  label { display: block; margin: .6rem 0; }
+  label > span { display: inline-block; width: 5.5rem; opacity: .8; }
+  input {
+    font: inherit; padding: .3rem .5rem; width: 22rem;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    border-radius: .35rem; background: transparent; color: inherit;
+  }
+  button {
+    font: inherit; padding: .45rem 1.2rem; margin-top: .5rem;
+    border-radius: .35rem; border: 1px solid currentColor;
+    background: transparent; color: inherit; cursor: pointer;
+  }
+  button:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+  pre {
+    margin-top: 1rem; padding: .75rem; height: 20rem; overflow: auto;
+    background: color-mix(in srgb, currentColor 6%, transparent);
+    border-radius: .35rem; font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+  <h1>dsh-voice-web</h1>
+  <p class="hint">点「开始」会请求麦克风权限并连到桥。空格键＝立刻掐断本地播放。</p>
+
+  <label><span>桥地址</span><input id="url" value="ws://127.0.0.1:8767" spellcheck="false"></label>
+  <label><span>token</span><input id="token" type="password" placeholder="服务端配了 tokens.txt 时必填"></label>
+  <label><span>设备名</span><input id="device" value="web" spellcheck="false"></label>
+
+  <button id="toggle">开始</button>
+  <pre id="log"></pre>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

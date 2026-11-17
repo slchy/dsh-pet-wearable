@@ -1,0 +1,185 @@
+/**
+ * 浏览器侧的语音客户端：一条 WS 连到桥，上行走麦克风，下行走扬声器。
+ *
+ * 只做「接线 + 帧分发」，不带任何业务判断 —— 判停、打断、快车道都在服务端。
+ * 打断是**靠上行音频**完成的：全双工下用户一开口，服务端的能量门就会把正在播的
+ * 那一轮掐掉，浏览器这边不需要额外发信号，只需要在收到 `Control: stop` 时
+ * 把本地已排队的音频丢掉。
+ */
+import { startCapture, type CaptureHandle } from './capture.ts';
+import {
+  DownstreamFrameType,
+  FrameDecoder,
+  UpstreamFrameType,
+  decodeText,
+  encodeFrame,
+  encodeTextFrame,
+} from './frames.ts';
+import { createPlayback, type PlaybackHandle } from './playback.ts';
+
+export type VoiceClientEvent =
+  | { readonly type: 'open' }
+  | { readonly type: 'ready' }
+  | { readonly type: 'control'; readonly text: string }
+  | { readonly type: 'call'; readonly json: unknown }
+  | { readonly type: 'error'; readonly message: string }
+  | { readonly type: 'close'; readonly code: number; readonly reason: string };
+
+export interface VoiceClientOptions {
+  /** 桥地址，如 `wss://<服务器地址>:8767`。本地演示可用 `ws://127.0.0.1:8767` */
+  readonly url: string;
+  /** 服务端配了 `tokens.txt` 时必填；放在 `Hello` 帧里，不进 URL */
+  readonly token?: string;
+  /** 在服务端日志与档案里用什么名字标识这个浏览器 */
+  readonly deviceId?: string;
+  readonly onEvent?: (event: VoiceClientEvent) => void;
+}
+
+export interface VoiceClient {
+  /** 打开麦克风并建立连接。**必须在用户手势的调用栈里调用**（自动播放策略） */
+  start(): Promise<void>;
+  /** 立刻掐掉本地播放（服务端那边靠上行音频自己发现被打断） */
+  interrupt(): void;
+  close(): void;
+  /** 音轨与播放是否都在跑 */
+  readonly active: boolean;
+}
+
+/**
+ * 能力声明。`audioIn: 'pcm16'` 是关键：服务端据此跳过 mSBC 解码
+ * （`uplink-pipeline.ts` 的 `codec` 分支）。其余全报「没有」——
+ * 浏览器没有拍照、佩戴、电量这些设备能力。
+ */
+function capabilities(): Record<string, unknown> {
+  return {
+    audioIn: 'pcm16',
+    capture: {},
+    presence: false,
+    power: false,
+    summon: false,
+    listenStart: false,
+    played: false,
+    ignorePhrases: [],
+  };
+}
+
+export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
+  let socket: WebSocket | null = null;
+  let context: AudioContext | null = null;
+  let capture: CaptureHandle | null = null;
+  let playback: PlaybackHandle | null = null;
+  const decoder = new FrameDecoder();
+  let closed = false;
+
+  const emit = (event: VoiceClientEvent): void => {
+    options.onEvent?.(event);
+  };
+
+  const send = (frame: Uint8Array): void => {
+    if (socket !== null && socket.readyState === WebSocket.OPEN) {
+      socket.send(frame);
+    }
+  };
+
+  const handleFrame = (type: number, payload: Uint8Array): void => {
+    if (type === DownstreamFrameType.Audio) {
+      playback?.push(payload);
+      return;
+    }
+    if (type === DownstreamFrameType.Control) {
+      const text = decodeText(payload);
+      // `stop` 是打断 / 一轮结束：已经排进去的音频不该再响
+      if (text === 'stop' || text === 'end_session') {
+        playback?.stop();
+      }
+      emit({ type: 'control', text });
+      return;
+    }
+    if (type === DownstreamFrameType.Welcome) {
+      emit({ type: 'ready' });
+      return;
+    }
+    if (type === DownstreamFrameType.Call) {
+      try {
+        emit({ type: 'call', json: JSON.parse(decodeText(payload)) });
+      } catch {
+        emit({ type: 'call', json: null });
+      }
+    }
+  };
+
+  return {
+    get active(): boolean {
+      return capture !== null && socket !== null && socket.readyState === WebSocket.OPEN;
+    },
+
+    async start(): Promise<void> {
+      if (closed) {
+        throw new Error('客户端已关闭，重新创建一个实例');
+      }
+      if (socket !== null) {
+        return;
+      }
+
+      context = new AudioContext();
+      // 用户手势里调 `resume` —— Safari 不加这句 context 会一直 suspended
+      await context.resume();
+      playback = createPlayback({ context });
+
+      capture = await startCapture({
+        context,
+        onChunk: (pcm) => { send(encodeFrame(UpstreamFrameType.Audio, pcm)); },
+        onError: (message) => { emit({ type: 'error', message }); },
+      });
+
+      socket = new WebSocket(options.url);
+      socket.binaryType = 'arraybuffer';
+
+      socket.onopen = () => {
+        emit({ type: 'open' });
+        send(encodeTextFrame(UpstreamFrameType.Hello, JSON.stringify({
+          proto: 2,
+          deviceId: options.deviceId ?? 'web',
+          ...(options.token === undefined || options.token === '' ? {} : { token: options.token }),
+          capabilities: capabilities(),
+        })));
+      };
+
+      socket.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+        for (const frame of decoder.push(new Uint8Array(event.data))) {
+          handleFrame(frame.type, frame.payload);
+        }
+      };
+
+      socket.onerror = () => {
+        emit({ type: 'error', message: 'WS 连接出错' });
+      };
+
+      socket.onclose = (event: CloseEvent) => {
+        emit({ type: 'close', code: event.code, reason: event.reason });
+      };
+    },
+
+    interrupt(): void {
+      playback?.stop();
+    },
+
+    close(): void {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      capture?.stop();
+      capture = null;
+      playback?.close();
+      playback = null;
+      if (socket !== null) {
+        socket.onclose = null;
+        socket.close();
+        socket = null;
+      }
+      void context?.close();
+      context = null;
+    },
+  };
+}

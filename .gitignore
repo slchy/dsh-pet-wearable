@@ -23,3 +23,6 @@ bench/**/*.json
 bench/e2e/out/
 bench/replay/out/
 bench/e2e/mictap/out/
+
+# 包② demo 的构建产物（npm run demo:build 生成）
+packages/dsh-voice-web/demo/main.js
