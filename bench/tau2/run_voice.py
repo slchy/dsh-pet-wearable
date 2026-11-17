@@ -78,6 +78,39 @@ def patch_builders(tick_ms: int, dsh_port: int, dsh_token: str | None) -> None:
     builder.build_voice_user = build_voice_user
 
 
+def bench_env(
+    work_dir: Path,
+    *,
+    patch: Path,
+    bridge_port: int,
+    session_file: Path,
+) -> dict[str, str]:
+    """本次 bench 专用的子进程环境。
+
+    **每一条隔离项都别删**。这些都是「不隔离就写进生产目录」的地方，而且每一条都
+    真的踩过：
+
+    - `VOICE_AGENT_SESSION`：不隔离会把生产的会话 id 盖掉（生产和 bench 共用
+      `~/.voice-agent/session.json`）
+    - `MIAI_ANNOUNCE_FILE=""`：不置空，bench 攒的后台汇报会被生产连上时补播出去
+    - `MIAI_ARCHIVE_DIR`：不隔离就落进生产的 `miai-archive/`，而 `archive.prune()`
+      只留最近 `keepSessions`（默认 20）个 —— **bench 每跑一场就挤掉一份真实档案**
+      （2026-11-17 实测：21 个目录里 13 个是 bench/回放，真实设备只剩 8 份）
+    - `MEMORY_FILE`：不隔离，快车道会读到生产的 `MEMORY.md`，同一题跑两次结果不一样
+
+    将来把这个框架单独发布时，这一组就是「产物不许落到别人生产目录」的最小要求。
+    """
+    return {
+        **os.environ,
+        "DSH_PATCH": str(patch),
+        "TAU2_BRIDGE_URL": f"http://127.0.0.1:{bridge_port}",
+        "VOICE_AGENT_SESSION": str(session_file),
+        "MIAI_ANNOUNCE_FILE": "",
+        "MIAI_ARCHIVE_DIR": str(work_dir / "archive"),
+        "MEMORY_FILE": str(work_dir / "fastlane-memory.md"),
+    }
+
+
 def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str, sentence_silence_ms: int = 200) -> "subprocess.Popen[str]":
     """拉起一个**只服务本次 bench** 的 dsh（不动生产那个 63993）。"""
     import socket as _socket
@@ -96,16 +129,8 @@ def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str, s
     # 放在 work_dir **旁边**而不是里面：沙箱允许 agent 写 work_dir 内的一切（见 session.ts）。
     session_file = work_dir.parent / f"{work_dir.name}.session.json"
     session_file.unlink(missing_ok=True)
-    log.info("dsh 会话指针 %s（每场清空）", session_file)
-    env = {
-        **os.environ,
-        "DSH_PATCH": str(patch),
-        "TAU2_BRIDGE_URL": f"http://127.0.0.1:{bridge_port}",
-        "VOICE_AGENT_SESSION": str(session_file),
-        # 离线播报队列同理：默认也在 ~/.voice-agent/ 下，bench 攒的话会被生产补播出去。
-        # 空串 = 不持久化（见 main.ts）。
-        "MIAI_ANNOUNCE_FILE": "",
-    }
+    log.info("bench 隔离：会话 %s / 档案 %s / 记忆 %s", session_file, work_dir / "archive", work_dir / "fastlane-memory.md")
+    env = bench_env(work_dir, patch=patch, bridge_port=bridge_port, session_file=session_file)
     log_path = Path("/tmp/dsh-bench.log")
     log_file = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(  # noqa: S603 —— 参数是我们自己拼的，无 shell
