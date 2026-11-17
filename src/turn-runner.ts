@@ -78,6 +78,13 @@ export interface TurnRunnerOptions {
   /** 一轮结束（落盘用），无论成功失败都会调用 */
   readonly onTurnFinished: () => void;
   /**
+   * 状态机在本方法里发生转移之后叫一次（`beginTurn` / `audioStarted` / `audioDone`）。
+   *
+   * 三次转移都发生在 `TurnRunner.run` 内部，`DialogRuntime.dispatch` 看不到它们。
+   * 没有这个钩子，`onDialogState` 只知道 `listening` 一个状态，话筒永远不会被释放。
+   */
+  readonly onState?: () => void;
+  /**
    * 挂/摘「流式增量」的钩子。
    *
    * 传进来一个回调就表示这一轮开始收 token（`null` 表示这一轮结束、摘掉）。
@@ -268,6 +275,10 @@ export class TurnRunner {
         this.log(`  取消    ✗ ${(error as Error).message}`);
       }
     });
+    // 这三次转移（beginTurn / audioStarted / audioDone）都在本方法里发生，
+    // 走不到 `DialogRuntime.dispatch`。不在这里通知，话筒就永远只看到 `listening`
+    // 一个状态 —— 结束时 `release('reply')` 不会执行，宠物的 `floorFree` 一直不成立。
+    this.options.onState?.();
 
     let interrupted = false;
     let audioBytes = 0;
@@ -284,6 +295,7 @@ export class TurnRunner {
           firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
           firstAudioAtMs = this.options.clock.now();
           fsm.audioStarted(ticket);
+          this.options.onState?.();
           this.log(`  TTS首块 ${(firstChunkAtMs / 1000).toFixed(2)} s`);
           this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
         }
@@ -458,6 +470,7 @@ export class TurnRunner {
     } finally {
       offInvalidate();
       fsm.audioDone(ticket);
+      this.options.onState?.();
       this.options.onTurnFinished();
     }
   }
