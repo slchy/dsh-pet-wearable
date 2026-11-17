@@ -1,13 +1,13 @@
-# 项目脚本标定
+﻿# 项目脚本标定
 
 仓库里 `scripts/` `bench/` `tools/` 加起来几十个脚本，每个都只回答一个问题。
 这份文件干三件事：
 
 1. **路由**：手上有个问题，该跑哪一个（§1）
 2. **口径归属**：一个数字只允许有一个实现，别处必须复用它（§2）
-3. **标定值**：跑对了应该看到什么数量级（§7）
+3. **标定值**：跑对了应该看到什么数量级（§12）
 
-## 0. 三条硬规矩
+## 0. 四条硬规矩
 
 **① `p50` / `p90` 不加限定 = 「闭嘴 → 出声」。** 这是项目级约定，唯一实现是
 `src/latency-report.ts` 的 `firstWordMs`（① + ② + ③）。其余一律不许裸叫 p50：
@@ -17,7 +17,7 @@
 - 真机 mSBC 与 bench PCM16 不可比；只有同一条路径的改前/改后才可比
 
 **② 先查 §1，再动手。** 手搓一个新脚本去算已有的口径，是本仓最常见的自伤 ——
-算出来的数字通常还错（§12 第 1 条就是活例）。
+算出来的数字通常还错（§13 第 1 条就是活例）。
 
 **③ 新探针一律放 `bench/`。** `scripts/deploy_cloud.py` 的 `ITEMS` 只同步
 `src mcp tools tests smart_turn scripts package.json tsconfig.json README.md`
@@ -53,7 +53,8 @@
 | 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
 | 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比 |
 | 不接眼镜、全自动跑几条话术 | `bench/e2e/run.py`（手机当喇叭+话筒） | 说完→首音 / 通过与否 |
-| 判停侧车为什么不敢收 | `bench/latency/probe-single-turn.mjs` + 档案 | 判停 p 值逐次变化 |
+| 判停侧车为什么不敢收 | **档案里的 `judge.decide`**（线上就有，最省事）；要离线复算才用 `bench/latency/probe-smartturn-silence.py` | 每次决定的 `p` + 等待；② 的成因 |
+| 换个判停阈值/延长次数会怎样 | `bench/latency/probe-smartturn-silence.py --curve START:END:STEP` | p 随尾部静音怎么变 |
 | CosyVoice 首包多少 / 要几个字才开跑 | `bench/latency/probe-cosyvoice-firstbatch.mts` | 首批字数 × 首块时间 |
 | 快车道会不会答错本该交给 `dsh` 的 | `bench/fast_lane/run.ts` | 误拦截率（>0 退出码 1） |
 | 换哪家快模型首字更短 | `bench/fast_lane/probe_models.mjs` | 逐模型首 token |
@@ -131,7 +132,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/latency/probe-single-turn.mjs` | 起生产形态服务端跑一整轮，读档案 —— 本地没有判停侧车，②只作参考 |
 | `bench/latency/analyze-real-archive.mjs` | 真机档案速览（含「等关门」列）。**只用于看 ②，段口径以 `latency-report.ts` 为准** |
 
-`bench/latency/` 下其余四个是 TTS 专项探针（见 §5）。
+`bench/latency/` 下其余四个是 TTS 专项探针（见 §6），两个 `probe-smartturn-*` 见 §5。
 
 ## 4. 真机回放与端到端
 
@@ -146,7 +147,19 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 **为什么优先 `replay` 而不是 `e2e`**：`replay` 输入是同一份音频，跨次可比；
 `e2e` 每轮内容不同，只能看"通不通"。
 
-## 5. TTS / 下行
+## 5. 判停（SmartTurn 侧车）
+
+| 脚本 | 作用 |
+|---|---|
+| `bench/latency/probe-smartturn-silence.py` | **p 随尾部静音怎么变**：`--curve START:END:STEP` 扫一条话音，`--events events.jsonl` 逐轮看真实停嘴处的 p。要在有 onnxruntime 的机器上跑（服务器 `~/miai-cloud/.venv/bin/python`） |
+| `bench/latency/probe-smartturn-output.py` | 模型输出到底是什么：形状 `[s6, 1]`、要不要 sigmoid、变长维 `s6` 怎么喂 |
+
+这两个是「② 为什么是 2400 ms」的取证工具。结论：**p 在「刚说完」那一刻最低**
+（说话中 0.6–0.98，说完 300–800 ms 掉到 0.02–0.07，静音 1.9 s 又回到 0.95），
+所以判停连说几次「没说完」、每拍 400 ms，直到能量门关掉才被强制收下。详见 §12.1 的
+`judge.decide`（线上直接就能看到同一件事）。
+
+## 6. TTS / 下行
 
 | 脚本 | 作用 |
 |---|---|
@@ -162,7 +175,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 注意 `scripts/` 下这四个是**历史探针**，跑起来要 `.env` 里的 `ALIYUN_*` /
 `DASHSCOPE_API_KEY`。新写的放 `bench/latency/`。
 
-## 6. ASR / 上行音频
+## 7. ASR / 上行音频
 
 | 脚本 | 作用 |
 |---|---|
@@ -176,7 +189,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/sbc-sync-test.py` | ffmpeg 解 mSBC 是否依赖 syncword（HFP 用 0xAD 不是 0x9C） |
 | `scripts/push-sbc.mjs` | 把 mSBC 按实时速率推给本地 harness，收下行 |
 
-## 7. 快车道
+## 8. 快车道
 
 | 脚本 | 作用 |
 |---|---|
@@ -186,7 +199,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 误拦截 > 0 → 退出码 1，可以当门禁用。
 
-## 8. `dsh` / agent 侧
+## 9. `dsh` / agent 侧
 
 | 脚本 | 作用 |
 |---|---|
@@ -197,7 +210,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/patch-sdk-cancel.mjs` | 给 dsh SDK 补 `session/cancel`（`--check` 返回 0 = 已打） |
 | `scripts/install-profile-patch.mjs` | 把人设 patch 装进本机 dsh sdk profile（`npm run install-profile`） |
 
-## 9. τ²-bench
+## 10. τ²-bench
 
 | 脚本 | 作用 |
 |---|---|
@@ -212,14 +225,14 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/tau2/qwen_realtime_user.py` | τ² 的模拟顾客（端到端全双工） |
 | `bench/sfe/fetch.py` | 下 SpeechFCEval 中文子集 |
 
-## 10. 设备模拟 / 运维
+## 11. 设备模拟 / 运维
 
 | 脚本 | 作用 |
 |---|---|
 | `tools/fake-phone.ts` | 假 v1 手机，也是协议的最小实现（开源时给客户端作者当参照） |
 | `tools/fake-v2-device.ts` | 假 v2 设备：`CaptureImage` / 电量上报。`--host <服务器地址> --port <端口> --tls --token <hex>` |
 | `scripts/watch-tune.sh` | 两端日志同时抓、按时间对齐（本机或能 ssh 到 `<服务器地址>`） |
-| `scripts/env-dump.py` | 见 §6 |
+| `scripts/env-dump.py` | 见 §7 |
 
 `npm run` 入口只有六个：`start` / `pair` / `sim` / `typecheck` / `test` / `install-profile`。
 其余一律直接 `node <路径>`。`.ts` / `.mts` 在 Node ≥ 22.18 上直接跑（类型擦除已默认开，
@@ -228,7 +241,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 ---
 
-## 11. 标定值（跑对了应该看到什么）
+## 12. 标定值（跑对了应该看到什么）
 
 **真机实测（2026-11-17，`v2` 设备，`182.135.1.250`，两场共 12 轮）**：
 
@@ -272,15 +285,47 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
    ②只有 6 ms）。用 `analyze-real-archive.mjs` 的「等关门」列一看就知道。
    **要压端到端先压 ②**，换模型省下的 200 ms 会被它的方差（5–2115）淹掉。
 
-### 已知仪表缺口：「这一轮走了哪条」不在档案里
+### 12.1 档案里能查什么（字段级）
 
-`turn.end` 只有 `dsh_ms` / `tts_first_ms` / `audio_s`，**没有路径字段**。而
-`dsh_ms` 分不出来：快车道预跑认领的轮次是 ~0，qwen 现场回的是 200–660，
-`dsh` 是 885–1342 —— 有重叠区（「还在吗？」343 ms 是快车道，
-「我怎么说？」662 ms 是 `dsh`）。
+**这张表是「观测工具」的另一半**：脚本给段号，字段给原因。写新脚本前先看这里有没有现成字段，
+不要再从 console 日志里 grep。
 
-上面那张表是靠 `journalctl -u miai-harness | grep 快车道` 里
-`判停前先问出去 "<文本>"` 人工归属的 —— **不查日志就分不对组**。
+| 事件 | 关键字段 | 能回答什么 |
+|---|---|---|
+| `gate.open` / `gate.close` | `gapMs` | 真实停嘴时刻 = `gate.close.t − gapMs`（**别直接减 `t`**） |
+| `asr.partial` / `asr.sentence` | `text`、`index`、`at.pcm` | ASR 逐字对比；`at.pcm` 是音频里的字节偏移，离线复算判停要用 |
+| `turn.start` | `text_len`、`image` | 这一轮进来的文字长度（并句后会更长） |
+| **`judge.decide`** | `p`、`waitMs`、`action`、`why` | **② 的成因**：判停每次给的概率 + 还要等多久。`action` = `accept`/`extend`/`error`，`why` = `grace`/`short`/`unfinished`/`unsure` |
+| `llm.first` | `ms` | 模型首字 |
+| `tts.first` | `ms` | TTS 首块（③ 的终点） |
+| **`dialog.state`** | `from`、`to`、**`why`** | **为什么进这个状态**。`why` 里写着「回执出声（可打断）」还是「首块音频已下发」—— 没有它，`thinking → speaking` 分不出是回执还是答案（差约 1 s） |
+| **`turn.end`** | `interrupted`、`audio_s`、`heard_s`、`dsh_ms`、`tts_first_ms`、`dsh_session`、**`path`**、**`delegate`** | `path` = `fast`/`dsh`：**这一轮谁答的**；`delegate` = `task`/`answer`/`memory`/`overcap`/`delegate`/`timeout`/`empty`/`error`：**为什么交给 dsh**；`dsh_session` 用来定位 dsh 的 session log |
+| `call.send` | `json` | 下行原语（`audio.stop` / `listen.stop` …） |
+| `device.played` | — | v2 设备「真播完」回执 |
+| `announce` / `announce.replay` | `len`、`emotion` / `count` | 后台汇报要播 / 补播了几条 |
+
+`turn.end` 的一行实例：
+
+```
+{"interrupted":false,"audio_s":5.0,"heard_s":5.0,"dsh_ms":714,"tts_first_ms":666,
+ "path":"dsh","delegate":"task","dsh_session":"session-…"}
+```
+
+**为什么必须由 agent 报 `path`**：`dsh_ms` 分不出来。快车道预跑被认领的轮次是 ~0，
+qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**（「还在吗？」343 ms 是快车道，
+「我怎么说？」662 ms 是 `dsh`）。而「本地闸挡住」和「快车道自己让位」在 console 日志里
+长得一模一样，只有 `delegate` 能分开。
+
+### 12.2 还是缺口（别假装有）
+
+| 缺什么 | 现在只能 |
+|---|---|
+| 回执的时长 / 首块 | 看 console 的 `回执 … 0.65 s（首块 330ms）` 行，档案里没有 |
+| TTS 这条流走的是流式还是整段回退 | 看 console 的 `流式 分支=…` / `流式 ✗ 合成失败…` |
+| 判停 `predict` 那一趟往返的耗时 | 看 console 的 `判停 侧车预热 … ms`（只有预热有数） |
+| 作业 / 子代理的状态转移 | **不要往档案里抄** —— dsh 的 session log 已经写全，用 `dsh-timeline.ts` 去取 |
+
+前三条要补的话，各自是一个 `onEvent` 调用；**先问值不值**（新增字段 = 档案变长 + 一套要维护的读法）。
 
 **TTS 服务端**（CosyVoice）：task 建立 50–62 ms，首包 275–440 ms，
 **服务端要 ~8 个字符才开跑**（2 字要 901 ms），首批音频恒定 22 ms / 1040 B @ 24 kHz。
@@ -291,7 +336,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 ---
 
-## 12. 踩过的坑（别重现）
+## 13. 踩过的坑（别重现）
 
 1. **手搓分段脚本**（`bench/latency/analyze-real-archive.mjs` 第一版）：
    轮次配对用了 `Array.find`，它给的是**最靠前**的那条定稿，于是第 2 轮配到第 1 轮的
