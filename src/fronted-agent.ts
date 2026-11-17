@@ -824,7 +824,7 @@ export class FrontedAgent implements AgentProvider {
     // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
     if (askedAnswer) {
       this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
-      return await this.delegate(userText, image, note, ticket, 'task');
+      return await this.delegate(userText, image, note, ticket, 'answer');
     }
     // 像「长期事实」的一句话：**必须让 dsh 亲耳听到**。
     // 实测 dsh 只对「用户自己说的」话写记忆 —— 把它塞进系统注记里转述（试过 5 种措辞，
@@ -832,14 +832,14 @@ export class FrontedAgent implements AgentProvider {
     // 让 L2 用自己的判断决定记不记；L1 不替它写、也不替它猜。
     if (memorable) {
       this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
-      return await this.delegate(userText, image, note, ticket, 'task');
+      return await this.delegate(userText, image, note, ticket, 'memory');
     }
     if (!candidate) {
       return await this.delegate(userText, image, note, ticket, 'task');
     }
     if (overCap) {
       this.log('  快车道    攒满上限，这一轮强制交给 dsh（顺便刷上下文）');
-      return await this.delegate(userText, image, note, ticket, 'task');
+      return await this.delegate(userText, image, note, ticket, 'overcap');
     }
 
     const startedAt = this.now();

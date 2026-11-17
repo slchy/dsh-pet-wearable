@@ -23,7 +23,28 @@ export interface TurnContext {
  * 只用于挑回执话术（`task` 是「我看看」、`timeout` 是「嗯，我想想」这类），
  * 不参与任何决策。
  */
-export type DelegateReason = 'task' | 'delegate' | 'timeout' | 'empty' | 'error';
+/**
+ * 交给慢车道的原因。
+ *
+ * 前四个是**本地闸**（一个模型调用都没发，0 ms），后四个是快车道真跑了却没成。
+ * 必须分开记：`task`（含任务词）和 `answer`（在回应 dsh 的问话）都由「本地挡住」
+ * 这一步产生，但排障时的含义完全不同 —— 前者是分流判据，后者是业务状态机，
+ * 混成一个值就等于没记。
+ */
+export type DelegateReason =
+  /** 含任务词 / 数字 / 太长：`isFastCandidate` 挡掉 */
+  | 'task'
+  /** 上一轮 dsh 在等回话，用户这句是**回应**（抢答会把业务状态机打断） */
+  | 'answer'
+  /** 像长期事实，必须让 dsh 亲耳听到它才会写记忆 */
+  | 'memory'
+  /** 快车道自己的上下文攒满上限，强制交给 dsh 刷一次 */
+  | 'overcap'
+  /** 快模型自己回的 `[[DELEGATE]]` */
+  | 'delegate'
+  | 'timeout'
+  | 'empty'
+  | 'error';
 
 /** 给 Agent 的图片附件（与 `session.ts` 的 `ImageAttachment` 同构）。 */
 export interface AgentImage {

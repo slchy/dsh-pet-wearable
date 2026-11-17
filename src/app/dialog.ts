@@ -57,6 +57,10 @@ const ANNOUNCE_QUIET_MS = 800;
  */
 const RECEIPTS: Record<DelegateReason, string> = {
   task: '我看看。',
+  // 用户刚回答了 dsh 的问话，回执只是填空 —— 「我看看」在这里听着像没听懂
+  answer: '嗯。',
+  memory: '我看看。',
+  overcap: '我看看。',
   delegate: '我看看。',
   timeout: '嗯，我想想。',
   empty: '嗯，我想想。',
