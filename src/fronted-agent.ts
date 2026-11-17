@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 快车道装饰器：**短句纯闲聊**直接答，其余交给内层 agent（dsh）。
  *
  * <h2>三条路径</h2>
@@ -225,6 +225,15 @@ export interface FastLaneOptions {
   /** 投机双轨：与 dsh 同时发（默认 true） */
   readonly speculate?: boolean;
   /**
+   * 快车道请求的对冲份数（默认 1 = 不对冲）。
+   *
+   * 实测 `qwen-flash` 的首字 130–430 ms 全是**等响应头**那一段的服务端排队噪声，
+   * 提示词长度、历史、前缀缓存、连接冷热都排除了（见 `FAST_LANE_TRACE` 的分解）。
+   * 并发发 N 份取最先回来的，能把 p90 拉向 p50；代价是 token  roughly ×N ——
+   * 快车道回复只有 20 来字，落败的那些在拿到响应头前就被掐掉，成本可忽略。
+   */
+  readonly hedge?: number;
+  /**
    * 判停前起跑：ASR 一句定稿就把这一句问出去（默认 true）。
    *
    * 留这个开关是为了**能 A/B**：这条路的收益只有一百多毫秒，混在「模型首字」
@@ -387,6 +396,7 @@ export class FrontedAgent implements AgentProvider {
   private readonly keepTurns: number;
   private readonly speculate: boolean;
   private readonly prefetchEnabled: boolean;
+  private readonly hedge: number;
   private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
   private readonly statusFacts: (() => string) | undefined;
   private readonly memory: ((userText: string) => readonly string[]) | undefined;
@@ -461,6 +471,7 @@ export class FrontedAgent implements AgentProvider {
     this.keepTurns = options.keepTurns ?? 4;
     this.speculate = options.speculate ?? true;
     this.prefetchEnabled = options.prefetch ?? true;
+    this.hedge = Math.max(1, options.hedge ?? 1);
     this.cancelMode = options.cancelMode ?? 'rpc';
     this.statusFacts = options.taskStatus;
     this.memory = options.memory;
@@ -981,13 +992,20 @@ export class FrontedAgent implements AgentProvider {
     emit: (text: string) => void,
   ): Promise<FastAnswer> {
     const doFetch = this.fetchImpl ?? fetch;
-    const controller = new AbortController();
-    this.askAbort = controller;
+    // **对冲**：同一句并发发 N 份，谁先**把响应头拿回来**谁赢，其余立刻 abort。
+    // 为什么按响应头判：实测「响应头 → 首 token」只差 ~1 ms，方差全在等响应头那一段
+    // （130–430 ms，见 `FAST_LANE_TRACE`），所以抢响应头就等于抢首字。
+    // 落败的请求在拿到响应头前就被掐掉，基本不产生生成费用。
+    const controllers = Array.from({ length: Math.max(1, this.hedge) }, () => new AbortController());
+    const abortAll = (why: Error): void => {
+      for (const c of controllers) c.abort(why);
+    };
+    this.askAbort = controllers[0]!;
     // **两段超时**：首字之前卡住 = 模型不干活，早点让给 dsh；
     // 首字之后还在出字 = 正常，给足时间 —— 用一个固定总超时会把
     // 「五百多毫秒才说完」的正常答案一起掐掉（实测 10 条闲聊里 6 条被掐）。
     let timer: NodeJS.Timeout = setTimeout(() => {
-      controller.abort(new Error(`首字超时 ${this.timeoutMs} ms`));
+      abortAll(new Error(`首字超时 ${this.timeoutMs} ms`));
     }, this.timeoutMs);
     // 不 unref：`finally` 里一定会 clearTimeout，unref 省不了什么；
     // 反而让「等这个定时器」变成不保活的事件循环 —— Node 22 的 test runner 会判定
@@ -995,27 +1013,40 @@ export class FrontedAgent implements AgentProvider {
     const rearm = (): void => {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        controller.abort(new Error(`整句超时 ${this.totalMs} ms`));
+        abortAll(new Error(`整句超时 ${this.totalMs} ms`));
       }, this.totalMs);
     };
+    const payload = JSON.stringify({
+      model: this.model,
+      stream: true,
+      temperature: 0.8,
+      max_tokens: 64,
+      messages: this.messages(userText),
+    });
     try {
-      const response = await doFetch(`${this.baseUrl}/chat/completions`, {
+      const racers = controllers.map((c) => doFetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           authorization: `Bearer ${this.apiKey}`,
         },
-        body: JSON.stringify({
-          model: this.model,
-          stream: true,
-          temperature: 0.8,
-          max_tokens: 64,
-          messages: this.messages(userText),
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok || response.body === null) {
-        throw new Error(`HTTP ${response.status}`);
+        body: payload,
+        signal: c.signal,
+      }).then((r) => {
+        if (!r.ok || r.body === null) throw new Error(`HTTP ${r.status}`);
+        return { r, c };
+      }));
+      // 落败/被打断的那些也要有人接：否则 abort 会变成进程级 rejection（线上挂过）
+      for (const p of racers) p.catch(() => undefined);
+      let winner: { r: Response; c: AbortController };
+      try {
+        // `any` 取的是第一个**成功**的（HTTP 错的那份算失败，会自动等另一份）
+        winner = await Promise.any(racers);
+      } catch {
+        throw new Error(`HTTP 全部失败（${racers.length} 份）`);
+      }
+      for (const c of controllers) {
+        if (c !== winner.c) c.abort(new Error('对冲落败'));
       }
       // 探针（`FAST_LANE_TRACE=1`）：把首字拆成「收发头」与「收头→首 token」。
       // 生产里首字 314–588 而裸探针只要 185–260，差的那截到底是网络、还是我们自己的
@@ -1024,14 +1055,14 @@ export class FrontedAgent implements AgentProvider {
         const msgs = this.messages(userText);
         const chars = msgs.reduce((n, m) => n + m.content.length, 0);
         this.log(`  快车道    提示词 ${msgs.length} 条 / ${chars} 字`);
-        this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms`);
+        this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms（对冲 ${racers.length} 份）`);
       }
-      return await readStream(response.body, startedAt, this.now, { onFirstToken: rearm, emit });
+      return await readStream(winner.r.body!, startedAt, this.now, { onFirstToken: rearm, emit });
     } finally {
       clearTimeout(timer);
-      controller.abort();
+      abortAll(new Error('请求结束'));
       // 只清自己那一个：两轮重叠时别把下一轮的请求从记录里抹掉
-      if (this.askAbort === controller) {
+      if (controllers.includes(this.askAbort as AbortController)) {
         this.askAbort = null;
       }
     }

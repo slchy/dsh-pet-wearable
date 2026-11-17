@@ -543,6 +543,9 @@ async function main(): Promise<void> {
         maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
         // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
         prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
+        // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
+        // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
+        hedge: envNumber('FAST_LANE_HEDGE', 2),
         // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
         taskStatus: () => dshSession.taskStatus(),
         // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），

@@ -174,3 +174,54 @@ test('并段的真实顺序：短句先起跑，长句到来时顶掉它，只�
   assert.deepEqual(asked, ['谢谢你', '谢谢你啦'], '短句那次被顶掉，长句重新起跑');
   assert.equal(reply.speech, '答的是谢谢你啦', '用户只会听到并完的那一句');
 });
+
+// ---------------------------------------------------------------- 对冲
+//
+// 首字方差全在「等响应头」（实测 130–430，提示词/历史/缓存都排除了），
+// 所以并发发 N 份抢最先回来的那份 —— 落败的必须在拿到响应头前被掐掉。
+
+test('对冲：取最先回来的那份，落败的被 abort', async () => {
+  const aborted: number[] = [];
+  let calls = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    hedge: 2,
+    speculate: false,
+    log: () => {},
+    fetchImpl: ((_url: string, init?: RequestInit) => {
+      const idx = calls;
+      calls += 1;
+      const slow = idx === 0;
+      const signal = init?.signal as AbortSignal | undefined;
+      signal?.addEventListener('abort', () => aborted.push(idx));
+      return new Promise<Response>((resolve, reject) => {
+        const t = setTimeout(() => resolve(sse(['[平静]', slow ? '慢的那份' : '快的那份'])), slow ? 200 : 30);
+        signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); });
+      });
+    }) as unknown as typeof fetch,
+  });
+
+  const reply = await agent.reply('你好呀');
+  await new Promise((r) => setTimeout(r, 250));
+
+  assert.equal(calls, 2, '应该发了两份');
+  assert.equal(reply.speech, '快的那份', '取最先回来的');
+  assert.ok(aborted.includes(0), '落败的那份要被 abort');
+});
+
+test('对冲：两份都失败才算失败', async () => {
+  let calls = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    hedge: 2,
+    speculate: false,
+    log: () => {},
+    fetchImpl: (async () => { calls += 1; return new Response('boom', { status: 500 }); }) as unknown as typeof fetch,
+  });
+
+  const reply = await agent.reply('你好呀');
+  assert.equal(calls, 2, '两份都发了');
+  assert.equal(reply.speech, '慢车道答复。', '全失败就退回 dsh，不能哑');
+});
