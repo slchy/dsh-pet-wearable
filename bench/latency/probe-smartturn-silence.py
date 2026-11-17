@@ -62,7 +62,8 @@ def predict(session: "ort.InferenceSession", pcm: bytes) -> float:
     if audio.size > WINDOW_SAMPLES:
         audio = audio[-WINDOW_SAMPLES:]
     if audio.size < WINDOW_SAMPLES:
-        audio = np.pad(audio, (0, WINDOW_SAMPLES - audio.size), mode="constant")
+        # 官方约定：不足 8 秒在**前面**补零，让真实音频对齐到末尾
+        audio = np.pad(audio, (WINDOW_SAMPLES - audio.size, 0), mode="constant")
     feats = compute_whisper_log_mel_features(audio, do_normalize=True)
     out = session.run(None, {"input_features": np.expand_dims(feats, axis=0)})
     return float(np.asarray(out[0]).reshape(-1)[0])

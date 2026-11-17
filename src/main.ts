@@ -769,6 +769,10 @@ async function main(): Promise<void> {
           // 真机实测要 4 拍（1600 ms）才收下；这里收到 2 拍（800 ms），
           // 仍能覆盖正常换气 200–400 ms。另三类文本判据不受影响，照旧吃 7 的额度。
           maxUnsureExtensions: envNumber('SMART_TURN_MAX_UNSURE', 2),
+          // 快照尾部最多留多少静音。官方训练样本切在停嘴那一点，尾巴上多出来的
+          // 静音会把 p 拉低（同一句：停嘴处 0.95、+300 ms 0.35、+800 ms 0.04）。
+          // 不裁的话「再等一拍」永远在等一个更差的数，只能靠上限硬收。
+          trailingTrimMs: envNumber('SMART_TURN_TRIM_MS', 100),
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
           // 结尾像「还有下文」（数字串/井号/连词）时再多等一拍。见
           // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，

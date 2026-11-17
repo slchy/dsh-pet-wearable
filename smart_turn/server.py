@@ -52,12 +52,13 @@ def load_session() -> "ort.InferenceSession":
 def predict(session: "ort.InferenceSession", pcm: bytes) -> float:
     audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
-    # 官方约定：不足 8 秒就**在前面补零**，让真实音频对齐到末尾；
+    # 官方约定：不足 8 秒就**在前面**补零，让真实音频对齐到末尾
+    # （`audio_utils.truncate_audio_to_last_n_seconds`：`np.pad(audio, (padding, 0))`）。
     # 超过 8 秒则从开头截断，只保留最近的 8 秒。
     if audio.size > _MAX_SAMPLES:
         audio = audio[-_MAX_SAMPLES:]
     if audio.size < _MAX_SAMPLES:
-        audio = np.pad(audio, (0, _MAX_SAMPLES - audio.size), mode="constant")
+        audio = np.pad(audio, (_MAX_SAMPLES - audio.size, 0), mode="constant")
 
     feats = compute_whisper_log_mel_features(audio, do_normalize=True)
     inputs = np.expand_dims(feats, axis=0)  # (1, 80, 800)

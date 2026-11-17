@@ -608,3 +608,68 @@ test('判停低分有独立预算：unsure 到上限就收下，不占文本判�
   assert.ok(utterances.length === 1, '最后必须收下这一轮，不能把话吞掉');
   assert.ok(facts.some((f) => f.action === 'accept'), '该有一条 accept');
 });
+
+test('开口时重置音频窗口：判停器只看到这一句', async () => {
+  // 官方 smart-turn 是按句裁窗口的（"audio from previous turns does not need to
+  // be included"）。原来是连续 8 s 滚动，短句子的窗口里大半是上一轮 —— 实测同一句
+  // 「我问你看最近看过哪些电影？」滚动窗口 p=0.26、按句裁 p=0.95。
+  const seen: Buffer[] = [];
+  const { assembler, utterances } = makeAssembler({
+    predict: async (pcm) => { seen.push(pcm); return 0.99; },
+    recentMaxBytes: 64,
+  });
+  try {
+    // 上一轮：一大段音频（远超窗口上限），
+    assembler.addAudio(Buffer.alloc(40, 7));
+    assembler.addSentence('上一轮的问题');
+    await delay(50);
+    assert.equal(utterances.length, 1);
+
+    // 新一轮开口：窗口只剩这段预卷
+    assembler.resetAudio([Buffer.alloc(8, 1), Buffer.alloc(8, 2)]);
+    assembler.addAudio(Buffer.alloc(8, 3));
+    assembler.addSentence('这一轮');
+
+    await delay(60);
+    const last = seen.at(-1);
+    assert.ok(last !== undefined, '判停器应该被调用');
+    assert.equal(last.length, 24, `窗口应当只有预卷 + 这一句（实际 ${last.length} 字节）`);
+    assert.ok(!last.includes(7), '上一轮的音频不能出现在这一句的窗口里');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('判停快照裁掉尾巴上的静音（训练样本切在停嘴那一点）', async () => {
+  const seen: Buffer[] = [];
+  const assembler = new UtteranceAssembler({
+    quietMs: 0,
+    extendMs: 30,
+    maxExtensions: 2,
+    fallbackWindowMs: 0,
+    threshold: 0.5,
+    recentMaxBytes: 16_000 * 2 * 4,      // 4 s，不会因为超限丢块
+    silenceDb: -45,                      // 判「有声」的门限
+    trailingTrimMs: 100,                 // 只留 100 ms 余量
+    predict: async (pcm) => { seen.push(pcm); return 0.99; },
+    onUtterance: () => {},
+    log: () => {},
+  });
+  try {
+    // 按真实的 20 ms 块喂：200 ms 有声 + 1000 ms 数字静音
+    for (let k = 0; k < 10; k += 1) {
+      const chunk = Buffer.alloc(640, 0);
+      for (let i = 0; i < 320; i += 1) chunk.writeInt16LE(i % 4000, i * 2);  // ≈ −18 dBFS
+      assembler.addAudio(chunk);
+    }
+    for (let k = 0; k < 50; k += 1) assembler.addAudio(Buffer.alloc(640, 0));
+    assembler.addSentence('嗯。');
+    await delay(60);
+  } finally {
+    assembler.dispose();
+  }
+  const last = seen.at(-1);
+  assert.ok(last !== undefined, '判停器应该被调用');
+  const ms = (last as Buffer).length / 32;
+  assert.ok(ms >= 280 && ms <= 320, `快照应当只剩 200 ms 语音 + 100 ms 余量（实际 ${ms} ms）`);
+});

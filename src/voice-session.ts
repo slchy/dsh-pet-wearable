@@ -145,6 +145,14 @@ const CAPTURE_GRACE_MS = 1_500;
  */
 const ASSEMBLER_RECENT_SECONDS = 8;
 
+/**
+ * 送给判停器的快照，尾部最多留多少毫秒静音。
+ *
+ * 官方训练样本切在停嘴那一点；多出来的静音会把 p 拉低，而 p 正是「要不要再等一拍」
+ * 的依据（见 `pcm16TrimTrailingSilence`）。100 ms 是给尾音和清辅音留的余量。
+ */
+const ASSEMBLER_TRAILING_TRIM_MS = 100;
+
 export interface VoiceSessionOptions {
   /** 监听端口 */
   readonly port: number;
@@ -176,6 +184,8 @@ export interface VoiceSessionOptions {
     readonly maxExtensions: number;
     /** 「判停说没说完」单独的上限，见 `UtteranceAssemblerOptions.maxUnsureExtensions` */
     readonly maxUnsureExtensions?: number;
+    /** 快照尾部最多留多少静音（ms），见 `UtteranceAssemblerOptions.trailingTrimMs` */
+    readonly trailingTrimMs?: number;
     readonly threshold: number;
     /** 结尾「像没说完」时再多等一拍，见 `UtteranceAssemblerOptions.unfinishedWaitMs` */
     readonly unfinishedWaitMs?: number;
@@ -543,6 +553,9 @@ class VoiceConnection {
         ? {}
         : { partialGraceMs: smartTurnOptions.partialGraceMs }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
+      // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
+      // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。
+      trailingTrimMs: smartTurnOptions?.trailingTrimMs ?? ASSEMBLER_TRAILING_TRIM_MS,
       // 判停的每次决定都落档：`② 定稿→开轮` 在档案里一直是黑盒，1 ms 和 2400 ms
       // 都可以是这个数，不看 p 分不清「判停不敢收」和「排队」。
       onJudge: (fact) => { this.archive?.event(EVENTS.judge, { ...fact }); },
@@ -607,6 +620,9 @@ class VoiceConnection {
       },
       onSpeechOpen: (peakDbfs, preroll, prerollMs) => {
         this.archive?.event(EVENTS.gateOpen, { peakDbfs: Number(peakDbfs.toFixed(1)), prerollMs });
+        // 新一轮开口：判停窗口只留这一句（官方也是按句裁的）。预卷就是这段的开头，
+        // 前面那些静音 / 上一轮的回答都不该进模型。
+        this.assembler.resetAudio(preroll);
         for (const part of preroll) {
           this.stt.feed(part);
         }

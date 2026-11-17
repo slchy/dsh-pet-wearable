@@ -35,7 +35,7 @@
  *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
-import { pcm16DurationMs, pcm16PeakDbfs } from './pcm.ts';
+import { pcm16DurationMs, pcm16PeakDbfs, pcm16TrimTrailingSilence } from './pcm.ts';
 
 export interface UtteranceAssemblerOptions {
   /** 句子结束后先静候这么久再判定 */
@@ -64,6 +64,13 @@ export interface UtteranceAssemblerOptions {
   readonly threshold: number;
   /** 送给判停器的最近音频上限（字节） */
   readonly recentMaxBytes: number;
+  /**
+   * 判停音频快照**尾部最多留多少静音**（ms）。
+   *
+   * 官方训练样本切在停嘴那一点；尾巴上的静音会把 p 拉低（实测停嘴处 0.95、
+   * +300 ms 0.35、+800 ms 0.04）。见 `pcm16TrimTrailingSilence`。
+   */
+  readonly trailingTrimMs?: number;
   /** 判停器。返回 <0 表示不可用 */
   readonly predict?: (pcm: Buffer) => Promise<number>;
   /**
@@ -292,11 +299,48 @@ export class UtteranceAssembler {
   addAudio(chunk: Buffer): void {
     this.recentChunks.push(Buffer.from(chunk));
     this.recentBytes += chunk.length;
+    this.trimRecent();
+    this.trackSilence(chunk);
+  }
+
+  /**
+   * 新一轮开口：把判停器的音频窗口**重置到这一句**。
+   *
+   * 为什么要重置：官方 `BaseSmartTurn` 喂的是「这一句」——
+   * `speech_start - pre_speech_ms` 到缓冲区末尾（见 smart-turn README
+   * "audio from previous turns does not need to be included"）。我们原来是
+   * **连续 8 s 滚动**，短句子的窗口里可能有 7 秒是上一轮的回答和中间那段静音。
+   * 实测（`bench/latency/probe-smartturn-padding.py`，同一份 `uplink.pcm`）：
+   * 同一句「我问你看最近看过哪些电影？」，滚动窗口 p=0.26、按句裁 p=0.95；而
+   * 句内任意切一刀（30/50/70%）滚动窗口都给 0.9 以上 —— 等于判停什么都没在判。
+   *
+   * @param chunks 这一句已知的前置音频（能量门的预卷），通常是 800 ms
+   */
+  resetAudio(chunks: readonly Buffer[] = []): void {
+    this.recentChunks.length = 0;
+    for (const c of chunks) {
+      this.recentChunks.push(Buffer.from(c));
+    }
+    this.recentBytes = this.recentChunks.reduce((n, c) => n + c.length, 0);
+    this.trimRecent();
+  }
+
+  private trimRecent(): void {
     while (this.recentBytes > this.options.recentMaxBytes && this.recentChunks.length > 1) {
       const dropped = this.recentChunks.shift();
       this.recentBytes -= dropped?.length ?? 0;
     }
-    this.trackSilence(chunk);
+  }
+
+  /**
+   * 送给判停器的音频快照：拼接 + 裁掉尾巴上多余的静音。
+   *
+   * 两处判停（提前预跑、定稿现算）都必须走这里，否则同一句话会因为"从哪个入口问"
+   * 拿到两个不同的 p。
+   */
+  private snapshot(): Buffer {
+    const pcm = Buffer.concat(this.recentChunks);
+    return pcm16TrimTrailingSilence(pcm, this.options.silenceDb, this.options.trailingTrimMs ?? 0);
   }
 
   /**
@@ -472,7 +516,7 @@ export class UtteranceAssembler {
     if (!upcoming && seq !== this.seq) {
       return;
     }
-    const pcm = Buffer.concat(this.recentChunks);
+    const pcm = this.snapshot();
     const startedAt = this.now();
     // 侧车可能抛（也可能同步抛）；两种都吞成「不可用」，否则这份提前发起的
     // promise 没人接，会变成 unhandledRejection
@@ -502,7 +546,7 @@ export class UtteranceAssembler {
       return await ready.probability;
     }
     try {
-      return await predict(Buffer.concat(this.recentChunks));
+      return await predict(this.snapshot());
     } catch {
       return -1;
     }

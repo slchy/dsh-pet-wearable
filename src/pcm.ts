@@ -35,6 +35,40 @@ export function pcm16DurationMs(bytes: number, sampleRate: number): number {
 }
 
 /**
+ * 裁掉尾部静音，只留 `keepMs` 毫秒余量。
+ *
+ * 为什么要裁：Smart Turn 的训练样本是**切在停嘴那一点**的 8 s 窗口（官方
+ * `truncate_audio_to_last_n_seconds` 只负责补零/截断，不补静音），所以窗口尾巴上
+ * 多出来的静音会直接把 p 拉低。实测同一句「我问你看最近看过哪些电影？」：
+ * 停嘴处 p=0.95，尾巴加 300 ms 静音 → 0.35，加 800 ms → 0.04。
+ *
+ * 不裁的后果不是"慢一点"：同一句话每多等一拍就换一个更差的 p，而「再等一拍」
+ * 正是靠 p 决定要不要等的 —— 于是永远等到预算耗尽。
+ *
+ * @param floorDbfs 判「有声」的门限（和能量门同一个），不传就原样返回
+ * @param keepMs 最后一个有声窗口之后再留多久，给尾音/清辅音留余量
+ */
+export function pcm16TrimTrailingSilence(pcm: Buffer, floorDbfs: number | undefined, keepMs: number): Buffer {
+  if (floorDbfs === undefined || pcm.length === 0) {
+    return pcm;
+  }
+  const stepBytes = PCM16_BYTES_PER_MS_AT_16K * 10;
+  let lastVoiced = -1;
+  for (let end = pcm.length; end > 0; end -= stepBytes) {
+    const start = Math.max(0, end - stepBytes);
+    if (pcm16PeakDbfs(pcm.subarray(start, end)) > floorDbfs) {
+      lastVoiced = end;
+      break;
+    }
+  }
+  if (lastVoiced < 0) {
+    return pcm;
+  }
+  const cut = Math.min(pcm.length, lastVoiced + PCM16_BYTES_PER_MS_AT_16K * Math.max(0, keepMs));
+  return cut >= pcm.length ? pcm : pcm.subarray(0, cut);
+}
+
+/**
  * 放大 PCM16（返回新 Buffer），带**软限幅**。
  *
  * 为什么需要：MiMo 出来的音量偏小，手机上要开到接近满格才听清。直接乘系数会在
