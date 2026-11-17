@@ -198,3 +198,19 @@ test('报告在 p90 超预算时给出「先治 ③」的判断', () => {
   assert.match(text, /超预算/);
   assert.match(text, /先治 ③/);
 });
+
+test('报告的 p50/p90 只标在「闭嘴→出声」上，单段不许裸叫 p50', () => {
+  // 项目级约定（docs/TOOLS.md §0）：裸说 p50 一律是「闭嘴→出声」。
+  // ③ 曾经被当成"开轮→首块"引用，于是 1127 ms 被误读成端到端 —— 那次是 TTS
+  // 背了模型首字的锅。报告自己的措辞要把这条守住，别让读者各读一套。
+  const one = jsonl([
+    { t: 1000, ev: 'gate.close', gapMs: 0 },
+    { t: 1400, ev: 'asr.sentence', text: '你好', index: 0 },
+    { t: 1420, ev: 'turn.start', text_len: 2, image: false },
+    { t: 5000, ev: 'tts.first', ms: 3580 },
+    { t: 8000, ev: 'turn.end', interrupted: false, dsh_ms: 3500 },
+  ]);
+  const text = formatReport(computeTurns(parseEvents(one)));
+  assert.match(text, /闭嘴→出声 {2}p50 \d+ \/ p90 \d+/);
+  assert.match(text, /其中③.*不是项目 p50/);
+});

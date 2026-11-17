@@ -23,6 +23,16 @@
  *
  * **首字总延迟 = ① + ② + ③**，也就是 ③ 结束时相对 ① 起点的距离。
  *
+ * <h2>p50 / p90 指什么（项目级约定）</h2>
+ *
+ * **本项目说「p50 / p90」不加限定，一律指「闭嘴 → 出声」**，也就是这里的
+ * `firstWordMs`。它是用户唯一感觉得到的那一段，其余都不许裸叫 p50：
+ *
+ * - 单段要说全名（「③ p50」「① p90」），或者干脆说「③ 该段中位」
+ * - 模型层（`bench/fast_lane` 的「首字」）不是这个口径 —— 它少了 ASR、判停、
+ *   TTS 三段，只能说「模型首字 p50」
+ * - 换路径（真机 mSBC ↔ bench PCM16）也不可比，同一条路径的改前/改后才可比
+ *
  * <h2>缺仪表怎么表示</h2>
  *
  * `tts.first` / `turn.end` 是后加的。更早的档案里没有它们，那些轮次对应字段为
@@ -58,7 +68,7 @@ export interface TurnLatency {
   readonly asrToTurn: number | null;
   /** ③ 开跑 → 首块音频（agent + TTS 首块，ms） */
   readonly turnToAudio: number | null;
-  /** **首字总延迟**：用户说完 → 第一个字出声（ms） */
+  /** **闭嘴 → 出声**：用户说完 → 第一个字出声（ms）。**本项目的 p50/p90 只指它** */
   readonly firstWordMs: number | null;
   /** ④ 首块音频 → 本轮结束（播放，ms） */
   readonly playbackMs: number | null;
@@ -396,7 +406,7 @@ export function formatReport(turns: readonly TurnLatency[], header = ''): string
     return lines.join('\n');
   }
 
-  lines.push('轮次  ①判停+ASR  ②排队  ③agent+TTS  首字总延迟  ④播放  agent自报  打断  文本');
+  lines.push('轮次  ①判停+ASR  ②排队  ③agent+TTS  闭嘴→出声  ④播放  agent自报  打断  文本');
   for (const t of turns) {
     lines.push(
       [
@@ -417,13 +427,14 @@ export function formatReport(turns: readonly TurnLatency[], header = ''): string
   const parts = summarize(turns.map((t) => t.turnToAudio));
 
   lines.push('');
-  lines.push('单位：毫秒。首字总延迟 = ① + ② + ③');
+  lines.push('单位：毫秒。首字总延迟 = ① + ② + ③ = 闭嘴→出声（本项目的 p50/p90 只指它）');
   lines.push(
-    `首字延迟  中位 ${cell(first.median)} / p90 ${cell(first.p90)} / 最大 ${cell(first.max)}`
+    `闭嘴→出声  p50 ${cell(first.median)} / p90 ${cell(first.p90)} / 最大 ${cell(first.max)}`
     + `（预算 ${FIRST_WORD_BUDGET_MS}）`,
   );
   lines.push(
-    `其中③   中位 ${cell(parts.median)} / p90 ${cell(parts.p90)} / 最大 ${cell(parts.max)}`,
+    `其中③（开轮→首块）该段 中位 ${cell(parts.median)} / p90 ${cell(parts.p90)} / 最大 ${cell(parts.max)}`
+    + '  ← 单段，不是项目 p50',
   );
 
   const gaps = new Map<MissingMark, number>();
@@ -442,8 +453,8 @@ export function formatReport(turns: readonly TurnLatency[], header = ''): string
   if (first.p90 !== null) {
     lines.push(
       first.p90 <= FIRST_WORD_BUDGET_MS
-        ? `判定：p90 ${Math.round(first.p90)} ms 在预算内，形态成立。`
-        : `判定：p90 ${Math.round(first.p90)} ms 超预算，宠物会显得"迟钝"——先治 ③，别做插件。`,
+        ? `判定：闭嘴→出声 p90 ${Math.round(first.p90)} ms 在预算内，形态成立。`
+        : `判定：闭嘴→出声 p90 ${Math.round(first.p90)} ms 超预算，宠物会显得"迟钝"——先治 ③，别做插件。`,
     );
   }
   // ① 为负 = ASR 定稿早于能量门关门。正常情况下不可能（门要等 holdMs 才关），

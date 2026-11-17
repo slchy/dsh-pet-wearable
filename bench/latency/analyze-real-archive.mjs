@@ -17,7 +17,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { computeTurns, parseEvents } from '../../src/latency-report.ts';
+import { computeTurns, parseEvents, summarize } from '../../src/latency-report.ts';
 
 const target = process.argv[2];
 if (target === undefined) {
@@ -29,17 +29,6 @@ const file = statSync(target).isDirectory() ? join(target, 'events.jsonl') : tar
 const events = parseEvents(readFileSync(file, 'utf8'));
 const turns = computeTurns(events);
 
-const median = (xs) => {
-  const s = [...xs].sort((a, b) => a - b);
-  if (s.length === 0) return NaN;
-  // 偶数个取中间两个的均值：直接 s[n/2] 会系统性偏高（6 个样本取第 4 个）
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-};
-const p90 = (xs) => {
-  const s = [...xs].sort((a, b) => a - b);
-  return s.length === 0 ? NaN : s[Math.min(s.length - 1, Math.floor(s.length * 0.9))];
-};
 const fmt = (v) => (v === null || v === undefined || Number.isNaN(v) ? '   —' : String(Math.round(v)).padStart(4));
 
 // 「等关门」要自己算 —— 但**轮次已经由 `computeTurns` 配好了**，这里只按同样的
@@ -72,7 +61,7 @@ function gateWaitFor(turn, index) {
 
 const rows = turns.map((t, i) => ({ ...t, gateWait: gateWaitFor(t, i) }));
 
-console.log('轮  ①说完→定稿  ②定稿→开轮  等关门  ③开轮→首块  agent自报  ④播放  说完→出声   文本');
+console.log('轮  ①说完→定稿  ②定稿→开轮  等关门  ③开轮→首块  agent自报  ④播放  闭嘴→出声   文本');
 for (const r of rows) {
   console.log(
     `${String(r.turn).padStart(2)}  ${fmt(r.silenceToAsr)}        ${fmt(r.asrToTurn)}        ${fmt(r.gateWait)}     `
@@ -81,14 +70,22 @@ for (const r of rows) {
   );
 }
 
-const col = (k) => rows.map((r) => r[k]).filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+// p50/p90 只给「闭嘴→出声」——项目级约定，见 src/latency-report.ts 的表头说明。
+// 单段一律印「该段中位」，免得多一份裸 p50 被人引用。
+// 统计算法也不自己写：`summarize()` 是唯一实现（它按线性插值算 p90，
+// 最近秩会和正式报告差几十毫秒 —— 同口径两种算法等于没有口径）。
+const summary = summarize(rows.map((r) => r.firstWordMs));
+const segMedian = (k) => {
+  const s = summarize(rows.map((r) => r[k]));
+  return s.median === null ? '   —' : String(Math.round(s.median)).padStart(4);
+};
 console.log(
-  `\np50   ① ${median(col('silenceToAsr'))}   ② ${median(col('asrToTurn'))}   `
-  + `③ ${median(col('turnToAudio'))}   说完→出声 ${median(col('firstWordMs'))} ms`,
+  `\n闭嘴→出声  p50 ${Math.round(summary.median ?? NaN)}   p90 ${Math.round(summary.p90 ?? NaN)} ms`
+  + `  （n=${summary.count}）`,
 );
 console.log(
-  `p90   ① ${p90(col('silenceToAsr'))}   ② ${p90(col('asrToTurn'))}   `
-  + `③ ${p90(col('turnToAudio'))}   说完→出声 ${p90(col('firstWordMs'))} ms`,
+  `各段该段中位  ① ${segMedian('silenceToAsr')}   ② ${segMedian('asrToTurn')}   `
+  + `③ ${segMedian('turnToAudio')}   其中模型首字 ${segMedian('agentMs')}`,
 );
 
 const slow = rows.filter((r) => r.asrToTurn !== null && r.asrToTurn > 300 && r.gateWait !== null);
