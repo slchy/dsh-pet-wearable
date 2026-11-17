@@ -5,47 +5,40 @@
 
 最后核对：**2026-11-17**（服务器实测，命令见文末「怎么重新核对」）。
 
-2026-11-17 这次核对的具体结果（免得下次又从零猜）：
-服务 `active`，启动于 2026-11-18 00:19:02 CST，`NRestarts=0`；生产代码 = `dda6418`（§2.2）；
-7 天内 **0 轮**真实对话；7 天内 2 次 `流式 ✗ 合成失败: Please ensure input text is valid.`
-（有兜底，回退整段合成，但那一轮首块会变慢）；`~/miai-archive` 21 份 / 256 K；
-`~/miai-vectors` **空**、`~/miai-vectors-synth` 3 份；另有 1 次
-`✗ 帧长异常 1330205776（上限 65536）` —— 有非协议数据打到 63993，服务拒了，但暴露面值得留意。
+当前状态：服务 `active`，启动于 2026-11-18 00:19:02 CST，`NRestarts=0`；生产代码 = `dda6418`（§2.2）；
+7 天内 0 轮真实对话；档案 21 份 / 256 K；`~/miai-vectors` 空、`~/miai-vectors-synth` 3 份。
+7 天内 2 次 `流式 ✗ 合成失败: Please ensure input text is valid.`（回退整段合成，那一轮首块变慢）；
+另 1 次 `✗ 帧长异常 1330205776（上限 65536）` —— 有非协议数据打到 63993，连接被拒。
 
 > 约定：真实主机地址与密钥**不写进文档**，只写它们在哪里。需要时去读对应文件。
 
 ---
 
-## 1. 两个仓、两个包 —— 是**两张表**，别当成一张
+## 1. 两个仓、两个包
 
-### 1.1 两个 **git 仓**
+### 1.1 git 仓
 
 | 仓 | 管什么 | 关键路径 |
 |---|---|---|
 | `dsh-pet-wearable`（云端） | harness（STT / 判停 / TTS / dsh 驱动）、**bench** | `src/`、`mcp/`、`bench/`、`docs/` |
-| `Miaiglassses2grokbot`（客户端） | 眼镜侧 protobuf、App（Kotlin）、配对、**部署入口** | `sdk/`、`client/`、`scripts/` |
+| `Miaiglassses2grokbot`（客户端） | 眼镜侧 protobuf、App（Kotlin）、配对、部署入口 | `sdk/`、`client/`、`scripts/` |
 
-- **bench 在 `dsh-pet-wearable/bench/`**，不在客户端仓。
-- **部署脚本一个都不在云端仓**：`deploy_cloud.py` 在
-  `Miaiglassses2grokbot/scripts/`（`HOST` / `KEY` / `REMOTE` 都在里面）。
-  在云端仓里找它是找不到的 —— 已经因为这个误判过「不知道生产在哪台机器」。
-- 客户端侧的 Gradle App 在 `sdk/sample`（Kotlin/Compose）。`client/` 下的 Java
-  （`Session.java` / `MainStream.java` 等）是**旧 app_process 管线**，已被取代 ——
-  查「现在怎么连云端」不要去那儿找答案。
+- bench 在 `dsh-pet-wearable/bench/`。
+- `deploy_cloud.py` 在 `Miaiglassses2grokbot/scripts/`，`HOST` / `KEY` / `REMOTE` 都在里面；云端仓里没有部署脚本。
+- 客户端侧 Gradle App 在 `sdk/sample`（Kotlin/Compose）。`client/` 下的 Java
+  （`Session.java` / `MainStream.java` 等）是旧 app_process 管线，已被取代。
 
-### 1.2 两个 **npm 包**（都是 dsh 插件，平级，互不依赖）
+### 1.2 npm 包（都是 dsh 插件）
 
 | 包 | 位置 | 插件名 | 内容 | 依赖对方 |
 |---|---|---|---|---|
-| `dsh-pet-wearable` | **仓根**（仓名同时是包名） | `pet-wearable` | 协议层 + 语音栈 | 无 |
-| `dsh-voice-web` | `packages/dsh-voice-web/` | `voice-web` | **语音栈副本** + web 兼容（WS 桥 + 浏览器端） | 无 |
+| `dsh-pet-wearable` | 仓根（仓名同时是包名） | `pet-wearable` | 协议层 + 语音栈 | 无 |
+| `dsh-voice-web` | `packages/dsh-voice-web/` | `voice-web` | 语音栈副本 + web 兼容（WS 桥 + 浏览器端） | 无 |
 
-- **包② 不是包① 的子组件**，它是另一个独立插件；能自包含是因为
-  `packages/dsh-voice-web/src/voice/` 里有一份**同步副本**（`scripts/sync-voice.mjs`
-  从仓根 `src/` 复制，**不进 git**，`prepack` / `typecheck` 自动刷新）。
-  这是当初刻意选的「不依赖、复制一份」，代价是两边依赖清单要手动对齐。
-- 混这两张表最常见的后果：以为 `dsh-voice-web` 是 `dsh-pet-wearable` 的一部分，
-  于是找不到它的部署路径 / 以为改仓根 `src/` 等于改了包②（**不会**，要重跑 sync）。
+- `dsh-voice-web` 不依赖 `dsh-pet-wearable`。语音栈是 `packages/dsh-voice-web/src/voice/` 里的副本，
+  由 `scripts/sync-voice.mjs` 从仓根 `src/` 复制，不进 git，`prepack` / `typecheck` 自动刷新。
+  改仓根 `src/` 后必须重跑 sync，包② 才会变。
+- `dsh-pet-wearable` 的 `driver.ts` 目前是骨架（`apply()` 只做配置校验）；`dsh-voice-web` 的 driver 真起语音栈和桥。
 
 ## 2. 服务器
 
@@ -94,7 +87,7 @@ grep -c VOICE_SPECULATE_MS main.ts          # 1 = dda6418 及之后
 也就是说本地之后的所有改动（抽 `assembly.ts`、`onListening`、整个 `packages/dsh-voice-web`）
 **都还没上生产**。将来从新 HEAD 部署会把这批核心文件改动带上真机链路，必须重启后实测。
 
-### 2.3 文档漂移：`--tts` 到底是什么
+### 2.3 `--tts` 以 unit 为准
 
 `deploy_cloud.py` 头部注释写的是 `--tts mimo`，而**实际 unit 是 `--tts cosyvoice`**：
 
