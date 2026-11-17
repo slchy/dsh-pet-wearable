@@ -1017,6 +1017,15 @@ export class FrontedAgent implements AgentProvider {
       if (!response.ok || response.body === null) {
         throw new Error(`HTTP ${response.status}`);
       }
+      // 探针（`FAST_LANE_TRACE=1`）：把首字拆成「收发头」与「收头→首 token」。
+      // 生产里首字 314–588 而裸探针只要 185–260，差的那截到底是网络、还是我们自己的
+      // 事件循环（ffmpeg/TTS/档案都在同一条线程上），只有这个分解能说清。
+      if (process.env['FAST_LANE_TRACE'] === '1') {
+        const msgs = this.messages(userText);
+        const chars = msgs.reduce((n, m) => n + m.content.length, 0);
+        this.log(`  快车道    提示词 ${msgs.length} 条 / ${chars} 字`);
+        this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms`);
+      }
       return await readStream(response.body, startedAt, this.now, { onFirstToken: rearm, emit });
     } finally {
       clearTimeout(timer);
