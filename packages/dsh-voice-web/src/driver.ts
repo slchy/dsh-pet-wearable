@@ -23,6 +23,7 @@ import {
   buildTts,
   envNumber,
   loadAuthenticator,
+  loadDotEnv,
   loadTls,
   openAnnounceStore,
   wireAgent,
@@ -130,10 +131,20 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       // 而「快车道开没开」「投机有没有生效」「保活多少分钟」必须能一眼确认 ——
       // 这几行恰恰是判断"线接没接上"的唯一凭据。
       const report = (line: string): void => { console.log(line) }
+
+      // `process.cwd()/.env`。dsh 自己会经 `@deepseek-ai/dsh-launch-environment`
+      // 把调用目录的 `.env` 合并进 `process.env`，所以这里通常返回 0；
+      // 留着是因为别的宿主不一定这么做，而"配了密钥却说没配"很难查。
+      // 必须在 `buildStt` / `buildTts` **之前** —— 那两个函数直接读 process.env。
+      const loaded = loadDotEnv()
+      if (loaded > 0) {
+        report(`凭据    ${process.cwd()}\\.env（${loaded} 项）`)
+      }
       const tls = loadTls(report)
       const authenticate = loadAuthenticator(report)
       const stt = await buildStt(config.stt, sttCreds())
       const tts = await buildTts(config.tts)
+      report(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）`)
       const workDir = config.workDir === '' ? process.cwd() : config.workDir
       // 与 CLI 同一个队列：任务结果离线时先存着，重连后补播
       const announceStore = openAnnounceStore(report)

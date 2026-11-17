@@ -46,6 +46,47 @@ export function envNumber(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * 读 `process.cwd()/.env`，**不覆盖已有的环境变量**。
+ *
+ * 从 `main.ts` 挪过来的：插件形态下进程是 dsh，没有 CLI 那一步，于是同一份 `.env`
+ * 在插件里读不到 —— 表现为"明明配了密钥却说没配"。两边都调它才一致。
+ *
+ * 只认 `KEY=value` 与带引号的写法；`export KEY=...` 这种 shell 语法不认，
+ * 因为这是给 Node 进程读的，不是给 shell 读的。
+ */
+export function loadDotEnv(): number {
+  const path = join(process.cwd(), '.env');
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const eq = line.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+      count += 1;
+    }
+  }
+  return count;
+}
+
 /** 启动期配置错误：调用方接住之后决定是退出进程还是拒绝加载插件。 */
 export class AssemblyError extends Error {
   constructor(message: string) {
