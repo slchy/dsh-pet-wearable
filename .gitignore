@@ -30,3 +30,4 @@ packages/dsh-voice-web/demo/main.js
 # 包② 里的语音栈副本：仓里只有一份源，这份由 scripts/sync-voice.mjs 生成，
 # 不进 git（发包时由 prepack 重新同步，tarball 里是实体内容）。
 packages/dsh-voice-web/src/voice/
+packages/dsh-voice-web/lib/

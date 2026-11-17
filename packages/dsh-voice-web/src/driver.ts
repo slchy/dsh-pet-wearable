@@ -12,6 +12,7 @@
  * 省掉「固定端口会不会撞」这条隐式约定。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
 import { startWebBridge, type WebBridge } from './bridge.ts'
@@ -61,6 +62,8 @@ export interface VoiceWebConfig {
   host: string
   /** 允许的页面来源。留空 = 只放同源（非浏览器客户端不带 Origin，仍放行） */
   origins: string[]
+  /** 是否在同一个端口把页面发出去。关掉就只提供 WS */
+  servePage: boolean
   tls: {
     /** TLS 私钥路径。与 `certPath` 要么都给，要么都不给 */
     keyPath: string
@@ -83,6 +86,7 @@ export const Config: Schema<VoiceWebConfig> = Schema.object({
   port: Schema.natural().max(65535).default(8767).description('浏览器连的 WS 端口'),
   host: Schema.string().default('127.0.0.1').description('监听地址；非本机地址要求 TLS 与来源白名单同时配齐'),
   origins: Schema.array(Schema.string()).default([]).description('允许的页面来源，如 https://<域名>；留空只放同源'),
+  servePage: Schema.boolean().default(true).description('是否在同一端口把页面发出去（关掉就只提供 WS）'),
   tls: Schema.object({
     keyPath: Schema.string().default('').description('TLS 私钥路径'),
     certPath: Schema.string().default('').description('TLS 证书路径'),
@@ -237,9 +241,18 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
         voicePort,
         ...(tls === undefined ? {} : { tls }),
         origins: config.origins,
+        // 编译产物在 lib/，页面在包根的 demo/ —— 两者都随包发布
+        webDir: config.servePage ? join(import.meta.dirname, '..', 'demo') : '',
         log: report,
       })
       logger.info(`就绪：浏览器 → :${bridge.port} → 语音栈 127.0.0.1:${voicePort}`)
+      if (config.servePage) {
+        // 这行走 console 而不是 logger：logger 的输出去处看不到，
+        // 而「去哪个地址打开」是人唯一必须知道的一条
+        const scheme = tls === undefined ? 'http' : 'https'
+        const shown = config.host === '0.0.0.0' ? '127.0.0.1' : config.host
+        console.log(`\nweb       ${scheme}://${shown}:${bridge.port}/   ← 浏览器打开这个地址\n`)
+      }
     } catch (error) {
       // 装配半途失败时把已经起来的收掉，不留「只有桥没有栈」的状态
       await bridge?.close()

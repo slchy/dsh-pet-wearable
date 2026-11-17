@@ -22,6 +22,8 @@ export type VoiceClientEvent =
   | { readonly type: 'ready' }
   | { readonly type: 'control'; readonly text: string }
   | { readonly type: 'call'; readonly json: unknown }
+  /** 下行有没有声音在放：页面靠它显示「它在说话」 */
+  | { readonly type: 'speaking'; readonly active: boolean }
   | { readonly type: 'error'; readonly message: string }
   | { readonly type: 'close'; readonly code: number; readonly reason: string };
 
@@ -33,6 +35,12 @@ export interface VoiceClientOptions {
   /** 在服务端日志与档案里用什么名字标识这个浏览器 */
   readonly deviceId?: string;
   readonly onEvent?: (event: VoiceClientEvent) => void;
+  /**
+   * 每个上行块（PCM16 16 kHz）原样给一份，用来画电平表。
+   *
+   * 放这里而不是让页面再开一路麦克风：同一份数据只该被采集一次。
+   */
+  readonly onChunk?: (pcm: Uint8Array) => void;
 }
 
 export interface VoiceClient {
@@ -124,11 +132,17 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
       context = new AudioContext();
       // 用户手势里调 `resume` —— Safari 不加这句 context 会一直 suspended
       await context.resume();
-      playback = createPlayback({ context });
+      playback = createPlayback({
+        context,
+        onActivity: (busy) => { emit({ type: 'speaking', active: busy }); },
+      });
 
       capture = await startCapture({
         context,
-        onChunk: (pcm) => { send(encodeFrame(UpstreamFrameType.Audio, pcm)); },
+        onChunk: (pcm) => {
+          options.onChunk?.(pcm);
+          send(encodeFrame(UpstreamFrameType.Audio, pcm));
+        },
         onError: (message) => { emit({ type: 'error', message }); },
       });
 

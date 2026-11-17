@@ -32,12 +32,35 @@
 
 ## 本地跑 demo
 
+不用另外起静态服务器 —— 桥把页面和 WS 发在**同一个端口**，所以：同源（不用配 `origins` 白名单），而且 `http://127.0.0.1` 本身就是安全上下文（`getUserMedia` 才有）。
+
 ```bash
-npm run typecheck          # 含同步语音栈
-npm run demo:build         # esbuild 打包 demo/main.ts
+npm run build              # 同步语音栈 + 编译 lib/ + 打包页面
 ```
 
-然后把 `demo/index.html` 放到任意静态服务器上打开（原生 ESM 不认 `.ts`，必须走打包产物）。
+`dsh --profile <装了本插件的 profile>` 启动后终端会打出：
+
+```
+web       http://127.0.0.1:8767/   ← 浏览器打开这个地址
+```
+
+页面上：一个开始/结束按钮、麦克风电平条、立即静音（空格也行）、日志折叠块。
+
+页面里的 WS 地址由 `location` 推出（同端口、`https` → `wss`），换机器换端口都不用改代码。
+
+## 浏览器这边的硬约束
+
+| 约束 | 说明 |
+|---|---|
+| **安全上下文** | 必须 `https://` 或 `http://localhost` / `http://127.0.0.1`。用 `http://<局域网 IP>` 打开时 `navigator.mediaDevices` **是 undefined**，连权限弹窗都不会出 |
+| **用户手势** | `AudioContext.resume()` 与 `getUserMedia` 都要在点击的调用栈里，否则 iOS Safari 上采集静默不出数据 |
+| **权限** | 嵌 iframe 时页面要带 `Permissions-Policy: microphone=(self)` |
+
+## 回声（AEC）现状
+
+整个语音栈**假定端侧已做 AEC**（见 `src/devices/primitives.ts`），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（默认 −40 dBFS）。
+
+浏览器这边只有 `echoCancellation: true` 这一层。Chrome 桌面版给的是 WebRTC AEC3，但残余电平在真实外放条件下是**未知的**，而门限是按真机标定的 —— 所以外放时可能把自己的声音当成用户开口。**没实测之前不要假设够用。**
 
 ## 链接
 

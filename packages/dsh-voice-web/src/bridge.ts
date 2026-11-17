@@ -13,6 +13,8 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import { connect } from 'node:net';
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { extname, join, normalize, resolve, sep } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 export interface WebBridgeOptions {
@@ -27,6 +29,12 @@ export interface WebBridgeOptions {
   /** 允许的页面来源。留空 = 只接受同源连接与不带 Origin 的非浏览器客户端 */
   readonly origins?: readonly string[];
   readonly tls?: { readonly key: Buffer; readonly cert: Buffer };
+  /**
+   * 同时把页面发出去。给了就处理 HTTP GET —— 页面从**同一个端口**加载，
+   * 于是天然同源（不用配 `origins` 白名单），而且 `http://127.0.0.1` 本身就是
+   * 安全上下文，`getUserMedia` 才可用。空/不给则只做 WS，GET 一律 404。
+   */
+  readonly webDir?: string;
   readonly log: (line: string) => void;
 }
 
@@ -34,6 +42,35 @@ export interface WebBridge {
   /** 真正监听后的端口（`port: 0` 时用来取随机口） */
   readonly port: number;
   close(): Promise<void>;
+}
+
+const CONTENT_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.map': 'application/json; charset=utf-8',
+};
+
+/**
+ * 把请求路径映射到 `webDir` 里的文件，越界返回 `null`。
+ *
+ * `normalize` 之后必须重新校验前缀：`/../..` 这类路径在拼接后会指到目录外，
+ * 只判 `startsWith` 而不看规范化结果就漏了。
+ */
+function resolveAsset(webDir: string, urlPath: string): string | null {
+  const decoded = decodeURIComponent(urlPath.split('?')[0] ?? '/');
+  const relative = decoded === '/' ? 'index.html' : decoded.replace(/^\/+/, '');
+  const full = resolve(join(webDir, normalize(relative)));
+  const root = resolve(webDir) + sep;
+  if (full !== resolve(webDir) && !full.startsWith(root)) {
+    return null;
+  }
+  return existsSync(full) && statSync(full).isFile() ? full : null;
 }
 
 /**
@@ -57,9 +94,31 @@ function originAllowed(origin: string, allowed: readonly string[] | undefined, h
 }
 
 export async function startWebBridge(options: WebBridgeOptions): Promise<WebBridge> {
+  const webDir = options.webDir === undefined || options.webDir === '' ? null : resolve(options.webDir);
+
+  const serveAsset = (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): void => {
+    if (webDir === null) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('只提供 WebSocket。配置 webDir 才会发页面。');
+      return;
+    }
+    const file = resolveAsset(webDir, req.url ?? '/');
+    if (file === null) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('没有这个文件');
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': CONTENT_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
+      // 本地调试：改完刷新就要看到，不留缓存
+      'cache-control': 'no-store',
+    });
+    createReadStream(file).pipe(res);
+  };
+
   const httpServer: Server = options.tls === undefined
-    ? createHttpServer()
-    : createHttpsServer({ key: options.tls.key, cert: options.tls.cert });
+    ? createHttpServer(serveAsset)
+    : createHttpsServer({ key: options.tls.key, cert: options.tls.cert }, serveAsset);
 
   const wss = new WebSocketServer({
     server: httpServer,
@@ -135,7 +194,12 @@ export async function startWebBridge(options: WebBridgeOptions): Promise<WebBrid
       httpServer.off('error', onError);
       const address = httpServer.address();
       const port = typeof address === 'object' && address !== null ? address.port : options.port;
-      options.log(`WS 桥监听 ${options.tls === undefined ? 'ws' : 'wss'}://${options.host}:${port}`);
+      const scheme = options.tls === undefined ? 'ws' : 'wss';
+      options.log(`WS 桥监听 ${scheme}://${options.host}:${port}`);
+      if (webDir !== null) {
+        const page = options.tls === undefined ? 'http' : 'https';
+        options.log(`页面     ${page}://${options.host === '0.0.0.0' ? '127.0.0.1' : options.host}:${port}/`);
+      }
       resolve();
     });
   });

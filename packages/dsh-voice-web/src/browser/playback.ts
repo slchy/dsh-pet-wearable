@@ -20,6 +20,12 @@ export interface PlaybackOptions {
    * 太小会因为主线程抖动把一块挤到过去、造成爆音；太大就是白加的延迟。
    */
   readonly startDelaySec?: number;
+  /**
+   * 出声状态变化：有声音在排 → `true`，排空 → `false`。
+   *
+   * 页面靠它显示"它在说话"；将来做播放期抬门限也要挂在这里。
+   */
+  readonly onActivity?: (busy: boolean) => void;
 }
 
 export interface PlaybackHandle {
@@ -64,15 +70,25 @@ export function createPlayback(options: PlaybackOptions): PlaybackHandle {
       source.connect(context.destination);
 
       // 服务端下行的块首尾相接，这里只保证不重叠、不留空
+      const wasIdle = running.size === 0;
       const startAt = Math.max(context.currentTime + startDelaySec, nextStartAt);
       source.start(startAt);
       nextStartAt = startAt + buffer.duration;
 
       running.add(source);
-      source.onended = () => { running.delete(source); };
+      if (wasIdle) {
+        options.onActivity?.(true);
+      }
+      source.onended = () => {
+        running.delete(source);
+        if (running.size === 0) {
+          options.onActivity?.(false);
+        }
+      };
     },
 
     stop(): void {
+      const had = running.size > 0;
       for (const source of running) {
         try {
           source.stop();
@@ -82,6 +98,9 @@ export function createPlayback(options: PlaybackOptions): PlaybackHandle {
       }
       running.clear();
       nextStartAt = 0;
+      if (had) {
+        options.onActivity?.(false);
+      }
     },
 
     close(): void {

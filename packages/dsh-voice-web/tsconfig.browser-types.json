@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.browser.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "lib/browser-types",
+    "rootDir": "src/browser"
+  },
+  "include": ["src/browser/**/*.ts"]
+}
