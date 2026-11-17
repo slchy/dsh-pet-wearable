@@ -6,7 +6,7 @@
  *   ② asr.sentence → turn.start   （定稿→开轮）
  *   ③ turn.start → tts.first      （开轮→TTS 首块；其中 llm.first 是模型首字）
  *
- * 为什么要自己起：本地没有 smart_turn 侧车，判停会退回固定窗口（600 ms），
+ * 为什么要自己起：本地没有 turn_judge 侧车，判停会退回固定窗口（600 ms），
  * 所以 ② 只作参考；① 和 ③ 的口径与服务端一致，可用于定位。
  *
  * 跑法：node scripts/probe-single-turn.mjs [--repeats 3]

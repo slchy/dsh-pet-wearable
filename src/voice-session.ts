@@ -53,7 +53,7 @@ import {
 import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './providers.ts';
 import type { SessionCore } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
-import { SmartTurn } from './smart-turn.ts';
+import { TurnJudge } from './turn-judge.ts';
 import { startToolControl, type ToolControl } from './tool-control.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
@@ -64,7 +64,7 @@ import { UtteranceAssembler } from './utterance-assembler.ts';
 export const UPSTREAM_SAMPLE_RATE = 16_000;
 
 /**
- * 判停器的最小接口（`SmartTurn` 满足它）。
+ * 判停器的最小接口（`TurnJudge` 满足它）。
  *
  * 抽成接口只为一件事：**共享与独占的判定要能单测**，不必起 python 侧车。
  */
@@ -81,31 +81,31 @@ export interface EndpointDetector {
  * 自己创建的那份（单连接命令行 / 测试）必须 stop，否则进程退不掉。
  */
 export function resolveEndpointDetector(
-  options: { readonly smartTurn?: object; readonly smartTurnClient?: EndpointDetector },
+  options: { readonly turnJudge?: object; readonly turnJudgeClient?: EndpointDetector },
   create: () => EndpointDetector,
   log: (line: string) => void,
 ): { readonly client: EndpointDetector | null; readonly owned: boolean } {
-  if (options.smartTurnClient !== undefined) {
-    if (options.smartTurn === undefined) {
+  if (options.turnJudgeClient !== undefined) {
+    if (options.turnJudge === undefined) {
       log('  判停    ⚠ 给了共享判停器但没有参数表（quietMs 等），会按 0 处理');
     }
-    return { client: options.smartTurnClient, owned: false };
+    return { client: options.turnJudgeClient, owned: false };
   }
-  if (options.smartTurn === undefined) {
+  if (options.turnJudge === undefined) {
     return { client: null, owned: false };
   }
   return { client: create(), owned: true };
 }
 
 /**
- * 没有判停器（SmartTurn 关掉）时的固定合并窗口。
+ * 没有判停器（TurnJudge 关掉）时的固定合并窗口。
  *
  * 旧行为：收到一句 ASR 就再等 600 ms 看有没有下文，没有就定稿。
  */
 const ASSEMBLER_FALLBACK_WINDOW_MS = 600;
 
 /**
- * 判停请求提前多久发起（与静候窗 `SMART_TURN_QUIET_MS` 重叠）。
+ * 判停请求提前多久发起（与静候窗 `TURN_JUDGE_QUIET_MS` 重叠）。
  *
  * `asrToTurn` 实测中位 224 ms = 静候窗 150 + 判停器往返约 70 + 派发几毫秒。
  * 提前 65 ms 把请求发出去，那趟往返就藏进静默窗里，中位降到约 150 ms；
@@ -177,8 +177,8 @@ export interface VoiceSessionOptions {
   readonly stt: SttProvider;
   /** TTS。采样率由 provider 自己声明，这里不再单独配。 */
   readonly tts: TtsProvider;
-  /** Smart Turn 判停器；缺任一项则不启用，退回固定合并窗口 */
-  readonly smartTurn?: {
+  /** TurnJudge 判停器；缺任一项则不启用，退回固定合并窗口 */
+  readonly turnJudge?: {
     readonly pythonPath: string;
     readonly scriptPath: string;
     readonly quietMs: number;
@@ -206,10 +206,10 @@ export interface VoiceSessionOptions {
    * ~300 ms，而真机每次重连（网络抖动 / 服务重启 / 重开 App）第一句都要付这一刀。
    * 常驻之后只有进程启动付一次。
    *
-   * 与 {@link smartTurn} 一起给（后者提供静默窗等参数）；只给这个不给参数表是
+   * 与 {@link turnJudge} 一起给（后者提供静默窗等参数）；只给这个不给参数表是
    * 配置错误，会退化成 `quietMs: 0`。
    */
-  readonly smartTurnClient?: EndpointDetector;
+  readonly turnJudgeClient?: EndpointDetector;
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
@@ -419,9 +419,9 @@ class VoiceConnection {
 
   private readonly dialog: DialogRuntime;
   private readonly uplink: UplinkPipeline;
-  private readonly smartTurn: EndpointDetector | null;
+  private readonly turnJudge: EndpointDetector | null;
   /** 判停器是不是这条连接自己的（自己建的在断开时必须销毁，共享的不许） */
-  private readonly ownsSmartTurn: boolean;
+  private readonly ownsTurnJudge: boolean;
   private readonly assembler: UtteranceAssembler;
   private readonly stt: SttSession;
 
@@ -528,49 +528,49 @@ class VoiceConnection {
       },
     );
 
-    const smartTurnOptions = options.smartTurn;
+    const turnJudgeOptions = options.turnJudge;
     const detector = resolveEndpointDetector(
       options,
-      () => new SmartTurn({
-        python: smartTurnOptions!.pythonPath,
-        script: smartTurnOptions!.scriptPath,
+      () => new TurnJudge({
+        python: turnJudgeOptions!.pythonPath,
+        script: turnJudgeOptions!.scriptPath,
         log: (line) => { console.log(`  ${line}`); },
       }),
       (line) => { console.log(line); },
     );
-    this.smartTurn = detector.client;
-    this.ownsSmartTurn = detector.owned;
+    this.turnJudge = detector.client;
+    this.ownsTurnJudge = detector.owned;
 
     this.assembler = new UtteranceAssembler({
-      quietMs: smartTurnOptions?.quietMs ?? 0,
-      extendMs: smartTurnOptions?.extendMs ?? 0,
-      maxExtensions: smartTurnOptions?.maxExtensions ?? 0,
-      ...(smartTurnOptions?.maxUnsureExtensions === undefined
+      quietMs: turnJudgeOptions?.quietMs ?? 0,
+      extendMs: turnJudgeOptions?.extendMs ?? 0,
+      maxExtensions: turnJudgeOptions?.maxExtensions ?? 0,
+      ...(turnJudgeOptions?.maxUnsureExtensions === undefined
         ? {}
-        : { maxUnsureExtensions: smartTurnOptions.maxUnsureExtensions }),
+        : { maxUnsureExtensions: turnJudgeOptions.maxUnsureExtensions }),
       fallbackWindowMs: ASSEMBLER_FALLBACK_WINDOW_MS,
-      threshold: smartTurnOptions?.threshold ?? 1,
-      ...(smartTurnOptions?.thresholdCjk === undefined
+      threshold: turnJudgeOptions?.threshold ?? 1,
+      ...(turnJudgeOptions?.thresholdCjk === undefined
         ? {}
-        : { thresholdCjk: smartTurnOptions.thresholdCjk }),
-      ...(smartTurnOptions?.unfinishedWaitMs === undefined
+        : { thresholdCjk: turnJudgeOptions.thresholdCjk }),
+      ...(turnJudgeOptions?.unfinishedWaitMs === undefined
         ? {}
-        : { unfinishedWaitMs: smartTurnOptions.unfinishedWaitMs }),
-      ...(smartTurnOptions?.partialGraceMs === undefined
+        : { unfinishedWaitMs: turnJudgeOptions.unfinishedWaitMs }),
+      ...(turnJudgeOptions?.partialGraceMs === undefined
         ? {}
-        : { partialGraceMs: smartTurnOptions.partialGraceMs }),
+        : { partialGraceMs: turnJudgeOptions.partialGraceMs }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
       // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。
-      trailingTrimMs: smartTurnOptions?.trailingTrimMs ?? ASSEMBLER_TRAILING_TRIM_MS,
+      trailingTrimMs: turnJudgeOptions?.trailingTrimMs ?? ASSEMBLER_TRAILING_TRIM_MS,
       // 判停的每次决定都落档：`② 定稿→开轮` 在档案里一直是黑盒，1 ms 和 2400 ms
       // 都可以是这个数，不看 p 分不清「判停不敢收」和「排队」。
       onJudge: (fact) => { this.archive?.event(EVENTS.judge, { ...fact }); },
-      predict: this.smartTurn
-        ? (pcm: Buffer) => this.smartTurn!.predict(pcm)
+      predict: this.turnJudge
+        ? (pcm: Buffer) => this.turnJudge!.predict(pcm)
         : undefined,
       // 只在有判停器时才有意义（没有判停器就走固定窗口，没有往返可叠）
-      ...(this.smartTurn ? { predictAtMs: ASSEMBLER_PREDICT_LEAD_MS } : {}),
+      ...(this.turnJudge ? { predictAtMs: ASSEMBLER_PREDICT_LEAD_MS } : {}),
       // 静音一到就把判停跑掉，和 ASR 那 200 ms 静音窗并行 —— 出句时概率已经算好。
       // 门槛用能量门那个（同一路放大后的波形、同一套设备标定）。
       silenceDb: options.gate.thresholdDbfs,
@@ -1063,8 +1063,8 @@ class VoiceConnection {
     this.assembler.dispose();
     // 只有自己建的那份才销毁：共享侧车由进程持有，断开就 stop 等于每次重连都
     // 重新加载 ONNX（实测 ~300 ms，第一句白吃）
-    if (this.ownsSmartTurn) {
-      this.smartTurn?.stop();
+    if (this.ownsTurnJudge) {
+      this.turnJudge?.stop();
     }
     this.control?.close();
     this.archive?.close();

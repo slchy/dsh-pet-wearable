@@ -207,7 +207,7 @@ stateDiagram-v2
 ## 4 UtteranceAssembler —— 判停
 
 **持有**：`voice-session` 的 `assembler`（`src/utterance-assembler.ts`）。
-**驱动**：ASR 中间结果 / 整句（`push`）、预测器（`smart-turn`）、定时器。
+**驱动**：ASR 中间结果 / 整句（`push`）、预测器（`turn-judge`）、定时器。
 
 | 状态 | 含义 |
 |---|---|

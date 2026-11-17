@@ -36,7 +36,7 @@ pipecat 线上（`BaseSmartTurn.analyze_end_of_turn`）取的窗口也是**按�
 - **正样本**：窗口结束在「最后一个有声样本 + N ms」
 - **负样本**：窗口结束在这一句的 30% / 50% / 70% 处（话还没说完）
 
-    python bench/latency/probe-smartturn-padding.py <events.jsonl> <uplink.pcm> \
+    python bench/latency/probe-turnjudge-padding.py <events.jsonl> <uplink.pcm> \
         --tails 0,100,200,300,400,800 --mid 0.3,0.5,0.7
 
 要在**有模型和 onnxruntime 的机器**上跑（服务器 `~/miai-cloud/.venv/bin/python`）。
@@ -51,7 +51,7 @@ import sys
 import numpy as np
 import onnxruntime as ort
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "smart_turn"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "turn_judge"))
 from whisper_features import compute_whisper_log_mel_features  # noqa: E402
 
 RATE = 16_000
@@ -140,7 +140,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--norm", default="wave", choices=("wave", "mel"))
     ap.add_argument("--modes", default="roll,scoped-front,scoped-back")
     ap.add_argument("--model", default=os.environ.get(
-        "SMART_TURN_MODEL",
+        "TURN_JUDGE_MODEL",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models",
                      "smart-turn-v3.2-cpu.onnx"),
     ))

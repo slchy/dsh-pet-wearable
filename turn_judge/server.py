@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Smart Turn v3.2 侧车：常驻进程，按帧收 PCM，回一个「这句说完了吗」的概率。
+"""TurnJudge 侧车：常驻进程，按帧收 PCM，回一个「这句说完了吗」的概率。
+
+模型是 pipecat 的 Smart Turn v3.2（`models/smart-turn-v3.2-cpu.onnx`，文件名保留上游原名）。
 
 为什么单独起一个 Python 进程，而不是在 Node 里做：
 
-  Smart Turn 的输入是 Whisper 风格的 log-mel（80×800），要先做 **400 点**
+  模型输入是 Whisper 风格的 log-mel（80×800），要先做 **400 点**
   rFFT（400 = 2^4 × 5^2，不是 2 的幂，手写混合基 FFT 容易出错）。
   官方把这份特征提取用 numpy 写成了一份自包含实现（见 whisper_features.py），
   直接复用比在 TS 里重写可靠得多。
@@ -28,14 +30,16 @@ from whisper_features import compute_whisper_log_mel_features
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_MODEL = os.path.join(_HERE, "..", "models", "smart-turn-v3.2-cpu.onnx")
-_MODEL_PATH = os.environ.get("SMART_TURN_MODEL", _DEFAULT_MODEL)
+_MODEL_PATH = (os.environ.get("TURN_JUDGE_MODEL")
+               or os.environ.get("SMART_TURN_MODEL")  # 旧名，改名过渡期兜底
+               or _DEFAULT_MODEL)
 
 _MAX_SAMPLES = 16_000 * 8  # 模型固定吃 8 秒
 
 
 def log(msg: str) -> None:
     # stdout 是协议通道，日志只能走 stderr
-    print(f"[smart-turn] {msg}", file=sys.stderr, flush=True)
+    print(f"[turn-judge] {msg}", file=sys.stderr, flush=True)
 
 
 def load_session() -> "ort.InferenceSession":

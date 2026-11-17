@@ -78,13 +78,13 @@ PY
 然后**把判停阈值抬上去**，逼出「没说完 → 并下一段」那条分支：
 
 ```bash
-export SMART_TURN_THRESHOLD=0.99 SMART_TURN_EXTEND_MS=2000
+export TURN_JUDGE_THRESHOLD=0.99 TURN_JUDGE_EXTEND_MS=2000
 ```
 
 默认阈值 0.5 时，干净的 TTS 片段会被判停器各判成一句（实测 0.977 / 0.985），
 于是**各自成轮**——这不是 bug，是「用户确实说完了」。要验并段就得让判停说没说完。
 
-> 「没说完」这一分支的上限是 `SMART_TURN_MAX_UNSURE`（默认 2），墙钟 = 它 × `EXTEND_MS`。
+> 「没说完」这一分支的上限是 `TURN_JUDGE_MAX_UNSURE`（默认 2），墙钟 = 它 × `EXTEND_MS`。
 > 上面这条把 `EXTEND_MS` 抬到 2000 正是为了让 2 拍够用（4 s）；如果只抬阈值不抬
 > `EXTEND_MS`，默认 2×400 ms 一般等不到第二段，会看到「强行收下」而不是并段。
 

@@ -101,8 +101,8 @@ src/
   frame.ts           ← 分帧编解码
   uplink-pipeline.ts ← mSBC → ffmpeg 子进程 → 能量门
   energy-gate.ts     ← 没声音就不建 STT 连接（有预卷缓冲）
-  utterance-assembler.ts ← 句子 → 一轮话语（按 Smart Turn 概率判停）
-  smart-turn.ts      ← 判停 sidecar 客户端（`smart_turn/` 那个 Python 服务）
+  utterance-assembler.ts ← 句子 → 一轮话语（按 TurnJudge 概率判停）
+  turn-judge.ts      ← 判停 sidecar 客户端（`turn_judge/` 那个 Python 服务）
   vad.ts             ← silero-vad 封装
   aliyun-asr.ts      ← 阿里云 NLS 实时识别
   mimo.ts            ← MiMo ASR / TTS（SSE 流式，下行 24 kHz）
@@ -118,7 +118,7 @@ src/
     ports.ts         ← 宿主设备接口（通用性边界）
     pet-timing.ts    ← 时机状态机（什么时候开口）
 tests/               ← `node --test tests/*.test.ts`
-smart_turn/          ← Python 判停 sidecar
+turn_judge/          ← Python 判停 sidecar
 mcp/                 ← take_photo 等 MCP 工具
 models/              ← silero_vad.onnx
 ```

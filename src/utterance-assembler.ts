@@ -15,7 +15,7 @@
  * （「你在运行什么？」→「平台上。」）。
  *
  * 所以一律先等 {@link UtteranceAssemblerOptions.quietMs}，再交给
- * {@link UtteranceAssemblerOptions.predict}（Smart Turn）看**音频本身**。
+ * {@link UtteranceAssemblerOptions.predict}（TurnJudge）看**音频本身**。
  * 它说没说完就再等一段：`p < threshold` 这一类最多
  * {@link UtteranceAssemblerOptions.maxUnsureExtensions} 次，其余三种文本判据合计
  * 最多 {@link UtteranceAssemblerOptions.maxExtensions} 次，然后强制收下，
@@ -136,7 +136,7 @@ export interface UtteranceAssemblerOptions {
   /**
    * ASR 中间结果刚到多久之内，音频判停「说完了」也不算数。默认 400 ms。
    *
-   * 音频判据（Smart Turn）只看波形：句子之间那点停顿，它分不清是「说完了」
+   * 音频判据（TurnJudge）只看波形：句子之间那点停顿，它分不清是「说完了」
    * 还是「换气」。而 ASR 的中间结果是**用户还在出字**的直接证据 ——
    * 定稿之后 partial 还在增长，说明下一句已经在路上，这时候收下就是抢话。
    *
@@ -343,10 +343,10 @@ export class UtteranceAssembler {
    * 新一轮开口：把判停器的音频窗口**重置到这一句**。
    *
    * 为什么要重置：官方 `BaseSmartTurn` 喂的是「这一句」——
-   * `speech_start - pre_speech_ms` 到缓冲区末尾（见 smart-turn README
+   * `speech_start - pre_speech_ms` 到缓冲区末尾（见 turn-judge README
    * "audio from previous turns does not need to be included"）。我们原来是
    * **连续 8 s 滚动**，短句子的窗口里可能有 7 秒是上一轮的回答和中间那段静音。
-   * 实测（`bench/latency/probe-smartturn-padding.py`，同一份 `uplink.pcm`）：
+   * 实测（`bench/latency/probe-turnjudge-padding.py`，同一份 `uplink.pcm`）：
    * 同一句「我问你看最近看过哪些电影？」，滚动窗口 p=0.26、按句裁 p=0.95；而
    * 句内任意切一刀（30/50/70%）滚动窗口都给 0.9 以上 —— 等于判停什么都没在判。
    *
@@ -798,7 +798,7 @@ export class UtteranceAssembler {
    * 这一小段是不是「一句话被切开的前半截」，值得再等一拍。
    *
    * 真机（2026-11-15）：用户问「…你是怎么答的？」，ASR 切成两句 ——
-   * 「…你你是怎么点？」+「大的。」。SmartTurn 对「大的。」给了 0.985：
+   * 「…你你是怎么点？」+「大的。」。TurnJudge 对「大的。」给了 0.985：
    * 它只看这两秒音频，「大的。」确实像个完整回答，判得不冤。于是碎片单独成轮，
    * agent 只能瞎猜，用户只好把整段话重说一遍。
    *

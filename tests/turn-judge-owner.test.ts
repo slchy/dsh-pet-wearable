@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { resolveEndpointDetector, type EndpointDetector } from '../src/voice-session.ts';
+import { envNumber, envString } from '../src/util.ts';
 
 function fakeDetector(): EndpointDetector & { stopped: boolean } {
   return {
@@ -35,7 +36,7 @@ const noop = (): void => {};
 
 test('共享的判停器：用它，但不归这条连接所有', () => {
   const shared = fakeDetector();
-  const r = resolveEndpointDetector({ smartTurn: params, smartTurnClient: shared }, () => {
+  const r = resolveEndpointDetector({ turnJudge: params, turnJudgeClient: shared }, () => {
     throw new Error('给了共享实例就不该再新建一个');
   }, noop);
   assert.equal(r.client, shared);
@@ -44,7 +45,7 @@ test('共享的判停器：用它，但不归这条连接所有', () => {
 
 test('没给共享实例：自己建一个，并且是它的主人', () => {
   const mine = fakeDetector();
-  const r = resolveEndpointDetector({ smartTurn: params }, () => mine, noop);
+  const r = resolveEndpointDetector({ turnJudge: params }, () => mine, noop);
   assert.equal(r.client, mine);
   assert.equal(r.owned, true, '自建实例必须 owned=true，否则进程退不掉');
 });
@@ -60,10 +61,30 @@ test('没配判停器：null，不新建', () => {
 test('只给共享实例不给参数表：仍然共享，但要说一声', () => {
   const shared = fakeDetector();
   const lines: string[] = [];
-  const r = resolveEndpointDetector({ smartTurnClient: shared }, () => fakeDetector(), (l) => {
+  const r = resolveEndpointDetector({ turnJudgeClient: shared }, () => fakeDetector(), (l) => {
     lines.push(l);
   });
   assert.equal(r.client, shared);
   assert.equal(r.owned, false);
   assert.ok(lines.some((l) => l.includes('没有参数表')), '静默退化成 quietMs=0 太难查');
+});
+
+// 2026-11-18 判停器改名 SMART_TURN_* → TURN_JUDGE_*。生产的 .env 还是旧名，
+// 读不到就是"判停悄悄退回固定窗口"，一句话都不会报错 —— 所以这条要钉住。
+test('环境变量：旧名 SMART_TURN_* 还能读，新名优先', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env['TURN_JUDGE_THRESHOLD'];
+    process.env['SMART_TURN_THRESHOLD'] = '0.42';
+    assert.equal(envNumber('TURN_JUDGE_THRESHOLD', 0.5), 0.42, '只有旧名时要认旧名');
+    process.env['TURN_JUDGE_THRESHOLD'] = '0.77';
+    assert.equal(envNumber('TURN_JUDGE_THRESHOLD', 0.5), 0.77, '两个都有时新名赢');
+    delete process.env['SMART_TURN_THRESHOLD'];
+    assert.equal(envNumber('TURN_JUDGE_THRESHOLD', 0.5), 0.77);
+    assert.equal(envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35), 0.35, '都没设时退回默认');
+    process.env['SMART_TURN'] = '0';
+    assert.equal(envString('TURN_JUDGE'), '0', '关闭开关的旧名也要认');
+  } finally {
+    process.env = saved;
+  }
 });

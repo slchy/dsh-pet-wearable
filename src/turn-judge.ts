@@ -1,5 +1,8 @@
 /**
- * Smart Turn v3.2 客户端：常驻的 Python 侧车，回答「这一轮说完了吗」。
+ * TurnJudge 客户端：常驻的 Python 侧车，回答「这一轮说完了吗」。
+ *
+ * 模型是 pipecat 的 Smart Turn v3.2（`models/smart-turn-v3.2-cpu.onnx`）——
+ * 文件名与模型名都保留上游原名，方便对账；「TurnJudge」是本项目这一层封装的名字。
  *
  * 为什么不是一个纯 TS 实现：模型输入是 Whisper 风格 log-mel（80×800），
  * 要先做 400 点 rFFT（400 = 2^4×5^2，非 2 的幂）。官方那份 numpy 实现
@@ -10,7 +13,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
-export interface SmartTurnOptions {
+export interface TurnJudgeOptions {
   /** 带 onnxruntime 的 python，通常是项目里的 .venv */
   python: string;
   /** server.py 路径 */
@@ -18,8 +21,8 @@ export interface SmartTurnOptions {
   log?: (line: string) => void;
 }
 
-export class SmartTurn {
-  private readonly opts: SmartTurnOptions;
+export class TurnJudge {
+  private readonly opts: TurnJudgeOptions;
   private readonly log: (line: string) => void;
   private proc: ChildProcessWithoutNullStreams | null = null;
   private rbuf: Buffer = Buffer.alloc(0);
@@ -27,7 +30,7 @@ export class SmartTurn {
   private chain: Promise<unknown> = Promise.resolve();
   private pending: ((p: number) => void) | null = null;
 
-  constructor(opts: SmartTurnOptions) {
+  constructor(opts: TurnJudgeOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
   }
@@ -52,10 +55,11 @@ export class SmartTurn {
     });
     proc.stderr.on('data', (d: Buffer) => {
       const s = d.toString().trim();
-      if (s) this.log(`[smart-turn] ${s.slice(0, 200)}`);
+      // 侧车自己已经打了 `[turn-judge]` 前缀，这里不再加一层
+      if (s) this.log(s.slice(0, 200));
     });
     proc.on('exit', (code) => {
-      this.log(`[smart-turn] 侧车退出 code=${code}，下次调用会重新拉起`);
+      this.log(`[turn-judge] 侧车退出 code=${code}，下次调用会重新拉起`);
       this.proc = null;
       const r = this.pending;
       this.pending = null;

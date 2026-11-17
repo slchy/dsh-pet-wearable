@@ -20,7 +20,7 @@
 算出来的数字通常还错（§13 第 1 条就是活例）。
 
 **③ 新探针一律放 `bench/`。** `scripts/deploy_cloud.py` 的 `ITEMS` 只同步
-`src mcp tools tests smart_turn scripts package.json tsconfig.json README.md`
+`src mcp tools tests turn_judge scripts package.json tsconfig.json README.md`
 九项，`bench/` 不在里面。往 `scripts/` 里塞一次性探针，等于把它推上生产服务器。
 
 **④ 每个事实只有一个源，观测工具自动去那儿取，绝不复制。** 复制一份 = 多一份要维护，
@@ -53,8 +53,8 @@
 | 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
 | 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比 |
 | 不接眼镜、全自动跑几条话术 | `bench/e2e/run.py`（手机当喇叭+话筒） | 说完→首音 / 通过与否 |
-| 判停侧车为什么不敢收 | **档案里的 `judge.decide`**（线上就有，最省事）；要离线复算才用 `bench/latency/probe-smartturn-silence.py` | 每次决定的 `p` + 等待；② 的成因 |
-| 换个判停阈值/延长次数会怎样 | `bench/latency/probe-smartturn-silence.py --curve START:END:STEP` | p 随尾部静音怎么变 |
+| 判停侧车为什么不敢收 | **档案里的 `judge.decide`**（线上就有，最省事）；要离线复算才用 `bench/latency/probe-turnjudge-silence.py` | 每次决定的 `p` + 等待；② 的成因 |
+| 换个判停阈值/延长次数会怎样 | `bench/latency/probe-turnjudge-silence.py --curve START:END:STEP` | p 随尾部静音怎么变 |
 | CosyVoice 首包多少 / 要几个字才开跑 | `bench/latency/probe-cosyvoice-firstbatch.mts` | 首批字数 × 首块时间 |
 | 快车道会不会答错本该交给 `dsh` 的 | `bench/fast_lane/run.ts` | 误拦截率（>0 退出码 1） |
 | 换哪家快模型首字更短 | `bench/fast_lane/probe_models.mjs` | 逐模型首 token |
@@ -132,7 +132,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/latency/probe-single-turn.mjs` | 起生产形态服务端跑一整轮，读档案 —— 本地没有判停侧车，②只作参考 |
 | `bench/latency/analyze-real-archive.mjs` | 真机档案速览（含「等关门」列）。**只用于看 ②，段口径以 `latency-report.ts` 为准** |
 
-`bench/latency/` 下其余四个是 TTS 专项探针（见 §6），两个 `probe-smartturn-*` 见 §5。
+`bench/latency/` 下其余四个是 TTS 专项探针（见 §6），两个 `probe-turnjudge-*` 见 §5。
 
 ## 4. 真机回放与端到端
 
@@ -147,13 +147,13 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 **为什么优先 `replay` 而不是 `e2e`**：`replay` 输入是同一份音频，跨次可比；
 `e2e` 每轮内容不同，只能看"通不通"。
 
-## 5. 判停（SmartTurn 侧车）
+## 5. 判停（TurnJudge 侧车）
 
 | 脚本 | 作用 |
 |---|---|
-| `bench/latency/probe-smartturn-padding.py` | **窗口怎么裁才是对的**：正样本（真停嘴）与负样本（句内切一刀）× 三种窗口（连续 8 s 滚动 / 按句裁+前补零 / 按句裁+后补零），逐格给 p。**这是查清「p 为什么是噪声」的那一个** |
-| `bench/latency/probe-smartturn-silence.py` | **p 随尾部静音怎么变**：`--curve START:END:STEP` 扫一条话音，`--events events.jsonl` 逐轮看真实停嘴处的 p。要在有 onnxruntime 的机器上跑（服务器 `~/miai-cloud/.venv/bin/python`） |
-| `bench/latency/probe-smartturn-output.py` | 模型输出到底是什么：形状 `[s6, 1]`、要不要 sigmoid、变长维 `s6` 怎么喂 |
+| `bench/latency/probe-turnjudge-padding.py` | **窗口怎么裁才是对的**：正样本（真停嘴）与负样本（句内切一刀）× 三种窗口（连续 8 s 滚动 / 按句裁+前补零 / 按句裁+后补零），逐格给 p。**这是查清「p 为什么是噪声」的那一个** |
+| `bench/latency/probe-turnjudge-silence.py` | **p 随尾部静音怎么变**：`--curve START:END:STEP` 扫一条话音，`--events events.jsonl` 逐轮看真实停嘴处的 p。要在有 onnxruntime 的机器上跑（服务器 `~/miai-cloud/.venv/bin/python`） |
+| `bench/latency/probe-turnjudge-output.py` | 模型输出到底是什么：形状 `[s6, 1]`、要不要 sigmoid、变长维 `s6` 怎么喂 |
 
 **结论（2026-11-17 查清，别再按「p 是噪声」处理）**：p 不是噪声，是**窗口喂错了**。
 
@@ -164,7 +164,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | 尾巴 | 尾巴上的静音会把 p 一路拉低（停嘴处 0.95、+300 ms 0.35、+800 ms 0.04），而 p 正是「要不要再等一拍」的依据 —— 每等一拍判据更差 |
 
 模型、特征提取、ORT 都验过是对的：模型文件与 pipecat 内置的
-`smart-turn-v3.2-cpu.onnx` **git blob 相同**；`smart_turn/whisper_features.py` 与上游逐行相同，
+`smart-turn-v3.2-cpu.onnx` **git blob 相同**；`turn_judge/whisper_features.py` 与上游逐行相同，
 输出与 `transformers.WhisperFeatureExtractor(chunk_length=8, do_normalize=True)`
 **bit-identical**（maxdiff 0.0）；换 ORT 1.19 与 1.31 结果一致。中文准确率本来就低
 （官方 benchmark 85.8%，其余语种 90–97%），所以 p 只当**参考信号**，别做硬判据。
@@ -175,7 +175,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 ### 5.1 两条判停收尾规则（2026-11-17 加，别再「调阈值」绕过去）
 
-1. **文本含汉字时用 `SMART_TURN_THRESHOLD_CJK`（0.35），不是全局 0.5。**
+1. **文本含汉字时用 `TURN_JUDGE_THRESHOLD_CJK`（0.35），不是全局 0.5。**
    官方 benchmark 里中文是最差一档（85.8%，**漏报 9.26% / 误报 4.95%**）——方向是偏向
    说「没说完」。真机同一场的实测正好两簇分开：
 

@@ -20,7 +20,7 @@
 | 流式输入 | ❌ 整段 base64 内联 | ✅ WebSocket 边推边识别 |
 | partial transcript | ✅（但已等整段） | ✅ 中间结果回调 |
 | VAD 位置 | — | 服务端，`silence=500 ms` |
-| 「说完」判定 | — | 服务端 `SentenceEnd` 作为**候选**，最终由本地 Smart Turn 确认 |
+| 「说完」判定 | — | 服务端 `SentenceEnd` 作为**候选**，最终由本地 TurnJudge 确认 |
 | 单连接最长时长 | — | ⚠️ 未测；无语音会 `Gateway:IDLE_TIMEOUT` |
 | 中途取消 | — | ✅ 关连接即取消 |
 | 封装格式 | WAV（裸 PCM 加头） | 裸 PCM16 16 kHz mono，无需头 |

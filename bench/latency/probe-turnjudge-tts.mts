@@ -1,12 +1,12 @@
 /**
  * 探针：用 CosyVoice 在**原生 16 kHz** 合成几句已知「说完 / 没说完」的话，
- * 落成裸 PCM16，喂给 Smart Turn 侧车看 p。
+ * 落成裸 PCM16，喂给 TurnJudge 侧车看 p。
  *
  * 为什么需要它：真机上行是 mSBC 解出来的、很轻（−40 dBFS），而档案里的下行是
  * 24 kHz 的 TTS（读成 16 kHz 会慢 1.5 倍）。要判断「模型/特征链对不对」，
  * 需要一段**采样率、电平都干净**的已知答案。
  *
- * 跑法：node --experimental-strip-types bench/latency/probe-smartturn-tts.mts <输出目录>
+ * 跑法：node --experimental-strip-types bench/latency/probe-turnjudge-tts.mts <输出目录>
  */
 const REPO = new URL('../../', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 const fs = await import('node:fs');

@@ -21,15 +21,15 @@ import {
   buildAgent,
   buildStt,
   buildTts,
-  envNumber,
   loadAuthenticator,
   loadDotEnv,
   loadTls,
   openAnnounceStore,
   wireAgent,
 } from './voice/assembly.ts'
+import { envNumber, envString } from './voice/util.ts'
 import { checkBindSafety } from './voice/bind-policy.ts'
-import { SmartTurn } from './voice/smart-turn.ts'
+import { TurnJudge } from './voice/turn-judge.ts'
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice/voice-session.ts'
 import type { AgentProvider } from './voice/providers.ts'
 import type { DshSession } from './voice/session.ts'
@@ -123,7 +123,7 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
     // 的控制流分析窄化成永远 null
     const voice: { stop: (() => void) | null } = { stop: null }
     let dshSession: DshSession | null = null
-    let smartTurn: SmartTurn | null = null
+    let turnJudge: TurnJudge | null = null
     let stopWired: () => void = () => {}
 
     try {
@@ -179,28 +179,28 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
 
       // 判停侧车与 CLI 同一套环境变量。少了它 web 会退回固定合并窗口，
       // 判停明显变差 —— 那不是"兼容性差异"，是功能缺失。
-      const smartTurnPython = process.env['SMART_TURN_PYTHON'] ?? ''
-      const smartTurnScript = process.env['SMART_TURN_SCRIPT'] ?? ''
-      const smartTurnEnabled = process.env['SMART_TURN'] !== '0'
-        && smartTurnPython !== '' && smartTurnScript !== ''
-      const smartTurnClient = smartTurnEnabled
-        ? new SmartTurn({
-          python: smartTurnPython,
-          script: smartTurnScript,
+      const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? ''
+      const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? ''
+      const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
+        && turnJudgePython !== '' && turnJudgeScript !== ''
+      const turnJudgeClient = turnJudgeEnabled
+        ? new TurnJudge({
+          python: turnJudgePython,
+          script: turnJudgeScript,
           log: report,
         })
         : null
-      if (smartTurnClient !== null) {
+      if (turnJudgeClient !== null) {
         // 低幅正弦而不是全零：全零在 log-mel 里是 −∞ dB，不该拿它当"正常输入"试模型
         const warmup = Buffer.alloc(UPSTREAM_SAMPLE_RATE * 2)
         for (let i = 0; i < warmup.length / 2; i += 1) {
           warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2)
         }
         const startedAt = Date.now()
-        const p = await smartTurnClient.predict(warmup)
+        const p = await turnJudgeClient.predict(warmup)
         logger.info(`判停侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}）`)
       }
-      smartTurn = smartTurnClient
+      turnJudge = turnJudgeClient
 
       // 语音栈先起：端口 0 → 等它报出真实端口，再把桥接上去
       const voicePort = await new Promise<number>((resolve) => {
@@ -212,18 +212,18 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
           agent,
           stt,
           tts,
-          ...(smartTurnClient === null ? {} : {
-            smartTurn: {
-              pythonPath: smartTurnPython,
-              scriptPath: smartTurnScript,
-              quietMs: envNumber('SMART_TURN_QUIET_MS', 0),
-              extendMs: envNumber('SMART_TURN_EXTEND_MS', 400),
-              maxExtensions: envNumber('SMART_TURN_MAX_EXT', 7),
-              threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
-              unfinishedWaitMs: envNumber('SMART_TURN_UNFINISHED_MS', 250),
-              partialGraceMs: envNumber('SMART_TURN_PARTIAL_GRACE_MS', 150),
+          ...(turnJudgeClient === null ? {} : {
+            turnJudge: {
+              pythonPath: turnJudgePython,
+              scriptPath: turnJudgeScript,
+              quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
+              extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 400),
+              maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 7),
+              threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
+              unfinishedWaitMs: envNumber('TURN_JUDGE_UNFINISHED_MS', 250),
+              partialGraceMs: envNumber('TURN_JUDGE_PARTIAL_GRACE_MS', 150),
             },
-            smartTurnClient,
+            turnJudgeClient,
           }),
           gate: {
             thresholdDbfs: envNumber('VOICE_PEAK_DBFS', -40),
@@ -287,7 +287,7 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       // 装配半途失败时把已经起来的收掉，不留「只有桥没有栈」的状态
       await bridge?.close()
       voice.stop?.()
-      smartTurn?.stop()
+      turnJudge?.stop()
       stopWired()
       dshSession?.stop()
       if (error instanceof AssemblyError) {
@@ -301,7 +301,7 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       // 之后 `server.close()` 才真的能在没有活动连接的情况下收尾。
       await bridge?.close()
       voice.stop?.()
-      smartTurn?.stop()
+      turnJudge?.stop()
       stopWired()
       dshSession?.stop()
     }

@@ -23,7 +23,7 @@
 1. 按「定稿时刻 + k×400 ms」逐拍取**真实快照**，看 `p` 怎么变（复现线上）
 2. 固定住语音段，**人为补 N ms 数字静音**，看 `p` 随 N 怎么变（分离变量）
 
-    python bench/latency/probe-smartturn-silence.py <uplink.pcm> <定稿时刻ms> [--step 400]
+    python bench/latency/probe-turnjudge-silence.py <uplink.pcm> <定稿时刻ms> [--step 400]
 
 `定稿时刻` 用档案里那条 `asr.sentence` 的 `t`（相对会话开始的毫秒）；
 PCM 与 `t` 的对应关系就是 `at.pcm`（`t=2` 时 `pcm=0`）。
@@ -40,7 +40,7 @@ import numpy as np
 import onnxruntime as ort
 
 # 侧车用的是自带的特征提取，直接复用，别重写
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "smart_turn"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "turn_judge"))
 from whisper_features import compute_whisper_log_mel_features  # noqa: E402
 
 RATE = 16_000
@@ -82,11 +82,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("sentence_ms", type=float, nargs="?", help="档案里 asr.sentence 的 t")
     ap.add_argument("--events", help="给 events.jsonl 就逐轮跑（忽略 sentence_ms）")
     ap.add_argument("--curve", help="START:END:STEP（ms），扫 p 随快照末尾的变化")
-    ap.add_argument("--step", type=int, default=400, help="每拍等多久（SMART_TURN_EXTEND_MS）")
-    ap.add_argument("--taps", type=int, default=7, help="最多拍几次（SMART_TURN_MAX_EXT）")
+    ap.add_argument("--step", type=int, default=400, help="每拍等多久（TURN_JUDGE_EXTEND_MS）")
+    ap.add_argument("--taps", type=int, default=7, help="最多拍几次（TURN_JUDGE_MAX_EXT）")
     ap.add_argument("--dbfs", type=float, default=-60.0, help="判「有声」的门限")
     ap.add_argument("--model", default=os.environ.get(
-        "SMART_TURN_MODEL",
+        "TURN_JUDGE_MODEL",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "smart-turn-v3.2-cpu.onnx"),
     ))
     args = ap.parse_args(argv[1:])

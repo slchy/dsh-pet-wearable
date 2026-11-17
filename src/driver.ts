@@ -45,7 +45,7 @@ export interface PetConfig {
    * 的事，插件不该替它决定（换个 TTS 就换一套名字）。
    */
   voice: string
-  /** 判停阈值：Smart Turn 概率高于此值就认为这一轮说完了 */
+  /** 判停阈值：TurnJudge 概率高于此值就认为这一轮说完了 */
   turnThreshold: number
   /** 主动开口的时机参数，默认值一律偏向「宁可少说」 */
   proactive: PetTimingOptions

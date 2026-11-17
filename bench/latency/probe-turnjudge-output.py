@@ -1,6 +1,6 @@
 ﻿import os, sys, json
 import numpy as np, onnxruntime as ort
-sys.path.insert(0, "smart_turn")
+sys.path.insert(0, "turn_judge")
 from whisper_features import compute_whisper_log_mel_features as F
 
 M = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "smart-turn-v3.2-cpu.onnx")

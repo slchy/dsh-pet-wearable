@@ -27,7 +27,7 @@
 │ 旁路：archive · announce-store · photo-inbox · tool-control          │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 可替换实现：aliyun-asr（STT）· mimo（ASR/TTS）· dsh（Agent）          │
-│             smart-turn（判停侧车）· silero-vad（可选 VAD）            │
+│             turn-judge（判停侧车）· silero-vad（可选 VAD）            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -36,7 +36,7 @@
 ```text
 main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
                              ├──▶ uplink-pipeline ──┬──▶ energy-gate
-                             │                      └──▶ utterance-assembler ──▶ smart-turn
+                             │                      └──▶ utterance-assembler ──▶ turn-judge
                              ├──▶ session-core ◀──▶ dialog-fsm
                              ├──▶ turn-runner ──▶ providers ◀── aliyun-asr / mimo / agent
                              ├──▶ photo-inbox
@@ -76,8 +76,8 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 |---|---|---|
 | `uplink-pipeline.ts` | mSBC（子进程 `ffmpeg` 解码）→ 放大 → 能量门 → 有声段交 STT；另有**原始 PCM 旁路**与**电平表** | `onRawPcm` 给的是**放大前**的字节（档案要能重算增益） |
 | `energy-gate.ts` | 「这块音频要不要推给 STT」的状态机 + 预卷缓冲 | 没声音就**不建 STT 连接**：ASR 网关对"没听到有效语音"的连接 10 s 就判空闲超时 |
-| `utterance-assembler.ts` | 句子 → 一轮话语：按 Smart Turn 概率或固定窗口判停；判停请求**与静默窗重叠**提前发出 | ASR 的句号是**句子**边界，不是**轮次**边界；问号结尾不等于说完了。提前算的那份结果带两条有效性条件（还是同一句、算完之后没再收到中间结果），不成立就现算一遍 —— 拿过期结果定稿就是抢话 |
-| `smart-turn.ts` | 常驻 Python 侧车的客户端：`[u32 len][int16 PCM]` 问、`[f64 概率]` 答 | 进程常驻、模型只加载一次；不可用时退回固定窗口 |
+| `utterance-assembler.ts` | 句子 → 一轮话语：按 TurnJudge 概率或固定窗口判停；判停请求**与静默窗重叠**提前发出 | ASR 的句号是**句子**边界，不是**轮次**边界；问号结尾不等于说完了。提前算的那份结果带两条有效性条件（还是同一句、算完之后没再收到中间结果），不成立就现算一遍 —— 拿过期结果定稿就是抢话 |
+| `turn-judge.ts` | 常驻 Python 侧车的客户端：`[u32 len][int16 PCM]` 问、`[f64 概率]` 答 | 进程常驻、模型只加载一次；不可用时退回固定窗口 |
 | `vad.ts` | silero-vad v5 封装（可选判停后端） | 输入是 `[1,576]`（512 + 64 点上下文）、值域 `[-1,1]`，阈值 0.4 |
 | `wake-word.ts` · `backchannel.ts` · `hq-intent.ts` | 三条**领域规则**：唤醒词 / 纯应答噪声 / 要看细节的措辞 | 唤醒词词表（`ignorePhrases`）与「要不要自动拍细节」（`detail` 意图）都来自设备能力（见 §2.3）；v1 基线下前者空表、后者不启用，三条规则都只是"已知的机械事实"，交给模型判断反而更贵更不准 |
 
@@ -207,7 +207,7 @@ Node 事件循环（单线程）
  │    └─ AliyunConnection          编排对象，随连接生灭（含控制口、档案、回合票据）
  ├─ 子进程
  │    ├─ ffmpeg            每连接一个：mSBC → PCM16 16 kHz
- │    ├─ smart-turn(.py)   进程级常驻：判停概率
+ │    ├─ turn-judge(.py)   进程级常驻：判停概率
  │    └─ dsh               会话级常驻：NDJSON over stdin/stdout
  └─ 本机 HTTP：控制口 127.0.0.1:<port>（MCP 工具进程回调）
 ```
@@ -223,7 +223,7 @@ Node 事件循环（单线程）
    只是它的控制口绑不上（日志会打 `✗ 控制口 <port>`），`POST /say`、MCP 拍照这些会失效。
    这对"一家人一台眼镜"的使用方式够用，但不支持多租户。
 6. **子进程失败不重试**：`ffmpeg` 死了只影响这条连接的上行；实例在下一条连接重建。
-   `smart-turn` 不可用时判停退回固定窗口；`dsh` 失败则这一轮报错（见 §6）。
+   `turn-judge` 不可用时判停退回固定窗口；`dsh` 失败则这一轮报错（见 §6）。
 
 ---
 
@@ -328,7 +328,7 @@ request({id, intent, needsUser}) ── capture ──▶ WAIT ◀── deliver
  │  Audio ──────────────▶│ frame ─▶ ffmpeg ─▶ 放大 ─▶ 能量门
  │                       │                                  │ 越门
  │                       │                                  ▼
- │                       │            utterance-assembler（Smart Turn 判停）
+ │                       │            utterance-assembler（TurnJudge 判停）
  │                       │                                  │ 成轮
  │                       │                                  ▼
  │                       │        SessionCore → turn(票据) → TurnRunner
@@ -446,7 +446,7 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
    进程重启后是"一条新连接"，不是"接着上次"。
 4. **鉴权热更新**：token 表在启动时读一次，改动需要重启。
 5. **上行只有 mSBC**：不做重采样 / 转码，手机必须原样转发设备的字节。
-6. **判停依赖侧车**：想用 Smart Turn 就得有 Python 与模型文件；不想装就用固定窗口，
+6. **判停依赖侧车**：想用 TurnJudge 就得有 Python 与模型文件；不想装就用固定窗口，
    代价是判停更钝。
 7. **不支持多路并发下行**：一条连接一条音频流；两台手机同时连会互相抢控制口（见 §3.5）。
 8. **没有端到端加密之外的私有协议**：就是 TLS/TCP + 明文帧，安全边界完全靠 TLS 与 token。

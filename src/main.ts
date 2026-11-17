@@ -38,7 +38,7 @@ import { FrontedAgent } from './fronted-agent.ts';
 import { MemoryFile } from './memory-file.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
-import { SmartTurn } from './smart-turn.ts';
+import { TurnJudge } from './turn-judge.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
@@ -49,7 +49,7 @@ import {
   tokenFilePath,
   TokenGate,
 } from './tokens.ts';
-import { sleep } from './util.ts';
+import { envNumber, envString, sleep } from './util.ts';
 /**
  * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` 工厂（或 default）。
  *
@@ -325,7 +325,7 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
  * 唤醒词。单独成句时**不是一轮对话**，直接丢掉。
  *
  * 实测：「小爱同学。」和「我眼前的是什么？」会被服务端拆成两个 SentenceEnd，
- * 第二个才是真正的命令。Smart Turn 对「小爱同学。」给 0.957（它确实是完整的一句话），
+ * 第二个才是真正的命令。TurnJudge 对「小爱同学。」给 0.957（它确实是完整的一句话），
  * 所以模型治不了这个，只能靠这条领域规则。
  */
 /**
@@ -351,20 +351,12 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
 const DEFAULT_SENTENCE_SILENCE_MS = 200;
 
 /**
- * Smart Turn 判为「没说完」时再多等多久。
+ * TurnJudge 判为「没说完」时再多等多久。
  *
  * 700 → 400：日志里「没说完，再等 700 ms」出现得极密，一轮叠 2–3 次就是
  * 1.4–2.1 秒的纯等待。400 仍够覆盖正常换气，且 `maxExtensions` 会给上限。
  */
-const SMART_TURN_EXTEND_MS = Number(process.env['SMART_TURN_EXTEND_MS'] ?? 400);
-
-/** 读一个数字型环境变量，非法值退回默认 */
-function envNumber(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
+const TURN_JUDGE_EXTEND_MS = Number(envString('TURN_JUDGE_EXTEND_MS') ?? 400);
 
 /**
  * 读 `cloud/.env`（KEY=VALUE，忽略 # 注释与空行）。
@@ -672,10 +664,10 @@ async function main(): Promise<void> {
     const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
 
-    const smartTurnPython = process.env['SMART_TURN_PYTHON'] ?? '';
-    const smartTurnScript = process.env['SMART_TURN_SCRIPT'] ?? '';
-    const smartTurnEnabled = process.env['SMART_TURN'] !== '0'
-      && smartTurnPython !== '' && smartTurnScript !== '';
+    const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
+    const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
+    const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
+      && turnJudgePython !== '' && turnJudgeScript !== '';
 
     /**
      * 判停器侧车：**进程级一份，跨连接常驻**。
@@ -686,26 +678,26 @@ async function main(): Promise<void> {
      *
      * 预热：先用 1 s 静音跑一次推理把模型加载进来，别让第一次真说话的那轮承担。
      */
-    const smartTurnClient = smartTurnEnabled
-      ? new SmartTurn({
-        python: smartTurnPython,
-        script: smartTurnScript,
+    const turnJudgeClient = turnJudgeEnabled
+      ? new TurnJudge({
+        python: turnJudgePython,
+        script: turnJudgeScript,
         log: (line) => { console.log(`  ${line}`); },
       })
       : null;
-    if (smartTurnClient !== null) {
+    if (turnJudgeClient !== null) {
       // 低幅正弦而不是全零：全零在 log-mel 里是 −∞ dB，不该拿它当"正常输入"试模型
       const warmup = Buffer.alloc(UPSTREAM_SAMPLE_RATE * 2);
       for (let i = 0; i < warmup.length / 2; i += 1) {
         warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2);
       }
       const startedAt = Date.now();
-      const p = await smartTurnClient.predict(warmup);
+      const p = await turnJudgeClient.predict(warmup);
       console.log(
         `判停    侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}）`
         + '，之后所有连接共用这一份\n',
       );
-      process.on('exit', () => { smartTurnClient.stop(); });
+      process.on('exit', () => { turnJudgeClient.stop(); });
     }
 
     // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」
@@ -749,49 +741,49 @@ async function main(): Promise<void> {
       agent,
       stt,
       tts,
-      smartTurn: smartTurnEnabled
+      turnJudge: turnJudgeEnabled
         ? {
-          pythonPath: smartTurnPython,
-          scriptPath: smartTurnScript,
-          // 句子定稿后先静候这么久再问 Smart Turn。350 → 150 → 80 → 40 → 0：
+          pythonPath: turnJudgePython,
+          scriptPath: turnJudgeScript,
+          // 句子定稿后先静候这么久再问 TurnJudge。350 → 150 → 80 → 40 → 0：
           // 有了「静音一到就预跑判停」（`VOICE_PAUSE_DETECT_MS`），`SentenceEnd` 到达时
           // 概率早就算好了，这段静候只是白等 —— 回放实测 ② 从 113 → 41 ms，
           // 把这里归零后只剩取缓存的那一下。
-          quietMs: envNumber('SMART_TURN_QUIET_MS', 0),
-          extendMs: SMART_TURN_EXTEND_MS,
+          quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
+          extendMs: TURN_JUDGE_EXTEND_MS,
           // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
-          // SmartTurn `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
+          // TurnJudge `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
           // 的兜底，而我们原来只有 3×400=1.2 s —— 触发点比人家快、兜底却只有一半，
           // 用户说半句停下来想一下就会被强制收下。7×400 ≈ 2.8 s，对齐业界。
-          maxExtensions: envNumber('SMART_TURN_MAX_EXT', 7),
+          maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 7),
           // 「判停说没说完」单独一个上限：那条分支不看任何文本信号，只按 p 再等
           // 一拍，而 p 是噪声（同一段音频两次回放，同一句 0.549 vs 0.189）。
           // 真机实测要 4 拍（1600 ms）才收下；这里收到 2 拍（800 ms），
           // 仍能覆盖正常换气 200–400 ms。另三类文本判据不受影响，照旧吃 7 的额度。
-          maxUnsureExtensions: envNumber('SMART_TURN_MAX_UNSURE', 2),
+          maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 2),
           // 快照尾部最多留多少静音。官方约定是「音频顶到输入向量的末尾」——
           // 尾巴留静音等于把语音从窗口末尾推开，p 会被拉低（0 ms → 0.95，
           // 800 ms → 0.04）。留多少在噪声里，取小值只为方向正确。
-          trailingTrimMs: envNumber('SMART_TURN_TRIM_MS', 20),
-          threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
+          trailingTrimMs: envNumber('TURN_JUDGE_TRIM_MS', 20),
+          threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
           // 中文单独一档：官方 benchmark 中文是最差的（85.8%，漏报 9.26% / 误报
           // 4.95%），方向是偏向说「没说完」。真机上完整短句「嗯，对。」给 0.22–0.41，
           // 真正没说完的「对吗？那句。」给 0.007–0.11 —— 用 0.5 会把前者判成没说完。
           // 0.35 落在这两簇中间，但样本只有 21 轮 —— 先按这个跑，用 `judge.decide`
           // 里的 `p` / `threshold` 复盘再定。
-          thresholdCjk: envNumber('SMART_TURN_THRESHOLD_CJK', 0.35),
+          thresholdCjk: envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35),
           // 结尾像「还有下文」（数字串/井号/连词）时再多等一拍。见
           // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，
           // 数字组之间的换气会被当句尾，订单号被切成两句。
-          unfinishedWaitMs: envNumber('SMART_TURN_UNFINISHED_MS', 250),
+          unfinishedWaitMs: envNumber('TURN_JUDGE_UNFINISHED_MS', 250),
           // 判停器说「说完了」之后，若这么久内还收到过中间结果，就再等一拍
           // （防「音频停了、ASR 还在出字」的抢话）。真机上这段**几乎每轮都触发**，
           // 一次 400 ms 直接进了首字延迟 —— 150 仍能挡住正常 partial 间隔，
           // 回放实测（同为 6 轮）2 段从 622–625 ms 降到 150–152 ms。
-          partialGraceMs: envNumber('SMART_TURN_PARTIAL_GRACE_MS', 150),
+          partialGraceMs: envNumber('TURN_JUDGE_PARTIAL_GRACE_MS', 150),
         }
         : undefined,
-      ...(smartTurnClient === null ? {} : { smartTurnClient }),
+      ...(turnJudgeClient === null ? {} : { turnJudgeClient }),
       gate: {
         thresholdDbfs: peakDbfs,
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
