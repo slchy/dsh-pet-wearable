@@ -1,0 +1,53 @@
+{
+  "name": "dsh-voice-web",
+  "version": "0.0.1",
+  "description": "Web compatibility for the dsh pet voice stack: WebSocket bridge plus browser capture and playback, reusing the voice stack from dsh-pet-wearable.",
+  "type": "module",
+  "license": "MIT",
+  "author": "slchy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slchy/dsh-pet-wearable.git",
+    "directory": "packages/dsh-voice-web"
+  },
+  "homepage": "https://github.com/slchy/dsh-pet-wearable#readme",
+  "bugs": {
+    "url": "https://github.com/slchy/dsh-pet-wearable/issues"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "voice-agent",
+    "websocket",
+    "browser-audio",
+    "realtime-audio"
+  ],
+  "exports": {
+    ".": "./src/driver.ts",
+    "./src/*": "./src/*"
+  },
+  "main": "./src/driver.ts",
+  "types": "./src/driver.ts",
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "dsh-pet-wearable": "file:../..",
+    "ws": "^8.23.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.7.0"
+  }
+}

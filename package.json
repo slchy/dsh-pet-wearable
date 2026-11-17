@@ -16,6 +16,9 @@
   "engines": {
     "node": ">=22.18.0"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "publishConfig": {
     "access": "public"
   },

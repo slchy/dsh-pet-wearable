@@ -52,6 +52,17 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 > **真机与生产环境依赖**：接入真实硬件需安装 `ffmpeg`（用于 mSBC 解码）并配置至少一家 STT/TTS 供应商；运行真实对话需接入 `dsh`（非本仓库直接 npm 依赖，默认走 headless，加 `--dsh-sdk` 换 SDK 形态）。生产接法是直连 TLS + `MIAI_TOKENS` 鉴权，见 [OPS-RECORD](./docs/OPS-RECORD.md)。
 
+## 仓库结构
+
+仓根本身就是 npm 包 `dsh-pet-wearable`（协议层 + 语音栈，dsh 插件），`src/` 与 `tests/` 一直在原位 —— 所以 `node src/main.ts` 的用法、systemd 的 `ExecStart`、部署脚本里的路径都照旧。
+
+根 `package.json` 只把 `src` 列进 `files`，因此 `packages/` 下的内容不会随 `dsh-pet-wearable` 一起发布；它们各自是独立的 dsh 插件包：
+
+| 包 | 内容 | 与包①的关系 |
+|---|---|---|
+| `dsh-pet-wearable`（仓根） | 协议层 + 语音栈 | — |
+| [packages/dsh-voice-web](./packages/dsh-voice-web) | web 兼容：WebSocket 桥 + 浏览器采集/播放 | 复用包①的语音栈 |
+
 ## 系统架构
 
 ```
