@@ -58,6 +58,15 @@
   button.primary { border-color: var(--accent); color: var(--accent); }
   button.primary[data-running="true"] { border-color: var(--err); color: var(--err); }
 
+  .measure { border-top: 1px solid var(--line); padding-top: .8rem; display: grid; gap: .35rem; }
+  .measure h2 { font-size: 13px; margin: 0 0 .2rem; font-weight: 600; color: var(--dim); }
+  .row { display: flex; justify-content: space-between; gap: 1rem; font-size: 13px; }
+  .row b { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-weight: 600; }
+  .verdict { font-size: 13px; margin: .3rem 0 0; }
+  .verdict[data-level="ok"] { color: var(--ok); }
+  .verdict[data-level="tight"] { color: var(--warn); }
+  .verdict[data-level="bad"] { color: var(--err); }
+
   details { border-top: 1px solid var(--line); padding-top: .7rem; }
   summary { cursor: pointer; color: var(--dim); font-size: 13px; }
   pre {
@@ -85,6 +94,15 @@
   </div>
 
   <div class="notice" id="notice" hidden></div>
+
+  <section class="measure">
+    <h2>回声余量测量</h2>
+    <div class="row"><span>静默期峰值</span><b id="m-noise">—</b></div>
+    <div class="row"><span>播放期峰值</span><b id="m-echo">—</b></div>
+    <div class="row"><span>对门限（−40 dBFS）</span><b id="m-margin">—</b></div>
+    <p class="verdict" id="m-verdict">开始对话后点「测回声余量」，期间请保持安静。</p>
+    <div class="controls"><button id="probe" disabled>测回声余量</button></div>
+  </section>
 
   <details>
     <summary>日志</summary>

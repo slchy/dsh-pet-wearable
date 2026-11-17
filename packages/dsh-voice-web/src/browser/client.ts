@@ -51,6 +51,14 @@ export interface VoiceClient {
   close(): void;
   /** 音轨与播放是否都在跑 */
   readonly active: boolean;
+  /**
+   * 采集与播放共用的那个 `AudioContext`。
+   *
+   * 暴露出来是为了让调用方从**同一个** context 放测试信号：浏览器的回声消除
+   * 拿同一 context 的输出当参考，另开一个 context 放出来的声音对 AEC 是"外人"，
+   * 测出来的回波电平会偏高，没有意义。
+   */
+  readonly context: AudioContext | null;
 }
 
 /**
@@ -119,6 +127,10 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
   return {
     get active(): boolean {
       return capture !== null && socket !== null && socket.readyState === WebSocket.OPEN;
+    },
+
+    get context(): AudioContext | null {
+      return context;
     },
 
     async start(): Promise<void> {
