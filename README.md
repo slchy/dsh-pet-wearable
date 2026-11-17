@@ -2,11 +2,13 @@
 
 **面向智能穿戴设备的云端全双工语音 Agent（基于 `dsh`）。**
 
-穿戴端仅负责音频采集与播放、拍照及设备状态上报，ASR、判停、推理与 TTS 全部在云端完成。系统支持随时打断与有节制的主动开口，并通过握手阶段的能力协商实现设备无关——接入新型号硬件无需改动核心代码。
+穿戴端仅负责音频采集与播放、拍照及设备状态上报，ASR、判停、推理与 TTS 全部在云端完成。对话分两层：短句闲聊由快车道直接答（首字 ~0.5 s），其余交给 `dsh` 做多步推理与工具调用，中途随时可打断。同时支持有节制的主动开口，并通过握手阶段的能力协商实现设备无关——接入新型号硬件无需改动核心代码。
 
 ## 「pet」指什么
 
 这里的 `pet` 指的是**行为层面的在场感与适度主动性**，而非桌面像素宠物、动画或固定人设（角色语气与习惯完全由提示词定义，可随时替换）。
+
+> 人设目前有**两份**：`dsh` 用 [mcp/profile.cordis.yml](./mcp/profile.cordis.yml)，快车道有自己一份系统提示词（`src/fronted-agent.ts`），改人设要两边都改。
 
 区别于传统唤醒词工具「叫了才应」的交互方式，全天候穿戴设备更适合一种低存在感的伴生形态：
 
@@ -21,7 +23,7 @@
 
 * **远场低电平拾音**：针对实测底噪 `-60…-51 dBFS` 的穿戴麦克风，采用上行增益 + 能量门（`-40 dBFS`）+ 基于音频特征的语义判停（Smart Turn），不依赖固定静音时长切分。
 
-* **插话与打断**：能量门或 ASR 增量任一命中即触发打断（不依赖关键词匹配，避免环境噪声误触峰值），立即作废当前轮次、下发 `audio.stop`，并记录未播完的片段。
+* **插话与打断**：ASR 的中间结果或定稿一到（旁听反馈如「嗯」除外）就打断，不靠关键词匹配；打断只在**正在播**时成立（`DialogFsm.bargeIn` 仅 `speaking`），立即下发 `audio.stop`、作废排队中的轮次，并把没播完的片段留给下一轮判断要不要补。
 
 * **低功耗与弱网恢复**：端侧不运行 ASR、TTS 或推理模型；低电量时自动抑制主动开口。网络断开重连后自动对齐会话状态，并补播断线期间完成的后台任务结果。
 
@@ -48,20 +50,28 @@ npm run sim -- --explore --runs 500   # 随机探索，检测不变量违反
 npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 ```
 
-> **真机与生产环境依赖**：接入真实硬件需安装 `ffmpeg`（用于 mSBC 解码）并配置至少一家 STT/TTS 供应商；运行真实对话需接入 `dsh`（非本仓库直接 npm 依赖）。
+> **真机与生产环境依赖**：接入真实硬件需安装 `ffmpeg`（用于 mSBC 解码）并配置至少一家 STT/TTS 供应商；运行真实对话需接入 `dsh`（非本仓库直接 npm 依赖，默认走 headless，加 `--dsh-sdk` 换 SDK 形态）。生产接法是直连 TLS + `MIAI_TOKENS` 鉴权，见 [OPS-RECORD](./docs/OPS-RECORD.md)。
 
 ## 系统架构
 
 ```
-  眼镜 / 耳机 / 手机                         云端
-┌────────────────────┐           ┌────────────────────────────────┐
-│ AudioRecord        │   mSBC ─► │ transport   帧解析 / 鉴权 / 心跳 │
-│ AudioTrack         │  ◄─ PCM   │       ↓                        │
-│ Camera2            │           │ 能量门 → ASR → 判停 → 对话轮次   │
-│ 佩戴 / 电量 / 触摸  │  Event ─► │       ↓                        │
-└────────────────────┘           │ TTS ← dsh agent                │
-                                 │       工具 / 后台 Job / 子代理   │
-                                 └────────────────────────────────┘
+端侧（眼镜 / 耳机 / 手机）              云端（本仓 src/）
+
+  AudioRecord / AudioTrack  ────────►  tls 连接（帧 · 鉴权 · 心跳）
+  Camera2 / 佩戴 / 电量 / 触摸  ─────►          │
+                                               ▼
+                               能量门 → ASR → 判停（UtteranceAssembler）
+                                               │ 整句
+                                               ▼
+                               DialogFsm（话筒 · 轮次票据 · 一轮一停）
+                                               │
+                                 ┌─────────────┴─────────────┐
+                                 ▼                           ▼
+                         快车道 FrontedAgent          dsh（工具 / 后台 Job / 子代理）
+                           短句闲聊直接答              任务、事实、带图
+                                 └─────────────┬─────────────┘
+                                               ▼
+                                   TTS（CosyVoice）→ PCM 下发
 ```
 
 架构遵循三条核心原则：
@@ -70,13 +80,29 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 2. **组件可替换**：STT、TTS 与 agent 都通过工厂契约注入（见 [src/providers.ts](./src/providers.ts)），无密钥时自动回落离线实现。换上新的 STT/TTS 只需一个实现文件加一个装配分支，业务逻辑不动；agent 走同一契约，但内置实现绑定 `dsh`。
 
-3. **逻辑可单测**：时机判定、判停、打断与绑定策略均抽离为不依赖 Socket 的纯函数，由 `npm test`（516 条用例）与假设备线协议测试完整覆盖。
+3. **逻辑可单测**：时机判定、判停、打断与绑定策略均抽离为不依赖 Socket 的纯函数，由 `npm test`（当前 519 条用例）与假设备线协议测试完整覆盖。
+
+各台状态机（`DialogFsm` / `FloorArbiter` / `PetBrain` / `UtteranceAssembler` / 快车道 / 播报队列）的状态、驱动方与「唯一真相」表见 [state-machines](./docs/state-machines.md)。
 
 ## 全双工与后台调度
 
-* **非阻塞执行**：前台命令超时阈值设为 `1s`，超时后不强杀进程而是转为后台 Job，主对话立即恢复响应。工具按耗时分层：`ls` 等轻量命令直接执行，探索、编译或外部 CLI 调用派发给 Subagent。
+* **快慢两层**：短句闲聊由快车道（`FrontedAgent` + 快模型）直接答；任务、事实、带图的句子交给 `dsh`。默认**投机**——两边同时起跑，快车道先给出实质文本就用它并掐掉在途的那一轮 `dsh`，判不出才整段让给 `dsh`（`FAST_LANE_SPECULATE=0` 退回串行）。插话会把上游一起取消，不只是停喇叭。
 
-* **话筒仲裁**：所有音频输出遵循严格优先级队列：`user` > `reply` > `announce` > `pet` > `reflex`。后台任务执行完毕后，会等待当前用户发言结束再行播报。
+* **非阻塞执行**（`dsh` 侧，规则在 [mcp/profile.cordis.yml](./mcp/profile.cordis.yml)）：前台命令只等很短一会儿，超时自动转后台 Job 并立刻把 job id 还回来；要判断、要多步的活派给 Subagent。主对话因此不被长任务占住。
+
+* **话筒只有一份真相**：仲裁在 `AppSession.floor`（[src/app/session.ts](./src/app/session.ts)），宠物只申请不仲裁。它是一张**抢占表**而不是严格优先级队列：
+
+  | 占用者 | 可被谁抢 |
+  |---|---|
+  | `user` | 无（用户永远优先） |
+  | `reply` | `user` |
+  | `announce` | `user`、`reflex`（**抢不动 `reply`/`pet`**：正题没说完不插播） |
+  | `pet` | `user`、`reflex`（`announce` 不抢，等它播完） |
+  | `reflex` | 任何人（`user` 除外） |
+
+  占用/释放由 `DialogFsm` 的状态转移驱动，一轮结束话筒自动放空。
+
+* **后台汇报让路**：任务完成后的播报**不属于任何一轮**（走旁白通道，不占票据、不改状态机），开口前过四道闸：没有正题在跑 → 用户安静 ≥ 800 ms → 开麦后复查（这期间用户说了一整句就排回队首，不是丢掉）→ 出声后被打断则停下并把没念完的部分交给下一轮判断。纯语气词（「嗯」）不算打断。
 
 ## 主动开口机制
 
@@ -84,7 +110,7 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 
 默认策略偏向克制。如需提高交互频率，可调小 `chatterAfterIdleMs`，**建议通过参数调优而非叠加新规则**，以保持行为的可解释性。
 
-在独立进程模式下，主动开口默认关闭，需设置环境变量 `PET_PROACTIVE=1` 开启（启动日志将输出当前开关状态）。
+在独立进程模式下，主动开口默认关闭，需设置环境变量 `PET_PROACTIVE=1` 开启（启动日志将输出当前开关状态）。注意 `AppSession`（持话筒仲裁，对话环自己要用）**总是构造**，关掉的只是宠物环 `PetSession`。
 
 ## 当前进展（`0.0.x`）
 
@@ -94,29 +120,40 @@ npm run sim -- --trace out/           # 导出 JSONL 格式时间线
 |---|---|
 | 语音主链路（mSBC → STT → 判停 → 推理 → TTS → 打断） | **真机跑通**（`src/main.ts` 独立进程形态） |
 | 设备会话（拉起语音、拍照回传、佩戴与电量上报） | **手机端跑通** |
+| 快车道（短句闲聊直答 + 投机双轨） | **已实现**，生产默认开；宿主不支持 `session/cancel` 时自动退回串行 |
+| L1/L2 共享记忆（快车道只读，`dsh` 唯一写者） | **已实现**（`MEMORY.md` + `remember` 工具） |
 | 主动开口状态机 | **已实现**，支持 `sim` 离线复现；独立进程需设 `PET_PROACTIVE=1` |
 | `dsh` 插件形态（`driver.ts`） | 入口与配置就绪，**语音链路尚未接线**，当前请使用独立进程形态 |
-| 首字延迟（20 轮真实对话实测） | 中位 `2.0 s` / p90 `8.3 s`；瓶颈主要在 Agent 多步推理（每步 `1.1–1.5 s`），而非生成或 TTS |
+| 首字延迟 | 闲聊（快车道命中）p50 ≈ `0.5 s`、p90 ≈ `0.8 s`；交给 `dsh` 的轮次 p50 ≈ `1.8–2.0 s`、p90 ≈ `2.2–3.0 s` |
 
-延迟排查与性能分析可通过可复算的日志脚本定位：`scripts/latency-report.ts` 用于逐轮分段统计，`scripts/dsh-timeline.ts` 用于对齐 `dsh` 会话日志以拆解 Agent 内部耗时。
+**延迟数字的口径**：上面两组来自 2026-11-16 的服务器实测 —— 第一组是 `bench/fast_lane`（真 API），第二组是 τ²-bench `18_zh_identity` 端到端；同一段真机音频用 `bench/replay` 回放，停嘴到首块 PCM 合计 `1.7–2.4 s`。外部 API 抖动很大（见 `AGENTS.md`），**改动前后要比同一份用例**，不要拿不同输入的两场数字对比。
+
+排查用可复算的日志脚本：`scripts/latency-report.ts` 逐轮分段统计，`scripts/dsh-timeline.ts` 对齐 `dsh` 会话日志拆解 Agent 内部耗时。
 
 ## 配置与部署
 
-完整配置说明请查阅 [docs/OPERATIONS.md](./docs/OPERATIONS.md)。常用核心配置如下：
+两种形态的配置面不同，别混着看：
+
+- **独立进程**（`node src/main.ts --listen 8766`）：命令行参数 + `MIAI_*` 环境变量
+  （`MIAI_STT` / `MIAI_TTS` / `MIAI_AGENT` / `MIAI_TOKENS` / `MIAI_TLS_KEY` / `MIAI_TLS_CERT` …），
+  供应商密钥走各自的环境变量。完整说明见 [docs/OPERATIONS.md](./docs/OPERATIONS.md)。
+- **`dsh` 插件**（`driver.ts`）：下面这张表，是插件 schema 的实际默认值。
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `port` | `8766` | 设备接入监听端口 |
 | `host` | `127.0.0.1` | 绑定地址；**监听非本机地址时必须同时配置 `tls` 与 `auth`**，否则拒绝监听（见 [bind-policy.ts](./src/bind-policy.ts)） |
 | `tls.keyPath` / `certPath` | `''` | TLS 证书路径，须成对配置或同时留空 |
-| `auth.tokenFile` | `''` | 设备鉴权 Token 文件，请使用 `npm run pair -- new` 生成，勿手动拼写 |
-| `voice` | `Chloe` | TTS 合成音色 |
-| `turnThreshold` | `0.5` | 语义判停阈值 |
+| `auth.tokenFile` | `''` | 设备鉴权 Token 文件，请使用 `npm run pair -- new` 生成，勿手动拼写；留空 = 不鉴权，此时只能绑本机 |
+| `device` | `''` | 仅 v1 手机的型号提示（如 `xiaomi-glasses`）；v2 设备在 `Hello` 里自报能力，不用填 |
+| `voice` | `''` | TTS 音色；**留空 = 用 provider 自己的默认值**（换 TTS 就换一套名字，插件不替它决定） |
+| `turnThreshold` | `0.5` | 语义判停阈值，调高更不容易被判为说完 |
+| `proactive.*` | 见 [driver.ts](./src/driver.ts) | 主动开口的时机参数（`chatterAfterIdleMs` / `minProactiveGapMs` / 深夜时段 / 低电量阈值），默认一律偏向「宁可少说」 |
 
-安装为 `dsh` 插件：
+`dsh` 的人设与 agent 规则在 [mcp/profile.cordis.yml](./mcp/profile.cordis.yml) 里（快车道那份系统提示词在代码里，见上文「pet 指什么」）。本地跑起来之前先把它装到 `dsh` 的 profile 上，否则你面对的是一个**没有任何人设**的通用 agent，行为和线上完全不同：
 
 ```bash
-dsh plugin --profile <profile> add dsh-pet-wearable
+npm run install-profile      # 拷到 ~/.dsh/profiles/sdk/cordis.patch.yml
 ```
 
 > **Patch 语义提示**：配置补丁中裸条目默认按 `id` 覆盖；新增节点必须写在 `insert:` 字段下，否则会触发 `entry not found` 错误。
@@ -125,7 +162,10 @@ dsh plugin --profile <profile> add dsh-pet-wearable
 
 | 文档 | 内容说明 |
 |---|---|
-| [ADR-0001](./docs/adr/0001-app-layer-and-pet.md) | 应用层与 pet 设计：端口、状态机、三张登记表及实施顺序 |
+| [state-machines](./docs/state-machines.md) | **状态机一览（以代码为准）**：六台机器的状态/事件/驱动方、一轮完整时序、「唯一真相」表 |
+| [fsm-align-report](./docs/fsm-align-report.md) | 状态机对齐的过程记录：每步改了什么、删了哪些状态、验收数据与未完成项 |
+| [OPS-RECORD](./docs/OPS-RECORD.md) | 运维事实与踩坑记录：双仓边界、密钥位置、端口、记忆契约 |
+| [ADR-0001](./docs/adr/0001-app-layer-and-pet.md) | 应用层与 pet 设计：端口、状态机、三张登记表及实施顺序（§6 话筒、§9 差异表已被上表取代） |
 | [ADR-0002](./docs/adr/0002-virtual-time-simulator.md) | 虚拟时间模拟器：单一调度器、Mock 组件、声明式场景与三层判定 |
 | [CLOUD-ARCHITECTURE](./docs/CLOUD-ARCHITECTURE.md) | 云端架构：模块分层、类职责、并发模型与扩展点 |
 | [device-protocol](./docs/device-protocol.md) | 线协议规范：帧格式、控制指令与状态帧（设备端开发必读） |
