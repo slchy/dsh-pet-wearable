@@ -62,6 +62,15 @@ export interface UtteranceAssemblerOptions {
   readonly fallbackWindowMs: number;
   /** 概率门限 */
   readonly threshold: number;
+  /**
+   * 文本里含汉字时用的门限；不设就一律用 {@link threshold}。
+   *
+   * 为什么中文单独一档：模型官方 benchmark 里中文是最差的一档（85.8%，漏报 9.26%
+   * / 误报 4.95%），方向是**偏向说「没说完」**。我们自己的真机上也是同一件事：
+   * 完整的短句「嗯，对。」给 0.22–0.41，而真正没说完的「对吗？那句。」给
+   * 0.007–0.11 —— 用 0.5 会把前者全判成没说完，各白等 400–800 ms。
+   */
+  readonly thresholdCjk?: number;
   /** 送给判停器的最近音频上限（字节） */
   readonly recentMaxBytes: number;
   /**
@@ -199,6 +208,8 @@ export interface JudgeFact {
   readonly action: 'accept' | 'extend' | 'error';
   /** 为什么还要等（只有 `extend` 有） */
   readonly why?: 'grace' | 'short' | 'unfinished' | 'unsure';
+  /** 这次决定用的阈值（中文和默认可能不同，落档才分得清） */
+  readonly threshold?: number;
 }
 
 /** 判定一次的结果，便于日志与测试断言 */
@@ -221,6 +232,9 @@ const UNFINISHED_TAIL =
 
 /** 尾部标点 —— ASR 每个 `SentenceEnd` 都会补一个，作为句界记号而不是内容 */
 const TRAILING_PUNCT = /[\s。．.，,、!！?？~～…\-—:：;；"'“”‘’]+$/u;
+
+/** 这句话里有中日韩汉字吗 —— 用来选判停阈值（见 `thresholdFor`） */
+const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
 
 /** 丢掉尾部标点，只看最后那个字 */
 function stripTail(text: string): string {
@@ -266,6 +280,14 @@ export class UtteranceAssembler {
      */
     readonly pre: boolean;
     readonly probability: Promise<number>;
+    /**
+     * 这份判停用的音频快照有多少字节。
+     *
+     * 用来判「再等一拍有没有意义」：静音期间快照会被裁掉尾巴，所以**字节数不变
+     * 就等于输入一模一样**（同一个模型、同一份特征 → 同一个 p）。真机上见过
+     * `0.412 → 0.280 → 0.280`：最后一个 0.280 是拿同一段音频重算的，纯白等 400 ms。
+     */
+    readonly bytes: number;
   } | null = null;
   /** `predictAtMs` 的定时器 */
   private predictTimer: NodeJS.Timeout | null = null;
@@ -294,6 +316,10 @@ export class UtteranceAssembler {
   private specCount = 0;
   /** 本次判停用的是不是预跑那份（是就不必再执行「刚收到中间结果」那条宽限） */
   private usedPrefired = false;
+  /** 上一次判停用的快照字节数（判「再等一拍有没有意义」，见 `prediction.bytes`） */
+  private lastSnapshotBytes = -1;
+  /** 上一次判停决定的时刻 */
+  private lastDecisionAt = Number.NEGATIVE_INFINITY;
   private disposed = false;
 
   constructor(options: UtteranceAssemblerOptions) {
@@ -357,6 +383,33 @@ export class UtteranceAssembler {
       ? undefined
       : this.options.silenceDb - (this.options.silenceFloorOffsetDb ?? 20);
     return pcm16TrimTrailingSilence(pcm, floor, this.options.trailingTrimMs ?? 0);
+  }
+
+  /**
+   * 现在的快照会有多少字节**（不真的拼出来）。
+   *
+   * 只用来判「和上次判定相比输入变了没有」—— 静音期间裁掉尾巴之后长度不变，
+   * 说明这一段音频一个字都没多，重算必然得到同一个 p。
+   */
+  private snapshotBytes(): number {
+    const pcm = Buffer.concat(this.recentChunks);
+    const floor = this.options.silenceDb === undefined
+      ? undefined
+      : this.options.silenceDb - (this.options.silenceFloorOffsetDb ?? 20);
+    return pcm16TrimTrailingSilence(pcm, floor, this.options.trailingTrimMs ?? 0).length;
+  }
+
+  /**
+   * 这次决定用哪个阈值。
+   *
+   * 中文单独一档：官方 benchmark 上中文是最差的一档（85.8%，漏报 9.26% / 误报
+   * 4.95%），也就是**它偏向说「没说完」**；同一份音频上实测完整短句给 0.22–0.41、
+   * 真正没说完的给 0.007–0.11，所以中文这条线该比英文低。
+   * 用文本里有没有 CJK 判，不用另做语言识别 —— 决定时手上就有这句话。
+   */
+  private thresholdFor(): number {
+    const cjk = this.options.thresholdCjk;
+    return cjk === undefined || !CJK.test(this.pendingText) ? this.options.threshold : cjk;
   }
 
   /**
@@ -537,7 +590,7 @@ export class UtteranceAssembler {
     // 侧车可能抛（也可能同步抛）；两种都吞成「不可用」，否则这份提前发起的
     // promise 没人接，会变成 unhandledRejection
     const probability = Promise.resolve().then(() => predict(pcm)).catch(() => -1);
-    this.prediction = { seq, startedAt, pre: upcoming, probability };
+    this.prediction = { seq, startedAt, pre: upcoming, probability, bytes: pcm.length };
   }
 
   /**
@@ -559,10 +612,14 @@ export class UtteranceAssembler {
     // （实测 partial 比真实停嘴晚 98–140 ms），所以「刚收到中间结果就再等一拍」不必再执行
     this.usedPrefired = hit && ready.pre;
     if (hit) {
+      // 记下这份判停用的是哪一段音频 —— 下一拍拿它比「输入有没有变」（见 `snapshotBytes`）
+      this.lastSnapshotBytes = ready.bytes;
       return await ready.probability;
     }
+    const pcm = this.snapshot();
+    this.lastSnapshotBytes = pcm.length;
     try {
-      return await predict(this.snapshot());
+      return await predict(pcm);
     } catch {
       return -1;
     }
@@ -634,6 +691,26 @@ export class UtteranceAssembler {
       return;
     }
 
+    // 「再等一拍」只有在**等到的东西变了**时才有意义。
+    //
+    // 静音期间快照会被裁掉尾巴，所以字节数不变 = 输入一模一样 = 同一个 p（同一个
+    // 模型、同一份特征）。真机上见过 `0.412 → 0.280 → 0.280`：最后那个 0.280 是
+    // 拿同一段音频重算的，白等 400 ms；连等两拍就是 800 ms 纯损失。
+    // 唯一的例外是文本变了（来了新 partial）—— 那算新信息，交给下面那条宽限处理。
+    // 没有音频（`lastSnapshotBytes <= 0`）时这个判据不成立：那时判停器本来就在
+    // 报「不可用」，没有「输入没变」可言。
+    const unchanged = this.lastSnapshotBytes > 0
+      && this.snapshotBytes() === this.lastSnapshotBytes
+      && this.lastPartialAt <= this.lastDecisionAt;
+    this.lastDecisionAt = evaluatedAt;
+    const threshold = this.thresholdFor();
+    if (probability < threshold && unchanged && this.extensions > 0) {
+      this.options.log(`  判停    ${shown} → 音频和文本都没变，不再等（阈值 ${threshold}）`);
+      this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
+      this.flush();
+      return;
+    }
+
     // 「判停还没吱声的这几十毫秒里又来了一条中间结果」= 硬证据：用户还在说。
     //
     // 这条必须在阈值的**外面**：真机上（2026-11-17 22:10 那场）用户把
@@ -658,7 +735,7 @@ export class UtteranceAssembler {
     }
 
     if (
-      probability >= this.options.threshold
+      probability >= threshold
       || this.extensions >= this.options.maxExtensions
       // 「判停说没说完」有自己的上限：侧车给的 p 是噪声，不能让它把总预算
       // （2.8 s）吃干净，也不能让它拖累那三条文本判据的额度
@@ -695,8 +772,8 @@ export class UtteranceAssembler {
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, unfinishedWait);
         return;
       }
-      this.options.log(`  判停    ${shown} → 收下这一轮`);
-      this.reportJudge({ p: probability, waitMs: 0, action: 'accept' });
+      this.options.log(`  判停    ${shown} → 收下这一轮（阈值 ${threshold}）`);
+      this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
       this.flush();
       return;
     }
@@ -704,9 +781,11 @@ export class UtteranceAssembler {
     this.extensions += 1;
     this.unsureExtensions += 1;
     this.options.log(
-      `  判停    ${shown} → 没说完，再等 ${this.options.extendMs} ms`,
+      `  判停    ${shown} → 没说完，再等 ${this.options.extendMs} ms（阈值 ${threshold}）`,
     );
-    this.reportJudge({ p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'unsure' });
+    this.reportJudge({
+      p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'unsure', threshold,
+    });
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
   }
 

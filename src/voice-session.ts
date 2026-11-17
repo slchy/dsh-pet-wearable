@@ -186,6 +186,8 @@ export interface VoiceSessionOptions {
     readonly maxExtensions: number;
     /** 「判停说没说完」单独的上限，见 `UtteranceAssemblerOptions.maxUnsureExtensions` */
     readonly maxUnsureExtensions?: number;
+    /** 文本含汉字时用的阈值，见 `UtteranceAssemblerOptions.thresholdCjk` */
+    readonly thresholdCjk?: number;
     /** 快照尾部最多留多少静音（ms），见 `UtteranceAssemblerOptions.trailingTrimMs` */
     readonly trailingTrimMs?: number;
     readonly threshold: number;
@@ -548,6 +550,9 @@ class VoiceConnection {
         : { maxUnsureExtensions: smartTurnOptions.maxUnsureExtensions }),
       fallbackWindowMs: ASSEMBLER_FALLBACK_WINDOW_MS,
       threshold: smartTurnOptions?.threshold ?? 1,
+      ...(smartTurnOptions?.thresholdCjk === undefined
+        ? {}
+        : { thresholdCjk: smartTurnOptions.thresholdCjk }),
       ...(smartTurnOptions?.unfinishedWaitMs === undefined
         ? {}
         : { unfinishedWaitMs: smartTurnOptions.unfinishedWaitMs }),

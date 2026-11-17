@@ -774,6 +774,12 @@ async function main(): Promise<void> {
           // 800 ms → 0.04）。留多少在噪声里，取小值只为方向正确。
           trailingTrimMs: envNumber('SMART_TURN_TRIM_MS', 20),
           threshold: envNumber('SMART_TURN_THRESHOLD', 0.5),
+          // 中文单独一档：官方 benchmark 中文是最差的（85.8%，漏报 9.26% / 误报
+          // 4.95%），方向是偏向说「没说完」。真机上完整短句「嗯，对。」给 0.22–0.41，
+          // 真正没说完的「对吗？那句。」给 0.007–0.11 —— 用 0.5 会把前者判成没说完。
+          // 0.35 落在这两簇中间，但样本只有 21 轮 —— 先按这个跑，用 `judge.decide`
+          // 里的 `p` / `threshold` 复盘再定。
+          thresholdCjk: envNumber('SMART_TURN_THRESHOLD_CJK', 0.35),
           // 结尾像「还有下文」（数字串/井号/连词）时再多等一拍。见
           // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，
           // 数字组之间的换气会被当句尾，订单号被切成两句。

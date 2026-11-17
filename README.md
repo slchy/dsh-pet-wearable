@@ -165,6 +165,7 @@ npm run sim -- --trace out/          # 导出完整 JSONL 格式时序轨迹
 | | `FAST_LANE_PREFETCH` | `1` | 是否开启判停前预跑 |
 | | `FAST_LANE_SPECULATE` | `1` | 是否开启双轨投机并发 |
 | **语义判停** | `SMART_TURN_THRESHOLD` | `0.5` | 语义说完概率阈值（低于此值判定未说完） |
+| | `SMART_TURN_THRESHOLD_CJK` | `0.35` | 文本含汉字时用的阈值（中文漏报率高于误报率，见 [docs/TOOLS.md](./docs/TOOLS.md) §5） |
 | | `SMART_TURN_QUIET_MS` | `0` | 定稿后额外静候时长（ms） |
 | | `SMART_TURN_PARTIAL_GRACE_MS`| `150` | 音频停止但 ASR 仍出字时的防抢话等待 |
 | | `SMART_TURN_MAX_UNSURE` | `2` | 判停未决时的最大延拍次数 |

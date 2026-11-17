@@ -757,3 +757,79 @@ test('裁静音的門限要比开门門限低一截，否则会把语音尾巴�
   // 语音 400 ms + 20 ms 余量；若用 −40 判静音，那段 −50 的尾巴会被裁掉（只剩 ~220 ms）
   assert.ok(ms >= 400, `轻的那 200 ms 也是语音，不该被裁掉（实际只留了 ${ms} ms）`);
 });
+
+/** 造一段「有声音」的 20 ms 块（峰值约 −18 dBFS） */
+function voicedChunk(): Buffer {
+  const c = Buffer.alloc(640, 0);
+  for (let i = 0; i < 320; i += 1) c.writeInt16LE(i % 4000, i * 2);
+  return c;
+}
+
+test('音频和文本都没变时不再干等：判停说没说完也只等一拍', async () => {
+  // 真机（2026-11-17 22:10）`judge.decide` 里出现过 0.412 → 0.280 → 0.280：
+  // 最后一个 0.280 是拿**同一段音频**重算的 —— 静音期间尾巴被裁掉，快照一个字节
+  // 都没多，重算必然得到同一个数。那一拍 400 ms 是纯损失。
+  const facts: Array<{ action: string; why?: string }> = [];
+  let calls = 0;
+  const assembler = new UtteranceAssembler({
+    quietMs: 0,
+    extendMs: 30,
+    maxExtensions: 7,
+    maxUnsureExtensions: 2,
+    partialGraceMs: 0,
+    fallbackWindowMs: 0,
+    threshold: 0.5,
+    recentMaxBytes: 16_000,
+    silenceDb: -40,
+    trailingTrimMs: 20,
+    predict: async () => { calls += 1; return 0.28; },
+    onUtterance: () => {},
+    onJudge: (f) => { facts.push(f); },
+    log: () => {},
+  });
+  try {
+    for (let k = 0; k < 10; k += 1) assembler.addAudio(voicedChunk());   // 200 ms 语音
+    assembler.addSentence('嗯，对。');
+    await new Promise((r) => setTimeout(r, 120));
+  } finally {
+    assembler.dispose();
+  }
+  const judges = facts.filter((f) => f.action !== 'error');
+  assert.equal(judges.length, 2, `第一拍之后输入没变，不该再等第二拍（实际判了 ${judges.length} 次）`);
+  assert.equal(judges[0]!.action, 'extend');
+  assert.equal(judges[1]!.action, 'accept');
+  assert.equal(calls, 2, '第二次仍然要真的问一次（才知道输入没变）');
+});
+
+test('中文用更低的阈值，英文用默认', async () => {
+  // 官方 benchmark 中文 85.8%（漏报 9.26% / 误报 4.95%）—— 模型偏向说「没说完」。
+  // 真机上完整短句「嗯，对。」给 0.22–0.41，而门槛是 0.5 → 白等 400–800 ms。
+  const run = async (text: string): Promise<string> => {
+    const facts: Array<{ action: string; threshold?: number }> = [];
+    const assembler = new UtteranceAssembler({
+      quietMs: 0,
+      extendMs: 30,
+      maxExtensions: 1,
+      partialGraceMs: 0,
+      fallbackWindowMs: 0,
+      threshold: 0.5,
+      thresholdCjk: 0.35,
+      recentMaxBytes: 16_000,
+      silenceDb: -40,
+      predict: async () => 0.4,          // 落在两个阈值之间
+      onUtterance: () => {},
+      onJudge: (f) => { facts.push(f); },
+      log: () => {},
+    });
+    try {
+      for (let k = 0; k < 5; k += 1) assembler.addAudio(voicedChunk());
+      assembler.addSentence(text);
+      await new Promise((r) => setTimeout(r, 80));
+    } finally {
+      assembler.dispose();
+    }
+    return facts[0]?.action ?? 'none';
+  };
+  assert.equal(await run('嗯，对。'), 'accept', '中文：0.4 ≥ 0.35，该当场收');
+  assert.equal(await run('yeah right'), 'extend', '非中文：0.4 < 0.5，仍要再等一拍');
+});
