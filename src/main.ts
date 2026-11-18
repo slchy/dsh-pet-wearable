@@ -357,8 +357,8 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
  * 敢砍到 200 是因为下游补了一层：`max_sentence_silence` 计的是**收到的音频里的静音**，
  * 说话人在数字组之间的换气（实测 200–400 ms）会被当成句尾，实测把
  * 「#W8665881」切成两句。切早了本身不致命 —— 句段由判停器合并
- * （`UtteranceAssembler` 把连续几句拼成一轮），`unfinishedWaitMs` 再专门兜
- * 「结尾是数字/井号/连词」那一类。
+ * （`UtteranceAssembler` 把连续几句拼成一轮），`waitBudgetSequenceMs` 再单独给
+ * 「结尾是数字/井号/连词」那一类一份更大的等待预算。
  *
  * 另有一条硬约束：上行能量门的 `holdMs`（默认 2000）必须远大于这个值，否则
  * 客户端停推之后服务端再也攒不到静音，句尾永远不来 —— 见
@@ -791,15 +791,6 @@ async function main(): Promise<void> {
           // 0.35 落在这两簇中间，但样本只有 21 轮 —— 先按这个跑，用 `judge.decide`
           // 里的 `p` / `threshold` 复盘再定。
           thresholdCjk: envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35),
-          // 结尾像「还有下文」（数字串/井号/连词）时再多等一拍。见
-          // `looksUnfinished`：`max_sentence_silence` 压到 200 之后，
-          // 数字组之间的换气会被当句尾，订单号被切成两句。
-          unfinishedWaitMs: envNumber('TURN_JUDGE_UNFINISHED_MS', 250),
-          // 判停器说「说完了」之后，若这么久内还收到过中间结果，就再等一拍
-          // （防「音频停了、ASR 还在出字」的抢话）。真机上这段**几乎每轮都触发**，
-          // 一次 400 ms 直接进了首字延迟 —— 150 仍能挡住正常 partial 间隔，
-          // 回放实测（同为 6 轮）2 段从 622–625 ms 降到 150–152 ms。
-          partialGraceMs: envNumber('TURN_JUDGE_PARTIAL_GRACE_MS', 150),
           // QoS：`②`（定稿→开轮）的总等待预算，兜底上限。0 = 不设。
           // 目的不是省时间，是让 `②` 有一个可预测的天花板 —— 真机 2026-11-18
           // 有 7/29 轮把分支额度吃干净，单轮白等 1.4 s。
@@ -808,6 +799,12 @@ async function main(): Promise<void> {
           // 这类句尾 p 判「没说完」是对的（念手机号每次停顿都真没说完），
           // 别让总预算把它掐掉。0 = 不启用。
           waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 0),
+          // **统一上限**：开轮静音的最大值，任何分支都不许绕过。
+          // 取 650 的依据是真机 54 轮实测（`docs/EOT-SUPPLEMENT.md` §8）：
+          // 开轮静音 500–1200 ms 的 7 轮**一次都没有**被用户接着说，而 <300 ms
+          // 的 6 轮**全部**被接着说 —— 650 落在"免费窗口"里，超过它的等待
+          // 换不来更低的误切。0 = 不设上限（回到旧行为）。
+          maxOpenSilenceMs: envNumber('TURN_JUDGE_MAX_OPEN_SILENCE_MS', 650),
         }
         : undefined,
       ...(turnJudgeClient === null ? {} : { turnJudgeClient }),

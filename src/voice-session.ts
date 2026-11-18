@@ -191,17 +191,12 @@ export interface VoiceSessionOptions {
     /** 快照尾部最多留多少静音（ms），见 `UtteranceAssemblerOptions.trailingTrimMs` */
     readonly trailingTrimMs?: number;
     readonly threshold: number;
-    /** 结尾「像没说完」时再多等一拍，见 `UtteranceAssemblerOptions.unfinishedWaitMs` */
-    readonly unfinishedWaitMs?: number;
-    /**
-     * 判停器说「说完了」后，若这么久内还收到过中间结果就再等一拍，
-     * 见 `UtteranceAssemblerOptions.partialGraceMs`。
-     */
-    readonly partialGraceMs?: number;
     /** QoS：`②` 的总等待预算（ms），见 `UtteranceAssemblerOptions.waitBudgetMs` */
     readonly waitBudgetMs?: number;
     /** QoS：序列形态的豁免预算（ms），见 `UtteranceAssemblerOptions.waitBudgetSequenceMs` */
     readonly waitBudgetSequenceMs?: number;
+    /** **统一上限**：开轮静音不得超过这个值，见 `UtteranceAssemblerOptions.maxOpenSilenceMs` */
+    readonly maxOpenSilenceMs?: number;
   };
   /**
    * 进程级共享的判停器客户端。
@@ -574,18 +569,15 @@ class VoiceConnection {
       ...(turnJudgeOptions?.thresholdCjk === undefined
         ? {}
         : { thresholdCjk: turnJudgeOptions.thresholdCjk }),
-      ...(turnJudgeOptions?.unfinishedWaitMs === undefined
-        ? {}
-        : { unfinishedWaitMs: turnJudgeOptions.unfinishedWaitMs }),
-      ...(turnJudgeOptions?.partialGraceMs === undefined
-        ? {}
-        : { partialGraceMs: turnJudgeOptions.partialGraceMs }),
       ...(turnJudgeOptions?.waitBudgetMs === undefined
         ? {}
         : { waitBudgetMs: turnJudgeOptions.waitBudgetMs }),
       ...(turnJudgeOptions?.waitBudgetSequenceMs === undefined
         ? {}
         : { waitBudgetSequenceMs: turnJudgeOptions.waitBudgetSequenceMs }),
+      ...(turnJudgeOptions?.maxOpenSilenceMs === undefined
+        ? {}
+        : { maxOpenSilenceMs: turnJudgeOptions.maxOpenSilenceMs }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
       // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。

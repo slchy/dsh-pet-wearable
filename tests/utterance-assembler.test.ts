@@ -95,58 +95,27 @@ test('只多等一次，不会一直拖', async () => {
   assert.equal(utterances.length, before + 1, '最多多等一次，之后必须收');
 });
 
-test('音频说完了，但刚收到中间结果 → 不收敛', async () => {
-  // 这条是「判停不能只看音频」的核心：中间结果在出 = 用户还在说。
-  const { assembler, utterances } = makeAssembler({ partialGraceMs: 20, extendMs: 40 });
+test('中间结果自身不再拖住定稿（grace 已删）', async () => {
+  // 2026-11-18 删除 grace：真机 2 场 87 次 extend 里「刚收到中间结果」命中 **0/8**、
+  // 白等 3200 ms —— 每一次都是白等。拦住抢话的是**静音闸门**（用户真又出声了
+  // 才会前移 `lastVoicedAt`），不是 ASR 出字这件事本身：qwen-realtime 在定稿前后
+  // 还会连发几条 partial（同文的、尾巴上补个「嗯。」的），按时间戳判就全成了白等。
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 40,
+    onJudge: (fact) => { facts.push(fact); },
+  });
 
   assembler.addSentence('我想问一下那个');
-  // 定稿之外**多出来的**字才算还在说（落后于定稿的 partial 见下一条）
   assembler.notePartial('我想问一下那个然后呢');
 
-  await delay(15);
-  assert.equal(utterances.length, 0, '用户还在出字，这时候收下就是抢话');
-
-  await delay(120);
-  assert.equal(utterances.length, 1, '等过 grace 之后还是要收，不能吞掉');
-});
-
-test('和定稿一字不差的中间结果不算「还有下文」', async () => {
-  // 真机（2026-11-18）：qwen-realtime 在定稿前 6–9 ms 会再发一条同样的 partial，
-  // 按时间戳算就白等一拍 —— 一场这么白丢 1.5–2 s。
-  const facts: Array<{ why?: string }> = [];
-  const { assembler, utterances } = makeAssembler({
-    partialGraceMs: 200,
-    extendMs: 40,
-    onJudge: (fact) => { facts.push(fact); },
-  });
-
-  assembler.addSentence('等于多少？');
-  assembler.notePartial('等于多少？');
-
-  await delay(80);
-  assert.equal(utterances.length, 1, '同文 partial 不该拖住定稿');
-  assert.equal(facts.filter((f) => f.why === 'grace').length, 0, '不该记 grace 延伸');
-});
-
-test('尾巴上的「嗯。」不算还有下文', async () => {
-  // ASR 在句尾静音上会吐一个语气词；它是旁听反馈，不是「用户又说了字」
-  const facts: Array<{ why?: string }> = [];
-  const { assembler, utterances } = makeAssembler({
-    partialGraceMs: 200,
-    extendMs: 40,
-    onJudge: (fact) => { facts.push(fact); },
-  });
-
-  assembler.addSentence('我让你挂断。');
-  assembler.notePartial('嗯。');
-
-  await delay(80);
-  assert.equal(utterances.length, 1);
-  assert.equal(facts.filter((f) => f.why === 'grace').length, 0);
+  await delay(20);
+  assert.equal(utterances.length, 1, '光有中间结果不算「还在说」，不该多等一拍');
+  assert.equal(facts.filter((f) => f.why === 'short').length, 0);
 });
 
 test('中间结果是过去的，不影响收敛', async () => {
-  const { assembler, utterances } = makeAssembler({ partialGraceMs: 20, extendMs: 40 });
+  const { assembler, utterances } = makeAssembler({ extendMs: 40 });
 
   assembler.notePartial('很久以前的一段');
   await delay(40);
@@ -218,7 +187,6 @@ test('预判之后用户又开口，那份结果作废、现算一次', async ()
   const { assembler, utterances } = makeAssembler({
     quietMs: 60,
     predictAtMs: 0,
-    partialGraceMs: 120,
     extendMs: 100,
     maxExtensions: 1,
     predict: async () => {
@@ -234,10 +202,9 @@ test('预判之后用户又开口，那份结果作废、现算一次', async ()
   await delay(70); // 窗口关掉：预判早于 lastPartialAt，不能信
 
   assert.equal(calls, 2, '作废之后要现算一次，而不是拿旧的凑数');
-  assert.equal(utterances.length, 0, '用户刚又开口，这时候收下就是抢话');
-
-  await delay(200);
-  assert.equal(utterances.length, 1, '宽限过去之后还是要收下');
+  // 现算的这份 p=0.99 说「说完了」，拦截抢话的只剩静音闸门/统一上限 ——
+  // 中间结果本身不再拖住定稿（grace 已删，见上面那条）
+  assert.equal(utterances.length, 1, '现算一次后按 p 收下');
 });
 
 test('连接收尾时，在飞的判停结果不会把话再说一遍', async () => {
@@ -276,40 +243,39 @@ test('looksUnfinished 只认「后面必须还有东西」的结尾', () => {
   }
 });
 
-test('结尾是数字时再等一拍，后半句并进来', async () => {
-  const { assembler, utterances } = makeAssembler({ unfinishedWaitMs: 60, extendMs: 200 });
+test('判停说没说完时，后半句照样并进同一轮', async () => {
+  // 2026-11-18：`unfinishedWaitMs` 那条文本正则删了（真机 3 次命中 **0/3**、白等
+  // 750 ms）。并句改由「p 说没说完」那条分支负责 —— 而念数字时模型本来就判得对，
+  // 不需要再叠一层正则。
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 200,
+    maxExtensions: 3,
+    maxUnsureExtensions: 3,
+    predict: async () => 0.01,
+  });
 
   assembler.addSentence('订单号是井号W866。');
   await delay(20);
-  assert.equal(utterances.length, 0, '结尾是数字，不能当口就成轮');
+  assert.equal(utterances.length, 0, '判停说没说完，先别成轮');
 
   // 用户喘了口气继续说 —— 上一句还没定稿，应当并成一轮
   assembler.addSentence('5881。');
-  await delay(150);
+  await delay(500);
 
   assert.equal(utterances.length, 1);
   assert.equal(utterances[0]?.text, '订单号是井号W8665881。', '订单号不能被切成两轮');
 });
 
-test('结尾像没说完也只多等一次，没下文就照常收下', async () => {
-  const { assembler, utterances } = makeAssembler({ unfinishedWaitMs: 40, extendMs: 40, maxExtensions: 7 });
+test('判停说完了就照常收下，不再靠文本正则硬等一拍', async () => {
+  const { assembler, utterances } = makeAssembler({ extendMs: 40, maxExtensions: 7 });
 
   const t0 = Date.now();
   assembler.addSentence('订单号是井号W866。');
   await delay(200);
 
-  assert.equal(utterances.length, 1, '等过一拍必须收下，不能无限拖');
+  assert.equal(utterances.length, 1);
   const waited = (utterances[0]?.at ?? 0) - t0;
-  assert.ok(waited < 150, `只该多等一拍 40 ms，实际等了 ${waited} ms`);
-});
-
-test('结尾不像没说完的句子不受影响', async () => {
-  const { assembler, utterances } = makeAssembler({ unfinishedWaitMs: 200 });
-
-  assembler.addSentence('就改成641室。');
-  await delay(15);
-
-  assert.equal(utterances.length, 1, '正常句尾不该为这条判据多等');
+  assert.ok(waited < 150, `不该为「结尾是数字」额外等一拍，实际等了 ${waited} ms`);
 });
 
 test('判停器抛错按「不可用」处理，照常收下这一轮', async () => {
@@ -582,9 +548,6 @@ test('判停每次决定都报一条：p 与「还要等多久」要落进档案
   let round = 0;
   const { assembler } = makeAssembler({
     maxExtensions: 1,
-    // 这里要验的是「低分那条分支怎么走」，所以把「刚收到中间结果」那条宽限关掉
-    // （它现在是独立判据，见下面那条 grace 的测试）
-    partialGraceMs: 0,
     predict: async () => {
       round += 1;
       // 第一次说「没说完」，第二次说「说完了」—— 逼出 extend 然后 accept
@@ -621,8 +584,6 @@ test('判停低分有独立预算：unsure 到上限就收下，不占文本判�
       extendMs: 20,
       maxExtensions: 7,
       maxUnsureExtensions: 2,
-      // 同上：只量 unsure 的预算，别让「刚收到中间结果」那条宽限插进来
-      partialGraceMs: 0,
       fallbackWindowMs: 0,
       threshold: 0.5,
       recentMaxBytes: 16_000,
@@ -715,19 +676,17 @@ test('判停快照裁掉尾巴上的静音（训练样本切在停嘴那一点�
   assert.ok(ms >= 280 && ms <= 320, `快照应当只剩 200 ms 语音 + 100 ms 余量（实际 ${ms} ms）`);
 });
 
-test('判停说没说完时，新到的中间结果照样能拦住收下', async () => {
+test('判停一直说没说完时，unsure 拍数用满就收下（中间结果不再续命）', async () => {
   // 真机（2026-11-17 22:10）：用户一口气说完「…对吗？那句。台词的经典是台词是什么来着？」，
-  // 判停给 0.007 —— 它判对了（话没说完）。但「没说完」那条分支只看 p、不看文本，
-  // 于是 ASR 的「台词的」明明已经到了，还是花光 unsure 预算强收下 → 半句成轮、
-  // 刚出声就被后半句打断作废。
-  const facts: Array<{ why?: string }> = [];
+  // 判停给 0.007 —— 它判对了（话没说完）。原来「刚收到中间结果」那条宽限会再续一拍，
+  // 但那 8 次里一次都没真救到（真机 0/8）。现在只做一次有上限的等待，到点就放行。
+  const facts: Array<{ why?: string; waitMs: number }> = [];
   const utterances: string[] = [];
   const assembler = new UtteranceAssembler({
     quietMs: 0,
     extendMs: 40,
     maxExtensions: 7,
-    maxUnsureExtensions: 1,        // 只给 1 拍 unsure，逼出「花光预算」那条路
-    partialGraceMs: 200,
+    maxUnsureExtensions: 1,        // 只给 1 拍 unsure
     fallbackWindowMs: 0,
     threshold: 0.5,
     recentMaxBytes: 16_000,
@@ -739,15 +698,46 @@ test('判停说没说完时，新到的中间结果照样能拦住收下', async
   try {
     assembler.addSentence('对吗？那句。');
     await delay(20);
-    // 判停还在等的时候，ASR 又出了新字 —— 这是「用户还在说」的硬证据
     assembler.notePartial('台词，');
     await delay(150);
   } finally {
     assembler.dispose();
   }
-  const grace = facts.filter((f) => f.why === 'grace');
-  assert.ok(grace.length >= 1, `新到的中间结果应当被记成 grace 延伸，实际 ${JSON.stringify(facts)}`);
-  assert.equal(utterances.length, 0, '有 fresh partial 时不该把话强收下');
+  assert.equal(utterances.length, 1, '拍数用满就该收下，不能无限等');
+  const waited = facts.reduce((sum, f) => sum + f.waitMs, 0);
+  assert.ok(waited <= 40, `只该等一拍 40 ms，实际 ${waited} ms`);
+});
+
+test('统一上限：静音到顶就放行，静音闸门也不许绕过', async () => {
+  // 这是「谁都不能绕过」的那条闸。原来静音闸门在 `overBudget()` **之前** return ——
+  // 它是唯一一条能绕开预算的路径，真机 2 场里 ② 被顶到 2264 ms。
+  // 这里把门槛设成 600 ms（闸门会一直「还有下文」地等下去），上限设 200 ms。
+  let clock = 1000;
+  const facts: Array<{ why?: string; whyAccept?: string; waitMs: number }> = [];
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 600,
+    maxExtensions: 20,
+    maxUnsureExtensions: 20,
+    maxOpenSilenceMs: 200,
+    now: () => clock,
+    predict: async () => 0.99,     // 就算判停说「说完了」，闸门也还要等静音
+    onJudge: (fact) => { facts.push(fact); },
+  });
+
+  for (let i = 0; i < 10; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  assembler.addSentence('我让你挂断。');
+  for (let i = 0; i < 25; i += 1) { clock += 20; assembler.addAudio(silent()); await delay(20); }
+
+  assert.equal(utterances.length, 1, '静音到上限必须放行');
+  assert.ok(
+    facts.some((f) => f.whyAccept === 'cap'),
+    `该记一次 whyAccept=cap，实际 ${JSON.stringify(facts)}`,
+  );
+  const waited = facts.reduce((sum, f) => sum + f.waitMs, 0);
+  // 闸门要等 600 ms 静音；上限 200 必须把它压到一半以下（假时钟下每拍只走 20 ms，
+  // 所以落地会比上限多出一拍的量级）
+  assert.ok(waited <= 300, `上限该把等待压到 600 ms 门槛之下，实际 ${waited} ms`);
 });
 
 test('裁静音的門限要比开门門限低一截，否则会把语音尾巴当静音裁掉', async () => {
@@ -812,7 +802,6 @@ test('音频和文本都没变时不再干等：判停说没说完也只等一�
     extendMs: 30,
     maxExtensions: 7,
     maxUnsureExtensions: 2,
-    partialGraceMs: 0,
     fallbackWindowMs: 0,
     threshold: 0.5,
     recentMaxBytes: 16_000,
@@ -846,7 +835,6 @@ test('中文用更低的阈值，英文用默认', async () => {
       quietMs: 0,
       extendMs: 30,
       maxExtensions: 1,
-      partialGraceMs: 0,
       fallbackWindowMs: 0,
       threshold: 0.5,
       thresholdCjk: 0.35,
@@ -1054,7 +1042,6 @@ test('QoS：总预算用完就收下，不再按分支额度等', async () => {
     extendMs: 40,
     maxExtensions: 7,
     maxUnsureExtensions: 7,
-    partialGraceMs: 0,
     waitBudgetMs: 80,
     predict: async () => 0.01,
     onJudge: (fact) => { facts.push(fact); },
@@ -1069,15 +1056,17 @@ test('QoS：总预算用完就收下，不再按分支额度等', async () => {
   assert.ok(facts.some((f) => f.budgetMs === 80), '落档要带上预算');
 });
 
-test('QoS：结尾是数字序列时给豁免，不被额度掐断', async () => {
-  const facts: Array<{ why?: string }> = [];
+test('QoS：结尾是数字序列时给更大的预算，但不给更多拍数', async () => {
+  // 2026-11-18 改：序列形态原来靠一条文本正则在 `maxExtensionsNow()` 里开 12 倍
+  // 豁免 —— 一个正则压过所有数值限额，实测一场里 `#13` 打 10 拍、`#16` 打 8 拍。
+  // 现在序列只换**预算**（`waitBudgetSequenceMs`），拍数仍由 `maxExtensions` 管。
+  const facts: Array<{ why?: string; waitMs: number }> = [];
   const { assembler, utterances } = makeAssembler({
     extendMs: 40,
-    maxExtensions: 2,
-    maxUnsureExtensions: 1,
-    partialGraceMs: 0,
+    maxExtensions: 3,
+    maxUnsureExtensions: 3,
     waitBudgetMs: 40,
-    waitBudgetSequenceMs: 240,
+    waitBudgetSequenceMs: 200,
     predict: async () => 0.01,
     onJudge: (fact) => { facts.push(fact); },
   });
@@ -1086,8 +1075,11 @@ test('QoS：结尾是数字序列时给豁免，不被额度掐断', async () =>
   await delay(600);
 
   assert.equal(utterances.length, 1, '最后还是要收下，不能吞掉');
+  const waited = facts.reduce((sum, f) => sum + f.waitMs, 0);
+  assert.ok(waited > 40, `序列该拿到比总预算更大的额度，实际只等了 ${waited} ms`);
+  assert.ok(waited <= 200, `不该超过序列预算，实际等了 ${waited} ms`);
   const unsure = facts.filter((f) => f.why === 'unsure').length;
-  assert.ok(unsure >= 4, `序列该被多等几拍（maxExtensions=2），实际 ${unsure} 拍`);
+  assert.ok(unsure <= 3, `拍数仍由 maxExtensions 管，实际 ${unsure} 拍`);
 });
 
 test('QoS：不在序列形态时，普通句尾仍按小预算收下', async () => {
@@ -1096,7 +1088,6 @@ test('QoS：不在序列形态时，普通句尾仍按小预算收下', async ()
     extendMs: 40,
     maxExtensions: 2,
     maxUnsureExtensions: 1,
-    partialGraceMs: 0,
     waitBudgetMs: 40,
     waitBudgetSequenceMs: 240,
     predict: async () => 0.01,

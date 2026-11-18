@@ -35,7 +35,6 @@
  *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
-import { isBackchannelOnly } from './backchannel.ts';
 import { pcm16DurationMs, pcm16PeakDbfs, pcm16TrimTrailingSilence } from './pcm.ts';
 
 export interface UtteranceAssemblerOptions {
@@ -53,8 +52,8 @@ export interface UtteranceAssemblerOptions {
    * 是噪声 —— 同一段音频两次回放，同一句从 `0.549` 变成 `0.189`，
    * 后者连等 5 拍 2.4 s。真机实测 4 次延长（1600 ms）才收下是常态。
    *
-   * 那三拍文本判据（`partialGraceMs` / 短片段 / `unfinishedWaitMs`）是**防抢话和
-   * 并句的安全闸**，不该被这个病理拖着一起收紧 —— 所以它们仍走 `maxExtensions`。
+   * 静音闸门和短片段判据是**防抢话和并句的安全闸**，不该被这个病理拖着一起收紧
+   * —— 所以它们仍走 `maxExtensions`。
    *
    * 缺省与 `maxExtensions` 相同（= 不改变旧行为）。
    */
@@ -111,19 +110,6 @@ export interface UtteranceAssemblerOptions {
    * 见 {@link UtteranceAssembler} 里 `shouldWaitForMore` 的说明。
    */
   readonly shortFragmentChars?: number;
-  /**
-   * 结尾「像没说完」时再多等一拍多久。默认 0（关闭）。
-   *
-   * 动机：`max_sentence_silence` 从 400 压到 200 之后，说话人**数字组之间的换气**
-   * 也会被当成句尾 —— 实测「#W8665881」被切成「订单号是井号W866。」+「5881。」，
-   * 后半截单独成轮，模型只好瞎猜。句子本身没变短，只是断在了数字中间。
-   *
-   * 所以判据不是「短」，而是「结尾必须还有下文」：数字、井号、序数词、连词、
-   * 单个字母。见 {@link looksUnfinished}。
-   *
-   * 只影响这一类结尾的句子，**每句最多多等一次** —— 不许无限拖。
-   */
-  readonly unfinishedWaitMs?: number;
   /** 上一轮收下之后多久内出现的短碎片算「同一句话被切开」。默认 1200 ms */
   readonly shortFragmentWindowMs?: number;
   /**
@@ -134,20 +120,6 @@ export interface UtteranceAssemblerOptions {
    * 是把判停的收益赔进去。ASR 断句间隔通常远小于 400 ms，够用了。
    */
   readonly shortFragmentWaitMs?: number;
-  /**
-   * ASR 中间结果刚到多久之内，音频判停「说完了」也不算数。默认 400 ms。
-   *
-   * 音频判据（TurnJudge）只看波形：句子之间那点停顿，它分不清是「说完了」
-   * 还是「换气」。而 ASR 的中间结果是**用户还在出字**的直接证据 ——
-   * 定稿之后 partial 还在增长，说明下一句已经在路上，这时候收下就是抢话。
-   *
-   * 设 0 关闭这条判据（只信音频，回到旧行为）。
-   *
-   * **只认「定稿之外的新内容」**（2026-11-18 真机）：qwen-realtime 在定稿前后
-   * 还会连发几条 partial —— 紧挨着定稿那条常常和它一字不差，尾巴上还会吐一个
-   * 「嗯。」。按时间戳算会把这两种都当成「用户还在说」，一场白等 1.5–2 s。
-   */
-  readonly partialGraceMs?: number;
   /**
    * 本地静音判据：上行峰值低于这个 dBFS 就算「没在说话」。不设就不启用预判停。
    *
@@ -213,7 +185,7 @@ export interface UtteranceAssemblerOptions {
   /**
    * **QoS：② 段（定稿→开轮）的总等待预算**，毫秒。0 = 不设（默认）。
    *
-   * 不管是因为 p 低、grace、结尾像没说完还是门槛不够 —— 累计等满这么多就收下。
+   * 不管是因为 p 低、静音门槛不够、还是这片语太短 —— 累计等满这么多就收下。
    * 目的是让 `②` 有一个**可预测的上限**，而不是「maxExtensions × extendMs」那样
    * 随分支数量漂移（真机 2026-11-18：7/29 轮把额度吃干净，单轮白等 1.4 s）。
    */
@@ -228,6 +200,18 @@ export interface UtteranceAssemblerOptions {
    * 判据复用 {@link looksUnfinished}（纯机械，不做语义推断）。
    */
   readonly waitBudgetSequenceMs?: number;
+  /**
+   * **统一上限**：开轮时的连续静音不得超过这个值（ms）。0 / 未设 = 不设上限。
+   *
+   * 为什么要它：`waitBudget` 系列只封住「收下」那条判定，静音闸门和文本判据各自
+   * 还有自己的额度，实测能绕过去 —— 真机一场 29 轮里有 15 轮 ② 超 1200 ms，
+   * 最大 2264 ms。这条是**唯一一条不许任何分支绕过的上限**：静音到顶就放行。
+   *
+   * 取 650 的依据（真机 54 轮，见 `docs/EOT-SUPPLEMENT.md` §8）：开轮静音
+   * 500–1200 ms 那 7 轮**一次都没有**被用户接着说，而 <300 ms 的 6 轮**全部**被接着说。
+   * 650 落在"免费窗口"里。
+   */
+  readonly maxOpenSilenceMs?: number;
   /**
    * 一句定稿（文本已定、还没判定停）时通知一次。   *
    * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
@@ -266,7 +250,9 @@ export interface JudgeFact {
   readonly waitMs: number;
   readonly action: 'accept' | 'extend' | 'error';
   /** 为什么还要等（只有 `extend` 有） */
-  readonly why?: 'grace' | 'short' | 'unfinished' | 'unsure' | 'silence';
+  readonly why?: 'short' | 'unsure' | 'silence';
+  /** 为什么放行（只有 `accept` 可能带）。`cap` = 静音到了统一上限 */
+  readonly whyAccept?: 'cap';
   /** 这次决定用的阈值（中文和默认可能不同，落档才分得清） */
   readonly threshold?: number;
   /** 截至这次决定，已连续静音多久（ms）。门槛判据的直接证据 */
@@ -289,8 +275,8 @@ export type EndpointDecision = 'accept' | 'extend' | 'predictor-unavailable';
  * - 字母：`井号W`（订单号、型号被拦腰截断）
  * - 连词与引子：`和` `就是` `因为` `的话`…
  *
- * **宁漏不误**：误判的代价是这一轮白等 {@link UtteranceAssemblerOptions.unfinishedWaitMs}，
- * 漏判只是维持现状。
+ * **宁漏不误**：误判的代价是这一轮多给一份序列预算（见
+ * {@link UtteranceAssemblerOptions.waitBudgetSequenceMs}），漏判只是维持现状。
  */
 const UNFINISHED_TAIL =
   /(?:[0-9０-９]|[零一二三四五六七八九十百千万亿两]|[A-Za-z#＃]|井号|第|和|跟|与|及|还有|就是|因为|所以|但是|然后|如果|的话|或者|还是)$/u;
@@ -360,14 +346,12 @@ export class UtteranceAssembler {
   /**
    * 其中「判停说没说完」用掉了几次。
    *
-   * 和 {@link extensions} 分开记：那三类文本判据是防抢话/并句的安全闸，
+   * 和 {@link extensions} 分开记：静音闸门和短片段判据是防抢话/并句的安全闸，
    * 不该被判停低分的病理拖着一起收紧（见 `maxUnsureExtensions`）。
    */
   private unsureExtensions = 0;
   /** 这一轮为等判停累计花掉的毫秒（QoS 预算用；`flush` 归零） */
   private waitedMs = 0;
-  /** 这一句是否已经为「结尾像没说完」等过一拍（只等一次） */
-  private unfinishedWaited = false;
   /** 上一次真正收下一轮的时刻，用来判断「短碎片是不是紧跟其后」 */
   private lastUtteranceAt = Number.NEGATIVE_INFINITY;
   /** 最近一次 ASR 中间结果的时刻：用户还在出字的直接证据 */
@@ -395,8 +379,6 @@ export class UtteranceAssembler {
   /** 上一次投机的时刻 / 这一句已经投机几次（`addSentence` 归零） */
   private specFiredAt = Number.NEGATIVE_INFINITY;
   private specCount = 0;
-  /** 本次判停用的是不是预跑那份（是就不必再执行「刚收到中间结果」那条宽限） */
-  private usedPrefired = false;
   /** 上一次判停用的快照字节数（判「再等一拍有没有意义」，见 `prediction.bytes`） */
   private lastSnapshotBytes = -1;
   /** 上一次判停决定的时刻 */
@@ -633,7 +615,7 @@ export class UtteranceAssembler {
    * ASR 中间结果到了 —— 用户还在说话。
    *
    * 这**不是**用来拼文本的（中间结果会反复改写，拼起来是乱的）。它有两个用途：
-   * 「还在出字」的信号（打断播放、判停宽限），以及给快车道**投机**攒素材
+   * 「还在出字」的信号（打断播放），以及给快车道**投机**攒素材
    * （真正起跑在静音那一刻，见 `trackSilence`）。
    */
   notePartial(text: string): void {
@@ -646,15 +628,14 @@ export class UtteranceAssembler {
     if (this.disposed) {
       return;
     }
-    // 上一截是「数字/井号结尾」时，那个句号是误判出来的句尾 —— 拼进去会把
-    // 订单号拦腰切开（「W866。5881」），模型读起来就是两个 token。
-    const joinedFromUnfinished = this.unfinishedWaited;
-    if (joinedFromUnfinished) {
-      const head = stripTail(this.pendingText);
-      this.pendingText = head ? head + text : text;
-    } else {
-      this.pendingText = this.pendingText ? this.pendingText + text : text;
-    }
+    // 上一截的结尾像「还有下文」（数字/井号/连词）时，那个句号是 ASR 误切出来的
+    // 句尾 —— 留着会把订单号拦腰切开（「W866。5881」），模型读起来是两个 token。
+    // 判据是**纯文本**的，不依赖这一轮为什么合并（`unfinishedWaitMs` 已删）：
+    // 静音闸门、「没说完」、短碎片三条合并路径都走这里。
+    const tail = this.pendingText && looksUnfinished(this.pendingText)
+      ? stripTail(this.pendingText)
+      : this.pendingText;
+    this.pendingText = tail ? tail + text : text;
     this.cancelTimer();
     // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿。
     // **例外**是预跑（`trackSilence`）：那份快照本来就是给这一句的（seq 已经对上），
@@ -663,7 +644,6 @@ export class UtteranceAssembler {
     if (this.prediction !== null && this.prediction.seq !== this.seq) {
       this.prediction = null;
     }
-    this.unfinishedWaited = false;
     const seq = this.seq;
     // 新的一句：投机的次数配额按句重置（下一段语音可以再投机两次）
     this.specCount = 0;
@@ -729,9 +709,6 @@ export class UtteranceAssembler {
     this.prediction = null;
     const hit = ready !== null && ready.seq === seq
       && (ready.pre || ready.startedAt >= this.lastPartialAt);
-    // 这一句的判停是「静音一到就提前跑」的：它看过音频静音，比 ASR 的 partial 更可信
-    // （实测 partial 比真实停嘴晚 98–140 ms），所以「刚收到中间结果就再等一拍」不必再执行
-    this.usedPrefired = hit && ready.pre;
     if (hit) {
       // 记下这份判停用的是哪一段音频 —— 下一拍拿它比「输入有没有变」（见 `snapshotBytes`）
       this.lastSnapshotBytes = ready.bytes;
@@ -758,7 +735,6 @@ export class UtteranceAssembler {
     this.extensions = 0;
     this.unsureExtensions = 0;
     this.waitedMs = 0;
-    this.unfinishedWaited = false;
     const text = this.pendingText.trim();
     this.pendingText = '';
     if (!text) {
@@ -777,7 +753,6 @@ export class UtteranceAssembler {
     this.pendingText = '';
     this.recentChunks.length = 0;
     this.recentBytes = 0;
-    this.unfinishedWaited = false;
   }
 
   /** 判定当前这一轮是否定稿。 */
@@ -793,9 +768,8 @@ export class UtteranceAssembler {
       return;
     }
 
-    // 判停**发起**的时刻：下面那条 partial 宽限看的是「窗口关掉那一刻」，不是
-    // 「推理跑完那一刻」。提前发起之后这两者会差一整个往返，取晚的那个等于
-    // 把宽限白白吃掉一截（旧写法就是这样，这条判据基本没生效过）。
+    // 判停**发起**的时刻（`lastDecisionAt` 用它判断「两次决定之间文本有没有变」）。
+    // 取发起而不是推理跑完那一刻 —— 快车道预跑让两者差一整个往返。
     const evaluatedAt = this.now();
     const probability = await this.takeProbability(seq, predict);
     const shown = probability < 0 ? '故障' : probability.toFixed(3);
@@ -823,8 +797,31 @@ export class UtteranceAssembler {
     // 上不花时间；只在用户确实又开口时才等 —— 那本来就不该开轮。
     // 必须放在下面那条「音频和文本都没变就不再等」**之前**，否则静音窗会被那条
     // 捷径绕过去（它只看 p 和快照字节数，不知道用户又说话了）。
+    // `thresholdFor()` 只依赖 `pendingText`，提前算就能让下面那条统一上限先执行
+    const threshold = this.thresholdFor();
+
+    // **统一上限**：静音到顶就放行，任何分支都不许再加拍。
+    // 放在所有分支之前 —— 它就是那条"谁都不能绕过"的闸。
+    const openSilenceCap = this.options.maxOpenSilenceMs ?? 0;
+    if (openSilenceCap > 0) {
+      const quietNow = this.now() - this.lastVoicedAt;
+      if (quietNow >= openSilenceCap) {
+        this.options.log(
+          `  判停    ${shown} → 静音 ${Math.round(quietNow)} ms ≥ 上限 ${openSilenceCap}，放行`,
+        );
+        this.reportJudge({
+          p: probability, waitMs: 0, action: 'accept', whyAccept: 'cap',
+          threshold, silenceMs: Math.round(quietNow),
+        });
+        this.flush();
+        return;
+      }
+    }
+
     const openQuiet = this.openQuietFor(probability);
-    if (openQuiet > 0 && this.extensions < this.maxExtensionsNow()) {
+    // 静音闸门也要受统一预算约束 —— 它原来是唯一一条能绕过 `overBudget()` 的路径
+    // （`return` 在预算判断之前），实测把 ② 顶到 2264 ms。
+    if (openQuiet > 0 && this.extensions < this.maxExtensionsNow() && !this.overBudget()) {
       // 必须取**此刻**：`evaluatedAt` 是 `await takeProbability` 之前拍的，
       // 判停那趟往返（70–200 ms）里 `lastVoicedAt` 可能已经前移 —— 用旧值会算出
       // 负的静音（实测日志里出现过「静音才 −55 ms」），门槛等于失效。
@@ -855,14 +852,14 @@ export class UtteranceAssembler {
     // 静音期间快照会被裁掉尾巴，所以字节数不变 = 输入一模一样 = 同一个 p（同一个
     // 模型、同一份特征）。真机上见过 `0.412 → 0.280 → 0.280`：最后那个 0.280 是
     // 拿同一段音频重算的，白等 400 ms；连等两拍就是 800 ms 纯损失。
-    // 唯一的例外是文本变了（来了新 partial）—— 那算新信息，交给下面那条宽限处理。
+    // 文本变了（来了新 partial）也算新信息 —— 但新信息**不能**再重开一拍（grace 已删），
+    // 只用来证明「这次输入确实不一样」，所以它出现在下面 `unchanged` 的条件里。
     // 没有音频（`lastSnapshotBytes <= 0`）时这个判据不成立：那时判停器本来就在
     // 报「不可用」，没有「输入没变」可言。
     const unchanged = this.lastSnapshotBytes > 0
       && this.snapshotBytes() === this.lastSnapshotBytes
       && this.lastPartialAt <= this.lastDecisionAt;
     this.lastDecisionAt = evaluatedAt;
-    const threshold = this.thresholdFor();
     if (probability < threshold && unchanged && this.extensions > 0) {
       this.options.log(`  判停    ${shown} → 音频和文本都没变，不再等（阈值 ${threshold}）`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
@@ -870,45 +867,26 @@ export class UtteranceAssembler {
       return;
     }
 
-    // 「判停还没吱声的这几十毫秒里又来了一条中间结果」= 硬证据：用户还在说。
-    //
-    // 这条必须在阈值的**外面**：真机上（2026-11-17 22:10 那场）用户把
-    // 「…对吗？那句。台词的经典是台词是什么来着？」一次说完，判停给了 0.007，
-    // 于是走的是「没说完」那条分支、只看 p 不看文本 —— 等第二拍时 ASR 的
-    // `台词的` 已经到了，照样被判「没说完」然后花光 unsure 预算强收下，
-    // 结果生成了一个半句轮次、刚出声就被用户后半句打断作废。
-    // 有 fresh partial 的时候不管 p 是多少都不该收。
-    const grace = this.options.partialGraceMs ?? 400;
-    const sincePartial = evaluatedAt - this.lastPartialAt;
-    if (grace > 0 && !this.usedPrefired
-      && sincePartial < grace && this.extensions < this.maxExtensionsNow()) {
-      if (this.partialIsNew()) {
-        this.extensions += 1;
-        this.waitedMs += this.options.extendMs;
-        this.options.log(
-          `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
-        );
-        this.reportJudge({
-          p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'grace',
-        });
-        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
-        return;
-      }
-      this.options.log(
-        `  判停    ${shown} → 中间结果没有新内容（${JSON.stringify(this.lastPartialText.slice(-8))}），不等`,
-      );
-    }
-
+    // **grace 已删除**（2026-11-18）。它原来的用意是「刚收到一条新 partial，说明还有
+    // 下文」，但真机 2 场 87 次 extend 里它命中 **0/8**，白等 3200 ms —— 全部是白等。
+    // 判停不确定时只做一次有上限的等待，不再为中间结果重开一拍。
     if (
       probability >= threshold
       || this.extensions >= this.maxExtensionsNow()
       // QoS：总预算用完了就收下，不管还剩多少分支额度
       || this.overBudget()
       // 「判停说没说完」有自己的上限：侧车给的 p 是噪声，不能让它把总预算
-      // （2.8 s）吃干净，也不能让它拖累那三条文本判据的额度
+      // （2.8 s）吃干净，也不能让它拖累静音闸门和短碎片的额度
       || this.unsureExtensions >= this.maxUnsureNow()
     ) {
-      if (this.shouldWaitForMore(this.pendingText)) {
+      // 短碎片这条**也受预算和拍数约束**：原来它在这个块里先 extend 再 return，
+      // 而进入这个块的理由就可能是「预算用完了」或「拍数用满了」—— 等于自己
+      // 给自己开后门（真机 short 那 1 次 extend 是白等 400 ms）。
+      if (
+        this.extensions < this.maxExtensionsNow()
+        && !this.overBudget()
+        && this.shouldWaitForMore(this.pendingText)
+      ) {
         this.extensions += 1;
         const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);
         this.waitedMs += wait;
@@ -920,27 +898,11 @@ export class UtteranceAssembler {
         return;
       }
 
-      // 结尾像「还有下文」（数字串、井号、连词…）：再等一拍，让后半句并进来。
-      // 每句只等一次 —— 等过之后仍然没下文，就认这是句尾。
-      const unfinishedWait = this.options.unfinishedWaitMs ?? 0;
-      if (
-        unfinishedWait > 0
-        && !this.unfinishedWaited
-        && this.extensions < this.maxExtensionsNow()
-        && looksUnfinished(this.pendingText)
-      ) {
-        this.unfinishedWaited = true;
-        this.extensions += 1;
-        this.waitedMs += unfinishedWait;
-        this.options.log(
-          `  判停    ${shown} → 结尾像没说完（…${JSON.stringify(this.pendingText.slice(-8))}），再等 ${unfinishedWait} ms`,
-        );
-        this.reportJudge({
-          p: probability, waitMs: unfinishedWait, action: 'extend', why: 'unfinished',
-        });
-        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, unfinishedWait);
-        return;
-      }
+      // **unfinished 已删除**（2026-11-18）。它靠一条文本正则（数字串/井号/连词）
+      // 再等一拍，真机 3 次命中 **0/3**、白等 750 ms；更要紧的是它给
+      // `maxExtensionsNow()` 开了 12 倍豁免，一个正则压过所有数值限额
+      // （实测一场里 `#13` 打 10 拍、`#16` 打 8 拍）。序列形态该多等，
+      // 由 `waitBudgetSequenceMs` 给**更大的预算**，不再给更多拍数。
       this.options.log(`  判停    ${shown} → 收下这一轮（阈值 ${threshold}）`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
       this.flush();
@@ -1006,17 +968,13 @@ export class UtteranceAssembler {
   }
 
   /**
-   * 这一轮的连续延长上限（次）。
+   * 这一轮的扩展次数上限。
    *
-   * 序列形态额外放宽：`maxExtensions` 是按「一般句尾」定的（真机 2 次 = 400 ms），
-   * 但念手机号时一个字一停，2 次远远不够 —— 那边由 `waitBudgetSequenceMs` 兜，
-   * 这里把次数上限抬上去，让**预算**而不是**次数**成为唯一的边界。
+   * **不再有「序列形态给 12 倍」的豁免**（2026-11-18 删除）：一条文本正则不该压过
+   * 数值限额 —— 实测一场里它让 `#13` 打 10 拍、`#16` 打 8 拍。序列该多等，
+   * 由 `waitBudgetSequenceMs` 给更大的**预算**，不再给更多拍数。
    */
   private maxExtensionsNow(): number {
-    const sequence = this.options.waitBudgetSequenceMs ?? 0;
-    if (sequence > 0 && looksUnfinished(this.pendingText)) {
-      return Math.max(this.options.maxExtensions, 12);
-    }
     return this.options.maxExtensions;
   }
 
@@ -1026,37 +984,9 @@ export class UtteranceAssembler {
     return budget > 0 && this.waitedMs >= budget;
   }
 
-  /** 「p 判没说完」这条分支的上限（序列形态同样豁免，理由见 `maxExtensionsNow`） */
+  /** 「p 判没说完」这条分支的上限（序列形态不给额外豁免，理由见 `maxExtensionsNow`） */
   private maxUnsureNow(): number {
-    const base = this.options.maxUnsureExtensions ?? this.options.maxExtensions;
-    const sequence = this.options.waitBudgetSequenceMs ?? 0;
-    if (sequence > 0 && looksUnfinished(this.pendingText)) {
-      return Math.max(base, 12);
-    }
-    return base;
-  }
-
-  /**
-   * 这条中间结果算不算「定稿之外的新内容」。
-   *
-   * qwen-realtime 会在定稿前后连发几条 partial：紧挨着定稿那条常常和它一字不差
-   * （只晚 6–9 ms），尾巴上还会再吐一个「嗯。」。按时间戳判会把这两种都当成
-   * 「用户还在说」，每次白等一拍（2026-11-18 真机一场白丢 1.5–2 s）。
-   *
-   * 判据纯文本、不做语义推断：去掉标点后，partial 既不等于定稿、也不是它的前缀、
-   * 也不是纯语气词，才算用户真的又往外说了字。
-   */
-  private partialIsNew(): boolean {
-    const strip = (text: string): string => text.replace(/[\s。.,，!！?？、~～…\-—]/g, '');
-    const partial = strip(this.lastPartialText);
-    if (partial === '') {
-      return false;
-    }
-    // 定稿里已经有的东西（相等，或 partial 只是定稿的落后版本）不算新内容
-    if (strip(this.pendingText).startsWith(partial)) {
-      return false;
-    }
-    return !isBackchannelOnly(partial);
+    return this.options.maxUnsureExtensions ?? this.options.maxExtensions;
   }
 
   private shouldWaitForMore(text: string): boolean {
