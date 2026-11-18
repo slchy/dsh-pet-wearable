@@ -1,10 +1,12 @@
 # STT / TTS realtime 能力调研清单
 
-> 用途：选型前置。调研结果决定 `ADR-006` 是否转回 `accepted`，或换厂商。
-> 关联：`TODO.md` T-004、`decisions/ADR-006-STT-TTS-VENDOR.md`
+> 用途：选型前置。调研结果是「MiMo 的 STT 不满足实时链路」，于是换了
+> 阿里云 NLS（ASR）+ CosyVoice（TTS）。
 >
-> **✅ 已结案（2026-11-05）**：结论是「不满足」，已另开
-> [`ADR-007`](decisions/ADR-007-REALTIME-VOICE-STACK.md) 取代 ADR-006 的 STT 部分。
+> **✅ 已结案（2026-11-05）**。现行栈见 [README](../README.md) 与
+> [CLOUD-ARCHITECTURE.md](./CLOUD-ARCHITECTURE.md)；
+> 2026-11-18 起的「客户端控端点」实验路径见
+> [QWEN-REALTIME-ASR-PROBED.md](./QWEN-REALTIME-ASR-PROBED.md)。
 > 下方问题清单保留为**验收模板**，将来换供应商照此逐条问。
 
 ---
@@ -34,7 +36,7 @@
 | 流式输出 | ✅ SSE，`choices[0].delta.audio.data` |
 | 输出格式 | ✅ `pcm16`，**24 kHz 单声道** |
 | 增量喂文本 | ✅ 按句提交（当前固定 1.0x 语速） |
-| 中途停止 | ❌ **未实现** —— 见 `TODO.md` T-005 |
+| 中途停止 | ❌ **未实现**（2026-11-05 记录；现行实现已有 `audio.stop` 打断，见 README 的 barge-in 一节） |
 | 音色 / 克隆 | ⚠️ 可指定具名音色；克隆未测 |
 | 音频时间戳 | ⚠️ 未测 |
 

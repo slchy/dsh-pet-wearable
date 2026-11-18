@@ -287,6 +287,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/patch-sdk-cancel.mjs` | 给 dsh SDK 补 `session/cancel`（`--check` 返回 0 = 已打） |
 | `scripts/patch-sdk-fork.mjs` | 给 dsh SDK 补 `session/fork`（双轨撤回用；`--check` 返回 0 = 已打） |
 | `bench/latency/probe-dsh-fork.mjs` | 验 fork 能不能用、切点取在哪才干净（起真 dsh，跑两轮再切掉第二轮） |
+| `bench/eot/our_judge_adapter.py` | 把线上判停器接到公开基准 `livekit/eot-bench` 上（numpy + onnxruntime，不装 torch）；跑法见 `bench/eot/README.md`，结果见 `docs/EOT-BENCH-RESULTS.md` |
 | `scripts/install-profile-patch.mjs` | 把人设 patch 装进本机 dsh sdk profile（`npm run install-profile`） |
 
 ## 10. τ²-bench
@@ -322,7 +323,10 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 ## 12. 标定值（跑对了应该看到什么）
 
-**真机实测（2026-11-17，`v2` 设备，两场共 12 轮；档案目录名见 §12.2.1）**：
+**真机实测（2026-11-17，`v2` 设备，两场共 12 轮；档案目录名见 §12.1 的字段说明）**：
+
+> 这里是**两场 12 轮**的样本；README「标定原始记录」用的是**另一份 13 轮同向量**
+> （`…_46019`），数字不同属正常，别把两套混着引用。
 
 > **这张表里只有「闭嘴→出声」那行的 p50/p90 是项目口径**，其余都是单段中位，
 > 只用来定位，不能引用成 p50。
@@ -394,26 +398,6 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 原来各等 944–956 ms，现在 **475 / 3 / 2 ms**（第 1 次是 479 / 3 / 1，可复现）；
 而「对吗？那句。」（用户确实还在说）仍然等 1020 ms —— 那是**该等**的。
 
-### 12.1 ASR 端点自控（实验路径，⚠️ **尚未全量验证**，2026-11-18）
-
-`MIAI_STT=qwen-realtime`：关掉服务端 VAD（`turn_detection: null`），由宿主在静音到点发
-`commit`（`VOICE_COMMIT_MS`，默认 40），开轮另设静音门槛（`VOICE_OPEN_QUIET_MS`）。
-
-同一份向量（`…_46019`）只动这一段：
-
-| 配置 | ① 停嘴→出句 中位 |
-|:---|:---:|
-| NLS（现网） | 372（真机源）/ 400（回放） |
-| qwen realtime，commit 40 + 门槛 300/200 | **254 – 302**（4 次回放） |
-
-**别把上面 §12 的端到端 p50 往这条路径上套**：`②`/`③` 的单次回放方差有 1 s 以上，
-4 次样本还定不出端到端数字。按账推算是 **0.95 – 1.05 s**，但那是推算，不是标定值。
-
-四个配置的逐轮对比、拆句计数、以及「门槛取 400/250 会过度合并」的反例，见
-[docs/QWEN-REALTIME-ASR-PROBED.md](./QWEN-REALTIME-ASR-PROBED.md)。
-
-上面那张真机表是第一、二刀**之前**的。
-
 ### 12.1 档案里能查什么（字段级）
 
 **这张表是「观测工具」的另一半**：脚本给段号，字段给原因。写新脚本前先看这里有没有现成字段，
@@ -464,6 +448,37 @@ qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**
 这是**模型首字**，不是闭嘴→出声。
 
 ---
+
+
+### 12.3 ASR 端点自控（实验路径，⚠️ **尚未全量验证**，2026-11-18）
+
+`MIAI_STT=qwen-realtime`：关掉服务端 VAD（`turn_detection: null`），由宿主在静音到点发
+`commit`（`VOICE_COMMIT_MS`，默认 40），开轮另设静音门槛（`VOICE_OPEN_QUIET_MS`）。
+
+同一份向量（`…_46019`）只动这一段：
+
+| 配置 | ① 停嘴→出句 中位 |
+|:---|:---:|
+| NLS（现网） | 372（真机源）/ 400（回放） |
+| qwen realtime，commit 40 + 门槛 300/200 | **254 – 302**（4 次回放） |
+
+**别把 §12 的端到端 p50 套到这条路径上**：`②`/`③` 的单次回放方差有 1 s 以上，
+4 次样本还定不出端到端数字。按账推算是 **0.95 – 1.05 s**，但那是推算，不是标定值。
+
+四个配置的逐轮对比、拆句计数、以及「门槛取 400/250 会过度合并」的反例，见
+[QWEN-REALTIME-ASR-PROBED.md](./QWEN-REALTIME-ASR-PROBED.md)。
+
+### 12.4 判停模型的中文基准（eot-bench，2026-11-18）
+
+判停器接到公开基准 [livekit/eot-bench](https://github.com/livekit/eot-bench) 的中文子集上跑过一轮：
+本项目 AUC **0.754**、5% 误切预算下等待 **0.918 s**；官方同模型（GPU 导出）0.745 / 0.959 s。
+
+**这是策略层指标**（基准一起扫 `threshold` / `action_delay` / `timeout`），
+**不是本项目的 ①**，别混着引用。
+
+结论：窗预处理只值 +0.009 AUC / −41 ms（**已到顶**），短板是模型本身；
+本地的 LiveKit mini 是 0.874 / 0.835 s，尚未落地。完整表与口径见
+[EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md)，复现见 [bench/eot/README.md](../bench/eot/README.md)。
 
 ## 13. 踩过的坑（别重现）
 
