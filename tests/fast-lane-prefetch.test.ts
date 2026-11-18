@@ -299,6 +299,50 @@ test('投机：太短的中间结果一个请求都不发', () => {
   assert.equal(asked, 0);
 });
 
+test('投机：门槛 6 → 2 之后，2–3 字的短句也起跑', () => {
+  // 归因逼出来的：② 被压到 100 ms 后，唯一还能藏 agent 的地方只剩 ①（停嘴→定稿 ~342 ms），
+  // 而 ②≈0 的那批轮次恰好全是 2–5 字短句（「你好呀。」「好。」）。6 字门槛把它们全挡在门外。
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['在呢。']);
+  });
+  agent.speculatePartial('你好');
+  assert.equal(asked, 1, '2 个字就该发出去（默认 specMinChars=2）');
+  agent.speculatePartial('那。');
+  assert.equal(asked, 1, '剥掉句尾标点后只剩 1 字，仍然不发');
+});
+
+test('投机：放宽的只是「发不发请求」，认领规则一个字没动', () => {
+  // 3 字能过门槛（≥minChars），但覆盖不到定稿的 60% —— 仍然不许认领。
+  assert.equal(acceptsSpeculation('改成', '改成641室。'), false, '覆盖率 29%，不许认');
+  assert.equal(
+    acceptsSpeculation('改成', '改成641室。', 2),
+    false,
+    'specMinChars 调小也不能让低覆盖的猜测被认下',
+  );
+  assert.equal(acceptsSpeculation('你好', '你好。'), true, '2 字、前缀、覆盖 67% → 认');
+});
+
+test('投机：specMinChars 可注入（调大就退回旧行为）', async () => {
+  let asked = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    fetchImpl: async () => {
+      asked += 1;
+      return sse(['在呢。']);
+    },
+    speculate: false,
+    specMinChars: 6,
+    log: () => {},
+  });
+  agent.speculatePartial('你好呀');
+  assert.equal(asked, 0, 'minChars=6 时 3 字不发');
+  agent.speculatePartial('你好呀你知道吗');
+  assert.equal(asked, 1);
+});
+
 test('投机：任务类句子同样不投机（与预跑同一组门槛）', () => {
   let asked = 0;
   const agent = makeAgent(async () => {

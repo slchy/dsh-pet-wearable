@@ -262,8 +262,12 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 | | `VOICE_OPEN_QUIET_SHORT_MS` | `200` | **仅 `qwen-realtime`**：判停 p ≥ `0.8`（目前写死）时改用的短门槛 |
 | **快车道** | `FAST_LANE_MODEL` | - | 轻量闲聊模型名称（如 `qwen-flash`） |
 | | `FAST_LANE_TIMEOUT_MS` | `1200` | 快车道首字超时时间，超时自动转交 `dsh` |
+| | `FAST_LANE_MAX_CHARS` | `14` | 句长上限：超过就整句交给 `dsh`（快车道只接短闲聊） |
 | | `FAST_LANE_PREFETCH` | `1` | 判停前预跑开关（`1` 开启，`0` 关闭） |
 | | `FAST_LANE_SPECULATE` | `1` | 快车道与 dsh 双轨投机开关 |
+| | `FAST_LANE_PARTIAL_SPECULATE` | `1` | 拿 ASR **中间结果**先起跑（定稿确认是前缀才认领） |
+| | `FAST_LANE_SPEC_MIN_CHARS` | `2` | 中间结果至少几个字才起跑。只控制「发不发请求」，认领仍要过前缀/覆盖 ≥60%/数字尾三条闸 |
+| | `FAST_LANE_HEDGE` | `2`（线上 `3`） | 并发发几份抢首字（不同 temperature）。算力换 p90，只取最先响应的那份 |
 | **语义判停** | `TURN_JUDGE_THRESHOLD` | `0.5` | 语义说完置信度阈值 |
 | | `TURN_JUDGE_THRESHOLD_CJK` | `0.35` | 针对中文短句的判停阈值（防止过早等待） |
 | | `TURN_JUDGE_QUIET_MS` | `0` | 定稿后额外静默期（ms） |

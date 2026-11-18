@@ -278,6 +278,13 @@ export interface FastLaneOptions {
   readonly now?: () => number;
   readonly log?: (line: string) => void;
   /**
+   * 中间结果至少几个字才起跑投机，默认 {@link SPEC_MIN_CHARS}（2）。
+   *
+   * 只控制「发不发请求」，不控制认不认（认领永远要过三条闸）。调大 = 省钱少猜，
+   * 调小 = 多发请求赌命中。对应环境变量 `FAST_LANE_SPEC_MIN_CHARS`。
+   */
+  readonly specMinChars?: number;
+  /**
    * 审计出口：把「问出去什么、答回来什么、为什么丢掉」**全量**交给档案。
    *
    * 只观察、不参与决策，抛错也会被吞掉（审计不该影响通话）。为什么要它：
@@ -306,10 +313,18 @@ export function isFastCandidate(text: string, maxChars = 14): boolean {
 }
 
 /**
- * 中间结果最少几个字才值得投机。短于这个的一律是「喂，」「那。」这类碎片，
- * 问出去必然是「你再说一遍」。
+ * 中间结果最少几个字才值得投机。**默认 2**（2026-11-18 从 6 降下来）。
+ *
+ * 原来写 6，理由是「短于 6 字的 partial 基本覆盖不到定稿的 60%，发了也是白花」。
+ * 但真机归因反过来看：**② 被压到 100 ms 之后，唯一还能藏 agent 的地方就是 ①**
+ * （停嘴→定稿 ~342 ms），而 ②≈0 的那批轮次恰恰全是 **2–5 字的短句**
+ * （「你好呀。」「嗯，不错哦。」「好。」）—— 6 字门槛把唯一还能救的那批全挡在门外。
+ *
+ * 放宽的**只有「发不发请求」这一侧**；认领仍要过 {@link acceptsSpeculation} 的三条
+ * （前缀 / 覆盖 ≥60% / 数字尾不许截断），所以**不影响正确性**，只多花请求。
+ * 用 `FAST_LANE_SPEC_MIN_CHARS` 覆盖（默认 2）。
  */
-const SPEC_MIN_CHARS = 6;
+const SPEC_MIN_CHARS = 2;
 
 /**
  * 投机文本至少要覆盖定稿的多大比例。
@@ -338,9 +353,9 @@ function stripPartialTail(text: string): string {
  * 3. **不能把数字截断**：`对，我想改成6` 对定稿 `…改成6414`。这是唯一一类
  *    「看着合法、其实已经错了」的投机 —— 模型会追问「改成几号」，而用户已经说过。
  */
-export function acceptsSpeculation(spec: string, final: string): boolean {
+export function acceptsSpeculation(spec: string, final: string, minChars = SPEC_MIN_CHARS): boolean {
   const s = stripPartialTail(spec);
-  if (s.length < SPEC_MIN_CHARS) return false;
+  if (s.length < minChars) return false;
   if (!final.startsWith(s)) return false;
   if (s.length < final.length * SPEC_MIN_COVERAGE) return false;
   const tail = final.slice(s.length);
@@ -457,6 +472,8 @@ export class FrontedAgent implements AgentProvider {
   private readonly totalMs: number;
   private readonly maxChars: number;
   private readonly keepTurns: number;
+  /** 中间结果投机的最小字数（见 {@link FrontedOptions.specMinChars}） */
+  private readonly specMinChars: number;
   private readonly speculate: boolean;
   private readonly prefetchEnabled: boolean;
   private readonly partialSpeculate: boolean;
@@ -551,6 +568,7 @@ export class FrontedAgent implements AgentProvider {
     this.totalMs = options.totalMs ?? 2_800;
     this.maxChars = options.maxChars ?? 14;
     this.keepTurns = options.keepTurns ?? 4;
+    this.specMinChars = Math.max(1, options.specMinChars ?? SPEC_MIN_CHARS);
     this.speculate = options.speculate ?? true;
     this.prefetchEnabled = options.prefetch ?? true;
     this.partialSpeculate = options.partialSpeculate ?? true;
@@ -648,7 +666,7 @@ export class FrontedAgent implements AgentProvider {
     // 投机起跑的那一趟对上了定稿：**认它**。它已经跑了几百毫秒，从头再问等于
     // 把投机白送的时间还回去。文本改写成定稿，后面 `takePrefetch` 按一字不差认领。
     const prev = this.prefetched;
-    if (prev !== null && prev.speculative && acceptsSpeculation(prev.text, text)) {
+    if (prev !== null && prev.speculative && acceptsSpeculation(prev.text, text, this.specMinChars)) {
       this.speculateStarts = 0;
       this.log(
         `  快车道    投机被定稿确认（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}，`
@@ -683,7 +701,7 @@ export class FrontedAgent implements AgentProvider {
     if (!this.prefetchEnabled || !this.partialSpeculate) return;
     const trace = process.env['FAST_LANE_TRACE'] === '1';
     // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱
-    if (stripPartialTail(text).length < SPEC_MIN_CHARS) {
+    if (stripPartialTail(text).length < this.specMinChars) {
       // tracer 上和「真的发出去了」区分开：「投机 静音…」那行是宿主打算投，这行才是结果
       if (trace) this.log(`  快车道    投机跳过：中间结果太短 ${JSON.stringify(text)}`);
       return;
