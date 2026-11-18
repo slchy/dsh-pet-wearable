@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { RollbackLedger } from '../src/session.ts';
+import { RollbackLedger, splitSuperseded } from '../src/session.ts';
 
 const ticket = (no: number, gen = 0) => ({ no, gen });
 
@@ -75,6 +75,38 @@ test('reset：fork 成功 / 换会话之后账本必须清空', () => {
   led.reset();
   assert.equal(led.peek(), null, '待撤回的切点属于旧会话，不能留到新会话');
   assert.equal(led.claim(ticket(1)), false, '旧会话的 seq 不能给新会话用');
+});
+
+test('透明化会话的清单：只删过期的，坏记录直接丢', () => {
+  const root = '/home/u/.dsh/sessions';
+  const now = Date.parse('2026-11-18T00:00:00Z');
+  const day = 24 * 60 * 60 * 1_000;
+  const good = (id: string, ageDays: number) => ({ id, at: now - ageDays * day, dir: `${root}/--ws--/${id}` });
+  const { drop, keep, bad } = splitSuperseded([
+    good('session-old', 8), // 过期 → 删
+    good('session-fresh', 6), // 没过期 → 留
+    good('session-edge', 7), // 正好 7 天 → 删（>= ttl）
+    { id: 'session-nodir', at: now - 30 * day }, // 缺 dir → 坏记录
+    { id: 'session-escape', at: now - 30 * day, dir: '/etc/passwd' }, // 不在 sessions 根下 → 坏记录
+    { id: 'session-mismatch', at: now - 30 * day, dir: `${root}/--ws--/session-other` }, // 目录名不等于 id
+    null,
+  ], now, root);
+
+  assert.deepEqual(drop.map((e) => e.id).sort(), ['session-edge', 'session-old']);
+  assert.deepEqual(keep.map((e) => e.id), ['session-fresh']);
+  assert.equal(bad, 4, '缺字段/越界路径/目录名不符/非对象，都算坏记录');
+});
+
+test('透明化会话的清单：全部在保留期内时一条都不删', () => {
+  const root = '/home/u/.dsh/sessions';
+  const now = Date.now();
+  const { drop, keep } = splitSuperseded(
+    [{ id: 'session-a', at: now - 1_000, dir: `${root}/x/session-a` }],
+    now,
+    root,
+  );
+  assert.equal(drop.length, 0);
+  assert.equal(keep.length, 1);
 });
 
 test('入箱的「取出」事件（inserted 为空）不算入箱', () => {

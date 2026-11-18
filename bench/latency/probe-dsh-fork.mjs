@@ -115,8 +115,9 @@ try {
   const cut = insert.seq - 1;
   log(`  第二轮：入箱 seq=${insert.seq} → 切点 atSeq=${cut}（turn/start 在 ${secondStart}，第一轮结束在 ${seqAfter1}）`);
 
+  const forkStartedAt = Date.now();
   const forked = await rpc('session/fork', { sessionId, atSeq: cut });
-  log(`✓ session/fork → ${forked.sessionId}`);
+  log(`✓ session/fork → ${forked.sessionId}（耗时 ${Date.now() - forkStartedAt} ms）`);
 
   const before = events.length;
   await turn(forked.sessionId, '哥刚才说：\n（探针）第三句，在新会话里。');

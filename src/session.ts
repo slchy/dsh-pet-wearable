@@ -27,7 +27,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -171,6 +171,49 @@ export interface SessionOptions {
 }
 
 export class DshError extends Error {}
+
+/** 透明化之后「原会话」保留多久：过了这段时间连目录一起删 */
+export const SUPERSEDED_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+
+/** 一条「被透明化掉的会话」记录 */
+export interface SupersededEntry {
+  /** dsh 会话 id */
+  readonly id: string;
+  /** 透明化时刻（epoch ms） */
+  readonly at: number;
+  /** 会话目录的绝对路径（删之前会再校验一次它在 dsh 的 sessions 根下） */
+  readonly dir: string;
+}
+
+/**
+ * 分拣「该删的」和「该留的」。
+ *
+ * 纯函数，好测：IO 留给调用方（这里只做时间比较）。坏记录（缺字段、路径不像）一律丢掉 ——
+ * 一条坏行不该让整份清单失效，更不能让它指向 `rm -rf` 一个奇怪路径。
+ */
+export function splitSuperseded(
+  entries: readonly unknown[],
+  now: number,
+  sessionsRoot: string,
+  ttl = SUPERSEDED_TTL_MS,
+): { drop: SupersededEntry[]; keep: SupersededEntry[]; bad: number } {
+  const drop: SupersededEntry[] = [];
+  const keep: SupersededEntry[] = [];
+  let bad = 0;
+  for (const raw of entries) {
+    if (!raw || typeof raw !== 'object') { bad += 1; continue; }
+    const e = raw as Record<string, unknown>;
+    const id = typeof e['id'] === 'string' ? e['id'] : '';
+    const at = typeof e['at'] === 'number' && Number.isFinite(e['at']) ? e['at'] : 0;
+    const dir = typeof e['dir'] === 'string' ? e['dir'] : '';
+    if (id === '' || at <= 0 || dir === '') { bad += 1; continue; }
+    // 只认 dsh sessions 根下、目录名正好是 id 的那一层
+    if (!dir.startsWith(`${sessionsRoot}/`) || dir.split('/').pop() !== id) { bad += 1; continue; }
+    if (now - at >= ttl) drop.push({ id, at, dir });
+    else keep.push({ id, at, dir });
+  }
+  return { drop, keep, bad };
+}
 
 /**
  * 「撤回切点」的账本：快车道赢了、而慢车道那一轮**已经答完**时，要把那一轮从
@@ -337,6 +380,8 @@ export class DshSession {
   private rollbackSupported: boolean | null = null;
   /** 撤回切点的账本：入箱 seq − 1，且按票据认领（见 `RollbackLedger`） */
   private readonly rollback = new RollbackLedger();
+  /** 最近一次撤回的结果（给「补上下文」决定措辞用，取一次就清） */
+  private rollbackOutcome: 'ok' | 'failed' | null = null;
   /** 在途的握手指令（并发 `ask` 必须等同一个，不能各自起进程） */
   private readonly handshaking = new SingleFlight<void>();
   /** 当前在途那一轮的票据（`null` = 还没开始 / 已经结束）；取消时按它丢过期票据 */
@@ -722,7 +767,31 @@ export class DshSession {
     if (!this.rollback.claim(ticket)) {
       return;
     }
-    this.log(`  回溯    记下切点 seq=${this.rollback.peek()}（下次开轮前撤回）`);
+    this.log(`  回溯    记下切点 seq=${this.rollback.peek()}（开轮前撤回）`);
+    // 现在没人在跑的话立刻做：fork 只要几十毫秒，做完「补上下文」那边才知道
+    // 该怎么措辞（成功 = 那轮没发生过 / 失败 = 用户没听到你的回答）。
+    void this.tryRollbackNow();
+  }
+
+  /** 空闲时立刻撤回；有轮次在飞就留给下一轮 `askSdk`（不交叉）。 */
+  private async tryRollbackNow(): Promise<void> {
+    if (!this.sdkReady || this.activeTicket !== null || this.openSessionId === null) {
+      return;
+    }
+    if (this.rollback.peek() === null) {
+      return;
+    }
+    await this.applyRollback(this.openSessionId);
+  }
+
+  /**
+   * 上次撤回的结果：`ok` 成功 / `failed` 没做成 / `none` 没撤过。**取一次就清**，
+   * 免得一条旧结果影响很久以后那轮的措辞。
+   */
+  takeRollbackOutcome(): 'ok' | 'failed' | 'none' {
+    const outcome = this.rollbackOutcome;
+    this.rollbackOutcome = null;
+    return outcome ?? 'none';
   }
 
   /**
@@ -737,6 +806,7 @@ export class DshSession {
       return sessionId;
     }
     if (this.rollbackSupported === false) {
+      this.rollbackOutcome = 'failed';
       this.log('  回溯    ✗ 宿主运行时没有 session/fork —— 跑一次 scripts/patch-sdk-fork.mjs');
       return sessionId;
     }
@@ -748,15 +818,111 @@ export class DshSession {
         throw new DshError('session/fork 没有返回新会话 id');
       }
       this.rollbackSupported = true;
+      this.rollbackOutcome = 'ok';
       this.openSessionId = child;
       this.saveSession(child);
       // 账本里的 seq 属于旧会话，留着下次会拿无效切点去 fork 新会话
       this.rollback.reset();
+      this.retireSession(sessionId);
       this.log(`  回溯    已撤回上一轮（切点 seq=${cut}，${Date.now() - startedAt} ms）→ ${child}`);
       return child;
     } catch (error) {
+      this.rollbackOutcome = 'failed';
       this.log(`  回溯    ✗ ${(error as Error).message}`);
       return sessionId;
+    }
+  }
+
+  /** dsh 的会话根（`~/.dsh/sessions`），透明化后的原会话就躺在它下面 */
+  private get sessionsRoot(): string {
+    return join(homedir(), '.dsh', 'sessions');
+  }
+
+  /** 「被透明化掉的会话」清单，和工作目录/会话指针放在一起 */
+  private get supersededFile(): string {
+    return join(dirname(this.sessionFile), 'superseded.jsonl');
+  }
+
+  /**
+   * 把被替换掉的会话登记进清单，顺手做一次过期清理。
+   *
+   * 为什么要归档而不是立刻删：fork 之后旧会话**还在磁盘上**（我们只是不再引用它），
+   * 万一切点或 fork 出了问题，它是唯一能回看的现场。留 7 天，然后连目录一起删。
+   *
+   * 不做定时器：清理挂在「启动时」和「每次 fork 之后」这两个本来就会发生的事件上，
+   * 少一个进程、少一份状态。代价是常年不重启又从不 fork 的机器不会清 —— 但那种机器
+   * 也不会产生新的待清理项。
+   */
+  private retireSession(oldId: string): void {
+    try {
+      const dir = this.findSessionDir(oldId);
+      if (dir === null) {
+        return;
+      }
+      mkdirSync(dirname(this.supersededFile), { recursive: true });
+      appendFileSync(
+        this.supersededFile,
+        `${JSON.stringify({ id: oldId, at: Date.now(), dir } satisfies SupersededEntry)}\n`,
+      );
+      this.collectSuperseded();
+    } catch (error) {
+      // 清理是后台卫生，坏了不该影响对话
+      this.log(`  回溯    清理登记失败：${(error as Error).message}`);
+    }
+  }
+
+  /** 在 `<sessionsRoot>/<workspace>/<id>` 里找那一层目录；找不到就算了 */
+  private findSessionDir(id: string): string | null {
+    const root = this.sessionsRoot;
+    let spaces: string[];
+    try {
+      spaces = readdirSync(root);
+    } catch {
+      return null;
+    }
+    for (const space of spaces) {
+      const dir = join(root, space, id);
+      if (existsSync(dir)) {
+        return dir;
+      }
+    }
+    return null;
+  }
+
+  /** 删掉超过 7 天的透明化会话（只在启动与 fork 之后跑） */
+  private collectSuperseded(): void {
+    let raw: string;
+    try {
+      raw = readFileSync(this.supersededFile, 'utf8');
+    } catch {
+      return;
+    }
+    const entries = raw.split('\n').filter((line) => line.trim() !== '').map((line) => {
+      try { return JSON.parse(line) as unknown; } catch { return null; }
+    });
+    const { drop, keep, bad } = splitSuperseded(entries, Date.now(), this.sessionsRoot);
+    for (const entry of drop) {
+      if (entry.id === this.openSessionId) {
+        continue; // 双保险：正在用的绝不删
+      }
+      try {
+        rmSync(entry.dir, { recursive: true, force: true });
+        this.log(`  回溯    清理旧会话 ${entry.id}（透明化于 ${new Date(entry.at).toISOString()}）`);
+      } catch (error) {
+        keep.push(entry);
+        this.log(`  回溯    ✗ 清理 ${entry.id} 失败：${(error as Error).message}`);
+      }
+    }
+    try {
+      writeFileSync(
+        this.supersededFile,
+        keep.map((e) => `${JSON.stringify(e)}\n`).join(''),
+      );
+    } catch {
+      // 写不进去就下次再试
+    }
+    if (bad > 0) {
+      this.log(`  回溯    清单里有 ${bad} 条坏记录，已丢弃`);
     }
   }
 
@@ -828,8 +994,10 @@ export class DshSession {
       : '  取消    ✗ 宿主运行时没有 session/cancel —— 跑一次 scripts/patch-sdk-cancel.mjs');
     this.rollbackSupported = await this.probeFork();
     this.log(this.rollbackSupported
-      ? '  回溯    session/fork 可用（快车道赢了而 dsh 已答完时，下一轮前把那一轮切掉）'
+      ? '  回溯    session/fork 可用（快车道赢了而 dsh 已答完时，把那一轮切掉）'
       : '  回溯    ✗ 宿主运行时没有 session/fork —— 跑一次 scripts/patch-sdk-fork.mjs');
+    // 顺手清一次过期（透明化超过 7 天的旧会话）。不做定时器：清理挂在启动这一事件上。
+    this.collectSuperseded();
   }
 
   /**

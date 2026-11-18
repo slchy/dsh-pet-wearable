@@ -1087,12 +1087,19 @@ export class FrontedAgent implements AgentProvider {
       blocks.push(note);
     }
     if (this.pending.length > 0) {
+      // 撤回没做成 = dsh 那一轮**已经答完且还在历史里**，而用户听到的是快车道的话。
+      // 这时候不能还说「没有经过你的会话」—— 得把「你那轮用户没听到」讲清楚，否则
+      // 上下文里同一句话有两个答案，它下次接着聊就会错。
+      const lost = this.inner.takeRollbackOutcome?.() === 'failed';
       blocks.push([
-        '（下面几轮是刚才由快车道直接答给用户的，没有经过你的会话；当作已知上下文即可）',
+        lost
+          ? '（下面几轮是刚才的对话。有几轮**你已经答完了，但用户没听到你的回答** ——'
+            + '用户实际听到的是每一对里「你」那一行；当作已知上下文即可）'
+          : '（下面几轮是刚才由快车道直接答给用户的，没有经过你的会话；当作已知上下文即可）',
         ...this.pending,
       ].join('\n'));
       this.pending.length = 0;
-      this.log('  快车道    把缓冲的闲聊轮次补进 dsh 上下文');
+      this.log(`  快车道    把缓冲的闲聊轮次补进 dsh 上下文${lost ? '（含「你那轮没被听到」的说明）' : ''}`);
     }
     if (blocks.length === 0) {
       return this.inner.reply(userText, image, note, { ticket });

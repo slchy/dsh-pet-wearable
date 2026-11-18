@@ -187,6 +187,11 @@ export class VoiceAgent {
     this.session.rollbackTurn(ticket);
   }
 
+  /** 上一次撤回的结果（给「补上下文」决定措辞用，取一次就清）。 */
+  takeRollbackOutcome(): 'ok' | 'failed' | 'none' {
+    return this.session.takeRollbackOutcome();
+  }
+
   /** 后台任务状态的一句话事实（来自 dsh 自己的事件，不发请求）。 */
   taskStatus(): string {
     return this.session.taskStatus();

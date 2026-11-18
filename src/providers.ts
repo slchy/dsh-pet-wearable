@@ -128,6 +128,8 @@ export interface AgentProvider {
    * `session/fork`（切一段前缀长出新会话）。实现必须**自己换指针**，调用方不感知。
    */
   rollbackTurn?(ticket?: TurnTicket): void;
+  /** 上一次撤回的结果（`ok` / `failed` / `none`，取一次就清）。补上下文时按它措辞。 */
+  takeRollbackOutcome?(): 'ok' | 'failed' | 'none';
   /**
    * 可选能力：**判停之前先问出去**。
    *
