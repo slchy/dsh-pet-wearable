@@ -100,13 +100,49 @@ test('音频说完了，但刚收到中间结果 → 不收敛', async () => {
   const { assembler, utterances } = makeAssembler({ partialGraceMs: 20, extendMs: 40 });
 
   assembler.addSentence('我想问一下那个');
-  assembler.notePartial('我想问一下那');
+  // 定稿之外**多出来的**字才算还在说（落后于定稿的 partial 见下一条）
+  assembler.notePartial('我想问一下那个然后呢');
 
   await delay(15);
   assert.equal(utterances.length, 0, '用户还在出字，这时候收下就是抢话');
 
   await delay(120);
   assert.equal(utterances.length, 1, '等过 grace 之后还是要收，不能吞掉');
+});
+
+test('和定稿一字不差的中间结果不算「还有下文」', async () => {
+  // 真机（2026-11-18）：qwen-realtime 在定稿前 6–9 ms 会再发一条同样的 partial，
+  // 按时间戳算就白等一拍 —— 一场这么白丢 1.5–2 s。
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    partialGraceMs: 200,
+    extendMs: 40,
+    onJudge: (fact) => { facts.push(fact); },
+  });
+
+  assembler.addSentence('等于多少？');
+  assembler.notePartial('等于多少？');
+
+  await delay(80);
+  assert.equal(utterances.length, 1, '同文 partial 不该拖住定稿');
+  assert.equal(facts.filter((f) => f.why === 'grace').length, 0, '不该记 grace 延伸');
+});
+
+test('尾巴上的「嗯。」不算还有下文', async () => {
+  // ASR 在句尾静音上会吐一个语气词；它是旁听反馈，不是「用户又说了字」
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    partialGraceMs: 200,
+    extendMs: 40,
+    onJudge: (fact) => { facts.push(fact); },
+  });
+
+  assembler.addSentence('我让你挂断。');
+  assembler.notePartial('嗯。');
+
+  await delay(80);
+  assert.equal(utterances.length, 1);
+  assert.equal(facts.filter((f) => f.why === 'grace').length, 0);
 });
 
 test('中间结果是过去的，不影响收敛', async () => {
@@ -183,7 +219,7 @@ test('预判之后用户又开口，那份结果作废、现算一次', async ()
     quietMs: 60,
     predictAtMs: 0,
     partialGraceMs: 120,
-    extendMs: 40,
+    extendMs: 100,
     maxExtensions: 1,
     predict: async () => {
       calls += 1;
@@ -194,7 +230,7 @@ test('预判之后用户又开口，那份结果作废、现算一次', async ()
   assembler.addAudio(Buffer.alloc(3200));
   assembler.addSentence('我想问一下那个');
   await delay(20);
-  assembler.notePartial('我想问一下那');
+  assembler.notePartial('我想问一下那个然后呢');
   await delay(70); // 窗口关掉：预判早于 lastPartialAt，不能信
 
   assert.equal(calls, 2, '作废之后要现算一次，而不是拿旧的凑数');

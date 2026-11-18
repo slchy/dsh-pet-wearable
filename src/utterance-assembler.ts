@@ -35,6 +35,7 @@
  *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
+import { isBackchannelOnly } from './backchannel.ts';
 import { pcm16DurationMs, pcm16PeakDbfs, pcm16TrimTrailingSilence } from './pcm.ts';
 
 export interface UtteranceAssemblerOptions {
@@ -141,6 +142,10 @@ export interface UtteranceAssemblerOptions {
    * 定稿之后 partial 还在增长，说明下一句已经在路上，这时候收下就是抢话。
    *
    * 设 0 关闭这条判据（只信音频，回到旧行为）。
+   *
+   * **只认「定稿之外的新内容」**（2026-11-18 真机）：qwen-realtime 在定稿前后
+   * 还会连发几条 partial —— 紧挨着定稿那条常常和它一字不差，尾巴上还会吐一个
+   * 「嗯。」。按时间戳算会把这两种都当成「用户还在说」，一场白等 1.5–2 s。
    */
   readonly partialGraceMs?: number;
   /**
@@ -846,15 +851,20 @@ export class UtteranceAssembler {
     const sincePartial = evaluatedAt - this.lastPartialAt;
     if (grace > 0 && !this.usedPrefired
       && sincePartial < grace && this.extensions < this.options.maxExtensions) {
-      this.extensions += 1;
+      if (this.partialIsNew()) {
+        this.extensions += 1;
+        this.options.log(
+          `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
+        );
+        this.reportJudge({
+          p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'grace',
+        });
+        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
+        return;
+      }
       this.options.log(
-        `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
+        `  判停    ${shown} → 中间结果没有新内容（${JSON.stringify(this.lastPartialText.slice(-8))}），不等`,
       );
-      this.reportJudge({
-        p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'grace',
-      });
-      this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
-      return;
     }
 
     if (
@@ -940,6 +950,29 @@ export class UtteranceAssembler {
       return long;
     }
     return probability >= (this.options.openQuietHighP ?? 0.8) ? short : long;
+  }
+
+  /**
+   * 这条中间结果算不算「定稿之外的新内容」。
+   *
+   * qwen-realtime 会在定稿前后连发几条 partial：紧挨着定稿那条常常和它一字不差
+   * （只晚 6–9 ms），尾巴上还会再吐一个「嗯。」。按时间戳判会把这两种都当成
+   * 「用户还在说」，每次白等一拍（2026-11-18 真机一场白丢 1.5–2 s）。
+   *
+   * 判据纯文本、不做语义推断：去掉标点后，partial 既不等于定稿、也不是它的前缀、
+   * 也不是纯语气词，才算用户真的又往外说了字。
+   */
+  private partialIsNew(): boolean {
+    const strip = (text: string): string => text.replace(/[\s。.,，!！?？、~～…\-—]/g, '');
+    const partial = strip(this.lastPartialText);
+    if (partial === '') {
+      return false;
+    }
+    // 定稿里已经有的东西（相等，或 partial 只是定稿的落后版本）不算新内容
+    if (strip(this.pendingText).startsWith(partial)) {
+      return false;
+    }
+    return !isBackchannelOnly(partial);
   }
 
   private shouldWaitForMore(text: string): boolean {
