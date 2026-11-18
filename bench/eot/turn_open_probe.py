@@ -85,9 +85,27 @@ def text_of(event: dict) -> str:
 
 def analyse_session(dir_path: str, floor_db: float) -> dict:
     ev = load_events(os.path.join(dir_path, "events.jsonl"))
+    # `silenceDb` 是**放大后**的门限，而档案里的 `uplink.pcm` 是**放大前**的。
+    # 不换算直接比，等于把门限抬高 20·log10(micGain) —— micGain=4 时是 12 dB，
+    # 轻的尾音会被算成静音，开轮静音整体偏长。按场次从 meta.json 取增益。
+    mic_gain = 1.0
+    meta_path = os.path.join(dir_path, "meta.json")
+    if os.path.exists(meta_path):
+        try:
+            meta = json.load(open(meta_path, encoding="utf-8"))
+            gain = meta.get("micGain")
+            gate = meta.get("gateDbfs")
+            if isinstance(gain, (int, float)) and gain > 0:
+                mic_gain = float(gain)
+            if isinstance(gate, (int, float)):
+                floor_db = float(gate)
+        except json.JSONDecodeError:
+            pass
+    floor_pre_gain = floor_db - 20.0 * np.log10(mic_gain)
+
     pcm_path = os.path.join(dir_path, "uplink.pcm")
     raw = np.fromfile(pcm_path, dtype="<i2") if os.path.exists(pcm_path) else np.zeros(0, dtype=np.int16)
-    voiced = voiced_mask(frame_peak_dbfs(raw), floor_db) if raw.size else np.zeros(0, dtype=bool)
+    voiced = voiced_mask(frame_peak_dbfs(raw), floor_pre_gain) if raw.size else np.zeros(0, dtype=bool)
     total_ms = raw.size / SR * 1000.0
 
     starts = [e for e in ev if e.get("ev") == "turn.start"]
@@ -106,11 +124,20 @@ def analyse_session(dir_path: str, floor_db: float) -> dict:
         at = st.get("at") or {}
         byte_off = at.get("pcm")
         silence_ms = None
+        last_voiced_pcm_ms = None
         if isinstance(byte_off, (int, float)) and voiced.size:
             fr = int(min(max(byte_off / (FRAME * 2), 0), voiced.size - 1))
             idx = np.flatnonzero(voiced[: fr + 1])
             if idx.size:
+                last_voiced_pcm_ms = int(idx[-1]) * FRAME_MS
                 silence_ms = (fr - int(idx[-1])) * FRAME_MS
+
+        def pcm_ms(event: dict | None) -> float | None:
+            """事件的 PCM 时刻（秒×1000）。`at.pcm` 是累计上行字节，mic 关门后不再增长。"""
+            if event is None:
+                return None
+            v = (event.get("at") or {}).get("pcm")
+            return None if not isinstance(v, (int, float)) else v / (FRAME * 2) * FRAME_MS
 
         # ---- 量 B ----
         tf = next((e for e in tts if t0 < e["t"] < nxt), None)
@@ -121,15 +148,16 @@ def analyse_session(dir_path: str, floor_db: float) -> dict:
         #   本轮结束后 1.2 s 内 → 我们答完一整句，用户立刻补上后半句
         resume_candidates = [
             e for e in sents + finals
-            if t0 < e["t"] < nxt and (
-                e["t"] - t0 <= 2500
-                or (en is not None and 0 <= e["t"] - en["t"] <= 1200)
-            )
+            if t0 < e["t"] < nxt and e["t"] - t0 <= 2500
         ]
         resume = resume_candidates[0] if resume_candidates else None
 
         outcome = "未继续说"
-        if resume is not None and resume["t"] > t0 + 1:
+        resume_delay = None if resume is None or resume["t"] <= t0 + 1 else resume["t"] - t0
+        # 只有**紧跟**开轮（≤1500 ms）才算「用户把同一句接着说下去」。
+        # 更晚的是下一轮对话 —— 早先那条「turn.end 后 1.2 s 内」的窗口会把
+        # +4~7 s 的独立话轮也捞进 b 桶，把「被打断」灌满假样本。
+        if resume_delay is not None and resume_delay <= 1500:
             if tf is None or resume["t"] < tf["t"]:
                 outcome = "a 出声前被吸收"
             elif (en or {}).get("interrupted") is True:
@@ -137,21 +165,49 @@ def analyse_session(dir_path: str, floor_db: float) -> dict:
             else:
                 outcome = "c 半句当整句答"
 
-        jd = [e for e in decides if t0 - 3000 < e["t"] <= t0]
+        jd = [e for e in decides if t0 - 4000 < e["t"] <= t0]
+        own_text = ""
+        for e in reversed([x for x in finals + sents if x["t"] <= t0]):
+            if text_of(e):
+                own_text = text_of(e)
+                break
+        asr_sent = next((e for e in reversed(sents) if t0 - 4000 < e["t"] <= t0), None)
         rows.append({
             "turn": i + 1,
-            "text": text_of(st) or (text_of(en or {})),
+            "text": own_text,
             "open_silence_ms": silence_ms,
+            "last_voiced_pcm_ms": last_voiced_pcm_ms,
+            "open_pcm_ms": pcm_ms(st),
+            "turn_start_t": t0,
             "path": (en or {}).get("path"),
             "tts_first_ms": None if tf is None else tf["t"] - t0,
-            "resume_after_start_ms": None if resume is None or resume["t"] <= t0 + 1 else resume["t"] - t0,
+            "resume_after_start_ms": resume_delay,
+            "next_text": "" if resume is None else text_of(resume),
             "interrupted": (en or {}).get("interrupted"),
             "outcome": outcome,
             "judge_whys": [e.get("why") for e in jd if e.get("action") == "extend"],
+            "judge_trace": [
+                {
+                    "rel_t": int(e["t"] - t0),
+                    "pcm_ms": pcm_ms(e),
+                    "p": round(float(e.get("p", -1)), 3),
+                    "waitMs": e.get("waitMs"),
+                    "action": e.get("action"),
+                    "why": e.get("why"),
+                    "threshold": e.get("threshold"),
+                }
+                for e in jd
+            ],
+            "asr_sentence_t": None if asr_sent is None else asr_sent["t"],
+            "asr_sentence_pcm_ms": pcm_ms(asr_sent),
+            "tts_first_pcm_ms": pcm_ms(tf),
         })
 
     return {
         "session": os.path.basename(dir_path),
+        "mic_gain": mic_gain,
+        "gate_dbfs_post_gain": floor_db,
+        "floor_dbfs_pre_gain": round(float(floor_pre_gain), 2),
         "audio_s": round(total_ms / 1000.0, 1),
         "n_turns": len(starts),
         "rows": rows,
@@ -228,6 +284,53 @@ def main() -> int:
                 f"  继续说 +{str(r['resume_after_start_ms'] or '-'):>5}"
                 f"  {r['outcome']:<12} {r['text'][:22]}"
             )
+
+    # ---- 表 1：开轮静音 ≥ 1200 ms 的轮次，逐轮时间线（全部落在 PCM 时间轴）----
+    print()
+    print("=== 表 1：开轮静音 ≥1200 ms 的时间线（ms，相对于该轮最后一个有声帧）===")
+    for s in sessions:
+        for r in s["rows"]:
+            if r["open_silence_ms"] is None or r["open_silence_ms"] < 1200:
+                continue
+            base = r["last_voiced_pcm_ms"]
+            def rel(v, base=base):
+                return "-" if v is None or base is None else f"{v - base:.0f}"
+            print(
+                f"\n[{s['session'][:15]} #{r['turn']}] 静音 {r['open_silence_ms']} ms  path {r['path']}"
+                f"  「{r['text'][:26]}」"
+            )
+            open_t = None
+            for ev_name, key in (("turn.start", "open_pcm_ms"), ("tts.first", "tts_first_pcm_ms")):
+                pass
+            # 事件时钟轴：全部相对 turn.start（这些事件同属服务端时钟，可直接相减）
+            print(f"   最后有声帧(pcm) {base}")
+            if r["asr_sentence_t"] is not None:
+                print(f"   asr.sentence  {r['asr_sentence_t'] - r['turn_start_t']:+d} ms（相对开轮）")
+            for j in r["judge_trace"]:
+                print(
+                    f"   judge         {j['rel_t']:+d} ms  p={j['p']:<6} wait={str(j['waitMs']):<4}"
+                    f" {j['action']:<7} why={j['why']}"
+                )
+            print(f"   turn.start    +0      ← 开轮（静音 {r['open_silence_ms']} ms）")
+            if r["tts_first_ms"] is not None:
+                print(f"   tts.first     +{r['tts_first_ms']} ms")
+
+    # ---- 表 2：开轮后用户接着说的每一次 ----
+    print()
+    print("=== 表 2：开轮后用户接着说（a+b+c 全部）===")
+    n = 0
+    for s in sessions:
+        for r in s["rows"]:
+            if r["outcome"] == "未继续说":
+                continue
+            n += 1
+            print(
+                f"\n{n}. [{s['session'][:15]} #{r['turn']}] {r['outcome']}"
+                f"  停顿 {r['open_silence_ms']} ms  开轮→出声 {r['tts_first_ms']}"
+                f"  开轮→用户再出声 {r['resume_after_start_ms']}  interrupted={r['interrupted']}"
+            )
+            print(f"   本轮：{r['text']}")
+            print(f"   下一段：{r['next_text']}")
     return 0
 
 
