@@ -906,3 +906,103 @@ test('极短的换气不会触发封段：静音没到点就不发', () => {
 
   assembler.dispose();
 });
+
+// ------------------------------------------------------- 开轮门槛 / 静音去抖
+// 提交只管切段（越早越好，解码 261 ms 是链路里最长的一段）；开轮不可逆，要保守。
+// 判据：定稿到达时「截至此刻」的连续静音够不够 —— 不够说明用户又开口了。
+
+test('定稿在换气处到达时不开轮，等静音够门槛再开', async () => {
+  let clock = 1000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 100,
+    extendMs: 20,
+    now: () => clock,
+    predict: async () => 0.99,
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 静音 80 ms
+  assembler.addSentence('对吗？');
+  await delay(5);
+  assert.equal(utterances.length, 0, '静音才 80 < 门槛 100，不能开轮');
+
+  for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 120 ms
+  await delay(40);
+  assert.deepEqual(utterances.map((u) => u.text), ['对吗？'], '够门槛了才开');
+  assembler.dispose();
+});
+
+test('换气后接着说的后半句会并进同一轮', async () => {
+  let clock = 1000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 100,
+    extendMs: 20,
+    now: () => clock,
+    predict: async () => 0.99,
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assembler.addSentence('对吗？');
+  await delay(5);
+
+  // 用户又开口了（连续两帧才算），静音计时归零
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assembler.addSentence('那句。');
+  await delay(5);
+  assert.equal(utterances.length, 0, '后半句刚到，静音不够就别急着开');
+
+  for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(40);
+  assert.deepEqual(utterances.map((u) => u.text), ['对吗？那句。'], '要并成一句');
+  assembler.dispose();
+});
+
+test('服务端判句（静音已够）时门槛不花时间', async () => {
+  let clock = 1000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 300,
+    extendMs: 20,
+    now: () => clock,
+    predict: async () => 0.5, // 低于阈值也要走完门槛判断
+    threshold: 0.5,
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 22; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 静音 440 ms
+  assembler.addSentence('你好。');
+  await delay(10);
+  assert.deepEqual(utterances.map((u) => u.text), ['你好。'], '静音早就够了，不该再等');
+  assembler.dispose();
+});
+
+test('单帧「有声」不算重新开口，连续两帧才算', () => {
+  let clock = 1000;
+  let commits = 0;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    commitAfterMs: 40,
+    now: () => clock,
+    onCommit: () => { commits += 1; },
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 1, '第一次封段');
+
+  // 20 ms 的「有声」：塞音闭塞段或门限抖动，不该重新武装
+  clock += 20; assembler.addAudio(voiced());
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 1, '单帧不算重新开口，不该再封一段');
+
+  // 连续两帧才算真的又说话了
+  clock += 20; assembler.addAudio(voiced());
+  clock += 20; assembler.addAudio(voiced());
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 2, '连续两帧才算，这时才该封下一段');
+  assembler.dispose();
+});

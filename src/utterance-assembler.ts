@@ -183,6 +183,29 @@ export interface UtteranceAssemblerOptions {
   /** 静音到 {@link commitAfterMs} 时调一次，宿主拿去 `stt.commit()` */
   readonly onCommit?: () => void;
   /**
+   * 开轮的**静音门槛**：定稿到达时，「截至此刻」的连续静音必须够这么久才开轮。
+   *
+   * 为什么必须和 {@link commitAfterMs} 分开：提交只管切段，越早越好（解码 260 ms
+   * 是整条链路里最长的一段）；开轮是**不可逆**的动作，要保守。以前两者是同一个
+   * 事件（定稿到达就开轮），所以切早了就会把换气当成句尾 —— 实测「对吗？」(80 ms
+   * 换气后) 被判停给 0.661 当场收下，接着后半句「那句。」到达，只好打断重答。
+   *
+   * 定稿到达时本地已经多听了 `commit→定稿` 那 260 ms，所以这个门槛在多数轮次上
+   * **不花时间**，只在「用户确实又开口了」时才拦住 —— 那本来也不该开轮。
+   *
+   * 不设 = 关闭（NLS 那种服务端判句的 provider 用不上：它吐句子时静音早已够）。
+   */
+  readonly openQuietMs?: number;
+  /**
+   * 判停概率高时用的短门槛（见 {@link openQuietMs}）。
+   *
+   * p 高说明「听起来完整」，可以少等一点；p 一般就等到长门槛，把换气挡在门外。
+   * 不设 = 两档一样。
+   */
+  readonly openQuietShortMs?: number;
+  /** 进入短门槛的 p（默认 0.8） */
+  readonly openQuietHighP?: number;
+  /**
    * 一句定稿（文本已定、还没判定停）时通知一次。   *
    * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
    * 先在这上面起跑，省掉判停那 140 ms 纯等待；真并了下一段就换一句重问。
@@ -220,7 +243,7 @@ export interface JudgeFact {
   readonly waitMs: number;
   readonly action: 'accept' | 'extend' | 'error';
   /** 为什么还要等（只有 `extend` 有） */
-  readonly why?: 'grace' | 'short' | 'unfinished' | 'unsure';
+  readonly why?: 'grace' | 'short' | 'unfinished' | 'unsure' | 'silence';
   /** 这次决定用的阈值（中文和默认可能不同，落档才分得清） */
   readonly threshold?: number;
 }
@@ -322,6 +345,13 @@ export class UtteranceAssembler {
   private lastPartialText = '';
   /** 最近一次「上行有声音」的时刻（本地静音检测，见 `silenceDb`） */
   private lastVoicedAt = Number.NEGATIVE_INFINITY;
+  /**
+   * 连续有声帧计数（去抖，见 `trackSilence`）。
+   *
+   * 单帧不算数：这段录音里 20 ms 的「有声」有 14 处，多是塞音闭塞段或门限抖动。
+   * 从第二帧起才更新 `lastVoicedAt`，之后每帧都推进 —— 它仍然等于真实停嘴时刻。
+   */
+  private voicedRun = 0;
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
   private preFiredAt = Number.NEGATIVE_INFINITY;
   /**
@@ -450,11 +480,21 @@ export class UtteranceAssembler {
     }
     const t = this.now();
     if (pcm16PeakDbfs(chunk) > floor) {
+      // **去抖**：这段录音里 20 ms 的「有声」帧有 14 处，很多是塞音的闭塞段
+      // 或门限抖动，不是真的重新开口。单帧就把 `lastVoicedAt` 推平会让
+      // 「截至此刻的静音」被反复归零（开轮条件永远不成立），预跑也被无谓作废。
+      // 所以第一帧只计数，从**第二帧**起才更新 —— 之后每帧都推进，`lastVoicedAt`
+      // 仍然等于「真实停嘴」那一刻（不能停在首帧，否则一句话说两秒就被算成两秒静音）。
+      this.voicedRun += 1;
+      if (this.voicedRun < 2) {
+        return;
+      }
       this.lastVoicedAt = t;
       // 音频比快照长了：预跑的那份判停不再代表「用户说完没有」
       this.prediction = null;
       return;
     }
+    this.voicedRun = 0;
     // 两条线拆开跑，阈值不同：
     //   投机 100 ms —— 拿中间结果先问出去，等久了纯属白等
     //   判停 200 ms —— 判停器看的是音频，跟 ASR 的静音窗对齐
@@ -741,6 +781,39 @@ export class UtteranceAssembler {
       return;
     }
 
+    // 开轮的**静音门槛**：定稿到达时，「截至此刻」的连续静音够不够。
+    //
+    // 和 p 不重复：p 回答「这段听起来完整吗」——「对吗？」单看确实完整，0.661
+    // 没判错；能区分「换气」和「句尾」的信息只有**后面又出声了**，也就是
+    // 「截至此刻的连续静音」被重置。
+    //
+    // 定稿通常已经晚于停嘴 `commit→定稿`（实测中位 261 ms），所以这条在多数轮次
+    // 上不花时间；只在用户确实又开口时才等 —— 那本来就不该开轮。
+    // 必须放在下面那条「音频和文本都没变就不再等」**之前**，否则静音窗会被那条
+    // 捷径绕过去（它只看 p 和快照字节数，不知道用户又说话了）。
+    const openQuiet = this.openQuietFor(probability);
+    if (openQuiet > 0 && this.extensions < this.options.maxExtensions) {
+      // 必须取**此刻**：`evaluatedAt` 是 `await takeProbability` 之前拍的，
+      // 判停那趟往返（70–200 ms）里 `lastVoicedAt` 可能已经前移 —— 用旧值会算出
+      // 负的静音（实测日志里出现过「静音才 −55 ms」），门槛等于失效。
+      const quietAt = this.now();
+      const quietNow = quietAt - this.lastVoicedAt;
+      if (quietNow < openQuiet) {
+        const wait = Math.max(1, Math.min(openQuiet - quietNow, this.options.extendMs));
+        this.extensions += 1;
+        this.options.log(
+          `  判停    ${shown} → 静音才 ${Math.round(quietNow)} ms（门槛 ${openQuiet}），`
+            + `还有下文，再等 ${Math.round(wait)} ms`,
+        );
+        this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'silence' });
+        this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
+        return;
+      }
+      this.options.log(
+        `  判停    ${shown} → 静音 ${Math.round(quietNow)} ms ≥ 门槛 ${openQuiet}，放行`,
+      );
+    }
+
     // 「再等一拍」只有在**等到的东西变了**时才有意义。
     //
     // 静音期间快照会被裁掉尾巴，所以字节数不变 = 输入一模一样 = 同一个 p（同一个
@@ -857,6 +930,18 @@ export class UtteranceAssembler {
    * 且距上一轮被收下不超过 {@link UtteranceAssemblerOptions.shortFragmentWindowMs}。
    * 两条件都成立才多等一次 —— 用户真的只是说了个「好。」而停顿更久时不会中招。
    */
+  private openQuietFor(probability: number): number {
+    const long = this.options.openQuietMs ?? 0;
+    if (long <= 0) {
+      return 0;
+    }
+    const short = this.options.openQuietShortMs;
+    if (short === undefined || short <= 0) {
+      return long;
+    }
+    return probability >= (this.options.openQuietHighP ?? 0.8) ? short : long;
+  }
+
   private shouldWaitForMore(text: string): boolean {
     // 已经为这一轮延过一次就不再拖：宁可早点收，也别让用户等出失聪
     if (this.extensions > 0) return false;

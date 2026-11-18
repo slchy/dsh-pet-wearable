@@ -815,6 +815,15 @@ async function main(): Promise<void> {
         // 服务端自己判句的 provider（NLS）必须留 0 —— 否则会在句子中间插一刀，
         // 把一个整句切成两段。第一轮回归按 40 ms 跑（`VOICE_COMMIT_MS=40`）。
         commitMs: envNumber('VOICE_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 120 : 0),
+        // 开轮门槛：定稿到达时「截至此刻」的连续静音够不够。SOTA 那边按「40 ms 窗
+        // + 261 ms 解码 ≈ 301 ms」推的起点，中位数上几乎不增加等待；p 高的轮次用
+        // 短档（听起来完整就不必等那么久）。只对 commit 路径生效。
+        ...(resolvedStt === 'qwen-realtime'
+          ? {
+            openQuietMs: envNumber('VOICE_OPEN_QUIET_MS', 300),
+            openQuietShortMs: envNumber('VOICE_OPEN_QUIET_SHORT_MS', 200),
+          }
+          : {}),
       },
       playbackTailMs: 600,
       /**

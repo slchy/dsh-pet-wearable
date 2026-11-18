@@ -242,6 +242,15 @@ export interface VoiceSessionOptions {
      * （服务端自己判句的 provider 必须留 0）。
      */
     readonly commitMs?: number;
+    /**
+     * 开轮的静音门槛（ms）：定稿到达时「截至此刻」的连续静音不够就再等。
+     *
+     * 只对「端点由我们控」的 provider 有意义 —— 提交得早，定稿会在用户可能
+     * 还在说的时候到；`0` = 关闭（NLS 吐句子时静音早已够，用不上）。
+     */
+    readonly openQuietMs?: number;
+    /** 判停概率高时的短门槛（见 {@link openQuietMs}） */
+    readonly openQuietShortMs?: number;
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
@@ -596,6 +605,16 @@ class VoiceConnection {
         : {
           commitAfterMs: options.gate.commitMs,
           onCommit: () => { this.stt.commit?.(); },
+        }),
+      // 开轮门槛：提交早 → 定稿也早，可能人还在说。定稿到达时看「截至此刻的
+      // 连续静音」，不够就等 —— 那本来就不该开轮。
+      ...(options.gate.openQuietMs === undefined || options.gate.openQuietMs <= 0
+        ? {}
+        : {
+          openQuietMs: options.gate.openQuietMs,
+          ...(options.gate.openQuietShortMs === undefined
+            ? {}
+            : { openQuietShortMs: options.gate.openQuietShortMs }),
         }),
       onUtterance: (text) => {
         this.app?.userFinal(text);
