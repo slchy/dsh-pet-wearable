@@ -21,7 +21,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { computeTurns, parseEvents, type TurnLatency } from '../src/latency-report.ts';
+import { computeTurns, parseEvents, percentile, type TurnLatency } from '../src/latency-report.ts';
 
 type Seg = 'silenceToAsr' | 'asrToTurn' | 'turnToAudio';
 
@@ -31,14 +31,15 @@ const SEGS: readonly { key: Seg; label: string }[] = [
   { key: 'turnToAudio', label: '③ agent+TTS' },
 ];
 
-/** 分位数（最近秩，n 小的时候不插值，避免"算出不存在的样本"）。 */
+/**
+ * 分位数**复用 `src/latency-report.ts` 的 `percentile`**（线性插值）。
+ *
+ * 这里曾经自己写了一个最近秩版本 —— 那正是 `percentile` 注释里点名禁止的：
+ * 偶数样本会取偏小的那个，让延迟系统性偏乐观（本例 fast n=12 因此报成 1001，
+ * 正确值是 1033）。口径只能有一个实现。
+ */
 function quantile(values: readonly number[], q: number): number | null {
-  if (values.length === 0) {
-    return null;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const rank = Math.ceil(q * sorted.length) - 1;
-  return sorted[Math.min(Math.max(rank, 0), sorted.length - 1)] ?? null;
+  return percentile(values, q);
 }
 
 function describe(values: readonly number[]): string {
