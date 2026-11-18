@@ -53,6 +53,13 @@ export interface ArchiveEvent {  /** 相对会话开始的毫秒数 */
   readonly interrupted?: unknown;
   /** `gate.close` 专有：距最后一个有声块多久（ms）。有它才能还原「用户停嘴」的时刻 */
   readonly gapMs?: unknown;
+  /**
+   * `turn.end` 专有：这一轮走的哪条（`fast` / `dsh`）。
+   *
+   * 分路径看延迟必须有它 —— 快车道和 dsh 的 `firstWordMs` 是两个量，
+   * 混在一起求 p50 得到的是两者混合分布，回答不了「快车道多快」。
+   */
+  readonly path?: unknown;
 }
 
 /** 一轮里可能缺席的时刻名。 */
@@ -143,6 +150,7 @@ export function parseEvents(jsonl: string): ArchiveEvent[] {
       audio_s: obj['audio_s'],
       interrupted: obj['interrupted'],
       gapMs: obj['gapMs'],
+      path: obj['path'],
     });
   }
   return out;

@@ -73,7 +73,19 @@ function reportOne(dir: string): string {
   } catch (error) {
     return `# ${dir}\n\n读不到 events.jsonl：${(error as Error).message}\n`;
   }
-  const turns = computeTurns(parseEvents(text));
+  const events = parseEvents(text);
+  const turns = computeTurns(events);
+
+  // 每轮走的哪条（`turn.end.path`）。必须按**顺序**对齐：`computeTurns` 按 `turn.start`
+  // 出现顺序编号，这边照同一顺序取「该 turn.start 之后第一个 turn.end」。
+  const startTimes = events.filter((e) => e.ev === 'turn.start').map((e) => e.t);
+  const paths: (string | null)[] = startTimes.map((t, i) => {
+    const next = startTimes[i + 1] ?? Number.POSITIVE_INFINITY;
+    const end = events.find((e) => e.ev === 'turn.end' && e.t > t && e.t < next);
+    const value = end?.path;
+    return typeof value === 'string' ? value : null;
+  });
+
   const lines: string[] = [`# ${dir}（${turns.length} 轮）`, ''];
 
   // ---- 1. 每段自己的分布 ----
@@ -130,6 +142,34 @@ function reportOne(dir: string): string {
     )[0];
     if (worst) {
       lines.push(`- **结论：按总量，${worst.label} 占 ${(worst.share * 100).toFixed(1)}%，是首要项**`);
+    }
+  }
+  lines.push('');
+
+  // ---- 1b. 按路径拆「闭嘴→出声」----
+  // 这是本项目唯一可以叫 p50 的量（§12.1）。分路径看才回答得了「快车道多快」。
+  lines.push('## 按路径拆：闭嘴 → 出声（= 项目 p50 口径）');
+  const byPath = new Map<string, number[]>();
+  for (const turn of turns) {
+    const value = turn.firstWordMs;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      continue;
+    }
+    const path = paths[turn.turn - 1] ?? '（未记 path）';
+    const list = byPath.get(path) ?? [];
+    list.push(value);
+    byPath.set(path, list);
+  }
+  if (byPath.size === 0) {
+    lines.push('- 没有可用的 firstWordMs');
+  }
+  for (const [path, values] of [...byPath.entries()].sort((a, b) => b[1].length - a[1].length)) {
+    const p50 = quantile(values, 0.5);
+    const p90 = quantile(values, 0.9);
+    const sorted = [...values].sort((a, b) => a - b);
+    lines.push(`- **${path}**：${describe(values)}  取值 ${sorted.join(' / ')}`);
+    if (p50 !== null && p90 !== null) {
+      lines.push(`  → p50 ${Math.round(p50)} / p90 ${Math.round(p90)}（预算 1200）`);
     }
   }
   lines.push('');
