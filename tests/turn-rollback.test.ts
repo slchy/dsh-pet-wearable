@@ -54,6 +54,29 @@ test('连续多轮：只留最早那个切点，取一次就清空', () => {
   assert.equal(led.take(), null, '取过就没了，不会重复 fork');
 });
 
+test('没有属主票据（自发轮/后台结算）不给切点', () => {
+  const led = new RollbackLedger();
+  led.observe('agent/inbox/spliced', 50, 1, null); // 不是我们催的那一轮
+  led.observe('turn/start', 51, 0, null);
+  assert.equal(
+    led.claim(ticket(1)),
+    false,
+    '没有票据信息就别猜 —— 拿错切点会把别人那一轮切掉',
+  );
+  assert.equal(led.peek(), null);
+});
+
+test('reset：fork 成功 / 换会话之后账本必须清空', () => {
+  const led = new RollbackLedger();
+  led.observe('agent/inbox/spliced', 60, 1, ticket(1));
+  led.observe('turn/start', 61, 0, ticket(1));
+  assert.equal(led.claim(ticket(1)), true);
+  assert.equal(led.peek(), 59);
+  led.reset();
+  assert.equal(led.peek(), null, '待撤回的切点属于旧会话，不能留到新会话');
+  assert.equal(led.claim(ticket(1)), false, '旧会话的 seq 不能给新会话用');
+});
+
 test('入箱的「取出」事件（inserted 为空）不算入箱', () => {
   const led = new RollbackLedger();
   led.observe('agent/inbox/spliced', 10, 1, ticket(1));

@@ -56,6 +56,15 @@ const DEFAULT_TIMEOUT_MS = 60_000;
  */
 const CANCEL_GRACE_MS = 2_000;
 
+/**
+ * 撤回（`session/fork`）等多久就算这次放弃。
+ *
+ * **这个超时不算冷路径**：fork 是在下一轮发 prompt 之前同步等的，它多慢，用户就多等。
+ * 所以只给 2 s —— 超时就当没撤成，照旧续原会话（历史里多一条幽灵轮，用户听不出）。
+ * 真机上 fork 是复制一段前缀，正常在几十毫秒量级；日志里会打出实测毫秒数。
+ */
+const FORK_TIMEOUT_MS = 2_000;
+
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -197,10 +206,11 @@ export class RollbackLedger {
   /** 认领「这一轮不要了」；票据对不上（迟到的作废）或没有切点时返回 false */
   claim(ticket?: TurnTicket): boolean {
     if (this.cut === null || this.cut < 0) return false;
+    // 没有属主票据 = 这一轮不是我们催的（自发轮/后台结算）→ 一律不认，宁可撤不了
+    // 也不能拿错切点把**别人**那一轮切掉。
     const mine = this.owner;
-    if (ticket !== undefined && mine !== null && (ticket.no !== mine.no || ticket.gen !== mine.gen)) {
-      return false;
-    }
+    if (mine === null) return false;
+    if (ticket !== undefined && (ticket.no !== mine.no || ticket.gen !== mine.gen)) return false;
     this.pending = this.pending === null ? this.cut : Math.min(this.pending, this.cut);
     return true;
   }
@@ -210,6 +220,18 @@ export class RollbackLedger {
     const cut = this.pending;
     this.pending = null;
     return cut;
+  }
+
+  /**
+   * 全清。两种时候必须调：
+   * - **fork 成功之后**：账本里的 seq 属于旧会话，留着下次会拿无效切点去 fork 新会话；
+   * - **换会话 / reset**：同上。
+   */
+  reset(): void {
+    this.lastInsert = null;
+    this.cut = null;
+    this.owner = null;
+    this.pending = null;
   }
 
   /** 只读：待撤回的切点（日志用） */
@@ -407,6 +429,8 @@ export class DshSession {
 
   /** 主动丢弃会话，下次 ask 会开新的。 */
   reset(): void {
+    // 换会话了：账本里的 seq 和待撤回的切点都属于旧会话，一起丢掉
+    this.rollback.reset();
     try {
       if (existsSync(this.sessionFile)) writeFileSync(this.sessionFile, '{}');
     } catch {
@@ -717,7 +741,8 @@ export class DshSession {
       return sessionId;
     }
     try {
-      const result = await this.rpc('session/fork', { sessionId, atSeq: cut }, 20_000) as { sessionId?: unknown };
+      const startedAt = Date.now();
+      const result = await this.rpc('session/fork', { sessionId, atSeq: cut }, FORK_TIMEOUT_MS) as { sessionId?: unknown };
       const child = typeof result?.sessionId === 'string' ? result.sessionId : '';
       if (child === '') {
         throw new DshError('session/fork 没有返回新会话 id');
@@ -725,7 +750,9 @@ export class DshSession {
       this.rollbackSupported = true;
       this.openSessionId = child;
       this.saveSession(child);
-      this.log(`  回溯    已撤回上一轮（切点 seq=${cut}）→ ${child}`);
+      // 账本里的 seq 属于旧会话，留着下次会拿无效切点去 fork 新会话
+      this.rollback.reset();
+      this.log(`  回溯    已撤回上一轮（切点 seq=${cut}，${Date.now() - startedAt} ms）→ ${child}`);
       return child;
     } catch (error) {
       this.log(`  回溯    ✗ ${(error as Error).message}`);
