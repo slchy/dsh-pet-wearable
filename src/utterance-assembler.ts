@@ -211,6 +211,24 @@ export interface UtteranceAssemblerOptions {
   /** 进入短门槛的 p（默认 0.8） */
   readonly openQuietHighP?: number;
   /**
+   * **QoS：② 段（定稿→开轮）的总等待预算**，毫秒。0 = 不设（默认）。
+   *
+   * 不管是因为 p 低、grace、结尾像没说完还是门槛不够 —— 累计等满这么多就收下。
+   * 目的是让 `②` 有一个**可预测的上限**，而不是「maxExtensions × extendMs」那样
+   * 随分支数量漂移（真机 2026-11-18：7/29 轮把额度吃干净，单轮白等 1.4 s）。
+   */
+  readonly waitBudgetMs?: number;
+  /**
+   * **QoS：句尾像未完成的序列**（数字、字母、「第」「然后」…）时的预算，毫秒。
+   * 0 = 不启用（默认）。
+   *
+   * 动机是反着的：这类句尾 `p` 判「没说完」**是对的**（念手机号时每停顿一次都
+   * 真没说完），可总预算会把这份正确判断提前掐掉 —— 真机 2026-11-18 一句手机号被
+   * 拆成 3–4 轮。所以序列形态要给一份**更大的豁免**，让它等到数字念完。
+   * 判据复用 {@link looksUnfinished}（纯机械，不做语义推断）。
+   */
+  readonly waitBudgetSequenceMs?: number;
+  /**
    * 一句定稿（文本已定、还没判定停）时通知一次。   *
    * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
    * 先在这上面起跑，省掉判停那 140 ms 纯等待；真并了下一段就换一句重问。
@@ -251,6 +269,12 @@ export interface JudgeFact {
   readonly why?: 'grace' | 'short' | 'unfinished' | 'unsure' | 'silence';
   /** 这次决定用的阈值（中文和默认可能不同，落档才分得清） */
   readonly threshold?: number;
+  /** 截至这次决定，已连续静音多久（ms）。门槛判据的直接证据 */
+  readonly silenceMs?: number;
+  /** 这一轮为了等判停已经花掉多少（ms）。② 的预算用得怎么样，看它 */
+  readonly waitedMs?: number;
+  /** 这次决定时这一轮的等待预算（ms）；0 = 没设预算 */
+  readonly budgetMs?: number;
 }
 
 /** 判定一次的结果，便于日志与测试断言 */
@@ -340,6 +364,8 @@ export class UtteranceAssembler {
    * 不该被判停低分的病理拖着一起收紧（见 `maxUnsureExtensions`）。
    */
   private unsureExtensions = 0;
+  /** 这一轮为等判停累计花掉的毫秒（QoS 预算用；`flush` 归零） */
+  private waitedMs = 0;
   /** 这一句是否已经为「结尾像没说完」等过一拍（只等一次） */
   private unfinishedWaited = false;
   /** 上一次真正收下一轮的时刻，用来判断「短碎片是不是紧跟其后」 */
@@ -731,6 +757,7 @@ export class UtteranceAssembler {
     this.prediction = null;
     this.extensions = 0;
     this.unsureExtensions = 0;
+    this.waitedMs = 0;
     this.unfinishedWaited = false;
     const text = this.pendingText.trim();
     this.pendingText = '';
@@ -797,7 +824,7 @@ export class UtteranceAssembler {
     // 必须放在下面那条「音频和文本都没变就不再等」**之前**，否则静音窗会被那条
     // 捷径绕过去（它只看 p 和快照字节数，不知道用户又说话了）。
     const openQuiet = this.openQuietFor(probability);
-    if (openQuiet > 0 && this.extensions < this.options.maxExtensions) {
+    if (openQuiet > 0 && this.extensions < this.maxExtensionsNow()) {
       // 必须取**此刻**：`evaluatedAt` 是 `await takeProbability` 之前拍的，
       // 判停那趟往返（70–200 ms）里 `lastVoicedAt` 可能已经前移 —— 用旧值会算出
       // 负的静音（实测日志里出现过「静音才 −55 ms」），门槛等于失效。
@@ -806,11 +833,15 @@ export class UtteranceAssembler {
       if (quietNow < openQuiet) {
         const wait = Math.max(1, Math.min(openQuiet - quietNow, this.options.extendMs));
         this.extensions += 1;
+        this.waitedMs += wait;
         this.options.log(
           `  判停    ${shown} → 静音才 ${Math.round(quietNow)} ms（门槛 ${openQuiet}），`
             + `还有下文，再等 ${Math.round(wait)} ms`,
         );
-        this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'silence' });
+        this.reportJudge({
+          p: probability, waitMs: wait, action: 'extend', why: 'silence',
+          silenceMs: Math.round(quietNow),
+        });
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
         return;
       }
@@ -850,9 +881,10 @@ export class UtteranceAssembler {
     const grace = this.options.partialGraceMs ?? 400;
     const sincePartial = evaluatedAt - this.lastPartialAt;
     if (grace > 0 && !this.usedPrefired
-      && sincePartial < grace && this.extensions < this.options.maxExtensions) {
+      && sincePartial < grace && this.extensions < this.maxExtensionsNow()) {
       if (this.partialIsNew()) {
         this.extensions += 1;
+        this.waitedMs += this.options.extendMs;
         this.options.log(
           `  判停    ${shown} → 刚收到中间结果（${sincePartial} ms 前），还有下文，再等 ${this.options.extendMs} ms`,
         );
@@ -869,14 +901,17 @@ export class UtteranceAssembler {
 
     if (
       probability >= threshold
-      || this.extensions >= this.options.maxExtensions
+      || this.extensions >= this.maxExtensionsNow()
+      // QoS：总预算用完了就收下，不管还剩多少分支额度
+      || this.overBudget()
       // 「判停说没说完」有自己的上限：侧车给的 p 是噪声，不能让它把总预算
       // （2.8 s）吃干净，也不能让它拖累那三条文本判据的额度
-      || this.unsureExtensions >= (this.options.maxUnsureExtensions ?? this.options.maxExtensions)
+      || this.unsureExtensions >= this.maxUnsureNow()
     ) {
       if (this.shouldWaitForMore(this.pendingText)) {
         this.extensions += 1;
         const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);
+        this.waitedMs += wait;
         this.options.log(
           `  判停    ${shown} → 太短且紧跟前一轮，再等 ${wait} ms`,
         );
@@ -891,11 +926,12 @@ export class UtteranceAssembler {
       if (
         unfinishedWait > 0
         && !this.unfinishedWaited
-        && this.extensions < this.options.maxExtensions
+        && this.extensions < this.maxExtensionsNow()
         && looksUnfinished(this.pendingText)
       ) {
         this.unfinishedWaited = true;
         this.extensions += 1;
+        this.waitedMs += unfinishedWait;
         this.options.log(
           `  判停    ${shown} → 结尾像没说完（…${JSON.stringify(this.pendingText.slice(-8))}），再等 ${unfinishedWait} ms`,
         );
@@ -913,6 +949,7 @@ export class UtteranceAssembler {
 
     this.extensions += 1;
     this.unsureExtensions += 1;
+    this.waitedMs += this.options.extendMs;
     this.options.log(
       `  判停    ${shown} → 没说完，再等 ${this.options.extendMs} ms（阈值 ${threshold}）`,
     );
@@ -924,7 +961,9 @@ export class UtteranceAssembler {
 
   /** 判停决定落档（见 {@link UtteranceAssemblerOptions.onJudge}）。没有出口就算了 */
   private reportJudge(fact: JudgeFact): void {
-    this.options.onJudge?.(fact);
+    // 落档时补上「这一轮花掉多少 / 预算是多少」：`②` 的成因只有 p 是看不出来的，
+    // 有这两个数才能事后算「预算用超了没」「序列豁免生效没」。
+    this.options.onJudge?.({ ...fact, waitedMs: this.waitedMs, budgetMs: this.waitBudget() });
   }
 
   /**
@@ -950,6 +989,51 @@ export class UtteranceAssembler {
       return long;
     }
     return probability >= (this.options.openQuietHighP ?? 0.8) ? short : long;
+  }
+
+  /**
+   * 这一轮当前的等待预算（ms）。0 = 不设预算。
+   *
+   * 两个旋钮分工不同：`waitBudgetSequenceMs` 是**多给**（序列没说完，p 判得对），
+   * `waitBudgetMs` 是**兜底上限**（其余情况的 `②` 硬顶）。序列判据优先。
+   */
+  private waitBudget(): number {
+    const sequence = this.options.waitBudgetSequenceMs ?? 0;
+    if (sequence > 0 && looksUnfinished(this.pendingText)) {
+      return sequence;
+    }
+    return this.options.waitBudgetMs ?? 0;
+  }
+
+  /**
+   * 这一轮的连续延长上限（次）。
+   *
+   * 序列形态额外放宽：`maxExtensions` 是按「一般句尾」定的（真机 2 次 = 400 ms），
+   * 但念手机号时一个字一停，2 次远远不够 —— 那边由 `waitBudgetSequenceMs` 兜，
+   * 这里把次数上限抬上去，让**预算**而不是**次数**成为唯一的边界。
+   */
+  private maxExtensionsNow(): number {
+    const sequence = this.options.waitBudgetSequenceMs ?? 0;
+    if (sequence > 0 && looksUnfinished(this.pendingText)) {
+      return Math.max(this.options.maxExtensions, 12);
+    }
+    return this.options.maxExtensions;
+  }
+
+  /** 预算已经用完了吗（用完了就收下，不再等） */
+  private overBudget(): boolean {
+    const budget = this.waitBudget();
+    return budget > 0 && this.waitedMs >= budget;
+  }
+
+  /** 「p 判没说完」这条分支的上限（序列形态同样豁免，理由见 `maxExtensionsNow`） */
+  private maxUnsureNow(): number {
+    const base = this.options.maxUnsureExtensions ?? this.options.maxExtensions;
+    const sequence = this.options.waitBudgetSequenceMs ?? 0;
+    if (sequence > 0 && looksUnfinished(this.pendingText)) {
+      return Math.max(base, 12);
+    }
+    return base;
   }
 
   /**

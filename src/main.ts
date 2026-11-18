@@ -800,6 +800,14 @@ async function main(): Promise<void> {
           // 一次 400 ms 直接进了首字延迟 —— 150 仍能挡住正常 partial 间隔，
           // 回放实测（同为 6 轮）2 段从 622–625 ms 降到 150–152 ms。
           partialGraceMs: envNumber('TURN_JUDGE_PARTIAL_GRACE_MS', 150),
+          // QoS：`②`（定稿→开轮）的总等待预算，兜底上限。0 = 不设。
+          // 目的不是省时间，是让 `②` 有一个可预测的天花板 —— 真机 2026-11-18
+          // 有 7/29 轮把分支额度吃干净，单轮白等 1.4 s。
+          waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 0),
+          // QoS：句尾像未完成的序列（数字/字母/「然后」…）时的豁免预算。
+          // 这类句尾 p 判「没说完」是对的（念手机号每次停顿都真没说完），
+          // 别让总预算把它掐掉。0 = 不启用。
+          waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 0),
         }
         : undefined,
       ...(turnJudgeClient === null ? {} : { turnJudgeClient }),

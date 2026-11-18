@@ -270,6 +270,8 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 | | `TURN_JUDGE_PARTIAL_GRACE_MS`| `150` | 音频停但 ASR 仍出字时的防抢话等待窗 |
 | | `TURN_JUDGE_MAX_UNSURE` | `2` | 判停未决时的最大延拍次数 |
 | | `TURN_JUDGE_TRIM_MS` | `20` | 判停快照尾部保留的最大静音（ms） |
+| | `TURN_JUDGE_WAIT_BUDGET_MS` | `0`（线上 400） | **QoS**：`②` 定稿→开轮的总等待预算，用完就收下。0 = 不设 |
+| | `TURN_JUDGE_SEQUENCE_BUDGET_MS` | `0`（线上 1200） | **QoS**：句尾像未完成的序列（数字/字母/「然后」）时的豁免预算。0 = 不启用 |
 | **主动开口** | `PET_PROACTIVE` | `0` | 是否开启主动开口（`1` 开启） |
 | | `VOICE_HOLD_MS` | `2000` | 能量门判定静音至关门的维持时间（ms） |
 

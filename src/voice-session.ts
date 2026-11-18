@@ -198,6 +198,10 @@ export interface VoiceSessionOptions {
      * 见 `UtteranceAssemblerOptions.partialGraceMs`。
      */
     readonly partialGraceMs?: number;
+    /** QoS：`②` 的总等待预算（ms），见 `UtteranceAssemblerOptions.waitBudgetMs` */
+    readonly waitBudgetMs?: number;
+    /** QoS：序列形态的豁免预算（ms），见 `UtteranceAssemblerOptions.waitBudgetSequenceMs` */
+    readonly waitBudgetSequenceMs?: number;
   };
   /**
    * 进程级共享的判停器客户端。
@@ -576,6 +580,12 @@ class VoiceConnection {
       ...(turnJudgeOptions?.partialGraceMs === undefined
         ? {}
         : { partialGraceMs: turnJudgeOptions.partialGraceMs }),
+      ...(turnJudgeOptions?.waitBudgetMs === undefined
+        ? {}
+        : { waitBudgetMs: turnJudgeOptions.waitBudgetMs }),
+      ...(turnJudgeOptions?.waitBudgetSequenceMs === undefined
+        ? {}
+        : { waitBudgetSequenceMs: turnJudgeOptions.waitBudgetSequenceMs }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
       // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。

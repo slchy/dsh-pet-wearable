@@ -1042,3 +1042,71 @@ test('单帧「有声」不算重新开口，连续两帧才算', () => {
   assert.equal(commits, 2, '连续两帧才算，这时才该封下一段');
   assembler.dispose();
 });
+
+// ---------------------------------------------------------------- QoS（② 的预算）
+//
+// 真机 2026-11-18：7/29 轮把分支额度吃干净，单轮白等 1.4 s；同一场里一句手机号
+// 被拆成 3–4 轮（念数字时每停顿一次 p 判「没说完」都是对的，却被额度提前掐掉）。
+
+test('QoS：总预算用完就收下，不再按分支额度等', async () => {
+  const facts: Array<{ why?: string; waitMs: number; budgetMs?: number }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 40,
+    maxExtensions: 7,
+    maxUnsureExtensions: 7,
+    partialGraceMs: 0,
+    waitBudgetMs: 80,
+    predict: async () => 0.01,
+    onJudge: (fact) => { facts.push(fact); },
+  });
+
+  assembler.addSentence('我让你挂断。');
+  await delay(400);
+
+  assert.equal(utterances.length, 1, '预算到点必须收下');
+  const waited = facts.reduce((sum, f) => sum + f.waitMs, 0);
+  assert.ok(waited <= 80, `不该超过预算，实际等了 ${waited} ms`);
+  assert.ok(facts.some((f) => f.budgetMs === 80), '落档要带上预算');
+});
+
+test('QoS：结尾是数字序列时给豁免，不被额度掐断', async () => {
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 40,
+    maxExtensions: 2,
+    maxUnsureExtensions: 1,
+    partialGraceMs: 0,
+    waitBudgetMs: 40,
+    waitBudgetSequenceMs: 240,
+    predict: async () => 0.01,
+    onJudge: (fact) => { facts.push(fact); },
+  });
+
+  assembler.addSentence('我的手机号是幺三八');
+  await delay(600);
+
+  assert.equal(utterances.length, 1, '最后还是要收下，不能吞掉');
+  const unsure = facts.filter((f) => f.why === 'unsure').length;
+  assert.ok(unsure >= 4, `序列该被多等几拍（maxExtensions=2），实际 ${unsure} 拍`);
+});
+
+test('QoS：不在序列形态时，普通句尾仍按小预算收下', async () => {
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 40,
+    maxExtensions: 2,
+    maxUnsureExtensions: 1,
+    partialGraceMs: 0,
+    waitBudgetMs: 40,
+    waitBudgetSequenceMs: 240,
+    predict: async () => 0.01,
+    onJudge: (fact) => { facts.push(fact); },
+  });
+
+  assembler.addSentence('说得好');
+  await delay(300);
+
+  assert.equal(utterances.length, 1);
+  const unsure = facts.filter((f) => f.why === 'unsure').length;
+  assert.ok(unsure <= 1, `普通句尾不该拿到序列豁免，实际 ${unsure} 拍`);
+});
