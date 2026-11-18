@@ -289,6 +289,10 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/patch-sdk-fork.mjs` | 给 dsh SDK 补 `session/fork`（双轨撤回用；`--check` 返回 0 = 已打） |
 | `bench/latency/probe-dsh-fork.mjs` | 验 fork 能不能用、切点取在哪才干净（起真 dsh，跑两轮再切掉第二轮） |
 | `bench/eot/our_judge_adapter.py` | 把线上判停器接到公开基准 `livekit/eot-bench` 上（numpy + onnxruntime，不装 torch）；跑法见 `bench/eot/README.md`，结果见 `docs/EOT-BENCH-RESULTS.md` |
+| `bench/eot/policy_replay.py` | 在真机 `judge.decide` 轨迹上**确定性重放**新的判停策略，出「② old→new / 定稿→首声 / 误切逐条清点」。改判停逻辑后的验收就靠它，结果见 `docs/EOT-SUPPLEMENT.md` §10 |
+| `bench/eot/turn_open_probe.py` | 量「开轮时静音多长」和「开早了之后发生什么」（结局 a/b/c 三分类） |
+| `bench/eot/judge_extend_probe.py` | 数每一次 `extend` 到底救到没有（窗口内用户有没有重新出声） |
+| `bench/eot/paired_replay.py` / `degrade_probe.py` | 判停模型的**唯一有效评估口径**（真机配对重放）+ 把 bench 音频走真机链路的消融（分离「音频链路」与「问题定义」） |
 | `scripts/install-profile-patch.mjs` | 把人设 patch 装进本机 dsh sdk profile（`npm run install-profile`） |
 
 ## 10. τ²-bench
@@ -409,7 +413,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `gate.open` / `gate.close` | `gapMs` | 真实停嘴时刻 = `gate.close.t − gapMs`（**别直接减 `t`**） |
 | `asr.partial` / `asr.sentence` | `text`、`index`、`at.pcm` | ASR 逐字对比；`at.pcm` 是音频里的字节偏移，离线复算判停要用 |
 | `turn.start` | `text_len`、`image` | 这一轮进来的文字长度（并句后会更长） |
-| **`judge.decide`** | `p`、`waitMs`、`action`、`why`、**`threshold`** | **② 的成因**：判停每次给的概率 + 还要等多久。`action` = `accept`/`extend`/`error`，`why` = `grace`/`short`/`unfinished`/`unsure`；`threshold` 是这次用的阈值（中文 0.35 / 其他 0.5），没有它分不清「换语言了」还是「p 变了」 |
+| **`judge.decide`** | `p`、`waitMs`、`action`、`why`、**`whyAccept`**、**`threshold`**、`silenceMs`、`waitedMs`、`budgetMs` | **② 的成因**：判停每次给的概率 + 还要等多久。`action` = `accept`/`extend`/`error`；`why` = `silence`/`short`/`unsure`（`grace`/`unfinished` 已在 `ed87bc7` 删除，旧档案里还会有）；`whyAccept=cap` = 静音到了统一上限（`TURN_JUDGE_MAX_OPEN_SILENCE_MS`）而放行；`threshold` 是这次用的阈值（中文 0.35 / 其他 0.5），没有它分不清「换语言了」还是「p 变了」 |
 | `llm.first` | `ms` | 模型首字 |
 | `tts.first` | `ms` | TTS 首块（③ 的终点） |
 | **`dialog.state`** | `from`、`to`、**`why`** | **为什么进这个状态**。`why` 里写着「回执出声（可打断）」还是「首块音频已下发」—— 没有它，`thinking → speaking` 分不出是回执还是答案（差约 1 s） |
