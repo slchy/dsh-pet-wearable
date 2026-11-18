@@ -118,6 +118,17 @@ export interface AgentProvider {
    */
   cancelTurn?(ticket?: TurnTicket): void;
   /**
+   * 可选能力：**撤回上一轮**（把已经答完的那一轮从会话历史里切掉）。
+   *
+   * 双向投机里取消来不及时会走到这里：dsh 那一轮已经 `completed`、`assistant/message`
+   * 已经落进历史，而用户听到的是快车道的答案。不撤回的话，下一次续会话 dsh 会以为
+   * 「我答过这句」，而且我们补上下文时还会给出**另一个答案**。
+   *
+   * 实现方式应该是「事务式」的：dsh 的会话日志是 append-only，唯一能变短的原语是
+   * `session/fork`（切一段前缀长出新会话）。实现必须**自己换指针**，调用方不感知。
+   */
+  rollbackTurn?(ticket?: TurnTicket): void;
+  /**
    * 可选能力：**判停之前先问出去**。
    *
    * 一句 ASR 定稿时文本就定了，判停器随后只决定要不要并下一段 —— 这中间那一拍

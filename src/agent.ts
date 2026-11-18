@@ -179,6 +179,14 @@ export class VoiceAgent {
     this.session.interruptTurn();
   }
 
+  /**
+   * 撤回上一轮：慢车道那一轮**已经答完**（取消来不及）、但用户听到的是快车道的答案 ——
+   * 把那一轮从 dsh 的会话历史里切掉（`session/fork`），下次续上一段前缀。
+   */
+  rollbackTurn(ticket?: TurnTicket): void {
+    this.session.rollbackTurn(ticket);
+  }
+
   /** 后台任务状态的一句话事实（来自 dsh 自己的事件，不发请求）。 */
   taskStatus(): string {
     return this.session.taskStatus();

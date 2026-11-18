@@ -919,7 +919,12 @@ export class FrontedAgent implements AgentProvider {
     if (dsh !== null) {
       this.cancelInner(ticket);
       dsh.then(
-        () => { this.log('  快车道    慢车道那一轮已作废'); },
+        () => {
+          this.log('  快车道    慢车道那一轮已作废');
+          // 取消来不及时它**已经答完**（0.6–0.9 s），`assistant/message` 就永久留在
+          // dsh 的会话历史里，而用户听到的是快车道的答案。下一轮开轮前把那一轮切掉。
+          this.inner.rollbackTurn?.(ticket);
+        },
         () => undefined,
       );
     }

@@ -163,6 +163,61 @@ export interface SessionOptions {
 
 export class DshError extends Error {}
 
+/**
+ * 「撤回切点」的账本：快车道赢了、而慢车道那一轮**已经答完**时，要把那一轮从
+ * dsh 的会话历史里切掉（`session/fork`）。
+ *
+ * 切点必须落在**入箱之前**：`turn/start` 前面那条 `agent/inbox/spliced`（inserted
+ * 非空）就是把这句话塞进收件箱，切在它之后，fork 出来的新会话会把它当待办
+ * **重放一遍**（探针实测：切点取 `turn/start − 1` 时幽灵句在新会话里出现 2 次，
+ * 取入箱 seq − 1 才干净）。
+ *
+ * 票据是必须的：那一轮的 promise 可能到下下轮才 resolve，这时账本里已经换成新的
+ * 那一轮了 —— 拿错切点去撤会把**下一轮**切掉。
+ */
+export class RollbackLedger {
+  private lastInsert: number | null = null;
+  private cut: number | null = null;
+  private owner: TurnTicket | null = null;
+  private pending: number | null = null;
+
+  /** 吃一条**本会话**的事件（`inserted` = 该事件往收件箱塞了几条，非入箱事件传 0） */
+  observe(type: string, seq: number, inserted: number, active: TurnTicket | null): void {
+    if (type === 'agent/inbox/spliced') {
+      if (inserted > 0) this.lastInsert = seq;
+      return;
+    }
+    if (type === 'turn/start') {
+      this.cut = this.lastInsert === null ? null : this.lastInsert - 1;
+      this.owner = active;
+      this.lastInsert = null;
+    }
+  }
+
+  /** 认领「这一轮不要了」；票据对不上（迟到的作废）或没有切点时返回 false */
+  claim(ticket?: TurnTicket): boolean {
+    if (this.cut === null || this.cut < 0) return false;
+    const mine = this.owner;
+    if (ticket !== undefined && mine !== null && (ticket.no !== mine.no || ticket.gen !== mine.gen)) {
+      return false;
+    }
+    this.pending = this.pending === null ? this.cut : Math.min(this.pending, this.cut);
+    return true;
+  }
+
+  /** 取走待撤回的切点（取一次就清空；连续多轮只会剩下最早那个） */
+  take(): number | null {
+    const cut = this.pending;
+    this.pending = null;
+    return cut;
+  }
+
+  /** 只读：待撤回的切点（日志用） */
+  peek(): number | null {
+    return this.pending;
+  }
+}
+
 interface RunOutcome {
   code: number;
   stdout: string;
@@ -256,6 +311,10 @@ export class DshSession {
   private sdkReady = false;
   /** 宿主运行时认不认 `session/cancel`（`null` = 还没探过） */
   private cancelSupported: boolean | null = null;
+  /** 宿主运行时认不认 `session/fork`（`null` = 还没探过） */
+  private rollbackSupported: boolean | null = null;
+  /** 撤回切点的账本：入箱 seq − 1，且按票据认领（见 `RollbackLedger`） */
+  private readonly rollback = new RollbackLedger();
   /** 在途的握手指令（并发 `ask` 必须等同一个，不能各自起进程） */
   private readonly handshaking = new SingleFlight<void>();
   /** 当前在途那一轮的票据（`null` = 还没开始 / 已经结束）；取消时按它丢过期票据 */
@@ -555,6 +614,10 @@ export class DshSession {
       this.openSessionId = sessionId;
     }
 
+    // 上一轮如果被快车道抢了、而 dsh 已经答完：这里先把那一轮从历史里切掉
+    // （`session/fork` 换指针，上层不感知）。失败不影响这一轮。
+    sessionId = await this.applyRollback(sessionId);
+
     this.assistantText = '';
     this.turnUsage = null;
     this.turnStartedAt = started;
@@ -612,6 +675,62 @@ export class DshSession {
       resumed,
       ...(this.firstTokenMs === null ? {} : { firstTokenMs: this.firstTokenMs }),
     };
+  }
+
+  /**
+   * 撤回上一轮：慢车道那一轮**已经答完**（取消来不及）、但用户听到的是快车道的答案。
+   *
+   * dsh 的会话日志是 append-only，没有「回退事件」（全量事件词表里没有，见
+   * `dsh-session/known-event-types.js`），唯一能让历史变短的公开原语是
+   * `session/fork`：从某个 seq 切一段前缀，长出一个新会话。这里**换指针**，
+   * 上层和用户都不感知 —— 效果就是「单会话内原子撤回」。
+   *
+   * 切点用本轮 `turn/start` 之前那条入箱事件的 seq − 1。不能取 `turn/start − 1`：
+   * 那一格正是入箱事件本身，复制过去之后新会话会把它当待办**重放一遍**。
+   *
+   * 只记账不动手：真正的 fork 在下一轮 `askSdk` 发 prompt 之前做（不占热路径，
+   * 也避免和正在跑的轮次交叉）。连续多轮取最早切点，一次 fork 全退掉。
+   */
+  rollbackTurn(ticket?: TurnTicket): void {
+    if (this.mode !== 'sdk') {
+      return;
+    }
+    if (!this.rollback.claim(ticket)) {
+      return;
+    }
+    this.log(`  回溯    记下切点 seq=${this.rollback.peek()}（下次开轮前撤回）`);
+  }
+
+  /**
+   * 把待撤回的那一轮切掉，返回**接下来该用的** session id。
+   *
+   * 失败不抛：撤回是"锦上添花"，失败就照旧续在原会话上（历史里多一条幽灵轮，
+   * 但用户听到的东西不受影响）。
+   */
+  private async applyRollback(sessionId: string): Promise<string> {
+    const cut = this.rollback.take();
+    if (cut === null) {
+      return sessionId;
+    }
+    if (this.rollbackSupported === false) {
+      this.log('  回溯    ✗ 宿主运行时没有 session/fork —— 跑一次 scripts/patch-sdk-fork.mjs');
+      return sessionId;
+    }
+    try {
+      const result = await this.rpc('session/fork', { sessionId, atSeq: cut }, 20_000) as { sessionId?: unknown };
+      const child = typeof result?.sessionId === 'string' ? result.sessionId : '';
+      if (child === '') {
+        throw new DshError('session/fork 没有返回新会话 id');
+      }
+      this.rollbackSupported = true;
+      this.openSessionId = child;
+      this.saveSession(child);
+      this.log(`  回溯    已撤回上一轮（切点 seq=${cut}）→ ${child}`);
+      return child;
+    } catch (error) {
+      this.log(`  回溯    ✗ ${(error as Error).message}`);
+      return sessionId;
+    }
   }
 
   /** 懒启动常驻进程并握手。崩溃后下次调用会自动重启。 */
@@ -680,6 +799,25 @@ export class DshSession {
     this.log(this.cancelSupported
       ? '  取消    session/cancel 可用（打断只作废下游输出，不动上游调用）'
       : '  取消    ✗ 宿主运行时没有 session/cancel —— 跑一次 scripts/patch-sdk-cancel.mjs');
+    this.rollbackSupported = await this.probeFork();
+    this.log(this.rollbackSupported
+      ? '  回溯    session/fork 可用（快车道赢了而 dsh 已答完时，下一轮前把那一轮切掉）'
+      : '  回溯    ✗ 宿主运行时没有 session/fork —— 跑一次 scripts/patch-sdk-fork.mjs');
+  }
+
+  /**
+   * 探一下宿主运行时认不认 `session/fork`。
+   *
+   * 认的话传一个不存在的 id 会回「会话找不到」，不认才回 `unknown ... runtime method`。
+   * 补丁打在全局 npm 包上，dsh 升级会被覆盖，所以每次握手探一次。
+   */
+  private async probeFork(): Promise<boolean> {
+    try {
+      await this.rpc('session/fork', { sessionId: '__probe__' }, 5_000);
+      return true;
+    } catch (error) {
+      return !(error as Error).message.includes('unknown');
+    }
   }
 
   /**
@@ -835,6 +973,19 @@ export class DshSession {
         typeof e['type'] === 'string' ? e['type'] : '',
         e['data'] as Record<string, unknown> | undefined,
       );
+      // 撤回用的刻度：`turn/start` 之前那一条 `agent/inbox/spliced`（inserted 非空）
+      // 就是把这句话塞进收件箱的地方。切在它之后，fork 出来的新会话会把它当待办
+      // **重放一遍** —— 探针实测：切点取 turn/start−1 时幽灵句出现了 2 次。
+      if (p['sessionId'] === this.openSessionId && typeof e['seq'] === 'number') {
+        const data = e['data'] as Record<string, unknown> | undefined;
+        const inserted = data?.['inserted'];
+        this.rollback.observe(
+          typeof e['type'] === 'string' ? e['type'] : '',
+          e['seq'],
+          Array.isArray(inserted) ? inserted.length : 0,
+          this.activeTicket,
+        );
+      }
       if (e['type'] !== 'assistant/message') return;
 
       const data = e['data'] as Record<string, unknown> | undefined;

@@ -282,6 +282,8 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/probe-api-speed.sh` | 裸 DeepSeek API 的 TTFT + token/s（判断慢在模型还是 dsh 层） |
 | `scripts/probe-announce.mjs` | 「后台 job 结算 → 播报」这条链路走不走得通 |
 | `scripts/patch-sdk-cancel.mjs` | 给 dsh SDK 补 `session/cancel`（`--check` 返回 0 = 已打） |
+| `scripts/patch-sdk-fork.mjs` | 给 dsh SDK 补 `session/fork`（双轨撤回用；`--check` 返回 0 = 已打） |
+| `bench/latency/probe-dsh-fork.mjs` | 验 fork 能不能用、切点取在哪才干净（起真 dsh，跑两轮再切掉第二轮） |
 | `scripts/install-profile-patch.mjs` | 把人设 patch 装进本机 dsh sdk profile（`npm run install-profile`） |
 
 ## 10. τ²-bench
