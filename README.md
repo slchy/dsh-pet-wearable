@@ -209,7 +209,7 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 - 🎯 **判停窗口按句裁剪 + 尾部静音削减**：判停输入仅喂单句音频，尾部静音保留 20ms，与训练特征对齐；`出句→开轮` 从 1.9s 骤降至 2ms。
 - 🌏 **中文字符判停阈值优化**：针对中文判停偏保守的特点，引入 `TURN_JUDGE_THRESHOLD_CJK=0.35`，防止短句误判未完成。
 - ⚡ **ASR 端点自控（实验中，尚未全量验证）**：支持关掉云端服务端 200ms VAD 窗，改由宿主本地在静音到点发 `commit`，再由「开轮静音门槛」挡住换气；同一份 13 轮向量上 `① 停嘴→出句` **400 → 254–302 ms**、有声拆句 1 → 0（见 [docs/QWEN-REALTIME-ASR-PROBED.md](./docs/QWEN-REALTIME-ASR-PROBED.md)）。
-- 🧪 **判停器有公开基准可对账（实验中）**：在 [livekit/eot-bench](https://github.com/livekit/eot-bench) 中文子集上，本项目的判停器 AUC 0.754 / 5% 误切预算下等待 0.918 s —— **只比「纯静音死等」的 1000 ms 省 82 ms**，排在 LiveKit mini（0.835 s）和 v1.1（0.741 s）之后。**结论是窗已调到头、模型是短板**；而 mini 的许可只允许在 LiveKit Agents 框架内使用，不能直接换过来，详见 [docs/EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md)。
+- 🧪 **判停器有公开基准可对账（实验中）**：在 [livekit/eot-bench](https://github.com/livekit/eot-bench) 中文子集上，本项目的判停器 AUC 0.754 / 5% 误切预算下等待 0.918 s，比「纯静音死等」的 1.100 s 省 **182 ms**（这个增量列已不作判断，见文档）。榜单的**跨模型排名待核实**（其余行是上游公开结果、口径未必一致），本文不据此排序。**真正的结论是：瓶颈不在模型而在策略**（重复询问/宽限/预算可绕过，2026-11-18 已修），详见 [docs/EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) §0。
 
 <details>
 <summary><b>🔍 点击展开：真机 13 轮同向量回放原始标定记录与时序审计</b></summary>
@@ -341,7 +341,7 @@ dsh-pet-wearable/
 |:---|:---|:---|
 | **状态机与流转** | [state-machines.md](./docs/state-machines.md) | 六大核心状态机（DialogFsm、FloorArbiter 等）时序与真相表 |
 | **工具与度量** | [TOOLS.md](./docs/TOOLS.md) | 观测工具矩阵、延迟口径唯一定义与排障路由表 |
-| **判停基准** | [EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) | 公开中文 EoT 基准上的排名、口径与「窗已到顶」的结论 |
+| **判停基准** | [EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) | 公开中文 EoT 基准上的数字、口径与**修订记录**（含被撤回的归因）；结论：瓶颈在策略不在模型 |
 | **ASR / TTS 实测** | [QWEN-REALTIME-ASR-PROBED.md](./docs/QWEN-REALTIME-ASR-PROBED.md) | DashScope realtime 的端点/静音窗实测与「回执会骗人」 |
 | | [ALIYUN-ASR-PROBED.md](./docs/ALIYUN-ASR-PROBED.md) | 阿里云 NLS（现网）协议与延迟实测 |
 | | [MIMO-API-PROBED.md](./docs/MIMO-API-PROBED.md) | MiMo 为何出局：不支持上行流式 |
