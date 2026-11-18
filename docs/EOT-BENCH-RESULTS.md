@@ -32,8 +32,8 @@
    这些在回放里救过 p（0.45 → 0.93），但在这个基准上只换来 41 ms。
    **窗已经调到头了**，继续抠没有意义。
 3. **真正的短板是模型**：SmartTurn v3.2 在中文是倒数第二档。
-   **LiveKit mini 是本地推理、AUC 0.874、5% 等待 0.835 s** —— 比我们快 83 ms、
-   排序能力强 0.12，是单点收益最大的一刀（**尚未落地**）。
+   **LiveKit mini** 本地推理、AUC 0.874、5% 等待 0.835 s —— 比我们快 83 ms、
+   排序能力强 0.12，看着是单点收益最大的一刀，但**许可不允许我们这样用**（见 §6）。
 
 ## 3. 顺带得到的标定数据
 
@@ -91,3 +91,39 @@ eot **p50 1383 / p90 2529 ms** —— 句中停顿和真实句尾在时长上**�
 `io.py::build_messages` 是用数据集自带的**词级真值**按 `transcript_lag=0.5 s` 截出来的
 「用户说了什么」，不是 ASR 输出。也就是说文本模型在基准里拿到的是**干净字幕**，
 我们线上拿到的是带错字、无标点的流式 partial。
+
+## 6. LiveKit mini 的形态：试过了，不能这么用
+
+查了它的发行物（`livekit-local-inference` 0.3.2，PyPI 上的元数据 + wheel 内容），结论是
+**技术上能接，许可上不行**。
+
+**形态**（不是 ONNX，是一个编译好的原生扩展，权重烤在里面）：
+
+| 项 | 事实 |
+|---|---|
+| 发行物 | `livekit-local-inference` 0.3.2，每版本 **30 个 wheel**：5 平台 × cp310–cp315，**没有 sdist** |
+| 体积 | cp312 manylinux x86_64 **90.0 MB**、win_amd64 90.2 MB；wheel 里就一个 `_native.cpXXX-*.pyd`（94.6 MB 解压后） |
+| 依赖 | **不声明任何依赖**：不用 torch、不用 onnxruntime，自带推理运行时 |
+| 内存 | `init_eot()` 文档原话「eagerly init the EOT model singleton (**~315 MB**)」—— 我们现在的 Smart Turn ONNX 是 8.7 MB |
+| API | `EOT().predict(pcm: int16 ndarray ≤ 32000, turn_samples)` → float；**< 1760 采样（0.11 s）直接返回 0.0**；`predict` 会释放 GIL |
+| 顺带 | 同一个 wheel 里还有一个**流式 VAD**（`VAD()`，512 采样/32 ms 一块，每实例持有 LSTM 状态 + `reset()`） |
+| 阈值 | 导出 `EOT_THRESHOLDS`：**按语言的推荐阈值**，是给这套权重标定过的（我们用不上） |
+
+**许可**：代码 Apache-2.0，权重是 `LicenseRef-LiveKit-Model`（专有 Model License）。
+第 3.b 条「Limitation on Use」写得很明确：
+
+> (i) not to use any LiveKit Models **on a standalone basis or with any frameworks
+> other than LiveKit Agents**；(ii) **not to use** any LiveKit Materials or any output
+> from, or results of using, LiveKit Models **to improve or otherwise develop any other
+> models** that are not LiveKit Models.
+
+我们是自建的 Node 语音链路（`dsh-pet-wearable`），不是 LiveKit Agents，所以
+**把 mini 换成我们的 TurnJudge 属于「standalone basis」**；(ii) 还意味着连「拿它的输出去调我们的
+模型」也不行。榜上那些数字是基准方跑出来的公开结果，引用没问题，但模型本身我们装不得。
+
+**所以上一轮「单点收益最大的一刀」这个结论作废。** 剩下的口子只有三个，都得花钱：
+
+1. 向 LiveKit 要一份**允许 standalone 的商用授权**（他们 Model License 是这么设计的）。
+2. **自己训**：`eot-bench-data` 本身是 Apache-2.0，许可上允许拿来训练；
+   Smart Turn v3.2 权重是 BSD-2，也有公开的训练代码。这是「花时间不花钱」的那条。
+3. **换框架**（把链路迁到 LiveKit Agents）—— 对我们现在是倒退，不考虑。

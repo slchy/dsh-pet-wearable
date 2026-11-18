@@ -209,7 +209,7 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 - 🎯 **判停窗口按句裁剪 + 尾部静音削减**：判停输入仅喂单句音频，尾部静音保留 20ms，与训练特征对齐；`出句→开轮` 从 1.9s 骤降至 2ms。
 - 🌏 **中文字符判停阈值优化**：针对中文判停偏保守的特点，引入 `TURN_JUDGE_THRESHOLD_CJK=0.35`，防止短句误判未完成。
 - ⚡ **ASR 端点自控（实验中，尚未全量验证）**：支持关掉云端服务端 200ms VAD 窗，改由宿主本地在静音到点发 `commit`，再由「开轮静音门槛」挡住换气；同一份 13 轮向量上 `① 停嘴→出句` **400 → 254–302 ms**、有声拆句 1 → 0（见 [docs/QWEN-REALTIME-ASR-PROBED.md](./docs/QWEN-REALTIME-ASR-PROBED.md)）。
-- 🧪 **判停器有公开基准可对账（实验中）**：在 [livekit/eot-bench](https://github.com/livekit/eot-bench) 中文子集上，本项目的判停器 AUC 0.754 / 5% 误切预算下等待 0.918 s —— 与官方同模型对得上，但比本地的 LiveKit mini（0.874 / 0.835 s）低一档。**结论是窗已调到头、模型是短板**，详见 [docs/EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md)。
+- 🧪 **判停器有公开基准可对账（实验中）**：在 [livekit/eot-bench](https://github.com/livekit/eot-bench) 中文子集上，本项目的判停器 AUC 0.754 / 5% 误切预算下等待 0.918 s —— 与官方同模型对得上，但排在 LiveKit mini（0.874 / 0.835 s）和 v1.1（0.923 / 0.741 s）之后。**结论是窗已调到头、模型是短板**；而 mini 的许可只允许在 LiveKit Agents 框架内使用，不能直接换过来，详见 [docs/EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md)。
 
 <details>
 <summary><b>🔍 点击展开：真机 13 轮同向量回放原始标定记录与时序审计</b></summary>

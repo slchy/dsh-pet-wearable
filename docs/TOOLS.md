@@ -476,13 +476,16 @@ qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**
 **这是策略层指标**（基准一起扫 `threshold` / `action_delay` / `timeout`），
 **不是本项目的 ①**，别混着引用。
 
-结论：窗预处理只值 +0.009 AUC / −41 ms（**已到顶**），短板是模型本身；
-本地的 LiveKit mini 是 0.874 / 0.835 s，尚未落地。完整表与口径见
-[EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md)，复现见 [bench/eot/README.md](../bench/eot/README.md)。
+结论：窗预处理只值 +0.009 AUC / −41 ms（**已到顶**），短板是模型本身。
+完整表与口径见 [EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md)（§6 是 mini 的形态与许可），
+复现见 [bench/eot/README.md](../bench/eot/README.md)。
 
-**mini 是纯音频模型**（最近 2.0 s + 本轮已说长度），和我们现在的 Smart Turn 同一个槽位；
-榜单里只有 LiveKit v1.1（云）和 ultraVAD 吃「上一句助手回复」，没有任何纯文本条目 ——
-按输入模态的分类见 [EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md) §5。
+**mini 是纯音频模型**（最近 2.0 s + 本轮已说长度），和我们现在的 Smart Turn 同一个槽位，
+不在「语义侧」；榜单里只有 LiveKit v1.1（云）和 ultraVAD 吃「上一句助手回复」，
+没有任何纯文本条目 —— 按输入模态的分类见 [EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md) §5。
+mini 的 AUC 是 0.874 / 0.835 s，但**许可不允许我们这样用**：它是编译好的原生扩展
+（`livekit-local-inference`，90 MB wheel + 315 MB 常驻），权重走专有的
+`LicenseRef-LiveKit-Model`，只能在 LiveKit Agents 框架内使用。
 
 ## 13. 踩过的坑（别重现）
 
