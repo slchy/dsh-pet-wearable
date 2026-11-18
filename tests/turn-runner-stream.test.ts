@@ -184,6 +184,18 @@ test('turn.end 记下这一轮是谁答的：path=fast', async () => {
   assert.equal(end.data['delegate'], undefined, '快车道胜出的轮次不该有 delegate');
 });
 
+test('turn.end 记下实际念出去的文本：快车道没有 session log，这是它唯一的口供', async () => {
+  // dsh 那侧另有 `session.v4.jsonl.zstd` 的 `assistant/message` 可对；快车道
+  // （qwen-flash）什么都不落盘，只说进 console 的前 120 字。而「抢话之后模型有没有
+  // 接上上下文」只能靠这条审 —— 情绪标签必须已经剥掉，记的是播出去的话。
+  const r = rig({ deltas: ['[平静]在呢。'], reply: { text: '[平静]在呢。', speech: '在呢。', path: 'fast' } });
+  await r.run();
+  const end = r.payloads.filter((p) => p.name === 'turn.end').at(-1);
+  assert.ok(end, '该有一条 turn.end');
+  assert.equal(end.data['said'], '在呢。', `实际：${JSON.stringify(end.data)}`);
+  assert.equal(end.data['said_chars'], 3);
+});
+
 test('turn.end 记下交给 dsh 的原因：本地闸(task) 与模型让位(delegate) 分得开', async () => {
   const r = rig({
     deltas: [],

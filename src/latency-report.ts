@@ -60,6 +60,13 @@ export interface ArchiveEvent {  /** 相对会话开始的毫秒数 */
    * 混在一起求 p50 得到的是两者混合分布，回答不了「快车道多快」。
    */
   readonly path?: unknown;
+  /**
+   * `turn.end` 专有：这一轮**实际念出去的**文本（已剥情绪标签）。
+   *
+   * 审计「抢话之后模型有没有接上」靠它：`path=dsh` 还能去 dsh 的 session log 翻
+   * `assistant/message`，快车道（qwen-flash）**没有那份东西**。
+   */
+  readonly said?: unknown;
 }
 
 /** 一轮里可能缺席的时刻名。 */
@@ -151,6 +158,7 @@ export function parseEvents(jsonl: string): ArchiveEvent[] {
       interrupted: obj['interrupted'],
       gapMs: obj['gapMs'],
       path: obj['path'],
+      said: obj['said'],
     });
   }
   return out;

@@ -417,7 +417,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `llm.first` | `ms` | 模型首字 |
 | `tts.first` | `ms` | TTS 首块（③ 的终点） |
 | **`dialog.state`** | `from`、`to`、**`why`** | **为什么进这个状态**。`why` 里写着「回执出声（可打断）」还是「首块音频已下发」—— 没有它，`thinking → speaking` 分不出是回执还是答案（差约 1 s） |
-| **`turn.end`** | `interrupted`、`audio_s`、`heard_s`、`dsh_ms`、`tts_first_ms`、`dsh_session`、**`path`**、**`delegate`** | `path` = `fast`/`dsh`：**这一轮谁答的**；`delegate` = `task`/`answer`/`memory`/`overcap`/`delegate`/`timeout`/`empty`/`error`：**为什么交给 dsh**；`dsh_session` 用来定位 dsh 的 session log |
+| **`turn.end`** | `interrupted`、`audio_s`、`heard_s`、`dsh_ms`、`tts_first_ms`、`dsh_session`、**`path`**、**`delegate`**、**`said`**、`said_chars` | `path` = `fast`/`dsh`：**这一轮谁答的**；`delegate` = `task`/`answer`/`memory`/`overcap`/`delegate`/`timeout`/`empty`/`error`：**为什么交给 dsh**；`dsh_session` 用来定位 dsh 的 session log；**`said` = 这一轮实际念出去的文本**（已剥情绪标签、多步时含全部增量；回执不算）—— 审计「抢话之后模型有没有接上」靠它，因为快车道（qwen-flash）**没有 session log**，dsh 那侧另有 `assistant/message` 可对 |
 | `call.send` | `json` | 下行原语（`audio.stop` / `listen.stop` …） |
 | `device.played` | — | v2 设备「真播完」回执 |
 | `announce` / `announce.replay` | `len`、`emotion` / `count` | 后台汇报要播 / 补播了几条 |
@@ -425,14 +425,19 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 `turn.end` 的一行实例：
 
 ```
-{"interrupted":false,"audio_s":5.0,"heard_s":5.0,"dsh_ms":714,"tts_first_ms":666,
- "path":"dsh","delegate":"task","dsh_session":"session-…"}
+{"interrupted":false,"audio_s":5.0,"heard_s":5.0,"said":"在呢，刚看了一下。","said_chars":8,
+ "dsh_ms":714,"tts_first_ms":666,"path":"dsh","delegate":"task","dsh_session":"session-…"}
 ```
 
 **为什么必须由 agent 报 `path`**：`dsh_ms` 分不出来。快车道预跑被认领的轮次是 ~0，
 qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**（「还在吗？」343 ms 是快车道，
 「我怎么说？」662 ms 是 `dsh`）。而「本地闸挡住」和「快车道自己让位」在 console 日志里
 长得一模一样，只有 `delegate` 能分开。
+
+**为什么要 `said`**：`path=dsh` 的回复还能去 dsh 的 `session.v4.jsonl.zstd` 里翻
+`assistant/message`（`dsh-timeline.ts` 已经会按 `dsh_session` 对齐）；**快车道没有这份东西**，
+只有 console 里截断的前 120 字。而 `isFastCandidate()` 只挡 ASCII 数字 —— 中文数字
+（「幺三八」）、短碎片、闲聊全都走快车道，正好是最需要审模型行为的那一批。
 
 ### 12.2 还是缺口（别假装有）
 

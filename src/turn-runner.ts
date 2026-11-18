@@ -603,6 +603,12 @@ export class TurnRunner {
         interrupted,
         audio_s: Number(audioSeconds.toFixed(2)),
         heard_s: Number(heardSeconds.toFixed(2)),
+        // 这一轮**念出去的**文本，审计模型行为用（尤其「抢话之后它有没有接上」）。
+        // `path=dsh` 另有 `session.v4.jsonl.zstd` 里的 `assistant/message` 可对；
+        // 快车道（qwen-flash）没有 session log，这是它唯一的口供。记实际播出的
+        // 文本（多步时是全部增量，见上方 `speech` 注释），回执不在这条里。
+        said: speech,
+        said_chars: [...speech].length,
         dsh_ms: agentLatencyMs,
         tts_first_ms: firstChunkAtMs === 0 ? -1 : firstChunkAtMs,
         // 这一轮是谁答的。没有它，档案里分不出快车道和 dsh —— `dsh_ms` 两组重叠，
