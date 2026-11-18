@@ -194,6 +194,10 @@ def main() -> int:
     result["item1_online_vs_zero"] = item1
 
     # ---- 项 2：max_hold_span_duration 敏感性 ----
+    # ⚠️ 只筛 **hold**：`eot_harness.metrics.span_table_from_predictions` 里
+    # 条件是 `(label != "hold") | hold_in_range`，即 eot 永远保留、不参与时长过滤。
+    # 早先这里写成 `sp[duration <= cap]` 把 eot 一起筛掉了（344 → 196 → 90），
+    # 那一版结论已作废并换成了「线上形状 + 延迟预算」的口径，不必重跑。
     thresholds = np.round(np.arange(0.02, 0.99, 0.01), 4)
     deltas = np.round(np.arange(0.2, 1.01, 0.1), 2)
     timeouts = np.round(np.arange(1.0, 3.51, 0.5), 2)
@@ -201,7 +205,8 @@ def main() -> int:
     for cap in (5.0, 1.5, 1.0):
         row = {}
         for name, sp in spans_by.items():
-            sub = sp[sp["duration"] <= cap + 1e-9]
+            keep = (sp["label"] != "hold") | (sp["duration"] <= cap + 1e-9)
+            sub = sp[keep]
             pt = five_pct_point(sub, thresholds, deltas, timeouts)
             row[name] = {
                 "n_hold": int((sub["label"] == "hold").sum()),
