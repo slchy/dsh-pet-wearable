@@ -44,6 +44,22 @@ export const EVENTS = {
   llmFirst: 'llm.first',
   /** 一轮结束。带 `dsh_session` 时可与 dsh 自己的会话档案对齐 */
   turnEnd: 'turn.end',
+
+  // ---- 模型的输入/输出（审计用，全量不截断）----
+  //
+  // 为什么单独一组而不是塞进 `turn.end`：**预跑和投机不一定会变成一轮**。
+  // 判停并了段、换了一句、插话作废 —— 这些请求已经发出去、模型也已经答了，
+  // 但永远不会走到 `turn.end`。不在这里留痕，就只剩 console 里截断的那 120 字。
+  /** 请求**发出去**的那一刻：`{kind, model, hedge, text, msgs}`（`msgs` 是全量 messages） */
+  agentAsk: 'agent.ask',
+  /** 请求**落定**：`{kind, ok, ms, first_token_ms, raw, opened, delegated}` 或 `{ok:false, err}` */
+  agentDone: 'agent.done',
+  /** 请求被主动作废（换一句 / 判停并段 / 不走快车道 / 文本对不上） */
+  agentDrop: 'agent.drop',
+  /** 预跑被认领与否 —— 「抢话时它答得快不快」和「这份答案有没有被用上」是两件事 */
+  agentClaim: 'agent.claim',
+  /** 委派轮先说的那句「嗯，我想想」（`text` + `chars`），它不在 `turn.end.said` 里 */
+  receipt: 'receipt',
   /**
    * 状态机的一次转移（`from` → `to`）。
    *

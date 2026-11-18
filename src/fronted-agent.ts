@@ -38,6 +38,7 @@
  * 换掉它的是委派轮不再白等判定。要退回串行：`FAST_LANE_SPECULATE=0`。
  */
 import { cleanForSpeech } from './agent.ts';
+import { EVENTS } from './events.ts';
 import { parseEmotion } from './emotion.ts';
 import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, TurnContext } from './providers.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
@@ -276,6 +277,15 @@ export interface FastLaneOptions {
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
   readonly log?: (line: string) => void;
+  /**
+   * 审计出口：把「问出去什么、答回来什么、为什么丢掉」**全量**交给档案。
+   *
+   * 只观察、不参与决策，抛错也会被吞掉（审计不该影响通话）。为什么要它：
+   * 快车道（qwen-flash）**没有 session log**，而 `isFastCandidate()` 只挡 ASCII
+   * 数字 —— 中文数字、短碎片、闲聊全走这条路。不落档，「抢话之后模型有没有接上
+   * 前半句」就无从审计。dsh 那侧另有 `session.v4.jsonl.zstd`，不用走这里。
+   */
+  readonly audit?: (name: string, data: Record<string, unknown>) => void;
 }
 
 /**
@@ -459,6 +469,8 @@ export class FrontedAgent implements AgentProvider {
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
+  /** 审计出口（只观察）：见 {@link FrontedOptions.audit} */
+  private readonly auditSink: (name: string, data: Record<string, unknown>) => void;
   private readonly pending: string[] = [];
   /**
    * 判停之前先问出去的那一轮（见 {@link prefetch}）。
@@ -549,6 +561,14 @@ export class FrontedAgent implements AgentProvider {
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
+    // 审计抛错不能把一轮通话带下水：这里吞掉
+    this.auditSink = (name, data) => {
+      try {
+        options.audit?.(name, data);
+      } catch {
+        // 忽略
+      }
+    };
   }
 
   get name(): string {
@@ -727,7 +747,7 @@ export class FrontedAgent implements AgentProvider {
         return;
       }
       slot.buffered.push(chunk);
-    });
+    }, speculative ? 'spec' : 'prefetch');
     // 预跑出来的 promise 可能永远没人认领（插话/并段）：接住，别让它变成进程级 rejection
     slot.answer.catch(() => undefined);
     // `ask()` 在第一个 await 之前同步设好了控制器，这里取到的就是这一趟的
@@ -757,6 +777,7 @@ export class FrontedAgent implements AgentProvider {
     if (!usable) {
       this.abortPrefetch(slot.abort);
       this.log(`  快车道    这一轮不走快车道，预跑作废（${JSON.stringify(slot.text)}）`);
+      this.auditSink(EVENTS.agentClaim, { ok: false, why: 'unusable', text: slot.text });
       return null;
     }
     if (slot.text !== userText) {
@@ -764,10 +785,14 @@ export class FrontedAgent implements AgentProvider {
       this.log(
         `  快车道    文本对不上，预跑作废（${JSON.stringify(slot.text)} → ${JSON.stringify(userText)}）`,
       );
+      this.auditSink(EVENTS.agentClaim, {
+        ok: false, why: 'text-mismatch', text: slot.text, want: userText,
+      });
       return null;
     }
     const ranFor = this.now() - slot.startedAt;
     this.log(`  快车道    认领预跑（已经跑了 ${ranFor.toFixed(0)} ms）`);
+    this.auditSink(EVENTS.agentClaim, { ok: true, text: slot.text, ran_for_ms: Math.round(ranFor) });
     return {
       answer: slot.answer,
       attach: (sink) => {
@@ -785,6 +810,7 @@ export class FrontedAgent implements AgentProvider {
     this.prefetched = null;
     this.abortPrefetch(slot.abort);
     this.log(`  快车道    预跑作废（${why}）`);
+    this.auditSink(EVENTS.agentDrop, { why, text: slot.text, speculative: slot.speculative });
   }
 
   private abortPrefetch(handle: { abort(why: Error): void } | null): void {
@@ -882,7 +908,7 @@ export class FrontedAgent implements AgentProvider {
         pre.attach(push);
         answer = await pre.answer;
       } else {
-        answer = await this.ask(userText, startedAt, push);
+        answer = await this.ask(userText, startedAt, push, 'live');
       }
     } catch (error) {
       const why = (error as Error).message;
@@ -1161,6 +1187,7 @@ export class FrontedAgent implements AgentProvider {
     userText: string,
     startedAt: number,
     emit: (text: string) => void,
+    kind: 'prefetch' | 'spec' | 'live' = 'live',
   ): Promise<FastAnswer> {
     const doFetch = this.fetchImpl ?? fetch;
     // **对冲**：同一句并发发 N 份，谁先**把响应头拿回来**谁赢，其余立刻 abort。
@@ -1189,12 +1216,18 @@ export class FrontedAgent implements AgentProvider {
         abortAll(new Error(`整句超时 ${this.totalMs} ms`));
       }, this.totalMs);
     };
+    const msgs = this.messages(userText);
     const payload = JSON.stringify({
       model: this.model,
       stream: true,
       temperature: 0.8,
       max_tokens: 64,
-      messages: this.messages(userText),
+      messages: msgs,
+    });
+    // 全量落档：**发出去的那一刻**就记，而不是等到有答案 —— 预跑/投机被作废时，
+    // 「问过什么」才是判断模型行为的起点。`msgs` 含 system + 历史窗 + 当前这句。
+    this.auditSink(EVENTS.agentAsk, {
+      kind, model: this.model, hedge: controllers.length, text: userText, msgs,
     });
     try {
       const racers = controllers.map((c) => doFetch(`${this.baseUrl}/chat/completions`, {
@@ -1225,12 +1258,25 @@ export class FrontedAgent implements AgentProvider {
       // 生产里首字 314–588 而裸探针只要 185–260，差的那截到底是网络、还是我们自己的
       // 事件循环（ffmpeg/TTS/档案都在同一条线程上），只有这个分解能说清。
       if (process.env['FAST_LANE_TRACE'] === '1') {
-        const msgs = this.messages(userText);
         const chars = msgs.reduce((n, m) => n + m.content.length, 0);
         this.log(`  快车道    提示词 ${msgs.length} 条 / ${chars} 字`);
         this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms（对冲 ${racers.length} 份）`);
       }
-      return await readStream(winner.r.body!, startedAt, this.now, { onFirstToken: rearm, emit });
+      const answer = await readStream(winner.r.body!, startedAt, this.now, { onFirstToken: rearm, emit });
+      // `raw` 是模型原文（可能带 `[平静]` 情绪标签、也可能被 [[DELEGATE]] 早退），
+      // `opened` 表示有没有已经推给 TTS —— 两者决定这份答案「能撤回还是已经出口」。
+      this.auditSink(EVENTS.agentDone, {
+        kind, ok: true, ms: Math.round(this.now() - startedAt),
+        first_token_ms: Math.round(answer.firstTokenMs),
+        raw: answer.text, opened: answer.opened, delegated: answer.delegated,
+      });
+      return answer;
+    } catch (error) {
+      this.auditSink(EVENTS.agentDone, {
+        kind, ok: false, ms: Math.round(this.now() - startedAt),
+        err: (error as Error).message,
+      });
+      throw error;
     } finally {
       clearTimeout(timer);
       abortAll(new Error('请求结束'));

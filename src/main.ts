@@ -486,6 +486,13 @@ async function main(): Promise<void> {
   }
 
   let agent: AgentProvider | null = null;
+  /**
+   * 快车道审计出口的**当前持有者**（哪条连接在写档案）。
+   *
+   * `FrontedAgent` 是进程级共用的，档案是每连接一份 —— 连接建立时把自己接上，
+   * 断开时摘掉。同时只有一个设备在用时归属精确；多设备并发写到最后连上的那条。
+   */
+  let agentAuditSink: ((name: string, data: Record<string, unknown>) => void) | null = null;
   let dshSession: DshSession | null = null;
   /**
    * 离线时的后台汇报队列。放 `~/.voice-agent/` 旁边（和会话 id 一个目录），
@@ -581,6 +588,8 @@ async function main(): Promise<void> {
         // 按这句话挑几条进提示词，不全塞（4 KB ≈ 1.5k token）
         memory: (text: string) => memoryFile.relevant(text),
         log: (line) => { console.log(line); },
+        // 全量审计：每次请求的 messages、模型的原文、以及被作废的那几趟
+        audit: (name, data) => { agentAuditSink?.(name, data); },
       });
       console.log(
         `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
@@ -853,6 +862,8 @@ async function main(): Promise<void> {
       archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
       archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
       archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
+      // 连接建立/断开时把快车道审计接到这条档案上（见 `agentAuditSink`）
+      setAgentAudit: (sink) => { agentAuditSink = sink; },
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),

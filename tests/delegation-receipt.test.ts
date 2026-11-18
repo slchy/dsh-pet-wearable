@@ -140,6 +140,14 @@ test('交给慢车道：先回执，答案到了再顶掉', async () => {
       r.logs.some((line) => line.includes('被正式回答顶掉')),
       `该有「被顶掉」日志，实际：${JSON.stringify(r.logs)}`,
     );
+    // 回执是用户听到的第一句，但它不属于任何 turn.end —— 不单独记，
+    // 审计「他到底听到了什么」就少一段
+    const receipt = r.payloads.filter((p) => p.name === 'receipt').at(-1);
+    assert.ok(receipt, `该有一条 receipt 事件，实际：${JSON.stringify(r.payloads.map((p) => p.name))}`);
+    assert.ok(
+      typeof receipt.data['text'] === 'string' && (receipt.data['text'] as string).length > 0,
+      '按稿要记下回执文本',
+    );
     assert.equal(
       r.runtime.runner.takeCannedResidue(),
       null,

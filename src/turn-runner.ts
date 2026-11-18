@@ -269,6 +269,9 @@ export class TurnRunner {
     }
     // 立刻通知：档案要记下这段 `speaking`，话筒归属也别等下一帧才对齐
     this.options.onState?.();
+    // 回执是**用户听到的第一句**，但它不属于任何 `turn.end`（不排 `speechChain`、
+    // 不留残句）—— 不单独记，审计「他到底听到了什么」就少一段。
+    this.options.onEvent?.(EVENTS.receipt, { text, chars: [...text].length });
     const rate = this.options.tts.sampleRate;
     const cached = this.receiptCache.get(text);
     if (cached !== undefined && cached.rate === rate) {

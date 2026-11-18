@@ -266,6 +266,14 @@ export interface VoiceSessionOptions {
   readonly archiveMaxMb: number;
   /** 保留多少个会话档案目录 */
   readonly archiveKeep: number;
+  /**
+   * 快车道审计出口的注册器。
+   *
+   * `FrontedAgent` 是**进程级共用**的，而档案是**每条连接一份** —— 所以连接建立时
+   * 把这些事件接到自己的档案上，断开时摘掉。同时只有一个设备在用时归属是精确的；
+   * 多设备并发会把审计写到最后连上的那一条（档案里带 `tag`，能看出来）。
+   */
+  readonly setAgentAudit?: (sink: ((name: string, data: Record<string, unknown>) => void) | null) => void;
   /** 照片落盘目录；空串表示不落盘（默认） */
   readonly photoDir: string;
   /** 控制口端口与超时 */
@@ -543,6 +551,8 @@ class VoiceConnection {
         levelLogMs: options.levelLogMs ?? 0,
       },
     );
+    // 快车道的输入/输出接进**这一条**连接的档案（见 `setAgentAudit` 的注释）
+    options.setAgentAudit?.((name, data) => this.archive?.event(name, data));
 
     const turnJudgeOptions = options.turnJudge;
     const detector = resolveEndpointDetector(
@@ -1104,6 +1114,8 @@ class VoiceConnection {
       this.turnJudge?.stop();
     }
     this.control?.close();
+    // 先摘审计出口再关档案：否则最后一批 `agent.done` 会写进已关闭的档案
+    this.options.setAgentAudit?.(null);
     this.archive?.close();
     this.stt.close();
     this.uplink.end();

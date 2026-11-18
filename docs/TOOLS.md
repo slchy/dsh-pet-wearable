@@ -289,6 +289,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/patch-sdk-fork.mjs` | 给 dsh SDK 补 `session/fork`（双轨撤回用；`--check` 返回 0 = 已打） |
 | `bench/latency/probe-dsh-fork.mjs` | 验 fork 能不能用、切点取在哪才干净（起真 dsh，跑两轮再切掉第二轮） |
 | `bench/eot/our_judge_adapter.py` | 把线上判停器接到公开基准 `livekit/eot-bench` 上（numpy + onnxruntime，不装 torch）；跑法见 `bench/eot/README.md`，结果见 `docs/EOT-BENCH-RESULTS.md` |
+| `scripts/said-audit.ts` | **审计模型行为**：把每轮「用户说了什么 → 被问了什么（全量 messages）→ 模型答了什么 → 用户听到多少」摆成时间线。快车道没有 session log，只能靠 `agent.*` + `turn.end.said`；老档案会显示「缺仪表」而不是空白 |
 | `bench/eot/policy_replay.py` | 在真机 `judge.decide` 轨迹上**确定性重放**新的判停策略，出「② old→new / 定稿→首声 / 误切逐条清点」。改判停逻辑后的验收就靠它，结果见 `docs/EOT-SUPPLEMENT.md` §10 |
 | `bench/eot/turn_open_probe.py` | 量「开轮时静音多长」和「开早了之后发生什么」（结局 a/b/c 三分类） |
 | `bench/eot/judge_extend_probe.py` | 数每一次 `extend` 到底救到没有（窗口内用户有没有重新出声） |
@@ -421,6 +422,14 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `call.send` | `json` | 下行原语（`audio.stop` / `listen.stop` …） |
 | `device.played` | — | v2 设备「真播完」回执 |
 | `announce` / `announce.replay` | `len`、`emotion` / `count` | 后台汇报要播 / 补播了几条 |
+| **`agent.ask`** | `kind`（`prefetch`/`spec`/`live`）、`model`、`hedge`、`text`、**`msgs`** | **快车道问了什么**：`msgs` 是**全量** messages（system + 历史窗 + 当前句），不截断 |
+| **`agent.done`** | `ok`、`ms`、`first_token_ms`、**`raw`**、`opened`、`delegated` / 失败时 `err` | **模型答了什么**：`raw` 是原文（含情绪标签、可能被 `[[DELEGATE]]` 早退）；`opened` = 有没有已经推给 TTS（推过就撤不回） |
+| **`agent.drop`** / **`agent.claim`** | `why` / `ok` + `ran_for_ms` | 预跑为什么作废、有没有被认领 —— **预跑不一定变成一轮**，只有这两条能看见被丢掉的那几趟 |
+| **`receipt`** | `text`、`chars` | 委派轮先说的那句「嗯，我想想」，它不在 `turn.end.said` 里 |
+
+> **为什么 `agent.*` 单独一组**：预跑/投机可能在 `turn.start` **之前**就被作废（换一句、
+> 判停并段、插话），那些请求已经发出去、模型也已经答了，但永远不会走到 `turn.end`。
+> 不单独落，就只剩 console 里截断的 120 字 —— 而快车道**没有 session log**。
 
 `turn.end` 的一行实例：
 

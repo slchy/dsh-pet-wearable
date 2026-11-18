@@ -499,6 +499,43 @@ test('人设与情绪标签：和 dsh 是同一个角色，只是话更短', asy
   assert.equal(reply.speech, '在呢哥。');
 });
 
+test('审计：agent.ask 落全量 messages，agent.done 落模型原文', async () => {
+  // 快车道没有 session log（dsh 那侧有 session.v4.jsonl.zstd）。不落这两条，
+  // 「抢话之后模型有没有接上前半句」就无从审计 —— 只剩 console 截断的 120 字。
+  const audit: Array<{ name: string; data: Record<string, unknown> }> = [];
+  let round = 0;
+  const agent = agentWith(
+    fakeInner().agent,
+    async () => {
+      round += 1;
+      return sse([round === 1 ? '那少穿点吧。' : '你说今天热。']);
+    },
+    { speculate: false, audit: (name, data) => { audit.push({ name, data }); } },
+  );
+  agent.attachLiveSink(() => {});
+
+  await agent.reply('今天真热。');
+  await agent.reply('我说什么来着');
+
+  const asks = audit.filter((a) => a.name === 'agent.ask');
+  assert.equal(asks.length, 2, '每次请求都要有一条 ask');
+  const msgs = asks[1]?.data['msgs'] as Array<{ role: string; content: string }>;
+  assert.ok(Array.isArray(msgs), 'ask 要带全量 messages');
+  assert.equal(msgs[0]?.role, 'system');
+  assert.deepEqual(
+    msgs.slice(1).map((m) => [m.role, m.content]),
+    [['user', '今天真热。'], ['assistant', '那少穿点吧。'], ['user', '我说什么来着']],
+    '审计里的 messages 必须和真正发出去的一致（含历史窗）',
+  );
+  assert.equal(asks[1]?.data['kind'], 'live');
+
+  const dones = audit.filter((a) => a.name === 'agent.done');
+  assert.equal(dones.length, 2);
+  assert.equal(dones[1]?.data['ok'], true);
+  assert.equal(dones[1]?.data['raw'], '你说今天热。', 'raw 是模型原文，不是清洗后的');
+  assert.equal(typeof dones[1]?.data['first_token_ms'], 'number');
+});
+
 test('对话窗口：自己答的和 dsh 答的都以 role 进 messages', async () => {
   const inner = fakeInner();
   const seen: Array<Array<{ role: string; content: string }>> = [];
