@@ -26,7 +26,7 @@
 ├──────────────┴──────────────┴───────────────┴───────────────────────┤
 │ 旁路：archive · announce-store · photo-inbox · tool-control          │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 可替换实现：aliyun-asr（STT）· mimo（ASR/TTS）· dsh（Agent）          │
+│ 可替换实现：aliyun-asr / qwen-realtime-asr（STT）· mimo（ASR/TTS）· dsh（Agent） │
 │             turn-judge（判停侧车）· silero-vad（可选 VAD）            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -127,6 +127,7 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | 文件 | 职责 | 约束 |
 |---|---|---|
 | `aliyun-asr.ts` | 阿里云 NLS 实时识别客户端（WebSocket） | 消息 id / task id 必须是 32 位纯十六进制；连接由能量门按需拉起 |
+| `qwen-realtime-asr.ts` | DashScope realtime 识别客户端（**端点由我们控**） | `turn_detection: null` 时服务端不判句，由宿主在静音到点时发 `input_audio_buffer.commit`；`silence_duration_ms` 地板是 200 ms（回执接受更小值但不生效）；协议**没有** `clear`，打断只能 commit 后丢结果；空缓冲 commit 会被拒，必须有脏标记。开关 `MIAI_STT=qwen-realtime`，默认仍走 NLS |
 | `mimo.ts` | MiMo 的 ASR 与 TTS（SSE 流式） | 上行 16 kHz、下行 **24 kHz**；TTS 是"聊天式"：风格进 `user`、正文进 `assistant` |
 | `agent.ts` | `VoiceAgent`：拼本轮输入 → 模型 → 剥情绪标签 → 清洗成可朗读文本 → 播报出口 | **人设提示词不在这里**，在 `mcp/profile.cordis.yml` 的 `personaPrefix`，由 dsh 当系统提示词注入（见 AGENTS.md）。清洗是必须的：TTS 会把 markdown 原样念出来。`cleanForSpeech` 还负责两类**看不见**的脏东西：零宽字符及其 HTML 实体（`&#8203;` 字面送进去会被念成符号）、以及两个中日韩字符之间的空格（那不是停顿标记，只会让合成器塞一个假停顿；英文 / 数字 / 代码段两侧的空格有语义，不动） |
 | `session.ts` | `DshSession`：把文本交给 agent 进程（NDJSON），续会话、取 usage、接住**自发轮次** | 单轮等待上限 180 s；超出必须抛错**并说出来**，不许静默 |
