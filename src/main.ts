@@ -597,7 +597,12 @@ async function main(): Promise<void> {
       });
       console.log(
         `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
-        + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`,
+        + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`
+        // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
+        + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
+        + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 2)}`
+        + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
+        + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`,
       );
       // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
       // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
