@@ -207,9 +207,10 @@ MIAI_ARCHIVE_KEEP=20                     # 保留多少个会话目录
 ## 延迟报告
 
 ```bash
-node scripts/observe.ts <会话目录>               # 一把梭：事实源清单 + 分段 + 审计 + dsh 对齐
+node scripts/observe.ts <会话目录>               # 一把梭：事实源清单 + 分段 + 审计 + dsh 对齐 + 模型行为
 node scripts/latency-report.ts <会话目录>        # 逐轮"用户说完 → 听到第一个字"分解
 node scripts/latency-report.ts <root> --all     # 每个会话各出一份
+node scripts/said-audit.ts <会话目录>            # 逐轮「用户说了什么 → 被问了什么 → 答了什么 → 听到多少」
 ```
 
 纯读，不改档案。`p50` / `p90` 在本项目**只有一个意思**：闭嘴 → 出声（用户停止说话到第一块

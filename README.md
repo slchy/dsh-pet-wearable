@@ -305,7 +305,10 @@ node --experimental-strip-types scripts/observe.ts <档案目录>
 # 4. 状态机时序与抢占合规审计
 node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录>
 
-# 5. 生成或管理设备配对凭证
+# 5. 逐轮审计模型行为：用户说了什么 → 被问了什么 → 答了什么 → 听到多少
+node --experimental-strip-types scripts/said-audit.ts <档案目录>
+
+# 6. 生成或管理设备配对凭证
 npm run pair -- new
 ```
 

@@ -5,7 +5,7 @@
  * ```bash
  * node scripts/observe.ts <会话目录>
  * node scripts/observe.ts <会话目录> --dsh-root <dsh 的 sessions 目录>
- * node scripts/observe.ts <会话目录> --only 分段,审计     # 只跑其中几段
+ * node scripts/observe.ts <会话目录> --only 分段,模型     # 只跑其中几段
  * ```
  *
  * <h2>为什么要有它</h2>
@@ -17,10 +17,15 @@
  * | ①②③④ 分段、停嘴时刻、缺仪表 | 本仓会话档案 `events.jsonl` | `latency-report.ts` |
  * | 状态轮转、插话有没有停音频 | 同上 | `fsm-trace-check.ts` |
  * | 一轮内部（step / 工具 / reasoning / 作业 / 子代理） | **dsh 自己的 session log** | `dsh-timeline.ts` |
+ * | 模型行为（问了什么 / 答了什么 / 用户听到多少） | 同上 + 快车道的 `agent.*`（它没有 session log） | `said-audit.ts` |
  *
  * 第三条**绝不复制进档案** —— dsh 已经把它写全了（`session.v4.jsonl.zstd`，每条带毫秒
  * `time`）。复制一份过来只会多一份要维护、还会和原件的时钟对不上。所以这里做的
  * 不是搬运，而是**自动去正确的源取数，并按同一时间轴摆好**。
+ *
+ * 第四条两者都要：`path=dsh` 的回复能在 dsh 的 log 里翻到，但**快车道（qwen-flash）
+ * 没有 session log** —— 它的问题/答案只能靠档案里的 `agent.ask` / `agent.done`
+ * （见 `docs/TOOLS.md` §12.1）。缺这些字段的老档案会显示「缺仪表」，不当空白。
  *
  * 缺哪个源就说缺哪个，不拿别的源里的数顶上（本项目的地基规矩：缺仪表记 null）。
  */
@@ -91,7 +96,7 @@ function sources(dir: string): Array<{ name: string; where: string; ok: boolean;
 function main(argv: readonly string[]): number {
   const target = argv.find((a) => !a.startsWith('--'));
   if (target === undefined) {
-    console.error('用法: node scripts/observe.ts <会话目录> [--dsh-root <dir>] [--only 分段,审计,dsh]');
+    console.error('用法: node scripts/observe.ts <会话目录> [--dsh-root <dir>] [--only 分段,审计,dsh,模型]');
     return 2;
   }
   const dir = resolve(target);
@@ -129,6 +134,13 @@ function main(argv: readonly string[]): number {
       args: [dir, ...(dshRoot === undefined ? [] : ['--dsh-root', dshRoot])],
       // 对齐要用 meta.json 的 startedAt，还要档案里有 dsh_session
       needs: ['events.jsonl', 'meta.json', 'dsh_session'],
+    },
+    {
+      key: '模型',
+      title: '模型行为（用户说了什么 / 被问了什么 / 答了什么 / 听到多少）',
+      script: 'said-audit.ts',
+      args: [dir],
+      needs: ['events.jsonl'],
     },
   ];
 
