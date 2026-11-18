@@ -44,6 +44,19 @@ Apache-2.0 §4(a) 还要求**给接收方一份许可证副本** —— 就是 �
 | 许可证 | **MIT** |
 | 随本仓分发？ | 否（自己下，见 [models/README.md](./models/README.md)） |
 
+## 3.1 TurnSense 音频前端（`bench/eot/turnsense_adapter.py` 里 vendored 的一段）
+
+| | |
+|---|---|
+| 进仓的部分 | `TurnsenseFrontend` 类：Kaldi fbank → LFR(7,6) → CMVN，约 60 行 |
+| 上游 | <https://github.com/Bairong-Xdynamics/TurnSense> 的 `frontend/audio_frontend.py` |
+| 权重 | <https://huggingface.co/brgroup/TurnSense>（`TurnSense1.0/` 49.8 MB int8、`TurnSense1.1/` 216 MB int8） |
+| 许可证 | **Apache-2.0**（仓里 `LICENSE` 是标准全文，**没有** README 说的"附加限制"） |
+| 随本仓分发？ | 代码：是（vendored，仅评测用）。权重：否 |
+| 依赖 | `kaldi-native-fbank`（Apache-2.0） |
+
+只用 `bench/eot/` 的评测链，**不参与线上**。改那段前端前先对照上游。
+
 ## 4. 许可证正文
 
 ### 4.1 BSD 2-Clause License（Daily）
