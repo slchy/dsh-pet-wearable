@@ -48,6 +48,7 @@
 |---|---|---|
 | **一场会话的全部事实**（分段 + 审计 + dsh 内部） | `scripts/observe.ts <档案目录>` | 三节输出；头部先列有哪些源可用 |
 | 一轮卡在哪、用户等了几秒 | `scripts/latency-report.ts <档案目录>` | ①②③ 分段 + 首字 p50/p90 vs 预算 |
+| **该治哪一段**（谁占大头、p90 是谁顶上去的） | `scripts/latency-attribution.ts <档案目录>` | 各段份额、③ 内部拆分、超预算轮次逐条 |
 | 这条链有没有一处不符合设计 | `scripts/fsm-trace-check.ts <档案>` | 违规列表（退出码 0/1） |
 | `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
 | 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
