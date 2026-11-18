@@ -480,6 +480,10 @@ qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**
 本地的 LiveKit mini 是 0.874 / 0.835 s，尚未落地。完整表与口径见
 [EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md)，复现见 [bench/eot/README.md](../bench/eot/README.md)。
 
+**mini 是纯音频模型**（最近 2.0 s + 本轮已说长度），和我们现在的 Smart Turn 同一个槽位；
+榜单里只有 LiveKit v1.1（云）和 ultraVAD 吃「上一句助手回复」，没有任何纯文本条目 ——
+按输入模态的分类见 [EOT-BENCH-RESULTS.md](./EOT-BENCH-RESULTS.md) §5。
+
 ## 13. 踩过的坑（别重现）
 
 1. **手搓分段脚本**（`bench/latency/analyze-real-archive.mjs` 第一版）：

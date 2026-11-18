@@ -1,8 +1,9 @@
 # 判停模型的中文基准（eot-bench）
 
 > 2026-11-18 跑。上游 [livekit/eot-bench](https://github.com/livekit/eot-bench)（Apache-2.0），
-> 数据集 `livekit/eot-bench-data` 的中文子集（config `zh`）：**344 轮、952 个静音 span**
-> （608 个句中停顿 `hold` + 344 个真实句尾 `eot`）。
+> 数据集 `livekit/eot-bench-data` 的中文子集（config `zh`，`min_silence=100ms`）：
+> **1099 个静音 span**（755 个句中停顿 `hold` + 344 个真实句尾 `eot`），按 100 ms 网格展开成 9441 个打分点。
+> span 数取自 `span_set.parquet`；早先写的 952/608 是数错了，以这里为准。
 > 适配器与跑法见 [bench/eot/README.md](../bench/eot/README.md)。
 
 ## 1. 结果（5% 误切预算，按等待时长排序）
@@ -42,8 +43,18 @@
 |---|---:|---:|
 | 200 ms | 80.5% | 0.0% |
 | **300 ms** | **56.8%** | **1.2%** |
+| 400 ms | 41.2% | 1.7% |
 | 500 ms | 28.7% | 4.7% |
 | 600 ms | 18.4% | 8.1% |
+| 700 ms | 13.1% | 10.8% |
+| 800 ms | 9.8% | 15.1% |
+
+「放过」= 该段静音 ≥ `T_open`（我们会在这儿开轮）；「推迟」= 该段静音 < `T_open`（要补等差额）。
+复算口径：`span_set.parquet` 的 `duration`，hold 755 个 / eot 344 个。
+
+背景分布（同源，`duration` 分位）：hold **p50 300 / p75 500 / p90 700 / p95 1000 ms**，
+eot **p50 1383 / p90 2529 ms** —— 句中停顿和真实句尾在时长上**重叠得很厉害**，
+所以 300 ms 才只能放过一半多一点，再往上调就开始误伤句尾。
 
 300 ms 是甜点（= 线上默认 `VOICE_OPEN_QUIET_MS`）。这张表同时说明
 **单靠静音窗永远分不开**（300 ms 时仍有 57% 的句中停顿会通过），
@@ -56,3 +67,27 @@
 - 基准是「人-智能体任务型对话」，和眼镜场景（短指令、近距离、噪声更强）不完全同分布。
 - 本项目的预处理还包含判停侧的「尾部静音只留 20 ms」等约定，与基准的因果切片一致，
   但没有单独做消融。
+
+## 5. 谁吃音频、谁吃文本（别把「语义侧」对错槽位）
+
+榜单这 9 个条目按输入模态分三类。要替换我们现在的判停器，只能换**同一类**的：
+
+| 输入 | 条目 |
+|---|---|
+| **纯音频** | SmartTurn v3.2（官方 GPU 导出）、**LiveKit Turn Detector v1.1-mini**、VAP、**本项目 TurnJudge**、Gradium / Soniox（厂商 STT 自带的端点判断，音频进去、什么时候判停由厂商内部决定） |
+| **音频 + 上一句助手回复** | LiveKit Turn Detector v1.1（云，`turn-detector-v1.1` 网关）、ultraVAD |
+| **纯文本** | **本榜没有** |
+
+两个容易搞错的地方：
+
+1. **mini 不在「语义侧」**：`livekit_turn_detector_mini_adapter.py` 里它的输入只有
+   「最近 **2.0 s** 音频 + `turn_samples`（本轮已经说了多长）」，**没有文本通道**。
+   它和我们现在的 Smart Turn v3.2 是同一个槽位（声学/韵律）。
+2. **我们的「语义判停」其实是声学的**：`src/turn-judge.ts` 喂的是 Whisper log-mel，
+   侧车协议只传 PCM。「语义」是历史叫法，别按字面理解 —— 真要看文本，得另接一路。
+
+文本模型在这套基准里虽然能跑（`livekit_text_adapter.py`，`livekit/turn-detector`
+的 qwen 系 ONNX），但上游已标 **deprecated**，且跑出来的数字**不能直接用**：
+`io.py::build_messages` 是用数据集自带的**词级真值**按 `transcript_lag=0.5 s` 截出来的
+「用户说了什么」，不是 ASR 输出。也就是说文本模型在基准里拿到的是**干净字幕**，
+我们线上拿到的是带错字、无标点的流式 partial。
