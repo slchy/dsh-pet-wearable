@@ -154,6 +154,9 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/latency/probe-turnjudge-padding.py` | **窗口怎么裁才是对的**：正样本（真停嘴）与负样本（句内切一刀）× 三种窗口（连续 8 s 滚动 / 按句裁+前补零 / 按句裁+后补零），逐格给 p。**这是查清「p 为什么是噪声」的那一个** |
 | `bench/latency/probe-turnjudge-silence.py` | **p 随尾部静音怎么变**：`--curve START:END:STEP` 扫一条话音，`--events events.jsonl` 逐轮看真实停嘴处的 p。要在有 onnxruntime 的机器上跑（服务器 `~/miai-cloud/.venv/bin/python`） |
 | `bench/latency/probe-turnjudge-output.py` | 模型输出到底是什么：形状 `[s6, 1]`、要不要 sigmoid、变长维 `s6` 怎么喂 |
+| `bench/latency/probe-realtime-asr-silence.mjs` | DashScope realtime 的 `silence_duration_ms` 收不收各种值（**回执会骗人**，见 `docs/QWEN-REALTIME-ASR-PROBED.md`） |
+| `bench/latency/probe-realtime-asr-events.mjs` | 客户端事件探测：`clear` / 空 `commit` / `session.finish` 收不收；`--idle 90` 测空闲超时 |
+| `bench/latency/probe-realtime-asr-turn.mjs` | 用真机 `uplink.pcm` 原速重放，量「真停嘴→定稿」；`--manual 40` 走手动 commit，`--gain` 补回放大前的增益 |
 
 **结论（2026-11-17 查清，别再按「p 是噪声」处理）**：p 不是噪声，是**窗口喂错了**。
 

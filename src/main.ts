@@ -19,6 +19,7 @@ import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
+import { qwenRealtimeStt } from './qwen-realtime-asr.ts';
 import { cosyVoiceTts } from './cosyvoice.ts';
 import { mimoTts } from './mimo.ts';
 import { EMOTIONS } from './emotion.ts';
@@ -67,7 +68,7 @@ async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
   return factory();
 }
 
-/** `--stt aliyun|noop|canned|<path>` */
+/** `--stt aliyun|qwen-realtime|noop|canned|<path>` */
 async function buildStt(
   spec: string,
   creds: {
@@ -79,6 +80,21 @@ async function buildStt(
   if (spec === 'canned') return cannedStt();
   if (spec === 'aliyun') {
     return aliyunStt(creds, (line) => { console.log(`  [asr] ${line}`); });
+  }
+  if (spec === 'qwen-realtime') {
+    const apiKey = process.env['DASHSCOPE_API_KEY'] ?? '';
+    if (!apiKey) {
+      throw new Error('STT=qwen-realtime 需要 DASHSCOPE_API_KEY（和 CosyVoice 用的是同一个 key）');
+    }
+    // 端点由我们控（`turn_detection: null`），静音窗见 `VOICE_COMMIT_MS`。
+    return qwenRealtimeStt(
+      {
+        apiKey,
+        ...(process.env['QWEN_ASR_URL'] ? { url: process.env['QWEN_ASR_URL'] } : {}),
+        ...(process.env['QWEN_ASR_MODEL'] ? { model: process.env['QWEN_ASR_MODEL'] } : {}),
+      },
+      (line) => { console.log(`  [asr] ${line}`); },
+    );
   }
   return loadProvider<SttProvider>(spec, 'stt');
 }
@@ -650,7 +666,10 @@ async function main(): Promise<void> {
     const sttBanner = resolvedStt === 'aliyun'
       ? `region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms`
         + (vocabularyId ? `  vocab=${vocabularyId}` : '  vocab=(未配置)')
-      : '(外部/内置实现，无需凭据)';
+      : resolvedStt === 'qwen-realtime'
+        ? `model=${process.env['QWEN_ASR_MODEL'] ?? 'qwen3-asr-flash-realtime'}`
+          + `  端点由我们控（commit=${envNumber('VOICE_COMMIT_MS', 120)} ms）`
+        : '(外部/内置实现，无需凭据)';
     console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
     const stt = await buildStt(resolvedStt, {
@@ -792,6 +811,10 @@ async function main(): Promise<void> {
         pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
     // 投机要比判停早：它的用途是给「提前合成音频」腾窗口，不是省自己的时间
     speculateMs: envNumber('VOICE_SPECULATE_MS', 100),
+        // 端点由我们控的 ASR（qwen realtime）要宿主封段：静音到点 `commit`。
+        // 服务端自己判句的 provider（NLS）必须留 0 —— 否则会在句子中间插一刀，
+        // 把一个整句切成两段。第一轮回归按 40 ms 跑（`VOICE_COMMIT_MS=40`）。
+        commitMs: envNumber('VOICE_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 120 : 0),
       },
       playbackTailMs: 600,
       /**

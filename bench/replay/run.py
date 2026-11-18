@@ -254,7 +254,12 @@ def bench_archives(bench_dir: str) -> list[str]:
 
 
 def parse(path: Path) -> list[dict]:
-    """把事件流折成逐轮：①/②/③ + ASR 文本（与 `latency-report.ts` 同一套口径）。"""
+    """把事件流折成逐轮：①/②/③ + ASR 文本（与 `latency-report.ts` 同一套口径）。
+
+    `asr` 取**这一轮里全部** `asr.sentence` 的拼接，不是最后一条：
+    客户端控端点的 ASR（`VOICE_COMMIT_MS`）会把一句话切成好几段，
+    只取最后一段会把整句话读成半句 —— 看着像「句首丢了」，其实组装器拼好了。
+    """
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     starts = [i for i, e in enumerate(events) if e.get("ev") == "turn.start"]
     out: list[dict] = []
@@ -266,6 +271,12 @@ def parse(path: Path) -> list[dict]:
             if events[i].get("ev") == "asr.sentence":
                 asr = i
                 break
+        # 同一轮的每一段（并段前的碎片）按顺序拼起来
+        pieces = [
+            events[i].get("text") or ""
+            for i in range(prev + 1, at)
+            if events[i].get("ev") == "asr.sentence"
+        ]
         for i in range(at, nxt):
             if events[i].get("ev") == "tts.first":
                 tts = i
@@ -280,7 +291,7 @@ def parse(path: Path) -> list[dict]:
             stop = g["t"] - (g.get("gapMs") or 0)
         out.append({
             "turn": n + 1,
-            "asr": events[asr].get("text") if asr is not None else None,
+            "asr": "".join(pieces) if pieces else None,
             "a1": (events[asr]["t"] - stop) if (asr is not None and stop is not None) else None,
             "a2": (events[at]["t"] - events[asr]["t"]) if asr is not None else None,
             "a3": (events[tts]["t"] - events[at]["t"]) if tts is not None else None,

@@ -234,6 +234,14 @@ export interface VoiceSessionOptions {
      * TTS 首块（330–375 ms），见 `UtteranceAssemblerOptions.speculateMs`。设 0 关闭。
      */
     readonly speculateMs?: number;
+    /**
+     * 静音多久就让 ASR **封段**（端点由我们控的 provider 才需要，见 `SttSession.commit`）。
+     *
+     * 服务端 VAD 的静音窗 200 ms 是硬下限（NLS 与 DashScope 一样），关掉它之后
+     * 这个值就是新的窗。切早了会把字切成两半，所以别一次压到底；`0` = 不封段
+     * （服务端自己判句的 provider 必须留 0）。
+     */
+    readonly commitMs?: number;
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
@@ -581,6 +589,14 @@ class VoiceConnection {
       ...(options.gate.speculateMs === undefined || options.gate.speculateMs <= 0
         ? {}
         : { speculateMs: options.gate.speculateMs }),
+      // 端点归我们把控的 ASR（qwen realtime）：静音到点就封段，解码那 ~260 ms
+      // 与判停那一拍并行跑。`commitMs` 为 0 就不接（NLS 自己判句，别插嘴）。
+      ...(options.gate.commitMs === undefined || options.gate.commitMs <= 0
+        ? {}
+        : {
+          commitAfterMs: options.gate.commitMs,
+          onCommit: () => { this.stt.commit?.(); },
+        }),
       onUtterance: (text) => {
         this.app?.userFinal(text);
         console.log('\n--- 本轮 ---');

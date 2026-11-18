@@ -833,3 +833,76 @@ test('中文用更低的阈值，英文用默认', async () => {
   assert.equal(await run('嗯，对。'), 'accept', '中文：0.4 ≥ 0.35，该当场收');
   assert.equal(await run('yeah right'), 'extend', '非中文：0.4 < 0.5，仍要再等一拍');
 });
+
+// ---------------------------------------------------------------- 封段（commit）
+// 端点由我们控的 ASR（DashScope realtime）里，`commit` 就是「这句话到此为止」。
+// 这条线错了的后果是文本被切成两半 —— 所以「一段语音只封一次」是硬要求：
+// 空缓冲的 commit 会被服务端回 `maybe no invalid audio stream`，而且会把
+// 后续的定稿顺序搅乱。
+
+test('静音到点就请求 ASR 封段，一段语音只封一次', () => {
+  let clock = 1000;
+  let commits = 0;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    commitAfterMs: 40,
+    now: () => clock,
+    onCommit: () => { commits += 1; },
+  });
+
+  for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  assert.equal(commits, 0, '还在说话，不能封段');
+
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 1, '静音满 40 ms 就该封');
+
+  for (let i = 0; i < 5; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 1, '同一段静音不重复封（空缓冲的 commit 会被服务端拒）');
+
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 2, '又来声音说明是下一段，该重新武装');
+
+  assembler.dispose();
+});
+
+test('没配 commitAfterMs 或没接 onCommit 就完全不封段', () => {
+  const run = (commitAfterMs: number | undefined, withHandler: boolean): number => {
+    let clock = 1000;
+    let commits = 0;
+    const { assembler } = makeAssembler({
+      silenceDb: -40,
+      ...(commitAfterMs === undefined ? {} : { commitAfterMs }),
+      now: () => clock,
+      ...(withHandler ? { onCommit: () => { commits += 1; } } : {}),
+    });
+    for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+    for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+    assembler.dispose();
+    return commits;
+  };
+  assert.equal(run(undefined, true), 0, '没设值就不该有动作（NLS 自己判句）');
+  assert.equal(run(40, false), 0, '没接处理器时更不该炸');
+  assert.equal(run(40, true), 1, '配齐了就该封');
+});
+
+test('极短的换气不会触发封段：静音没到点就不发', () => {
+  let clock = 1000;
+  let commits = 0;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    commitAfterMs: 120,
+    now: () => clock,
+    onCommit: () => { commits += 1; },
+  });
+
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 60 ms
+  assert.equal(commits, 0, '60 < 120，这只是换气');
+
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); } // 又说了
+  for (let i = 0; i < 7; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.equal(commits, 1, '这次真停了才封');
+
+  assembler.dispose();
+});

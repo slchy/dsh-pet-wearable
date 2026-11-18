@@ -170,6 +170,19 @@ export interface UtteranceAssemblerOptions {
    */
   readonly speculateMs?: number;
   /**
+   * 静音持续多久就把「到目前为止的音频」**封成一段**交给客户端控端点的 ASR
+   * （见 `SttSession.commit`）。不设 = 不触发（服务端自己判句的 provider）。
+   *
+   * 这个值和 {@link silencePauseMs} 是两件事：那个是「让判停器先算」，
+   * 这个是「让 ASR 开始解码」。后者在关键路径上，前者只是把等待重叠掉。
+   *
+   * 切早了会把字切成两半（下一段的文本拼回去，但边界那个字可能丢），
+   * 所以这个值要靠真机标定，不要一次压到底。
+   */
+  readonly commitAfterMs?: number;
+  /** 静音到 {@link commitAfterMs} 时调一次，宿主拿去 `stt.commit()` */
+  readonly onCommit?: () => void;
+  /**
    * 一句定稿（文本已定、还没判定停）时通知一次。   *
    * 判停器随后只决定「要不要并下一段」，**不影响这段文本** —— 所以快车道可以
    * 先在这上面起跑，省掉判停那 140 ms 纯等待；真并了下一段就换一句重问。
@@ -311,6 +324,13 @@ export class UtteranceAssembler {
   private lastVoicedAt = Number.NEGATIVE_INFINITY;
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
   private preFiredAt = Number.NEGATIVE_INFINITY;
+  /**
+   * 这一段语音是否已经请求过 ASR 封段（每段只封一次）。
+   *
+   * 「一段」的边界是 `lastVoicedAt`：又来声音就自然重新武装（比较的是时刻，
+   * 不是布尔），静音期内反复进 `trackSilence` 只封一次。
+   */
+  private commitFiredAt = Number.NEGATIVE_INFINITY;
   /** 上一次投机的时刻 / 这一句已经投机几次（`addSentence` 归零） */
   private specFiredAt = Number.NEGATIVE_INFINITY;
   private specCount = 0;
@@ -440,6 +460,36 @@ export class UtteranceAssembler {
     //   判停 200 ms —— 判停器看的是音频，跟 ASR 的静音窗对齐
     this.maybeSpeculate(t);
     this.maybePrefirePrediction(t);
+    this.maybeCommit(t);
+  }
+
+  /**
+   * 静音满 `commitAfterMs` 就让 ASR 封段（端点由我们控时才有这一步）。
+   *
+   * 为什么不等判停：判停要 200 ms 静音才有把握，而封段只要「这句停下来了」——
+   * 封早了顶多多一段碎片（并段逻辑照拼），封晚了整段延迟都是白等。
+   * 解码那 ~260 ms 与判停那一拍是**并行**的，谁慢谁说话。
+   *
+   * 一段语音只封一次（`commitFiredAt`），长时间静音不会反复 commit ——
+   * 空缓冲的 commit 会被服务端回 `maybe no invalid audio stream`。
+   */
+  private maybeCommit(t: number): void {
+    const after = this.options.commitAfterMs ?? 0;
+    if (after <= 0 || this.options.onCommit === undefined) {
+      return;
+    }
+    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
+      return;
+    }
+    if (this.lastVoicedAt <= this.commitFiredAt) {
+      return;
+    }
+    if (t - this.lastVoicedAt < after) {
+      return;
+    }
+    this.commitFiredAt = t;
+    this.options.log(`  封段    静音 ${after} ms → ASR 开始解码`);
+    this.options.onCommit();
   }
 
   /**

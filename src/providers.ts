@@ -204,6 +204,25 @@ export interface SttSession {
   /** 「这段说完了」：请求厂商出最终结果（不必关闭连接）。 */
   hangup(): void;
   close(): void;
+  /**
+   * 可选能力：**端点由我们说了算**。
+   *
+   * 服务端 VAD 的静音窗有硬下限（NLS `max_sentence_silence` 与 DashScope
+   * `silence_duration_ms` 都是 200 ms，低于它填了也不生效 —— 实测回执会原样
+   * 回 100/150，但判停时刻和 200 完全重合）。关掉服务端 VAD 之后，由宿主在
+   * 静音到点时调 `commit()` 封段，静音窗从此是我们自己的旋钮。
+   *
+   * 只有实现了这个方法的 provider 才需要宿主喂 `commit` 触发。
+   */
+  commit?(): void;
+  /**
+   * 可选能力：**下一次识别结果作废**。
+   *
+   * 打断时用。DashScope realtime 协议没有 `input_audio_buffer.clear`
+   * （实测回 `invalid_value`），缓冲里的音频丢不掉 —— 只能照常封段，
+   * 再把回来的文本扔掉。不实现这个方法就表示「作废不了，别扔」。
+   */
+  discard?(): void;
 }
 
 export interface SttHandlers {
