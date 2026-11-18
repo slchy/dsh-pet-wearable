@@ -326,7 +326,7 @@ dsh-pet-wearable/
 │   ├── app/session.ts         # 话筒抢占仲裁 (Floor Arbiter)
 │   └── pet/                   # 主动开口时机状态机与仿真调度
 ├── docs/                      # 状态机时序、架构设计、硬件协议与运维文档
-├── bench/                     # 真实向量回放、延迟评测、判停基准（eot-bench 适配器）
+├── bench/                     # 真实向量回放、延迟评测、判停基准（eot-bench 适配器、微调准备）
 ├── tools/                     # 设备模拟器 (fake-phone, fake-v2-device)
 └── tests/                     # 覆盖完整的单元测试用例
 ```
