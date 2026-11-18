@@ -359,3 +359,7 @@ npm run pair -- new
 ## 📄 开源协议
 
 本项目采用 [MIT License](./LICENSE) 开源。
+
+仓里还含第三方代码（`turn_judge/whisper_features.py`：Daily 的 BSD 2-Clause +
+Hugging Face 的 Apache 2.0）与第三方模型（判停模型 BSD 2-Clause、silero-vad MIT，
+两者都不入库）。义务、版权声明与许可证正文见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
