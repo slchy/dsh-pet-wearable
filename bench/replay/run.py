@@ -113,6 +113,25 @@ def list_archives() -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def read_meta(name: str) -> dict:
+    """把这份素材的 `meta.json` 读回来（向量库优先，其次档案目录）。
+
+    **这是回放配置的唯一可信来源**：录制那一刻实际生效的 `stt` / `tts` / gate 参数
+    都记在里面。服务器的 `.env` 不是 —— 它有陈旧值（`MIAI_STT=aliyun` 早就不代表
+    线上，生产靠 systemd 的 `--stt qwen-realtime` 覆盖）。
+    """
+    txt = ssh(
+        f'for f in {REMOTE_VECTORS}/{name}/meta.json {REMOTE_SYNTH}/{name}/meta.json '
+        f'{REMOTE_ARCHIVE}/{name}/meta.json; do if [ -f "$f" ]; then cat "$f"; break; fi; done'
+    ).strip()
+    if not txt:
+        raise SystemExit(f"没有 {name} 的 meta.json（先用 --list 看看）")
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError:
+        raise SystemExit(f"{name} 的 meta.json 读不了")
+
+
 def source_kind(name: str) -> str:
     """这份素材是谁的：`real`（真机 mSBC 上行）还是 `synth`（bench 适配器 / TTS 合成）。
 
@@ -123,16 +142,7 @@ def source_kind(name: str) -> str:
     partial 也短得多（实测短句只出 1–2 个字，够不到投机门槛）。混在一起就会出现
     「拿合成回放当基准，还写进文档说这是真机」—— 已经踩过。
     """
-    txt = ssh(
-        f'for f in {REMOTE_VECTORS}/{name}/meta.json {REMOTE_SYNTH}/{name}/meta.json '
-        f'{REMOTE_ARCHIVE}/{name}/meta.json; do if [ -f "$f" ]; then cat "$f"; break; fi; done'
-    ).strip()
-    if not txt:
-        raise SystemExit(f"没有 {name} 的 meta.json（先用 --list 看看）")
-    try:
-        meta = json.loads(txt)
-    except json.JSONDecodeError:
-        raise SystemExit(f"{name} 的 meta.json 读不了")
+    meta = read_meta(name)
     if str(meta.get("uplinkCodec") or "") == "msbc":
         return "real"
     return "synth"
@@ -178,9 +188,14 @@ def token_and_device() -> tuple[str, str]:
 # 不隔离的后果逐条列在 `bench/tau2/run_voice.py::bench_env` 里，两边同一套规矩。
 
 
-def spawn_harness(port: int, bench_dir: str, repo: str) -> None:
-    """在服务器上起一个隔离的 harness，等到端口可连为止。"""
-    print(f"\n起隔离 harness：端口 {port}，目录 {bench_dir}（不碰生产 63993）")
+def spawn_harness(port: int, bench_dir: str, repo: str, base_env: dict[str, str]) -> None:
+    """在服务器上起一个隔离的 harness，等到端口可连为止。
+
+    `base_env` 是**显式**的基准配置（来自向量 meta）—— 它在 `. .env` **之后**导出，
+    所以 `.env` 里那些陈旧值（`MIAI_STT=aliyun`）在这条进程上一律被盖掉。
+    回放的唯一真相源是向量 meta，不是服务器配置。
+    """
+    print(f"\n起隔离 harness：端口 {port}，目录 {bench_dir}（不碰生产 {PORT}）")
     ssh(
         "set -e; "
         f"cd {repo}; "
@@ -191,17 +206,17 @@ def spawn_harness(port: int, bench_dir: str, repo: str) -> None:
         f"export VOICE_AGENT_SESSION={bench_dir}/session.json; "
         f"export PHOTO_DIR={bench_dir}/photos; "
         "export MIAI_ANNOUNCE_FILE=; "
-        # 额外配置（A/B 实验用）：`MIAI_BENCH_ENV="K1=V1;K2=V2"`，只放行 KEY=VALUE 与分号，
-        # 免得把任意 shell 塞进这条 ssh 命令里。
-        f"{extra_env()} "
+        # 基准配置（向量 meta）+ 实验自变量，一次性导出；`.env` 里那些陈旧值被盖掉。
+        # `--stt/--tts` 也在里面，所以下面的命令行**不再重复**（配置只有这一处）。
+        f"{export_str(base_env)} "
         # 收掉上一场：**按端口认进程，别用 `pkill -f '--listen <port>'`** ——
         # 这条 ssh 命令自己的命令行里就含那串字，pkill 会把当前 shell 一起杀掉，
         # 表现是「启动脚本悄悄什么都没做」（实测踩过）。
         f"{kill_on_port(port)}; "
         f": > {bench_dir}/harness.log; "
         # 参数照抄生产的 ExecStart（`--agent dsh --dsh-sdk` 是必须的：流式识别
-        # 收到 SentenceEnd 就要接一轮对话，没 agent 直接退出）；`--stt/--tts`
-        # 走 .env 里的 MIAI_*，不在这里重复一遍配置
+        # 收到 SentenceEnd 就要接一轮对话，没 agent 直接退出）。`--stt/--tts`
+        # 这里**不传**：唯一真相源是上面那些显式 export，命令行再写一遍就是第三处配置。
         f"setsid node src/main.ts --listen {port} --host 127.0.0.1 --agent dsh --dsh-sdk "
         f"--work-dir {bench_dir}/workspace >> {bench_dir}/harness.log 2>&1 & "
         f"for i in $(seq 1 90); do ss -ltn 2>/dev/null | grep -q ':{port} ' && exit 0; sleep 1; done; "
@@ -219,23 +234,114 @@ def kill_on_port(port: int) -> str:
     )
 
 
-def extra_env() -> str:
-    """`MIAI_BENCH_ENV="K1=V1;K2=V2"` → `export K1=V1 K2=V2;`，A/B 实验用。
+def export_str(pairs: dict[str, str]) -> str:
+    """一组 KEY=VALUE → 一条 `export` 语句（多个赋值必须在同一个 export 里）。"""
+    if not pairs:
+        return ""
+    return "export " + " ".join(f"{k}={v}" for k, v in pairs.items()) + "; "
 
-    只放行 `KEY=VALUE` 与分号：这条字符串会拼进 ssh 命令，宽松就等于把 shell 交给环境变量。
 
-    **必须是一个 export 带多个赋值**。写成 `export K1=V1; K2=V2;` 只有第一个进了环境，
-    后面的只是当前 shell 的变量 —— 子进程（node）看不到，实验静默失效
-    （踩过：三变量那次只有第一个生效，查了半天「为什么 trace 没打」）。
-    """
+def bench_env_pairs() -> dict[str, str]:
+    """`MIAI_BENCH_ENV` 解析成 dict。**这是实验的自变量，不是配置来源**（见 `resolve_config`）。"""
     raw = os.environ.get("MIAI_BENCH_ENV", "").strip()
     if not raw:
-        return ""
-    pairs = [p.strip() for p in raw.split(";") if p.strip()]
-    for p in pairs:
+        return {}
+    pairs: dict[str, str] = {}
+    for p in (x.strip() for x in raw.split(";") if x.strip()):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.:\-/]*", p):
             raise SystemExit(f"MIAI_BENCH_ENV 里有一项不像 KEY=VALUE：{p!r}")
-    return "export " + " ".join(pairs) + "; "
+        key, _, value = p.partition("=")
+        pairs[key] = value
+    return pairs
+
+
+def provider_of(recorded: str) -> str:
+    """`aliyun:cn-shanghai` → `aliyun`；`qwen-realtime:qwen3-asr-flash-realtime` → `qwen-realtime`。
+
+    `meta.json` 记的是 provider 的 `name`（带型号/region），`MIAI_STT` 要的是
+    `main.ts` 认的那个牌子。
+    """
+    return recorded.split(":", 1)[0].strip()
+
+
+def resolve_config(meta: dict, overrides: dict[str, str]) -> tuple[dict[str, str], list[tuple[str, str, str]], bool]:
+    """这次回放**最终生效**的配置。
+
+    **唯一真相源是向量 `meta.json`** —— 它记的是录那一刻真生效的 ASR / TTS。
+    服务器 `.env` 不参与（里面 `MIAI_STT=aliyun` 是陈旧值，生产靠 systemd 的
+    `--stt qwen-realtime` 覆盖，两处打架过一次）。`MIAI_BENCH_ENV` 是**实验自变量**：
+    它要改基准必须在这里显式列成「覆盖」，并在 `last.json` 留底。
+
+    每项只出一行（值就是最终生效值）；缺了就标 `(缺)`，由调用方拒跑 ——
+    没有真相源时必须人工声明，不许落到 `.env`。
+
+    返回 `(要 export 的, 打印用的三元组, 是否跨 ASR)`。
+    """
+    need_hint = 'MIAI_BENCH_ENV="MIAI_STT=aliyun;MIAI_TTS=cosyvoice"'
+    effective: dict[str, str] = {}
+    rows: list[tuple[str, str, str]] = []
+    cross_asr = False
+
+    for key, meta_key in (("MIAI_STT", "stt"), ("MIAI_TTS", "tts")):
+        recorded = str(meta.get(meta_key) or "")
+        base = provider_of(recorded) if recorded != "" else ""
+        override = overrides.get(key, "")
+        if override != "" and base != "" and override != base:
+            effective[key] = override
+            rows.append((key, override, f"**覆盖向量 meta（{recorded}）** ← MIAI_BENCH_ENV"))
+            if key == "MIAI_STT":
+                cross_asr = True
+        elif override != "":
+            effective[key] = override
+            rows.append((key, override, f"向量 meta（{recorded}）/ MIAI_BENCH_ENV 一致"
+                         if base != "" else "MIAI_BENCH_ENV（没有向量 meta）"))
+        elif base != "":
+            effective[key] = base
+            rows.append((key, base, f"向量 meta（{recorded}）"))
+        else:
+            rows.append((key, "(缺)", f"meta 里没有，也没显式给 —— 必须指定：{need_hint}"))
+
+    for key, value in overrides.items():
+        if key in ("MIAI_STT", "MIAI_TTS"):
+            continue   # 已在上面处理
+        effective[key] = value
+        rows.append((key, value, "MIAI_BENCH_ENV"))
+
+    return effective, rows, cross_asr
+
+
+def check_config(
+    cfg_rows: list[tuple[str, str, str]], cross_asr: bool, *, spawn: bool, allow_cross_asr: bool
+) -> None:
+    """配置不合格就**在起进程之前**拒跑：没有真相源、或跨 ASR 还没显式承认。"""
+    if not spawn:
+        return
+    missing = [k for k, v, _ in cfg_rows if v == "(缺)"]
+    if missing:
+        raise SystemExit(f"回放没有配置真相源：{', '.join(missing)} 既不在向量 meta 里，也没显式给。")
+    if cross_asr and not allow_cross_asr:
+        raise SystemExit(
+            "回放 ASR 与向量 meta 不一致（跨 ASR）。\n"
+            "  这时 ① 和逐轮对比都无效，只有「同一批回放上两个配置互比」可信。\n"
+            "  确认要这么跑就显式加 --allow-cross-asr。"
+        )
+
+
+def show_config(
+    rows: list[tuple[str, str, str]], cross_asr: bool, live: bool
+) -> None:
+    print("\n=== 回放配置（唯一真相源：向量 meta.json）===")
+    width = max((len(k) for k, _, _ in rows), default=10)
+    for key, value, source in rows:
+        print(f"  {key:<{width}}  {value:<14} {source}")
+    if any(v == "(缺)" for _, v, _ in rows):
+        print("  ✗ 有项没有真相源 —— 拒跑（见上）")
+    elif live:
+        print("  ASR 一致性：不适用 —— 连的是已有实例，配置由它自己决定")
+    elif cross_asr:
+        print("  ⚠ 跨 ASR：这次回放的 ① 与**逐轮对比**无效，只有「同一批回放上两个配置互比」可信")
+    else:
+        print("  ASR 一致性：✓ 与录向量时相同 —— 逐轮对比有效")
 
 
 def stop_harness(port: int) -> None:
@@ -348,6 +454,9 @@ def main() -> int:
     ap.add_argument("--pcm", default="",
                     help="改用**服务器上**的 PCM16 16k 文件（逗号分隔，每个算一轮）代替向量回放。"
                          "用来验造出来的音频，比如「一句话被切成两段」——配方见 README")
+    ap.add_argument("--allow-cross-asr", action="store_true",
+                    help="允许回放用的 ASR 与向量 meta 不同（跨 ASR 时 ① 与逐轮对比无效，"
+                         "只有两个配置在同一批回放上互比可信）。默认拒跑，逼你显式承认")
     args = ap.parse_args()
 
     if not SSH_KEY.exists():
@@ -382,6 +491,7 @@ def main() -> int:
         source = "(pcm)"
         before: list[dict] = []
         vector_path = ""
+        meta: dict = {}
         print("--pcm 模式：造出来的音频，**不是真机素材**，结果不能混进真机基准")
     else:
         # 不给 --archive 时只从**真机**库里挑；空就说清楚，绝不自作主张退到合成库
@@ -401,20 +511,29 @@ def main() -> int:
         label = "真机 mSBC" if kind == "real" else "合成/回放（PCM16，**不能当基准**）"
         print(f"源档案 {source}   来源={label}")
 
+        # 配置先算、先拦：跨 ASR / 没真相源都不该走到 pin 和下载
+        meta = read_meta(source)
+        base_env, cfg_rows, cross_asr = resolve_config(meta, bench_env_pairs())
+        show_config(cfg_rows, cross_asr, live=not args.spawn)
+        check_config(cfg_rows, cross_asr, spawn=args.spawn, allow_cross_asr=args.allow_cross_asr)
         if args.pin:
             pin_vector(source, kind)
             return 0
-        vector_path = pin_vector(source, kind)
 
+        vector_path = pin_vector(source, kind)
         OUT.mkdir(parents=True, exist_ok=True)
         src_events = OUT / f"source-{source}.jsonl"
         scp_down(f"{REMOTE}:{vector_path}/events.jsonl", src_events)
         before = parse(src_events)
         show("【源】真机当时", before)
+    if pcm_paths:
+        base_env, cfg_rows, cross_asr = resolve_config(meta, bench_env_pairs())
+        show_config(cfg_rows, cross_asr, live=not args.spawn)
+        check_config(cfg_rows, cross_asr, spawn=args.spawn, allow_cross_asr=args.allow_cross_asr)
 
     # 回放默认**自己起一个隔离 harness**：不打生产端口，档案也不会挤掉真实设备的
     if args.spawn:
-        spawn_harness(args.bench_port, args.bench_dir, args.repo)
+        spawn_harness(args.bench_port, args.bench_dir, args.repo, base_env)
         host, port = "127.0.0.1", str(args.bench_port)
         # 生产的 .env 里配了 TLS 证书，隔离实例沿用同一套（客户端本来就是 127.0.0.1 连）
         tls = "" if args.no_tls else "--tls"
@@ -508,8 +627,25 @@ def main() -> int:
                   f"   |  回放 n={len(new)} p50 {pct(new, 0.5)} p90 {pct(new, 0.9)}")
 
     (OUT / "last.json").write_text(
-        json.dumps({"source": source, "replay": last, "before": before, "runs": runs},
-                   ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(
+            {
+                "source": source,
+                "replay": last,
+                # 这一场到底在什么配置下跑的 —— 唯一真相源（向量 meta）与本次差异都留底，
+                # 事后看数不会再靠回忆「那天 shell 里设了什么」
+                "config": {
+                    "rows": [{"key": k, "value": v, "source": s} for k, v, s in cfg_rows],
+                    "cross_asr": cross_asr,
+                    "bench_env": os.environ.get("MIAI_BENCH_ENV", ""),
+                },
+                "before": before,
+                "runs": runs,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"明细 → {OUT / 'last.json'}")
     return 0
 

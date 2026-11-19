@@ -199,22 +199,25 @@ ASR 在定稿时改写文本，救它就得拿答错换速度。**
   `建立`；它比 66 ms 少 13 ms，因为预开的 task 闲置后服务端首个合成块略晚一点
   （`setup` 报 67 对 53），而那段已经不在关键路径上了。
 - **回放能不能逐轮比，只有一个判据：回放用的 ASR 和录向量时的那条是否同一个。**
+  工具现在会自己拦：基准来自向量 `meta.json`（唯一真相源），跨 ASR 必须显式
+  `--allow-cross-asr` 才跑，并且会在配置表里标红、留底到 `out/last.json`（见
+  `bench/replay/README.md`）。
   - 那两份真机向量都是 **aliyun 录的**，而且这是 git 能钉死的事实：档案
     `20261117-221010` 的时间是 `2026-11-17T22:10:10Z`，而 qwen provider 首次落地
     `6493420` 是 `2026-11-18 01:25:49 -0800`（= 11-18 09:25Z）—— **比档案晚了 11 小时**，
     那一刻 qwen 的代码还不存在。`meta.stt` 取的是实际生效的 provider name
     （`voice-session.ts`：`stt: options.stt.name`），qwen 的 name 格式是
     `qwen-realtime:<model>`（`qwen-realtime-asr.ts`），两者不会串。
-  - 所以：**回放不覆盖 `MIAI_STT`**（读 `.env`，aliyun）→ 和向量同 ASR，逐轮可比。
+  - 所以：**回放不覆盖 `MIAI_STT`**（读向量 meta 的 aliyun）→ 和向量同 ASR，逐轮可比。
     之前 hedge / `SPEC_MIN_CHARS` / `VOICE_SPECULATE_MS` 那批 14 场回归就是这样跑的
     （`MIAI_BENCH_ENV` 里只有三个 `FAST_LANE_*`/`COSYVOICE_TRACE`，没有 `MIAI_STT`），
     **没被污染**。
   - **一旦给回放塞 `MIAI_STT=qwen-realtime`（为了"像线上"）就跨 ASR 了** —— 切句器不同，
     ① 从 372 掉到 275 全是换 ASR 带来的，逐轮对比失去意义（组间对比仍然成立）。
-    我最近那两次 prewarm A/B 就是这么错的。
-  - `meta.json` 里线上那条链路的参数（`MIAI_STT=aliyun` 写在 `.env`、systemd 用
-    `--stt qwen-realtime` 覆盖）是**陈旧配置**，别拿它当证据 —— 认那个字段没用，
-    要看 provider name。
+    我最近那两次 prewarm A/B 就是这么错的；现在这种跑法会被工具拒掉，除非显式加
+    `--allow-cross-asr`。
+  - 服务器 `.env` 里那个 `MIAI_STT=aliyun` 是**陈旧值**（生产靠 systemd
+    `--stt qwen-realtime` 覆盖），回放已不再依赖它 —— 认 `meta.json` 的 provider name。
 - 那 52 ms 在回放里为什么测不出来：它比轮级噪声小一个量级（模型首字 p50 278、判停 p90 272、
   外加 dsh 偶发长挂），而回放一轮只出一个 ③ 样本，有效轮次只有 3–12。
   要分辨它得几十轮 × 多趟 —— 而 bench harness 第二趟起会卡死（第 1 轮 `turn.start` 之后

@@ -20,6 +20,48 @@ python bench/replay/run.py                              # 用向量库里最新�
 
 要连接已有的实例（旧行为）：`--no-spawn --port 63993`。
 
+## 配置是显式的：唯一真相源 = 向量 `meta.json`
+
+回放**不读服务器的 `.env` 决定 ASR/TTS**。基准一律来自向量自己的 `meta.json` ——
+那是录这一段音频时**真生效**的配置（`"stt": "aliyun:cn-shanghai"`、
+`"tts": "cosyvoice:longanhuan"`），由 `voice-session.ts` 的 `stt: options.stt.name`
+写进去，不是读某个 env 抄的。
+
+```
+=== 回放配置（唯一真相源：向量 meta.json）===
+  MIAI_STT  aliyun        向量 meta（aliyun:cn-shanghai）
+  MIAI_TTS  cosyvoice     向量 meta（cosyvoice:longanhuan）
+  ASR 一致性：✓ 与录向量时相同 —— 逐轮对比有效
+```
+
+做法：起 harness 时先 `. .env`（要它的 token / TLS / 其他项），然后**显式 export**
+上面这些键，`--stt/--tts` 不再出现在命令行上（配置只有一处）。
+
+### `MIAI_BENCH_ENV` 是实验自变量，不是配置来源
+
+```powershell
+MIAI_BENCH_ENV="FAST_LANE_SPEC_MIN_CHARS=2;FAST_LANE_HEDGE=3" python bench/replay/run.py ...
+```
+
+它只能**叠加差异**，而且会被逐条打进配置表、写进 `out/last.json` 的 `config`：
+
+```
+  MIAI_STT  qwen-realtime  **覆盖向量 meta（aliyun:cn-shanghai）** ← MIAI_BENCH_ENV
+  ⚠ 跨 ASR：这次回放的 ① 与**逐轮对比**无效，只有「同一批回放上两个配置互比」可信
+```
+
+### 跨 ASR 默认拒跑
+
+向量是 aliyun 录的就不许拿 qwen 去回放还画逐轮对比表 —— 两条 ASR 切句不同，
+`① 372 → 275` 那 97 ms 全是换 ASR 换来的（踩过）。真要跑得显式：
+
+```
+--allow-cross-asr
+```
+
+没有向量 meta 时（`--pcm`）也一样：必须用 `MIAI_BENCH_ENV` 显式给出
+`MIAI_STT` / `MIAI_TTS`，否则拒跑 —— 不许落到 `.env` 那个陈旧值上。
+
 ## 跑完自动审时序与状态
 
 `run.py` 结束时会调用 `scripts/fsm-trace-check.ts` 审这一场的档案，输出逐轮分段与违规：

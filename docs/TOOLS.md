@@ -148,6 +148,13 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 **为什么优先 `replay` 而不是 `e2e`**：`replay` 输入是同一份音频，跨次可比；
 `e2e` 每轮内容不同，只能看"通不通"。
 
+**回放的配置是显式的，唯一真相源是向量 `meta.json`**（录那段音频时真生效的 ASR/TTS）。
+起 harness 时会先 `. .env`，再用显式 export 盖掉 `MIAI_STT`/`MIAI_TTS` ——
+`.env` 里那个 `MIAI_STT=aliyun` 是陈旧值，回放不再依赖它。`MIAI_BENCH_ENV` 只用于
+叠加实验自变量，会逐条打进配置表并写进 `out/last.json` 的 `config`；
+**跨 ASR 默认拒跑**，必须显式 `--allow-cross-asr`（跨 ASR 时 ① 与逐轮对比都无效）。
+详见 `bench/replay/README.md`。
+
 ## 5. 判停（TurnJudge 侧车）
 
 | 脚本 | 作用 |
