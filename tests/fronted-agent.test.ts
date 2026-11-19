@@ -96,6 +96,23 @@ function agentWith(
   });
 }
 
+test('判据：真机上被误判成任务的那些闲聊，现在走快车道', () => {
+  // 真机 92 轮里 25 轮被判成 task，这几句全在里面（`看 / 怎么 / 为什么 / 哪` 曾经一票否决）
+  for (const text of [
+    '你看过星球大战没？', '你今天怎么样啊？', '为什么？', '为什么他们呢？',
+    '你觉得星球大战怎么样？', '嗯。', '怕。', '说得好。',
+  ]) {
+    assert.equal(isFastCandidate(text), true, `该走快车道：${text}`);
+  }
+  // 实时事实、命令式、工具名仍然必须挡 —— 模型在这些问题上会编
+  for (const text of [
+    '今天天气怎么样', '外面下雨吗', '几点了', '看看我拍照的这张',
+    '帮我查一下订单', '你去搜。', '把电话挂断。', '我的手机号是多少？', '等于多少？',
+  ]) {
+    assert.equal(isFastCandidate(text), false, `必须交给 dsh：${text}`);
+  }
+});
+
 test('判据：闲聊候选 vs 任务请求', () => {
   for (const text of ['你好呀', '谢谢你', '我可想你了', '你是谁', '你叫什么名字']) {
     assert.equal(isFastCandidate(text), true, `该走快车道：${text}`);
