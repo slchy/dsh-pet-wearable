@@ -71,7 +71,7 @@
 | `abortAwaitShot()` | `awaiting_shot` | `listening` | 代次不变 |
 | **`receiptStarted()`** | `thinking` | `speaking` | 置 `_receiptOnly`；不在 `thinking` 时返回 `false`（这一轮已被作废/已收尾，不该出声） |
 | **`receiptEnded()`** | `speaking`（且 `_receiptOnly`） | `thinking` | 幂等；不动代次。回执被真音频顶掉后调用它是空操作 |
-| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略；**清 `_receiptOnly`**（真音频接管） |
+| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略；**清 `_receiptOnly`**（真音频接管）。**触发点是首块音频要下发的那一刻**（`turn-runner` 的 `emit()` 里，紧挨着 `sendAudio`），不是回复文本到达时 |
 | `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 迟到票据按 `{no, gen}` 丢弃；`_receiptOnly` 为真时**直接返回**（回执那段 `speaking` 不是本轮音频） |
 | `requestEnd()` | `listening`、`awaiting_shot` | `ending` | 在 `speaking`/`thinking` 只置标志，让告别语播完 |
 | `bargeIn(why)` | **仅** `speaking`（含回执那段） | `listening` | `gen += 1`（作废排队轮次）→ 清 `_receiptOnly` → 通知 `onInvalidate('bargeIn')` |
@@ -469,14 +469,26 @@ sequenceDiagram
     else 交给 dsh
         FA-->>TR: 放掉缓冲 + dsh 的答复
     end
+    TR->>T: 首批文本 → continue-task（流式），或逐句合成
+    T-->>TR: 首块音频（此刻才发）
     TR->>FSM: audioStarted(ticket) → speaking
-    TR->>T: 逐句/整段合成
-    T-->>U: 首块音频
+    Note over TR,FSM: 顺序是**先拿到首块音频，再进 `speaking`**
+    TR->>U: 下发这一块
+    TR->>T: 后续文本继续喂（边生成边合成）
     TR->>TR: 播放进度（设备 played 回执 或 时长估算）
     TR->>FSM: audioDone(ticket) → listening
     TR->>AS: onDialogState('listening')
     AS->>AS: release(reply)
 ```
+
+> **`audioStarted` 的位置别画错**（2026-11-19 核对）：它在 `turn-runner.ts` 的 `emit()`
+> 里，紧挨着 `downlink.sendAudio()` —— 也就是**首块音频真要下发的那一刻**，不是回复
+> 文本到达时。`fsm-trace.ts` 的审计规则「`tts.first` 必须落在本轮、且在 `speaking`
+> 之后」就是靠这个顺序成立的。
+>
+> 一张画早了的图会让人以为「进入 `speaking` 到出声之间有 380 ms 空窗、吸收窗口因此
+> 缩水」——**不成立**。那张图如果真搬到代码里，`speaking` 就会在用户听不见东西的时候
+> 成立，插话窗口反而错位。
 
 ### 分支 A：用户插话
 
