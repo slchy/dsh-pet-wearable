@@ -190,6 +190,29 @@ test('FAST_LANE_PREFETCH=0 就完全不预跑（A/B 对照用）', () => {
   assert.equal(asked, 0, '关了就不该发请求');
 });
 
+test('prefetch 的返回值就是「这一趟已经在跑了」——宿主靠它决定要不要预开 TTS task', () => {
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['在呢。']);
+  });
+
+  assert.equal(agent.prefetch('你好呀'), true, '起跑一次 → true');
+  assert.equal(agent.prefetch('你好呀'), true, '同一句再报一次也是 true（那一趟确实在跑）');
+  assert.equal(agent.prefetch('帮我查一下订单'), false, '任务类句子不预跑 → false（TTS 也不该预开）');
+  assert.equal(asked, 1, '只有第一次真的发了请求');
+
+  const withSwitch = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    fetchImpl: async () => sse(['在呢。']),
+    speculate: false,
+    prefetch: false,
+    log: () => {},
+  });
+  assert.equal(withSwitch.prefetch('你好呀'), false, '开关关掉 → false');
+});
+
 test('并段的真实顺序：短句先起跑，长句到来时顶掉它，只答一次', async () => {
   const asked: string[] = [];
   const agent = makeAgent(async (_url, init) => {
