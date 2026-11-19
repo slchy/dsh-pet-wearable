@@ -594,6 +594,8 @@ async function main(): Promise<void> {
         // 投机的最小字数：默认 6。2026-11-18 试过降到 2，请求涨 2.5 倍、端到端 p50 没动
         // （14 场回放，见 OPS-RECORD §12.8），已退回。这里留旋钮不再改代码。
         specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
+        // 窗口越小首字越快（快车道只答短句）
+        windowChars: envNumber('FAST_LANE_WINDOW_CHARS', 800),
         // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
         // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
         hedge: envNumber('FAST_LANE_HEDGE', 2),
@@ -612,6 +614,7 @@ async function main(): Promise<void> {
         // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
         + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
         + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
+        + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
         + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
         + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`,
       );

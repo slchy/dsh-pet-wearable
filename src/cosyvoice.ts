@@ -746,8 +746,12 @@ const STREAM_BATCH_CHARS = 10;
 const FIRST_BATCH_CHARS = 2;
 
 /** 这一批够不够送：第一批只看有没有正文，之后按 {@link STREAM_BATCH_CHARS} 攒。 */
-export function streamBatchReady(batch: string, first: boolean): boolean {
-  return batch.length >= (first ? FIRST_BATCH_CHARS : STREAM_BATCH_CHARS);
+export function streamBatchReady(
+  batch: string,
+  first: boolean,
+  firstChars = FIRST_BATCH_CHARS,
+): boolean {
+  return batch.length >= (first ? firstChars : STREAM_BATCH_CHARS);
 }
 
 /**
@@ -828,6 +832,14 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
   /** `COSYVOICE_PREWARM=0` 关掉预开（A/B 与出事时的退路，默认开） */
   const PREWARM_ENABLED = process.env['COSYVOICE_PREWARM'] !== '0';
   const idleCloseMs = options.idleCloseMs ?? 5 * 60_000;
+  /**
+   * 首批最少几个字才送（默认 2）。
+   *
+   * 测过：孤立单字的首包比 2 字慢 23 ms（服务端要攒一下）；但流式里 1 字先送、
+   * 后续字紧跟时，服务端拿到的是连续文本，首块不一定慢 —— 而省下的是「等第 2 个
+   * token」那 20–35 ms。用 `COSYVOICE_FIRST_BATCH_CHARS=1` 打开实测。
+   */
+  const firstBatchChars = Math.max(1, Number(process.env['COSYVOICE_FIRST_BATCH_CHARS'] ?? FIRST_BATCH_CHARS));
 
   let conn: Connection | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1066,7 +1078,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         };
         for await (const text of chunksIn) {
           batch += text;
-          if (!streamBatchReady(batch, first)) continue;
+          if (!streamBatchReady(batch, first, firstBatchChars)) continue;
           if (first && hasUnclosedTag(batch)) continue;
           const cut = splitStreamBatch(batch);
           batch = cut.keep;

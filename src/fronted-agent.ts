@@ -278,6 +278,13 @@ export interface FastLaneOptions {
   readonly now?: () => number;
   readonly log?: (line: string) => void;
   /**
+   * 快车道对话窗口的**字符**预算（默认 {@link WINDOW_CHARS}，800）。
+   *
+   * 窗口越大首字越慢：每多一轮，system+history 就多几十上百 token。快车道只答短句、
+   * 只记 `RECENT_TURNS` 轮，所以这个值可以调小换首字 —— 环境变量 `FAST_LANE_WINDOW_CHARS`。
+   */
+  readonly windowChars?: number;
+  /**
    * 中间结果至少几个字才起跑投机，默认 {@link SPEC_MIN_CHARS}（6）。
    *
    * 只控制「发不发请求」，不控制认不认（认领永远要过三条闸）。调大 = 省钱少猜，
@@ -479,6 +486,7 @@ export class FrontedAgent implements AgentProvider {
   private readonly totalMs: number;
   private readonly maxChars: number;
   private readonly keepTurns: number;
+  private readonly windowChars: number;
   /** 中间结果投机的最小字数（见 {@link FrontedOptions.specMinChars}） */
   private readonly specMinChars: number;
   private readonly speculate: boolean;
@@ -587,6 +595,7 @@ export class FrontedAgent implements AgentProvider {
     this.totalMs = options.totalMs ?? 2_800;
     this.maxChars = options.maxChars ?? 14;
     this.keepTurns = options.keepTurns ?? 4;
+    this.windowChars = Math.max(200, options.windowChars ?? WINDOW_CHARS);
     this.specMinChars = Math.max(1, options.specMinChars ?? SPEC_MIN_CHARS);
     this.speculate = options.speculate ?? true;
     this.prefetchEnabled = options.prefetch ?? true;
@@ -1029,7 +1038,7 @@ export class FrontedAgent implements AgentProvider {
     const size = (): { chars: number } => ({
       chars: this.history.reduce((n, t) => n + t.text.length, 0),
     });
-    while (this.history.length >= 2 && (this.history.length > WINDOW_MESSAGES || size().chars > WINDOW_CHARS)) {
+    while (this.history.length >= 2 && (this.history.length > WINDOW_MESSAGES || size().chars > this.windowChars)) {
       this.history.splice(0, 2);
     }
   }
