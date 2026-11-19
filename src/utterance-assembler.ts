@@ -631,13 +631,8 @@ export class UtteranceAssembler {
   /**
    * 中间结果一到就交出去（`maybeSpeculate` 的「不等静音」版）。
    *
-   * **不限制「一段语音只投机一次」**：`specMinChars` 降到 3 之后，第一个够字数的
-   * 中间结果往往只有定稿的四分之一长，`SPEC_MIN_COVERAGE=0.6` 一定拒 ——
-   * 而我原来在这里挡掉后续 partial，等于每句白花一次请求、一次都命中不了
-   * （真机 `20261119-080409`：投机命中 3/11）。
-   *
-   * 频次由 `FrontedAgent.speculatePartial` 管：同文本不重发、变长才重起、
-   * 每句最多 `speculateStarts` 次。这里只管「有素材就交出去」。
+   * 保留「一段语音只投机一次」：ASR 之后还会补几版 partial，让它们重投机等于把
+   * 已经跑了 160 ms 的那一趟作废重来（实测认领时「已经跑了 6 ms」，还不如不提前）。
    */
   private speculateOnPartial(t: number): void {
     if (this.options.onPartial === undefined) {
@@ -646,14 +641,10 @@ export class UtteranceAssembler {
     if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
       return;
     }
-    if (this.specCount >= 2) {
+    if (this.lastVoicedAt <= this.specFiredAt) {
       return;
     }
-    // 用户**还在说话**才允许用更长的版本重来；一静音就收手。
-    // 静音后定稿马上到，把在跑的那趟作废重来等于白跑 —— `dda6418` 踩过
-    // 「第二次投机把第一次作废 → 定稿时只跑了 6 ms」。
-    const speaking = t - this.lastVoicedAt < (this.options.speculateMs ?? 100);
-    if (!speaking) {
+    if (this.specCount >= 2) {
       return;
     }
     const latest = this.lastPartialText;
