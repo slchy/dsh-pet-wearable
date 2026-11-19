@@ -312,7 +312,13 @@ def analyze(path: Path):
                 n=n + 1,
                 chars=len(final_n),
                 final=final,
-                silence=sent["t"] - stop if stop is not None else None,
+                # ① 为负 = `gate.close` 配到了**上一段语音**的能量门（真机 `20261119-153754`
+                # 轮 41 是 −1054）。这类样本不是「提前定稿」，是配对错 —— 记 null，
+                # 别让它悄悄把一组的中位压下去。
+                silence=(
+                    None if stop is None or sent["t"] - stop < 0
+                    else sent["t"] - stop
+                ),
                 cov_strict_100=cov_strict_100,
                 cov_lcp_100=cov_lcp_100,
                 silent_100=silent_100,
