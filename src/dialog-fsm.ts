@@ -224,8 +224,11 @@ export class DialogFsm {
       return null;
     }
     if (this._state !== 'listening' && this._state !== 'awaiting_shot') {
-      // 串行队列保证不会到这里；真到了就是调度 bug，必须看见
-      this.log(`  状态    ⚠ 在 ${this._state} 时开新一轮，按 thinking 处理`);
+      // **`thinking` 是合法前驱，不是调度 bug。** 用户在模型还在跑的时候又说了一句
+      // （真机上一半的句中停顿都走这条路），`_turn += 1` 让旧票过期，旧轮的结果会被
+      // `isStale` 丢弃 —— 这正是「出声前吸收窗口」的实现方式。
+      // 把它记成异常会让人以为要修，而修掉它就等于取消吸收窗口。
+      this.log(`  状态    ${this._state} 期间又说了一句 → 第 ${this._turn + 1} 轮取代它（旧票作废）`);
     }
     this._turn += 1;
     this._endAfterSpeech = false;

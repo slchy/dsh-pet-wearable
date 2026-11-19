@@ -66,7 +66,8 @@
 
 | 事件 | 从 | 到 | 条件 / 副作用 |
 |---|---|---|---|
-| `beginTurn()` | `listening`、`awaiting_shot` | `thinking` | `no += 1`，发新票据；在 `ending`/`closed` 时返回 `null`，调用方放弃这一轮 |
+| `beginTurn()` | `listening`、`awaiting_shot`、**`thinking`** | `thinking` | `no += 1`，发新票据；在 `ending`/`closed` 时返回 `null`，调用方放弃这一轮 |
+| | | | **`thinking` 是合法前驱**：用户在模型还在跑的时候又说了一句 → 新票据让旧票过期，旧轮的结果被 `isStale` 丢弃。**这就是「出声前吸收窗口」的实现方式**，真机上一半的句中停顿都走这条路。以前这里记成「⚠ 调度 bug」（注释写着「串行队列保证不会到这里」），是**错的** —— 按注释去「修」它，等于取消吸收窗口 |
 | `beginAwaitShot()` | `listening` | `awaiting_shot` | 不在 `listening` 时返回 `null` |
 | `abortAwaitShot()` | `awaiting_shot` | `listening` | 代次不变 |
 | **`receiptStarted()`** | `thinking` | `speaking` | 置 `_receiptOnly`；不在 `thinking` 时返回 `false`（这一轮已被作废/已收尾，不该出声） |
@@ -82,6 +83,26 @@
 ——`TurnRunner` 订阅它并调 `agent.cancelTurn(ticket)`，所以「插话」「快车道胜出后掐掉慢车道」
 「连接结束」走的是同一条取消管道。
 
+### 出声前的吸收窗口 = `thinking → thinking`
+
+用户说完一句、模型还在跑（`thinking`），这期间他**又开口**，实际发生的是：
+
+1. ASR 定稿 → `SessionCore.dispatch` 的 `utterance` 分支 —— 它**不检查当前相位**
+2. `fsm.beginTurn()` → `no += 1` → 新票据，`thinking → thinking`
+3. 旧票过期 → 旧轮上游的取消走 `onInvalidate` 那条管道（`agent.cancelTurn(ticket)`）
+4. 旧轮的结果回来时 `isStale(ticket)` 为真 → **一个字都不下发**；
+   快车道也不会走 `commit` → **不写进对话历史**
+
+效果等价于「合并后重答」，但**实现是新轮取代旧轮**，不是把两段文本拼起来。
+
+**为什么这条值得单列**：它就是「延迟越低、越容易被句中停顿切开」的那个吸收窗口本身，
+却长期只在一句话里被提到，既没进事件表也没进审计。`beginTurn()` 里那句
+「串行队列保证不会到这里」的注释曾经把这条正常路径记成调度 bug —— 按它去「修」，
+等于取消吸收窗口。
+
+**还没做的审计**（`fsm-trace`）：被取代的轮次（票 `no` 小于当前轮、且没有 `turn.end`）
+不得出现 `tts.first` 或下行音频。真机上「半句当整句答」如果还在发生，先查这里。
+
 ```mermaid
 stateDiagram-v2
     [*] --> listening
@@ -89,6 +110,7 @@ stateDiagram-v2
     awaiting_shot --> listening : abortAwaitShot()
     listening --> thinking : beginTurn()
     awaiting_shot --> thinking : beginTurn()
+    thinking --> thinking : beginTurn()（用户又说了一句 → 新票取代旧轮）
     thinking --> speaking : audioStarted(t)
     speaking --> listening : audioDone(t) / bargeIn()
     thinking --> listening : audioDone(t)
