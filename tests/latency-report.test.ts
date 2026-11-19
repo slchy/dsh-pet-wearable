@@ -41,8 +41,70 @@ test('完整一轮：四段与首字总延迟都对得上', () => {
   assert.equal(turn.text, '米馍在吗');
 });
 
-test('缺 tts.first 的旧档案：首字延迟记 null，不拿 0 冒充', () => {
+test('TTS 两段与事件循环停顿：有仪表就取出来，没有就记 null', () => {
+  // `建立` 和 `首包` 慢起来长得一样但治法不同（见 docs/OPS-RECORD.md §12.8.1），
+  // 所以这两个数必须能落到逐轮上；老档案没有 `tts.task` 时必须记 null。
+  const withMarks = jsonl([
+    { t: 0, ev: 'gate.open' },
+    { t: 500, ev: 'gate.close', gapMs: 200 },
+    { t: 900, ev: 'asr.sentence', text: '你好' },
+    { t: 930, ev: 'turn.start' },
+    // 回执那条在前、回答那条在后：取最后一条
+    { t: 1000, ev: 'tts.task', setup_ms: 60, first_ms: 120, stream: false },
+    { t: 2000, ev: 'tts.first', ms: 400 },
+    { t: 2500, ev: 'tts.task', setup_ms: 310, first_ms: 330, stream: true },
+    { t: 3000, ev: 'turn.end', dsh_ms: 300, loop_max_ms: 252 },
+  ]);
+  const [turn] = computeTurns(parseEvents(withMarks));
+  assert.ok(turn);
+  assert.equal(turn.ttsSetupMs, 310, '一轮有多条 tts.task 时取最后一条（回答在最后）');
+  assert.equal(turn.ttsSynthMs, 330);
+  assert.equal(turn.loopMaxMs, 252);
+
   const legacy = jsonl([
+    { t: 0, ev: 'gate.open' },
+    { t: 500, ev: 'gate.close', gapMs: 200 },
+    { t: 900, ev: 'asr.sentence', text: '你好' },
+    { t: 930, ev: 'turn.start' },
+    { t: 2000, ev: 'tts.first', ms: 400 },
+    { t: 3000, ev: 'turn.end', dsh_ms: 300 },
+  ]);
+  const [old] = computeTurns(parseEvents(legacy));
+  assert.ok(old);
+  assert.equal(old.ttsSetupMs, null);
+  assert.equal(old.ttsSynthMs, null);
+  assert.equal(old.loopMaxMs, null);
+});
+
+test('报告里把 TTS 两段和事件循环停顿打出来；缺仪表时说清楚', () => {
+  const withMarks = jsonl([
+    { t: 0, ev: 'gate.open' },
+    { t: 500, ev: 'gate.close', gapMs: 200 },
+    { t: 900, ev: 'asr.sentence', text: '你好' },
+    { t: 930, ev: 'turn.start' },
+    { t: 1500, ev: 'tts.task', setup_ms: 60, first_ms: 330, stream: true },
+    { t: 2000, ev: 'tts.first', ms: 400 },
+    { t: 3000, ev: 'turn.end', dsh_ms: 300, loop_max_ms: 252 },
+  ]);
+  const text = formatReport(computeTurns(parseEvents(withMarks)));
+  assert.match(text, /TTS task {2}建立 中位 60 \/ p90 60/);
+  assert.match(text, /首包 中位 330 \/ p90 330/);
+  assert.match(text, /事件循环 {2}本轮最大停顿 中位 252/);
+
+  const legacy = jsonl([
+    { t: 0, ev: 'gate.open' },
+    { t: 500, ev: 'gate.close', gapMs: 200 },
+    { t: 900, ev: 'asr.sentence', text: '你好' },
+    { t: 930, ev: 'turn.start' },
+    { t: 2000, ev: 'tts.first', ms: 400 },
+    { t: 3000, ev: 'turn.end', dsh_ms: 300 },
+  ]);
+  const oldText = formatReport(computeTurns(parseEvents(legacy)));
+  assert.match(oldText, /TTS task {2}缺仪表/, '没有 tts.task 时要明说缺仪表，不能静默');
+  assert.doesNotMatch(oldText, /事件循环/);
+});
+
+test('缺 tts.first 的旧档案：首字延迟记 null，不拿 0 冒充', () => {  const legacy = jsonl([
     { t: 1000, ev: 'gate.close' },
     { t: 1400, ev: 'asr.sentence', text: '喂', index: 0 },
     { t: 1420, ev: 'turn.start', text_len: 1, image: false },

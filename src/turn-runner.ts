@@ -14,6 +14,7 @@
 import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
+import { loopLagSnapshot } from './loop-lag.ts';
 import type { DownlinkSink } from './transport.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 import type { DeviceCall } from './devices/primitives.ts';
@@ -621,6 +622,12 @@ export class TurnRunner {
         ...(delegateReason === undefined ? {} : { delegate: delegateReason }),
         // 记下 dsh 的会话 id，事后才能把这一段和 dsh 自己的 step/tool 轨迹对齐
         ...(this.options.agent.sessionId ? { dsh_session: this.options.agent.sessionId } : {}),
+        // **事件循环被占住的时长**，这一轮里最大的一次。
+        // 为什么要它：TTS 偶发多出 ~250 ms，而「合成本身」和「服务端接单」都量过是平的
+        // （见 `COSYVOICE_TRACE` 与 `docs/OPS-RECORD.md` §12.8.1）—— 那就只剩
+        // 「进程被卡了一下」这一种解释，可这条从来没有仪表。有了 max/p99 就能直接判：
+        // 尖峰轮的 `loop_max_ms` 也大 → 是我们自己卡的，跟厂商无关。
+        ...loopLagSnapshot(),
       });
 
       return {

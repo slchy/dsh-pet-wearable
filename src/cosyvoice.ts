@@ -116,6 +116,19 @@ export interface CosyVoiceOptions {
   readonly useInstruction?: boolean;
   /** 空闲多久后主动关连接（默认 5 分钟，避免长连接被服务端静默掐掉后下一句话付握手钱） */
   readonly idleCloseMs?: number;
+  /**
+   * 每个 task 收首块时回调一次：`setup_ms` = run-task → task-started，
+   * `first_ms` = 首批文本送出 → 首块音频。
+   *
+   * 这两段**长得很像但治法完全不同**（`setup` 慢 = 还没轮到我们/进程被卡，
+   * `first` 慢 = 合成），所以常开、进档案，不必再开 `COSYVOICE_TRACE` 从控制台捞
+   * （见 `docs/OPS-RECORD.md` §12.8.1）。
+   */
+  readonly onTask?: (info: {
+    readonly setup_ms: number;
+    readonly first_ms: number;
+    readonly stream: boolean;
+  }) => void;
 }
 
 /** 阿里云的 task_id 必须 32 位无横线；`randomUUID()` 默认带横线会被拒。 */
@@ -208,12 +221,28 @@ class Connection {
   /** 等 `task-finished` / `task-failed` 的等待者，按 task_id 分槽 */
   private readonly settleWaiters = new Map<string, (error: Error | null) => void>();
   private failure: Error | null = null;
-  /** 探针时刻（`COSYVOICE_TRACE=1` 时才有意义） */
+  /** 探针时刻（记录**总是**做，console 那行才看 `COSYVOICE_TRACE`） */
   private traceSentAt = 0;
   private traceStartedAt = 0;
   private traceFirstAt: number | null = null;
+  private readonly onTask: CosyVoiceOptions['onTask'];
 
-  constructor(url: string, apiKey: string) {
+  /**
+   * 把这一次 task 的两段耗时交给宿主（`tts.task` 事件，常开）。
+   *
+   * 缺时刻就报 -1，**不拿 0 冒充** —— 0 会被当成「瞬间完成」混进统计里。
+   */
+  private reportTask(setup: number, first: number, stream: boolean): void {
+    if (this.onTask === undefined) return;
+    this.onTask({
+      setup_ms: Number.isFinite(setup) ? Math.round(setup) : -1,
+      first_ms: Number.isFinite(first) ? Math.round(first) : -1,
+      stream,
+    });
+  }
+
+  constructor(url: string, apiKey: string, onTask?: CosyVoiceOptions['onTask']) {
+    this.onTask = onTask;
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
     this.ready = new Promise((resolve, reject) => {
       this.ws.once('open', () => { resolve(); });
@@ -338,20 +367,22 @@ class Connection {
     // 连接已复用（见类注释），所以这段全是服务端时间，只能靠提前 run-task 或
     // 流式 continue-task 重叠掉。
     const tracing = process.env['COSYVOICE_TRACE'] === '1';
-    if (tracing) {
-      this.traceSentAt = performance.now();
-      this.traceStartedAt = 0;
-      this.traceFirstAt = null;
-    }
+    // 两个时刻**总是**记：console 那行只在 tracing 时打，但 `tts.task` 事件常开
+    this.traceSentAt = performance.now();
+    this.traceStartedAt = 0;
+    this.traceFirstAt = null;
     const probed = (chunk: Buffer): void => {
-      if (tracing && this.traceFirstAt === null) {
+      if (this.traceFirstAt === null) {
         this.traceFirstAt = performance.now();
         const setup = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - this.traceSentAt;
         const first = this.traceFirstAt - (this.traceStartedAt === 0 ? this.traceSentAt : this.traceStartedAt);
-        console.log(
-          `  TTS task  建立 ${setup.toFixed(0)} ms  首包 ${first.toFixed(0)} ms  `
-          + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
-        );
+        if (tracing) {
+          console.log(
+            `  TTS task  建立 ${setup.toFixed(0)} ms  首包 ${first.toFixed(0)} ms  `
+            + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
+          );
+        }
+        this.reportTask(setup, first, false);
       }
       onChunk(chunk);
     };
@@ -446,17 +477,20 @@ class Connection {
     const sentAt = performance.now();
     this.traceStartedAt = 0;
     let firstTextAt = 0;
-    let traced = false;
+    let reported = false;
     this.sink = (chunk: Buffer): void => {
-      if (tracing && !traced) {
-        traced = true;
+      if (!reported) {
+        reported = true;
         // 缺哪个时刻就打 NaN，不拿 0 冒充
         const setup = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - sentAt;
         const first = firstTextAt === 0 ? Number.NaN : performance.now() - firstTextAt;
-        console.log(
-          `  TTS task  建立 ${setup.toFixed(0)} ms  首包 ${first.toFixed(0)} ms  `
-          + '（流式：首包自首批文本送出起算）',
-        );
+        if (tracing) {
+          console.log(
+            `  TTS task  建立 ${setup.toFixed(0)} ms  首包 ${first.toFixed(0)} ms  `
+            + '（流式：首包自首批文本送出起算）',
+          );
+        }
+        this.reportTask(setup, first, true);
       }
       onChunk(chunk);
     };
@@ -649,7 +683,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
       return conn;
     }
     drop();
-    const fresh = new Connection(url, apiKey);
+    const fresh = new Connection(url, apiKey, options.onTask);
     await fresh.open();
     conn = fresh;
     return fresh;

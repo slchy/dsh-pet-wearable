@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 把一份会话档案（`events.jsonl`）折算成**逐轮延迟分解**。
  *
  * <h2>为什么需要它</h2>
@@ -67,6 +67,12 @@ export interface ArchiveEvent {  /** 相对会话开始的毫秒数 */
    * `assistant/message`，快车道（qwen-flash）**没有那份东西**。
    */
   readonly said?: unknown;
+  /** `turn.end` 专有：这一轮事件循环被占住的最大时长（ms） */
+  readonly loop_max_ms?: unknown;
+  /** `tts.task` 专有：「建立」段（run-task → task-started，ms） */
+  readonly setup_ms?: unknown;
+  /** `tts.task` 专有：「首包」段（首批文本送出 → 首块音频，ms） */
+  readonly first_ms?: unknown;
 }
 
 /** 一轮里可能缺席的时刻名。 */
@@ -88,6 +94,17 @@ export interface TurnLatency {
   readonly playbackMs: number | null;
   /** agent 自报耗时（ms） */
   readonly agentMs: number | null;
+  /**
+   * 这一轮里**事件循环被占住的最大时长**（ms，`turn.end.loop_max_ms`）。
+   *
+   * 用来判「TTS 变慢是别人慢还是我们自己卡了」：`loopMaxMs` 与 TTS 尖峰同步出现
+   * → 是我们自己的进程被卡住，跟厂商无关（见 `docs/OPS-RECORD.md` §12.8.1）。
+   */
+  readonly loopMaxMs: number | null;
+  /** TTS task 的「建立」段（run-task → task-started，ms） */
+  readonly ttsSetupMs: number | null;
+  /** TTS task 的「首包」段（首批文本送出 → 首块音频，ms） */
+  readonly ttsSynthMs: number | null;
   /** 是否被用户插话中断 */
   readonly interrupted: boolean;
   /** 这一轮对应的 ASR 文本（截断，便于人肉对上） */
@@ -159,6 +176,9 @@ export function parseEvents(jsonl: string): ArchiveEvent[] {
       gapMs: obj['gapMs'],
       path: obj['path'],
       said: obj['said'],
+      loop_max_ms: obj['loop_max_ms'],
+      setup_ms: obj['setup_ms'],
+      first_ms: obj['first_ms'],
     });
   }
   return out;
@@ -334,6 +354,16 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     }
 
     const end = endAt < 0 ? undefined : events[endAt];
+    // TTS 那一段再拆成「建立」和「首包」：`tts.task` 是常开的（见 `cosyvoice.ts` 的 onTask）。
+    // 一轮里可能有一条以上（回执 + 回答），**取本轮最后一条** —— 回答那条在最后。
+    let ttsSetup: number | null = null;
+    let ttsSynth: number | null = null;
+    for (let i = at; i < nextAt; i += 1) {
+      const ev = events[i];
+      if (ev?.ev !== EVENTS.ttsTask) continue;
+      ttsSetup = num(ev.setup_ms) ?? ttsSetup;
+      ttsSynth = num(ev.first_ms) ?? ttsSynth;
+    }
     out.push({
       turn: n + 1,
       silenceToAsr,
@@ -342,6 +372,9 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       firstWordMs,
       playbackMs,
       agentMs: num(end?.dsh_ms) ?? null,
+      loopMaxMs: num(end?.loop_max_ms) ?? null,
+      ttsSetupMs: ttsSetup,
+      ttsSynthMs: ttsSynth,
       interrupted: end?.interrupted === true,
       text: preview(asrAt < 0 ? undefined : events[asrAt]?.text),
       missing,
@@ -452,6 +485,27 @@ export function formatReport(turns: readonly TurnLatency[], header = ''): string
     `其中③（开轮→首块）该段 中位 ${cell(parts.median)} / p90 ${cell(parts.p90)} / 最大 ${cell(parts.max)}`
     + '  ← 单段，不是项目 p50',
   );
+
+  // TTS 那一段再拆两截：这两截慢起来长得一模一样，治法完全不同
+  // （`建立` = 还没轮到我们/进程被卡；`首包` = 合成）。
+  const setup = summarize(turns.map((t) => t.ttsSetupMs));
+  const synth = summarize(turns.map((t) => t.ttsSynthMs));
+  const lag = summarize(turns.map((t) => t.loopMaxMs));
+  if (setup.count > 0 || synth.count > 0) {
+    lines.push(
+      `TTS task  建立 中位 ${cell(setup.median)} / p90 ${cell(setup.p90)}`
+      + `    首包 中位 ${cell(synth.median)} / p90 ${cell(synth.p90)}`
+      + `（n=${Math.max(setup.count, synth.count)}）`,
+    );
+  } else {
+    lines.push('TTS task  缺仪表（档案里没有 tts.task —— 多半是这一版之前录的）');
+  }
+  if (lag.count > 0) {
+    lines.push(
+      `事件循环  本轮最大停顿 中位 ${cell(lag.median)} / p90 ${cell(lag.p90)} / 最大 ${cell(lag.max)}`
+      + '  ← 它跟着 TTS 尖峰一起大，就是**我们自己被卡住**，不是厂商慢',
+    );
+  }
 
   const gaps = new Map<MissingMark, number>();
   for (const t of turns) {

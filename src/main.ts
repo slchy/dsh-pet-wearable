@@ -23,6 +23,7 @@ import { qwenRealtimeStt } from './qwen-realtime-asr.ts';
 import { cosyVoiceTts } from './cosyvoice.ts';
 import { mimoTts } from './mimo.ts';
 import { EMOTIONS } from './emotion.ts';
+import { EVENTS } from './events.ts';
 import { BASE_STYLE, DEFAULT_TTS_VOICE } from './mimo.ts';
 import {
   cannedStt,
@@ -116,6 +117,8 @@ async function buildTts(spec: string): Promise<TtsProvider> {
       model: process.env['COSYVOICE_MODEL'],
       voice: process.env['COSYVOICE_VOICE'],
       useInstruction: process.env['COSYVOICE_EMOTION_MODE'] === 'instruction',
+      // 每个 task 的「建立 / 首包」两段，常开落到当前档案（见 `tts.task`）
+      onTask: (info) => { auditSink?.(EVENTS.ttsTask, { ...info }); },
     });
   }
   if (spec === 'mimo') {
@@ -431,6 +434,17 @@ function installLogClock(): void {
   };
 }
 
+/**
+ * 审计出口的**当前持有者**：哪条连接在写档案。
+ *
+ * `FrontedAgent` 和 TTS provider 都是进程级共用的（在 `main()` 之前就建好了），
+ * 而档案是**每连接一份** —— 所以出口必须是模块级可变量：连接建立时把自己接上，
+ * 断开时摘掉。同时只有一个设备在用时归属精确；多设备并发会写到最后连上的那条。
+ *
+ * 承载两类事件：`agent.*`（快车道问了什么/答了什么）和 `tts.task`（建立/首包两段）。
+ */
+let auditSink: ((name: string, data: Record<string, unknown>) => void) | null = null;
+
 async function main(): Promise<void> {
   installLogClock();
   loadDotEnv();
@@ -486,13 +500,6 @@ async function main(): Promise<void> {
   }
 
   let agent: AgentProvider | null = null;
-  /**
-   * 快车道审计出口的**当前持有者**（哪条连接在写档案）。
-   *
-   * `FrontedAgent` 是进程级共用的，档案是每连接一份 —— 连接建立时把自己接上，
-   * 断开时摘掉。同时只有一个设备在用时归属精确；多设备并发写到最后连上的那条。
-   */
-  let agentAuditSink: ((name: string, data: Record<string, unknown>) => void) | null = null;
   let dshSession: DshSession | null = null;
   /**
    * 离线时的后台汇报队列。放 `~/.voice-agent/` 旁边（和会话 id 一个目录），
@@ -592,7 +599,7 @@ async function main(): Promise<void> {
         memory: (text: string) => memoryFile.relevant(text),
         log: (line) => { console.log(line); },
         // 全量审计：每次请求的 messages、模型的原文、以及被作废的那几趟
-        audit: (name, data) => { agentAuditSink?.(name, data); },
+        audit: (name, data) => { auditSink?.(name, data); },
       });
       console.log(
         `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
@@ -870,8 +877,8 @@ async function main(): Promise<void> {
       archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
       archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
       archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
-      // 连接建立/断开时把快车道审计接到这条档案上（见 `agentAuditSink`）
-      setAgentAudit: (sink) => { agentAuditSink = sink; },
+      // 连接建立/断开时把审计（快车道 + TTS 两段）接到这条档案上（见 `auditSink`）
+      setAudit: (sink) => { auditSink = sink; },
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),

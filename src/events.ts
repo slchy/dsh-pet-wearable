@@ -40,6 +40,14 @@ export const EVENTS = {
   turnStart: 'turn.start',
   /** TTS 首块耗时（`ms`）。延迟复算的关键仪表之一 */
   ttsFirst: 'tts.first',
+  /**
+   * 单个 TTS task 的两段耗时，**常开**（不是调试探针）。
+   *
+   * `setup_ms` = run-task → task-started（还没轮到我们 / 进程被卡）；
+   * `first_ms` = 首批文本送出 → 首块音频（合成）。
+   * 这两段慢起来长得一模一样，治法完全不同 —— 见 `docs/OPS-RECORD.md` §12.8.1。
+   */
+  ttsTask: 'tts.task',
   /** 首个输出 token 耗时（`ms`）。与 ttsFirst 之间夹着"整段生成"那一段 */
   llmFirst: 'llm.first',
   /** 一轮结束。带 `dsh_session` 时可与 dsh 自己的会话档案对齐 */
