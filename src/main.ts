@@ -125,6 +125,8 @@ async function buildTts(spec: string): Promise<TtsProvider> {
       useInstruction: process.env['COSYVOICE_EMOTION_MODE'] === 'instruction',
       // 每个 task 的「建立 / 首包」两段，常开落到当前档案（见 `tts.task`）
       onTask: (info) => { auditSink?.(EVENTS.ttsTask, { ...info }); },
+      // 流式 task 的分批送达明细，收尾时落一次（见 `tts.done`）
+      onDone: (info) => { auditSink?.(EVENTS.ttsDone, { ...info }); },
     });
   }
   if (spec === 'mimo') {

@@ -139,6 +139,38 @@ export interface CosyVoiceOptions {
     /** 这一趟是不是认领了 `prewarm()` 预开的 task（判「预热省没省下来」就看它） */
     readonly prewarmed: boolean;
   }) => void;
+  /**
+   * 流式 task 收尾时回调一次，带**分批送达明细**（`tts.done` 事件）。
+   *
+   * 为什么不在首块时就报：`finish-task` 和最后一批文本都在首块之后，
+   * 而这两样正是判断「首包慢是不是在等后头的字」要看的东西。
+   */
+  readonly onDone?: (info: {
+    readonly setup_ms: number;
+    readonly first_ms: number;
+    readonly feed_ms: number;
+    readonly prewarmed: boolean;
+    /** 一共送了几批 */
+    readonly batches: number;
+    /** 送出去的总字数（清洗后） */
+    readonly chars: number;
+    readonly first_text_ms: number;
+    readonly last_text_ms: number;
+    readonly finish_ms: number;
+    readonly head: readonly FeedStep[];
+    /** 最后一批；批数不超过 `FEED_TRACE_HEAD` 时为 null（已经在 `head` 里了） */
+    readonly tail: FeedStep | null;
+  }) => void;
+}
+
+/** 流式 task 里一次 `continue-task` 的送达明细（`tts.done` 的 `head` / `tail` 元素） */
+export interface FeedStep {
+  /** 这一批送完之后的累积字数 */
+  readonly chars: number;
+  /** 相对 run-task 发出时刻的毫秒数 */
+  readonly at: number;
+  /** 这一批是否以标点结尾（1/0）—— 有些流式合成等到标点才出声 */
+  readonly punct: number;
 }
 
 /** 阿里云的 task_id 必须 32 位无横线；`randomUUID()` 默认带横线会被拒。 */
@@ -149,6 +181,17 @@ export function sameProsody(a: Emotion, b: Emotion): boolean {
   return EMOTION_PROSODY[a].rate === EMOTION_PROSODY[b].rate
     && EMOTION_PROSODY[a].pitch === EMOTION_PROSODY[b].pitch;
 }
+
+/**
+ * `tts.done` 逐批记多少条。
+ *
+ * 首包只取决于开头那几批：首批送出去之后服务端攒到能出声的量就开口了，
+ * 后面第 20 批什么时候到不影响首包。所以只记前 4 批 + 最后一批。
+ */
+const FEED_TRACE_HEAD = 4;
+
+/** 一批文本是否以标点结尾（决定 `FeedStep.punct`） */
+const ENDS_WITH_PUNCT = /[。，、！？；：…,.!?;:]\s*$/u;
 
 /**
  * 一块音频是不是**数字静音**。
@@ -242,6 +285,7 @@ class Connection {
   private traceStartedAt = 0;
   private traceFirstAt: number | null = null;
   private readonly onTask: CosyVoiceOptions['onTask'];
+  private readonly onDone: CosyVoiceOptions['onDone'];
   /**
    * **预开好的 task**：`run-task` 已发、`task-started` 已回，但一个字都没送。
    *
@@ -281,8 +325,19 @@ class Connection {
     });
   }
 
-  constructor(url: string, apiKey: string, onTask?: CosyVoiceOptions['onTask']) {
+  /** 流式 task 收尾时把分批明细交给宿主（`tts.done`）。缺时刻同样报 -1。 */
+  private reportDone(info: Parameters<NonNullable<CosyVoiceOptions['onDone']>>[0]): void {
+    this.onDone?.(info);
+  }
+
+  constructor(
+    url: string,
+    apiKey: string,
+    onTask?: CosyVoiceOptions['onTask'],
+    onDone?: CosyVoiceOptions['onDone'],
+  ) {
     this.onTask = onTask;
+    this.onDone = onDone;
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
     this.ready = new Promise((resolve, reject) => {
       this.ws.once('open', () => { resolve(); });
@@ -648,23 +703,32 @@ class Connection {
     const sentAt = adopted?.sentAt ?? performance.now();
     this.traceStartedAt = adopted?.startedAt ?? 0;
     let firstTextAt = 0;
+    let lastTextAt = 0;
     let reported = false;
+    let setupMs = Number.NaN;
+    let firstMs = Number.NaN;
+    let feedMs = Number.NaN;
+    /** 已送出的批数与字数（`tts.done` 用） */
+    let batchCount = 0;
+    let chars = 0;
+    const head: FeedStep[] = [];
+    let tail: FeedStep | null = null;
     this.sink = (chunk: Buffer): void => {
       if (!reported) {
         reported = true;
         // 缺哪个时刻就打 NaN，不拿 0 冒充
         const startedAt = this.traceStartedAt === 0 ? sentAt : this.traceStartedAt;
-        const setup = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - sentAt;
-        const first = firstTextAt === 0 ? Number.NaN : performance.now() - firstTextAt;
+        setupMs = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - sentAt;
+        firstMs = firstTextAt === 0 ? Number.NaN : performance.now() - firstTextAt;
         // task-started → 首批文本送出：这一段是**我们**的（等模型吐字 / 等攒够一批）
-        const feed = firstTextAt === 0 ? Number.NaN : firstTextAt - startedAt;
+        feedMs = firstTextAt === 0 ? Number.NaN : firstTextAt - startedAt;
         if (tracing) {
           console.log(
-            `  TTS task  建立 ${setup.toFixed(0)} ms  供给 ${feed.toFixed(0)} ms  `
-            + `首包 ${first.toFixed(0)} ms（流式：首包自首批文本送出起算）`,
+            `  TTS task  建立 ${setupMs.toFixed(0)} ms  供给 ${feedMs.toFixed(0)} ms  `
+            + `首包 ${firstMs.toFixed(0)} ms（流式：首包自首批文本送出起算）`,
           );
         }
-        this.reportTask(setup, first, true, adopted !== null, feed);
+        this.reportTask(setupMs, firstMs, true, adopted !== null, feedMs);
       }
       onChunk(chunk);
     };
@@ -694,7 +758,18 @@ class Connection {
     }
 
     const send = (text: string): void => {
-      if (firstTextAt === 0) firstTextAt = performance.now();
+      const now = performance.now();
+      if (firstTextAt === 0) firstTextAt = now;
+      lastTextAt = now;
+      chars += text.length;
+      batchCount += 1;
+      const step: FeedStep = {
+        chars,
+        at: Math.round(now - sentAt),
+        punct: ENDS_WITH_PUNCT.test(text) ? 1 : 0,
+      };
+      if (head.length < FEED_TRACE_HEAD) head.push(step);
+      else tail = step;
       this.ws.send(JSON.stringify({
         header: { action: 'continue-task', task_id: taskId, streaming: 'duplex' },
         payload: { input: { text } },
@@ -726,6 +801,7 @@ class Connection {
     } catch (error) {
       feedError = error instanceof Error ? error : new CosyVoiceError(String(error));
     }
+    const finishAt = performance.now();
     this.ws.send(JSON.stringify({
       header: { action: 'finish-task', task_id: taskId, streaming: 'duplex' },
       payload: { input: {} },
@@ -733,6 +809,32 @@ class Connection {
 
     const error = await done;
     this.sink = null;
+    // 有正文才报：一批都没送出去的 task 会把 -1 混进「首包」统计里
+    if (firstTextAt !== 0) {
+      if (tracing) {
+        const brief = (step: FeedStep): string =>
+          `${step.chars}字@${step.at}${step.punct === 1 ? '·' : ''}`;
+        console.log(
+          `  TTS 送批 ${batchCount} 批 ${chars} 字  首批 ${Math.round(firstTextAt - sentAt)} ms  `
+          + `收尾 ${Math.round(finishAt - sentAt)} ms  头 ${head.map(brief).join(' ')}`
+          + (tail === null ? '' : `  尾 ${brief(tail)}`),
+        );
+      }
+      const round = (value: number): number => (Number.isFinite(value) ? Math.round(value) : -1);
+      this.reportDone({
+        setup_ms: round(setupMs),
+        first_ms: round(firstMs),
+        feed_ms: round(feedMs),
+        prewarmed: adopted !== null,
+        batches: batchCount,
+        chars,
+        first_text_ms: Math.round(firstTextAt - sentAt),
+        last_text_ms: Math.round(lastTextAt - sentAt),
+        finish_ms: Math.round(finishAt - sentAt),
+        head,
+        tail: batchCount > FEED_TRACE_HEAD ? tail : null,
+      });
+    }
     if (feedError) throw feedError;
     if (error) throw error;
   }
@@ -889,7 +991,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
     if (connecting !== null) return connecting;
     drop();
     const make = (async (): Promise<Connection> => {
-      const fresh = new Connection(url, apiKey, options.onTask);
+      const fresh = new Connection(url, apiKey, options.onTask, options.onDone);
       await fresh.open();
       conn = fresh;
       return fresh;
