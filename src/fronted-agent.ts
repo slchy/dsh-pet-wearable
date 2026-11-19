@@ -495,6 +495,18 @@ export class FrontedAgent implements AgentProvider {
   private readonly log: (line: string) => void;
   /** 审计出口（只观察）：见 {@link FrontedOptions.audit} */
   private readonly auditSink: (name: string, data: Record<string, unknown>) => void;
+  /**
+   * 快车道答过、但 **dsh 还没真正确认收到** 的轮次（每轮两行：`用户:` / `你:`）。
+   *
+   * 区别于 `pending`：这些已经随某一轮的 `note` 发出去了，但那一轮可能被快车道掐掉
+   * （`speculate` 默认双轨，快车道一开口就 `cancelInner`）。被掐的那一轮不会进 dsh 的
+   * 会话，所以这批注记等于没送 —— 必须等 `rememberDsh`（dsh 真的答完并被采用）才算送达。
+   *
+   * 以前是「发出去就清空」，线上日志里能直接看到后果：
+   * `把缓冲的闲聊轮次补进 dsh 上下文` 紧接着 `path=fast dsh_ms=0.6` —— 那一批轮次
+   * 在两边都不存在了（快车道只记 2 轮、dsh 会话里没有），用户说「记忆断层」就是它。
+   */
+  private sentPending: string[] = [];
   private readonly pending: string[] = [];
   /**
    * 判停之前先问出去的那一轮（见 {@link prefetch}）。
@@ -1041,6 +1053,13 @@ export class FrontedAgent implements AgentProvider {
       return;
     }
     this.cancelledKey = key;
+    // 这一轮掐掉 → 随它送进 dsh 的那批闲聊轮次**没进 dsh 会话**，放回队列等下次。
+    // 不这么做就是线上那条「记忆断层」：补进上下文的那几轮在两边都不存在。
+    if (this.sentPending.length > 0) {
+      this.pending.unshift(...this.sentPending);
+      this.log(`  快车道    这一轮掐掉了 dsh → ${this.sentPending.length / 2} 轮闲聊留到下次同步`);
+      this.sentPending = [];
+    }
     try {
       if (this.cancelMode === 'interrupt') {
         this.inner.interruptTurn?.();
@@ -1114,6 +1133,9 @@ export class FrontedAgent implements AgentProvider {
 
   /** 记下 dsh 最后说的话（快模型下一轮要看：它在问什么、答案是什么） */
   private rememberDsh(speech: string, userText: string): void {
+    // dsh 真的答完、而且这一轮被采用了 → 随它送进去的那批闲聊轮次**确认送达**。
+    // 这是唯一清空 `sentPending` 的地方（被取消的轮次不算，见 `cancelInner`）。
+    this.sentPending.length = 0;
     // dsh 那一轮的用户话术也进窗口 —— 否则窗口里会出现「没有提问的回答」
     if (this.history.at(-1)?.who !== 'user' || this.history.at(-1)?.text !== userText.trim()) {
       this.push('user', userText);
@@ -1138,6 +1160,11 @@ export class FrontedAgent implements AgentProvider {
     if (note !== undefined) {
       blocks.push(note);
     }
+    if (this.sentPending.length > 0) {
+      // 上一批送进 dsh 的那一轮没被采用（快车道赢了）→ 这批轮次 dsh 从来没见过，合并回来
+      this.pending.unshift(...this.sentPending);
+      this.sentPending = [];
+    }
     if (this.pending.length > 0) {
       // 撤回没做成 = dsh 那一轮**已经答完且还在历史里**，而用户听到的是快车道的话。
       // 这时候不能还说「没有经过你的会话」—— 得把「你那轮用户没听到」讲清楚，否则
@@ -1150,8 +1177,12 @@ export class FrontedAgent implements AgentProvider {
           : '（下面几轮是刚才由快车道直接答给用户的，没有经过你的会话；当作已知上下文即可）',
         ...this.pending,
       ].join('\n'));
+      // **先记着、别清**：这一轮可能被快车道掐掉（掐掉的轮次不会进 dsh 会话），
+      // 只有在 `rememberDsh` 里才确认送达。
+      this.sentPending = this.pending.slice();
       this.pending.length = 0;
-      this.log(`  快车道    把缓冲的闲聊轮次补进 dsh 上下文${lost ? '（含「你那轮没被听到」的说明）' : ''}`);
+      this.log(`  快车道    ${this.sentPending.length / 2} 轮闲聊随这一轮送进 dsh`
+        + `${lost ? '（含「你那轮没被听到」的说明）' : ''}`);
     }
     if (blocks.length === 0) {
       return this.inner.reply(userText, image, note, { ticket });

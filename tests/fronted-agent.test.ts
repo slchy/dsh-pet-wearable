@@ -354,6 +354,27 @@ test('cancelMode=off 时什么都不做', async () => {
   assert.equal(called, 0);
 });
 
+test('快车道赢下的轮次不会在 dsh 那边蒸发（被掐掉的请求不算送达）', async () => {
+  // 线上日志：`把缓冲的闲聊轮次补进 dsh 上下文` 紧接着 `path=fast dsh_ms=0.6`
+  // —— 注记随一个随后被取消的请求送出，那批轮次在两边都不存在了。
+  const inner = slowInner(120);
+  const agent = agentWith(inner.agent, async () => sse(['[平静]', '我在呢。']));
+  agent.attachLiveSink(() => {});
+
+  // 两轮闲聊：dsh 那两轮都被快车道掐掉，一批注记也没真正落地
+  await agent.reply('你好呀');
+  await agent.reply('我可想你了');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // 第三轮命中任务词 → 真的交给 dsh
+  const third = await agent.reply('帮我查一下订单');
+
+  assert.equal(third.path, 'dsh');
+  const sent = inner.calls.at(-1)?.note ?? '';
+  assert.match(sent, /你好呀/, '第一轮必须补进 dsh 的上下文（那两轮 dsh 从没真正收到）');
+  assert.match(sent, /我可想你了/, '第二轮也要 —— 顺序不能靠运气');
+});
+
 test('投机：快车道让位时不取消（那一轮正是我们要的结果）', async () => {
   const inner = fakeInner();
   let cancelled = 0;
