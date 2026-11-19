@@ -264,12 +264,16 @@ stateDiagram-v2
 ## 5 FrontedAgent 快车道
 
 **持有**：`FrontedAgent.innerMode`（`pass` / `buffer` / `drop`）+ 本地对话窗口。
-**驱动**：`TurnRunner` 调 `agent.reply(text, …, {ticket})`；内部先做**本地判据**，再决定
+**驱动**：`TurnRunner` 调 `agent.reply(text, …, {ticket})`；内部先做**形态判据**，再决定
 问不问快模型。
+
+> 判据只挡形态，**不判语义**（2026-11-19 起）：空、超 `FAST_LANE_MAX_CHARS`、含阿拉伯数字。
+> 语义上该不该转交由模型在流里输出 `[[DELEGATE]]` 决定 —— 本地词表判过一版，
+> 「你看过星球大战没？」「为什么？」因为含「看」「为什么」被一票判成任务，真机 92 轮里 25 轮白走 dsh。
 
 | 状态 | 含义 |
 |---|---|
-| 判定 | 任务类、超长、带图、像长期事实 → 直接 `delegate` 给 dsh，**不问快模型** |
+| 判定 | 超长、带图、像长期事实、上句 dsh 在等回话 → 直接 `delegate` 给 dsh，**不问快模型** |
 | 投机起跑 | `speculate` 开：dsh 与快模型同时起跑，dsh 的增量先缓冲（`innerMode=buffer`） |
 | 快模型流式 | 只看到开头两个字就能判暗号；`[[DELEGATE]]` 判为委派 |
 | 胜出 | `commit`：`innerMode=drop`、掐掉在途 dsh（`cancelTurn`）、把这一轮记进窗口 |
@@ -286,7 +290,7 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     [*] --> 判定
-    判定 --> delegate : 任务类/带图/像长期事实
+    判定 --> delegate : 超长/带图/像长期事实/接问话
     判定 --> 投机起跑 : 闲聊候选且 speculate
     判定 --> 快模型流式 : 闲聊候选且不投机
     投机起跑 --> 快模型流式 : 第一个字
