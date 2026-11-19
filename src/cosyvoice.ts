@@ -127,6 +127,14 @@ export interface CosyVoiceOptions {
   readonly onTask?: (info: {
     readonly setup_ms: number;
     readonly first_ms: number;
+    /**
+     * `task-started` → 首批文本送出，**我们这侧**的空档（等模型吐第一段字 / 等攒够批）。
+     *
+     * 加这一段是为了能把「首块慢」拆到底：`setup` 慢 = 还没轮到我们，
+     * `feed` 慢 = 我们自己没供上字，`first` 慢 = 服务端合成慢。
+     * 非流式（`run`）没有分批送字，报 -1。
+     */
+    readonly feed_ms: number;
     readonly stream: boolean;
     /** 这一趟是不是认领了 `prewarm()` 预开的 task（判「预热省没省下来」就看它） */
     readonly prewarmed: boolean;
@@ -256,11 +264,18 @@ class Connection {
    *
    * 缺时刻就报 -1，**不拿 0 冒充** —— 0 会被当成「瞬间完成」混进统计里。
    */
-  private reportTask(setup: number, first: number, stream: boolean, prewarmed: boolean): void {
+  private reportTask(
+    setup: number,
+    first: number,
+    stream: boolean,
+    prewarmed: boolean,
+    feed = Number.NaN,
+  ): void {
     if (this.onTask === undefined) return;
     this.onTask({
       setup_ms: Number.isFinite(setup) ? Math.round(setup) : -1,
       first_ms: Number.isFinite(first) ? Math.round(first) : -1,
+      feed_ms: Number.isFinite(feed) ? Math.round(feed) : -1,
       stream,
       prewarmed,
     });
@@ -531,7 +546,7 @@ class Connection {
             + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
           );
         }
-        this.reportTask(setup, first, false, adopted !== null);
+        this.reportTask(setup, first, false, adopted !== null);  // 非流式没有「供给」段
       }
       onChunk(chunk);
     };
@@ -638,15 +653,18 @@ class Connection {
       if (!reported) {
         reported = true;
         // 缺哪个时刻就打 NaN，不拿 0 冒充
+        const startedAt = this.traceStartedAt === 0 ? sentAt : this.traceStartedAt;
         const setup = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - sentAt;
         const first = firstTextAt === 0 ? Number.NaN : performance.now() - firstTextAt;
+        // task-started → 首批文本送出：这一段是**我们**的（等模型吐字 / 等攒够一批）
+        const feed = firstTextAt === 0 ? Number.NaN : firstTextAt - startedAt;
         if (tracing) {
           console.log(
-            `  TTS task  建立 ${setup.toFixed(0)} ms  首包 ${first.toFixed(0)} ms  `
-            + '（流式：首包自首批文本送出起算）',
+            `  TTS task  建立 ${setup.toFixed(0)} ms  供给 ${feed.toFixed(0)} ms  `
+            + `首包 ${first.toFixed(0)} ms（流式：首包自首批文本送出起算）`,
           );
         }
-        this.reportTask(setup, first, true, adopted !== null);
+        this.reportTask(setup, first, true, adopted !== null, feed);
       }
       onChunk(chunk);
     };

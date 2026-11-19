@@ -71,6 +71,8 @@ export interface ArchiveEvent {  /** 相对会话开始的毫秒数 */
   readonly loop_max_ms?: unknown;
   /** `tts.task` 专有：「建立」段（run-task → task-started，ms） */
   readonly setup_ms?: unknown;
+  /** `tts.task` 专有：「供给」段（task-started → 首批文本送出，我们这侧的空档，ms） */
+  readonly feed_ms?: unknown;
   /** `tts.task` 专有：「首包」段（首批文本送出 → 首块音频，ms） */
   readonly first_ms?: unknown;
 }
@@ -103,6 +105,8 @@ export interface TurnLatency {
   readonly loopMaxMs: number | null;
   /** TTS task 的「建立」段（run-task → task-started，ms） */
   readonly ttsSetupMs: number | null;
+  /** TTS task 的「供给」段（task-started → 首批文本送出，我们这侧的空档，ms） */
+  readonly ttsFeedMs: number | null;
   /** TTS task 的「首包」段（首批文本送出 → 首块音频，ms） */
   readonly ttsSynthMs: number | null;
   /** 是否被用户插话中断 */
@@ -357,11 +361,13 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     // TTS 那一段再拆成「建立」和「首包」：`tts.task` 是常开的（见 `cosyvoice.ts` 的 onTask）。
     // 一轮里可能有一条以上（回执 + 回答），**取本轮最后一条** —— 回答那条在最后。
     let ttsSetup: number | null = null;
+    let ttsFeed: number | null = null;
     let ttsSynth: number | null = null;
     for (let i = at; i < nextAt; i += 1) {
       const ev = events[i];
       if (ev?.ev !== EVENTS.ttsTask) continue;
       ttsSetup = num(ev.setup_ms) ?? ttsSetup;
+      ttsFeed = num(ev.feed_ms) ?? ttsFeed;
       ttsSynth = num(ev.first_ms) ?? ttsSynth;
     }
     out.push({
@@ -374,6 +380,7 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       agentMs: num(end?.dsh_ms) ?? null,
       loopMaxMs: num(end?.loop_max_ms) ?? null,
       ttsSetupMs: ttsSetup,
+      ttsFeedMs: ttsFeed,
       ttsSynthMs: ttsSynth,
       interrupted: end?.interrupted === true,
       text: preview(asrAt < 0 ? undefined : events[asrAt]?.text),
@@ -486,14 +493,16 @@ export function formatReport(turns: readonly TurnLatency[], header = ''): string
     + '  ← 单段，不是项目 p50',
   );
 
-  // TTS 那一段再拆两截：这两截慢起来长得一模一样，治法完全不同
-  // （`建立` = 还没轮到我们/进程被卡；`首包` = 合成）。
+  // TTS 那一段拆三截：三截慢起来长得一模一样，治法完全不同
+  // （`建立` = 还没轮到我们/进程被卡；`供给` = 我们自己没供上字；`首包` = 服务端合成）。
   const setup = summarize(turns.map((t) => t.ttsSetupMs));
+  const feed = summarize(turns.map((t) => t.ttsFeedMs));
   const synth = summarize(turns.map((t) => t.ttsSynthMs));
   const lag = summarize(turns.map((t) => t.loopMaxMs));
   if (setup.count > 0 || synth.count > 0) {
     lines.push(
       `TTS task  建立 中位 ${cell(setup.median)} / p90 ${cell(setup.p90)}`
+      + `    供给 中位 ${cell(feed.median)} / p90 ${cell(feed.p90)}`
       + `    首包 中位 ${cell(synth.median)} / p90 ${cell(synth.p90)}`
       + `（n=${Math.max(setup.count, synth.count)}）`,
     );
