@@ -615,12 +615,48 @@ export class UtteranceAssembler {
    * ASR 中间结果到了 —— 用户还在说话。
    *
    * 这**不是**用来拼文本的（中间结果会反复改写，拼起来是乱的）。它有两个用途：
-   * 「还在出字」的信号（打断播放），以及给快车道**投机**攒素材
-   * （真正起跑在静音那一刻，见 `trackSilence`）。
+   * 「还在出字」的信号（打断播放），以及给快车道**投机**攒素材。
+   *
+   * 投机**不等静音**：`maybeSpeculate` 的 100 ms 静音闸曾经把提前量削到只剩
+   * 定稿前那几十毫秒（真机 8 轮实测 2 / 3 / 7 / 27 ms），而模型要 440–730 ms ——
+   * 于是「预跑 8/8 命中」却几乎不省时间。字数门槛和每句两次上限由
+   * `FrontedAgent.speculatePartial` 那一侧把关，这里一到就交出去。
    */
   notePartial(text: string): void {
     this.lastPartialAt = this.now();
     this.lastPartialText = text;
+    this.speculateOnPartial(this.now());
+  }
+
+  /**
+   * 中间结果一到就交出去（`maybeSpeculate` 的「不等静音」版）。
+   *
+   * 保留「一段语音只投机一次」：ASR 之后还会补几版 partial，让它们重投机等于把
+   * 已经跑了 160 ms 的那一趟作废重来（实测认领时「已经跑了 6 ms」，还不如不提前）。
+   */
+  private speculateOnPartial(t: number): void {
+    if (this.options.onPartial === undefined) {
+      return;
+    }
+    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
+      return;
+    }
+    if (this.lastVoicedAt <= this.specFiredAt) {
+      return;
+    }
+    if (this.specCount >= 2) {
+      return;
+    }
+    const latest = this.lastPartialText;
+    if (latest === '') {
+      return;
+    }
+    this.specFiredAt = t;
+    this.specCount += 1;
+    this.options.log(
+      `  投机    中间结果一到就交出去（第 ${this.specCount}/2 次，不等静音）`,
+    );
+    this.options.onPartial(this.pendingText + latest);
   }
 
   /** 一句定稿的识别结果。 */
