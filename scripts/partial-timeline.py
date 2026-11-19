@@ -60,21 +60,57 @@ def proposal_fire(spec: str) -> bool:
 
 
 def accepts_exact(spec: str, final: str) -> bool:
-    """**提议的认领条件**：去标点后完全一致。
-
-    现在的门槛是「前缀 + 覆盖 ≥60%」，而缺的那 40% 常常正是宾语
-    （「对呀，那你知道」←「那你知道蓝母吗？」），模型只能反问。
-    """
+    """去标点后完全一致（**不含字数门槛**，用来量收益上限）。"""
     s = norm(spec)
     return len(s) >= 2 and s == norm(final)
+
+
+def accepts_online(spec: str, final: str) -> bool:
+    """**与线上 `acceptsSpeculation` 一字不差**：去全部标点后相同 + ≥ `SPEC_MIN_CHARS`。
+
+    两个口径必须分开：线上还卡着 `minChars=6`，「你退下吧。」（4 字）发得出去、
+    认不回来。用 `accepts_exact` 算配额会高估命中。
+    """
+    s = norm(spec)
+    return len(s) >= SPEC_MIN_CHARS and s == norm(final)
 
 
 # 一版 partial 之后这么久没有新版，说明 ASR 自己已经定下来了。
 STABLE_MS = 200
 
 
+def online_sim(window, final):
+    """模拟**线上现在的行为**（认领已收紧成完全一致）。
+
+    规则：第一版 ≥ `SPEC_MIN_CHARS` 就发；之后变长时，配额没用完就重发；
+    配额满就沿用。返回 `(最后那一版, 它能不能被认领, 发了几次)`。
+
+    为什么要模拟：`830768d` 的「变长就沿用」是给**旧门槛**（前缀 + 60%）设计的 ——
+    沿用的那一版**一定是前缀、不是定稿**，所以在新门槛下永远认不了。
+    """
+    picks = []
+    for _, p in window:
+        if len(norm(p["text"])) < SPEC_MIN_CHARS:
+            continue
+        if not picks:
+            picks.append(p)
+            continue
+        if len(picks) >= 2:
+            break
+        prev = norm(picks[-1]["text"])
+        cur = norm(p["text"])
+        if cur.startswith(prev) and len(cur) > len(prev):
+            picks.append(p)       # 变长：如果还有配额，就用更长的
+        else:
+            picks.append(p)       # 被改写：也重发
+    if not picks:
+        return None, False, 0
+    last = picks[-1]
+    return last["t"], accepts_online(last["text"], final), len(picks)
+
+
 def proposal_hit(window, final, sent_t):
-    """**带句末标点就发**，看需要发几版才能命中（完全一致）。
+    """**带句末标点就发**，看需要发几版才能命中（按**线上**认领口径）。
 
     返回 `(命中时刻, 发了几次)`。「发几次」直接决定 `speculateStarts` 该给多大：
     每句 2 次不够的话，后面那些「带标点的版本」就轮不到了。
@@ -84,20 +120,15 @@ def proposal_hit(window, final, sent_t):
         if not TERMINAL_PUNCT.search(p["text"]):
             continue
         tries += 1
-        if accepts_exact(p["text"], final):
+        if accepts_online(p["text"], final):
             return p["t"], tries
     return None, tries
 
 
 def stable_hit(window, final, sent_t):
-    """**提议的发出条件**：这一版 partial 已经稳定（200 ms 没新版）就发。
+    """这一版 partial 已经稳定（`STABLE_MS` 没新版）就发，按**线上**口径认领。
 
-    返回 `(命中时刻, 命中前发了几次)`：命中 = 这版稳定**且去标点后完全一致**。
-    发出时并不知道能不能对上定稿，所以「发了几次」就是配额消耗 ——
-    `speculateStarts` 每句上限 2，超过 2 次的那个命中拿不到。
-
-    「带句末标点就发」试过：认领率只有 22%，因为第一版带标点的常常是很早的错句。
-    稳定是更强的信号 —— ASR 停下来 200 ms，说明它对这段解码有把握了。
+    返回 `(命中时刻, 命中前发了几次)`。
     """
     tries = 0
     for k, (_, p) in enumerate(window):
@@ -105,7 +136,7 @@ def stable_hit(window, final, sent_t):
         if nxt - p["t"] < STABLE_MS:
             continue
         tries += 1
-        if accepts_exact(p["text"], final):
+        if accepts_online(p["text"], final):
             return p["t"] + STABLE_MS, tries
     return None, tries
 
@@ -246,6 +277,7 @@ def analyze(path: Path):
         # 稳定口径：这版 partial 已经不再变（200 ms 无新版）就发，认领要完全一致
         t_stable, stable_tries = stable_hit(window, final, sent["t"])
         t_pay, pay_tries = proposal_hit(window, final, sent["t"])
+        sim_t, sim_ok, sim_n = online_sim(window, final)
 
         # 现在这条路径实际能拿到的提前量：
         # `maybeSpeculate` 只在静音满 100 ms 的那个 tick 问一次，那一刻可认领就有，否则整轮没有。
@@ -298,6 +330,9 @@ def analyze(path: Path):
                 stable_tries=stable_tries,
                 early_pay=None if t_pay is None else sent["t"] - t_pay,
                 pay_tries=pay_tries,
+                sim_early=None if sim_t is None else sent["t"] - sim_t,
+                sim_ok=sim_ok,
+                sim_n=sim_n,
                 now=now,
                 retry=retry,
                 n_partial=len(window),
@@ -370,6 +405,20 @@ def report(name, rows):
             print(f"  带标点口径：命中 {len(pay)}/{len(rows)} 轮（配额不限）")
         else:
             print(f"  带标点口径：配额 {cap} 次以内能拿到 {n}/{len(rows)} 轮")
+
+    # 线上现在的行为（第一版 ≥6 字就发，配额 2，认领要完全一致）
+    sims = [r for r in rows if r["sim_early"] is not None]
+    sim_ok = [r for r in sims if r["sim_ok"]]
+    print(
+        f"\n  【线上模拟】发出去 {len(sims)}/{len(rows)} 轮，"
+        f"其中能认领 {len(sim_ok)}/{len(rows)} 轮"
+    )
+    if sim_ok:
+        e = sorted(r["sim_early"] for r in sim_ok)
+        print(
+            f"    能认领的提前量 中位 {statistics.median(e):>4.0f}  max {e[-1]:>4}"
+            f"（发 2 次的 {sum(1 for r in sim_ok if r['sim_n'] >= 2)} 轮）"
+        )
 
     # 「只问一次」vs「每 tick 都问」—— 这两行是「记账顺序该不该修」的判据，
     # 不能预设修了不影响行为。

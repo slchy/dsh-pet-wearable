@@ -421,6 +421,21 @@ function stripPartialTail(text: string): string {
 }
 
 /**
+ * **比对专用**的归一化：去掉全部标点和空白。
+ *
+ * 只用 `stripPartialTail` 不够（2026-11-19 核对出来）：ASR 的流式 partial 通常
+ * **不带句中逗号**，而定稿带 —— `对呀那你知道蓝母吗` 对 `对呀，那你知道蓝母吗？`
+ * 文字完全相同，却因为一个逗号认不了。脚本 `scripts/partial-timeline.py` 一直是
+ * 按「去全部标点」算的，两边必须用同一把尺，否则线上的命中会比统计少。
+ *
+ * 去全部标点不引入误认：认领时喂给模型的是**定稿文本**（见 `prefetch`），
+ * 标点差异只影响「认不认」，不影响「问了什么」。
+ */
+function normalizeForCompare(text: string): string {
+  return text.replace(/[\s，,。.、；;：:？?！!…～~“”"'‘’（）()《》〈〉【】\[\]{}—－·/\\|]+/gu, '');
+}
+
+/**
  * 定稿是否确认这份投机文本 —— **这条路唯一的闸门**，错了就会答非所问。
  *
  * **只认「去标点后完全一致」**（2026-11-19 收紧，原来是「前缀 + 覆盖 ≥60%」）。
@@ -442,8 +457,8 @@ function stripPartialTail(text: string): string {
  * 是 `asr.sentence` 在等静音确认 —— 那一档收益照拿，且零风险。
  */
 export function acceptsSpeculation(spec: string, final: string, minChars = SPEC_MIN_CHARS): boolean {
-  const s = stripPartialTail(spec);
-  const f = stripPartialTail(final);
+  const s = normalizeForCompare(spec);
+  const f = normalizeForCompare(final);
   if (s.length < minChars) return false;
   return s === f;
 }
@@ -778,7 +793,10 @@ export class FrontedAgent implements AgentProvider {
         final: text,
         spec_chars: specCore.length,
         final_chars: text.length,
-        coverage: Number((specCore.length / Math.max(1, text.length)).toFixed(3)),
+        coverage: Number(
+          (normalizeForCompare(prev.text).length
+            / Math.max(1, normalizeForCompare(text).length)).toFixed(3),
+        ),
         missing: text.slice(specCore.length),
         ran_for_ms: Math.round(this.now() - prev.startedAt),
       });
@@ -819,8 +837,9 @@ export class FrontedAgent implements AgentProvider {
   speculatePartial(text: string): boolean {
     if (!this.prefetchEnabled || !this.partialSpeculate) return false;
     const trace = process.env['FAST_LANE_TRACE'] === '1';
-    // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱
-    if (stripPartialTail(text).length < this.specMinChars) {
+    // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱。
+    // 和认领用同一把尺（`normalizeForCompare`），否则「发得出去、认不回来」。
+    if (normalizeForCompare(text).length < this.specMinChars) {
       // tracer 上和「真的发出去了」区分开：「投机 静音…」那行是宿主打算投，这行才是结果
       if (trace) this.log(`  快车道    投机跳过：中间结果太短 ${JSON.stringify(text)}`);
       return false;
@@ -830,22 +849,22 @@ export class FrontedAgent implements AgentProvider {
       // 定稿后才起的那一趟文本是确定的，别用猜测顶掉它（它已经比投机更准，不必再投）
       if (!prev.speculative) return true;
       if (prev.text === text) return true;
-      if (text.length > prev.text.length && text.startsWith(prev.text)
-        && prev.text.length / text.length >= SPEC_MIN_COVERAGE) {
-        return true;
-      }
       // **已经在跑的那趟覆盖得够多 → 沿用，既不重发也不消耗配额。**
-      // 认领的门槛本来就是「覆盖 ≥ `SPEC_MIN_COVERAGE`」（`acceptsSpeculation`），所以照
-      // 现有这版问出来的答案，跟拿新文本重问是一样的 —— 而重来会把已经跑掉的时间全扔掉。
       // 真机 `20261119-080409` 轮 11：投机提前 **1370 ms** 发出，ASR 又补了一版等于定稿的
       // partial，被判成「判停并了段」重起 —— 开轮时站在起跑线上的那趟只跑了 **2 ms**。
       if (!text.startsWith(prev.text) || text.length <= prev.text.length) {
+        // 被改写 / 变短：ASR 在纠错，早期那版大概率对不上定稿 —— 收掉，下一版可以重来
         this.dropPrefetch(
           `中间结果被改写（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}）`,
         );
         this.speculateStarts = 0;
         return false;
       }
+      // **变长**：认领要的是「去标点后完全一致」，而沿用的这一版是**前缀、不是全文**，
+      // 所以留着它永远认不回来（2026-11-19 收紧认领后才发现，`830768d` 的沿用逻辑
+      // 只在旧门槛「前缀 + 覆盖 ≥60%」下成立）。还有配额就重发更长的版本：
+      // 第一版已经跑掉的时间是沉没成本，**认不回来才是真的亏**。
+      if (this.speculateStarts >= 2) return true;   // 配额用满，只能沿用
     }
     if (this.speculateStarts >= 2) return prev !== null && prev.speculative;
     if (!this.isPrefetchable(text)) {
