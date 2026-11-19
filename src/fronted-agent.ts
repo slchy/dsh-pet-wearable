@@ -75,7 +75,14 @@ const DELEGATE = '[[DELEGATE]]';
  */
 
 
-const SYSTEM_PROMPT = [
+/**
+ * 快车道系统提示词 —— **含委派规则**（`FAST_LANE_DELEGATE=1`，默认）。
+ *
+ * 原文存档见 `docs/fast-lane-prompt-archive.md`（2026-11-19 备份）。
+ * 改这里之前先想清楚：这条提示词和 `SYSTEM_PROMPT_PLAIN` 是**两套人格行为**，
+ * 不是同一套的细节差异 —— 切哪个由 `delegateEnabled` 决定。
+ */
+const SYSTEM_PROMPT_WITH_DELEGATE = [
   // 人设：和 L2 是同一个角色，只是话更短。少一句人设，用户就会听出「换了个人」
   '你是「米馍」，用户是「哥」—— 他戴着智能眼镜，你的话会变成语音在他耳边播放。',
   '说话口语、简短、有人味；不用敬语，不卖萌过度，不解释你在做什么。',
@@ -103,6 +110,27 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /**
+ * 快车道系统提示词 —— **一般聊天模型**（`FAST_LANE_DELEGATE=0`）。
+ *
+ * 与上面那版的关系：语料**只有闲聊**，没有任何「该不该交给别人」的分支，
+ * 也没有 `[[DELEGATE]]` 这个出口。切到这一版意味着快车道只做它擅长的那一件事，
+ * 而「哪些句子根本不进快车道」必须由上游决定 —— 否则问天气、问订单时它会照聊。
+ */
+const SYSTEM_PROMPT_PLAIN = [
+  '你是「米馍」，用户是「哥」—— 他戴着智能眼镜，你的话会变成语音在他耳边播放。',
+  '说话口语、简短、有人味；不用敬语，不卖萌过度，不解释你在做什么。',
+  '每句回复**最开头**写一个情绪标签，从这六个里选：[开心] [得意] [惊讶] [平静] [担心] [委屈]。',
+  '标签只给语音合成用，不会被念出来；正文里不要再出现方括号。',
+  '',
+  '你就是在陪他聊天，他说什么你接什么：',
+  '- 招呼、寒暄、夸奖、撒娇、道别 —— 接住就好，不用客套。',
+  '- 他说累、饿、冷、难过、烦躁 —— 先接情绪，别急着给建议。',
+  '- 问你看法、聊他看过的片子书、聊你俩之前说过的 —— 照实聊，',
+  '  **不确定就说不知道**，别编细节、别假装查过。',
+  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown。',
+].join('\n');
+
+/**
  * 有后台任务时追加的规则。**必须给事实才追加** —— 没事实时提「后台任务」反而
  * 会诱导它编一个。
  */
@@ -116,8 +144,22 @@ const TASK_RULE = [
 ].join('\n');
 
 /**
- * 问「进度」而不是「干活」的句子。
+ * `FAST_LANE_DELEGATE=0` 时的同义规则：**不提委派**。
  *
+ * 那版提示词里根本没有「交给别人」这个选项，还提一句「不要委派」等于把不存在的
+ * 分支重新摆到模型面前 —— 它会开始琢磨要不要委派，然后写出 `[[DELEGATE]]` 被判成正文念出来。
+ */
+const TASK_RULE_PLAIN = [
+  '',
+  '【这一轮额外给了你一条「后台任务」事实】',
+  '- 用户问进度（好了吗/查到了吗/还在跑吗/怎么样了/还要多久），**直接照那条事实说一句**：',
+  '  在跑就说还在跑，别报结果；',
+  '- 事实说没有在跑的，就别编「正在查」，也别编「刚查到」；',
+  '- 不要复述整条事实，用口语说一句。',
+].join('\n');
+
+/**
+ * 问「进度」而不是「干活」的句子。
  * 这类句子里的字（查/找/看）会命中 `TASK_WORDS` 被挡去 dsh，但它们问的是**已经在跑
  * 的那件事**，有事实就能照实答 —— 那正是慢车道最不该拦的一类。
  *
@@ -235,6 +277,18 @@ export interface FastLaneOptions {
   readonly keepTurns?: number;
   /** 投机双轨：与 dsh 同时发（默认 true） */
   readonly speculate?: boolean;
+  /**
+   * 快车道有没有**委派能力**（模型输出 `[[DELEGATE]]` 就转 dsh），默认 true。
+   *
+   * 关掉（`FAST_LANE_DELEGATE=0`）时做两件事：
+   * 1. 提示词换成 `SYSTEM_PROMPT_PLAIN` —— 纯聊天，没有分流规则也没有暗号出口；
+   * 2. `delegated` 恒为 false，即使模型自己写出那六个字符也按普通文本处理。
+   *
+   * **代价必须清楚**：快车道不再有「我不知道该不该交给 dsh」这个出口。问天气、
+   * 问订单这类问题它会按聊天模型的方式答（可能编），所以关掉之后**上游必须自己
+   * 决定哪些句子根本不进快车道**，不能指望它自己让路。
+   */
+  readonly delegateEnabled?: boolean;
   /**
    * 快车道请求的对冲份数（默认 1 = 不对冲）。
    *
@@ -409,6 +463,7 @@ async function readStream(
   startedAt: number,
   now: () => number,
   hooks: StreamHooks,
+  allowDelegate = true,
 ): Promise<FastAnswer> {
   const decoder = new TextDecoder();
   let buffer = '';
@@ -432,7 +487,7 @@ async function readStream(
       }
       const payload = line.slice('data:'.length).trim();
       if (payload === '[DONE]') {
-        return finish(text.trim().startsWith(DELEGATE));
+        return finish(allowDelegate && text.trim().startsWith(DELEGATE));
       }
       let parsed: { choices?: Array<{ delta?: { content?: string } }> };
       try {
@@ -455,14 +510,14 @@ async function readStream(
       }
       held += piece;
       const head = held.trimStart();
-      if (head.startsWith('[[')) {
+      if (allowDelegate && head.startsWith('[[')) {
         return finish(true);
       }
       // 模型偶尔会先写情绪标签再写暗号（`[平静][[DELEGATE]]`）—— 标签一出现闸门就开，
       // 暗号会被当正文念出去。去掉开头的标签再看一眼。
       const withoutTag = head.replace(/^\[[^[\]]{1,4}\]\s*/, '');
       if (withoutTag !== head) {
-        if (withoutTag.startsWith('[[')) {
+        if (allowDelegate && withoutTag.startsWith('[[')) {
           return finish(true);
         }
         if (withoutTag === '') {
@@ -501,6 +556,7 @@ export class FrontedAgent implements AgentProvider {
   /** 中间结果投机的最小字数（见 {@link FrontedOptions.specMinChars}） */
   private readonly specMinChars: number;
   private readonly speculate: boolean;
+  private readonly delegateEnabled: boolean;
   private readonly prefetchEnabled: boolean;
   private readonly partialSpeculate: boolean;
   /** 投机已经起跑几次（同一条「越改越长」的链最多 2 次，别让 ASR 抖动变成请求风暴） */
@@ -609,6 +665,7 @@ export class FrontedAgent implements AgentProvider {
     this.windowChars = Math.max(200, options.windowChars ?? WINDOW_CHARS);
     this.specMinChars = Math.max(1, options.specMinChars ?? SPEC_MIN_CHARS);
     this.speculate = options.speculate ?? true;
+    this.delegateEnabled = options.delegateEnabled ?? true;
     this.prefetchEnabled = options.prefetch ?? true;
     this.partialSpeculate = options.partialSpeculate ?? true;
     this.hedge = Math.max(1, options.hedge ?? 1);
@@ -1229,7 +1286,7 @@ export class FrontedAgent implements AgentProvider {
    * （不然「我叫什么」接不上）、dsh 最后一句（不然「好的」会在 dsh 问话之后被抢答）。
    */
   private systemPrompt(userText: string): string {
-    const parts: string[] = [SYSTEM_PROMPT];
+    const parts: string[] = [this.delegateEnabled ? SYSTEM_PROMPT_WITH_DELEGATE : SYSTEM_PROMPT_PLAIN];
 
     let memories: readonly string[] = [];
     try {
@@ -1240,9 +1297,13 @@ export class FrontedAgent implements AgentProvider {
     if (memories.length > 0) {
       parts.push(`【长期记忆（由 dsh 维护，你只能读）】${memories.join('；')}`);
       // 记忆里已经有的，交给 dsh 就是白等一轮（它读的是同一份文件）
-      parts.push('【长期记忆】里已经写明的事（称呼、住处、偏好这类），直接用记忆照实回答，**不要委派**；记忆里没有的才 [[DELEGATE]]。');
+      parts.push(this.delegateEnabled
+        ? '【长期记忆】里已经写明的事（称呼、住处、偏好这类），直接用记忆照实回答，**不要委派**；记忆里没有的才 [[DELEGATE]]。'
+        : '【长期记忆】里已经写明的事（称呼、住处、偏好这类），直接用记忆照实回答；记忆里没有的就说没印象，别编。');
     } else {
-      parts.push('只依据上面的对话和长期记忆回答；问到更早的事就 [[DELEGATE]]。');
+      parts.push(this.delegateEnabled
+        ? '只依据上面的对话和长期记忆回答；问到更早的事就 [[DELEGATE]]。'
+        : '只依据上面的对话和长期记忆回答；问到更早的事就说没印象，别编。');
     }
 
     let facts = '';
@@ -1252,7 +1313,12 @@ export class FrontedAgent implements AgentProvider {
       facts = '';
     }
     if (facts !== '') {
-      parts.push(TASK_RULE.trim(), facts);
+      // 禁用委派时那段规则不能说「不要委派」—— 那版提示词里根本没有委派这回事，
+      // 提它等于把不存在的选项重新塞回模型面前。
+      parts.push(
+        (this.delegateEnabled ? TASK_RULE : TASK_RULE_PLAIN).trim(),
+        facts,
+      );
     }
     return parts.join('\n');
   }
@@ -1348,7 +1414,9 @@ export class FrontedAgent implements AgentProvider {
         this.log(`  快车道    提示词 ${msgs.length} 条 / ${chars} 字`);
         this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms（对冲 ${racers.length} 份）`);
       }
-      const answer = await readStream(winner.r.body!, startedAt, this.now, { onFirstToken: rearm, emit });
+      const answer = await readStream(
+        winner.r.body!, startedAt, this.now, { onFirstToken: rearm, emit }, this.delegateEnabled,
+      );
       // `raw` 是模型原文（可能带 `[平静]` 情绪标签、也可能被 [[DELEGATE]] 早退），
       // `opened` 表示有没有已经推给 TTS —— 两者决定这份答案「能撤回还是已经出口」。
       this.auditSink(EVENTS.agentDone, {

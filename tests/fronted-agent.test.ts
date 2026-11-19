@@ -777,6 +777,34 @@ test('没有事实时不追加规则（空串 = 保持原样）', async () => {
   assert.ok(!system.includes('后台任务'), system);
 });
 
+test('禁用委派：提示词不带暗号，模型写出暗号也不转 dsh', async () => {
+  // `FAST_LANE_DELEGATE=0` = 快车道只当聊天模型。两件事都要验：
+  // 提示词里不能出现 `[[DELEGATE]]`（否则等于把不存在的选项摆到它面前），
+  // 而且就算模型自己写出来，也不能当成委派信号。
+  const inner = fakeInner();
+  let systemMsg = '';
+  const agent = new FrontedAgent({
+    inner: inner.agent,
+    apiKey: 'k',
+    speculate: false,
+    delegateEnabled: false,
+    log: () => {},
+    fetchImpl: (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      systemMsg = String((body.messages?.[0] as { content?: string } | undefined)?.content ?? '');
+      return sse(['[[', 'DELEGATE]]']);
+    }) as unknown as typeof fetch,
+  });
+  agent.attachLiveSink(() => {});
+
+  const reply = await agent.reply('帮我查一下订单');
+
+  assert.ok(!systemMsg.includes('[[DELEGATE]]'), '纯聊天版提示词不该提暗号');
+  assert.ok(!systemMsg.includes('委派'), '也不该提「委派」这件事');
+  assert.equal(reply.path, 'fast', '禁用委派 → 不转 dsh');
+  assert.equal(inner.calls.length, 0, 'dsh 一次都没被问');
+});
+
 test('状态询问：本地不再拦，「查到了吗」由模型自己决定答还是委派', async () => {
   const inner = fakeInner();
   const asked: string[] = [];

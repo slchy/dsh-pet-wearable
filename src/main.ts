@@ -599,6 +599,9 @@ async function main(): Promise<void> {
         // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
         // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
         hedge: envNumber('FAST_LANE_HEDGE', 2),
+        // 委派能力：`0` = 快车道只当聊天模型（提示词换成纯聊天版，`[[DELEGATE]]` 不再生效）。
+        // 关掉之后「哪些句子根本不进快车道」必须由上游决定 —— 它不会自己让路。
+        delegateEnabled: process.env['FAST_LANE_DELEGATE'] !== '0',
         // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
         taskStatus: () => dshSession.taskStatus(),
         // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），
@@ -609,14 +612,15 @@ async function main(): Promise<void> {
         audit: (name, data) => { auditSink?.(name, data); },
       });
       console.log(
-        `快车道    开（短句闲聊直答，其余交给 dsh；FAST_LANE=0 关闭）  `
+        `快车道    开（${process.env['FAST_LANE_DELEGATE'] !== '0' ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
         + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`
         // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
         + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
         + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
         + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
         + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
-        + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`,
+        + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
+        + ` delegate=${process.env['FAST_LANE_DELEGATE'] !== '0' ? 'on' : 'OFF（纯聊天）'}`,
       );
       // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
       // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
