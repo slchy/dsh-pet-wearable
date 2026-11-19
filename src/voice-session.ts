@@ -127,15 +127,6 @@ const ASSEMBLER_PREDICT_LEAD_MS = 65;
 const INITIAL_LISTEN_MS = 60_000;
 
 /**
- * 设备连上之后等多久再预合成回执。
- *
- * 预合成要占 TTS 那条连接（一次一个 task），立刻占会和用户第一句话的回答抢。
- * 真机上「连上 → 开口 → 定稿」通常 >1 s，取 800 ms：既躲开连接刚建的抖动，
- * 又能在绝大多数人开口前把「我看看。」备好。
- */
-const PRIME_RECEIPTS_DELAY_MS = 800;
-
-/**
  * 连接就绪后等多久看「设备有没有在推流」。
  *
  * `EXPERIMENTS §42` 实测：手机发 `WakeUpEvent` 后 0.62 s 内就来流。所以 1.5 s
@@ -672,10 +663,6 @@ class VoiceConnection {
     // TCP+TLS+Upgrade）。放在「这一轮开始」就太晚了 —— 那时用户已经在等。
     // ASR 那侧不用在这里调：`stt.open()` 内部已经预取 token。
     options.tts.warm?.();
-    // 回执预合成：等连接建好、且留出一点余量再占 TTS（它一次只能跑一个 task，
-    // 立刻占会和用户第一句话抢）。预合成之后回执走缓存，TTS 预热留给正式回答。
-    const primeTimer = setTimeout(() => { this.dialog.primeReceipts(); }, PRIME_RECEIPTS_DELAY_MS);
-    primeTimer.unref?.();
 
     this.uplink = new UplinkPipeline({
       ffmpegPath: options.ffmpegPath,

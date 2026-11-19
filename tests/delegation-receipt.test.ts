@@ -112,27 +112,6 @@ const wait = async (ms: number): Promise<void> => {
   await new Promise((resolve) => { setTimeout(resolve, ms); });
 };
 
-test('回执预合成之后走缓存，不再占 TTS（预热留给正式回答）', async () => {
-  const r = rig(400);
-  try {
-    r.runtime.primeReceipts();
-    await wait(30);
-    assert.ok(
-      r.logs.some((line) => line.includes('预合成进缓存')),
-      `设备连上后应把回执备好：${JSON.stringify(r.logs)}`,
-    );
-
-    r.runtime.dispatch({ type: 'utterance', text: '帮我查一下订单' });
-    await wait(120);
-    assert.ok(
-      r.logs.some((line) => line.includes('（缓存）')),
-      `回执应当命中缓存 —— 命中才不会去抢 TTS 的预开 task：${JSON.stringify(r.logs)}`,
-    );
-  } finally {
-    r.dispose();
-  }
-});
-
 test('交给慢车道：先回执，答案到了再顶掉', async () => {
   const r = rig(400);
   try {
