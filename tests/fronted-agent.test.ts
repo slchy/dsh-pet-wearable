@@ -96,21 +96,21 @@ function agentWith(
   });
 }
 
-test('判据：真机上被误判成任务的那些闲聊，现在走快车道', () => {
-  // 真机 92 轮里 25 轮被判成 task，这几句全在里面（`看 / 怎么 / 为什么 / 哪` 曾经一票否决）
+test('判据只做形态判断：不再按关键词分流', () => {
+  // 曾经「看 / 怎么 / 为什么 / 哪」一票否决，真机 92 轮里有 25 轮因此走进 dsh
+  // （每轮还垫一句回执，用户以为快模型罢工）。现在这些都交给模型的语义判断。
   for (const text of [
     '你看过星球大战没？', '你今天怎么样啊？', '为什么？', '为什么他们呢？',
-    '你觉得星球大战怎么样？', '嗯。', '怕。', '说得好。',
+    '你觉得星球大战怎么样？', '今天天气怎么样', '外面下雨吗', '几点了',
+    '帮我查一下订单', '把电话挂断。', '我的手机号是多少？',
   ]) {
-    assert.equal(isFastCandidate(text), true, `该走快车道：${text}`);
+    assert.equal(isFastCandidate(text), true, `形态上没问题就该让模型判语义：${text}`);
   }
-  // 实时事实、命令式、工具名仍然必须挡 —— 模型在这些问题上会编
-  for (const text of [
-    '今天天气怎么样', '外面下雨吗', '几点了', '看看我拍照的这张',
-    '帮我查一下订单', '你去搜。', '把电话挂断。', '我的手机号是多少？', '等于多少？',
-  ]) {
-    assert.equal(isFastCandidate(text), false, `必须交给 dsh：${text}`);
-  }
+  // 只剩两条硬边界：太长、含阿拉伯数字
+  assert.equal(isFastCandidate('我觉得你今天特别好看而且心情看起来也很好呀'), false, '超 14 字交给 dsh');
+  assert.equal(isFastCandidate('订单号是W8665881'), false, '数字必须精确，不让模型转述');
+  assert.equal(isFastCandidate('等于多少？'), true, '不含阿拉伯数字 —— 由模型决定算不算需要工具');
+  assert.equal(isFastCandidate(''), false);
 });
 
 test('判据：闲聊候选 vs 任务请求', () => {
@@ -118,9 +118,6 @@ test('判据：闲聊候选 vs 任务请求', () => {
     assert.equal(isFastCandidate(text), true, `该走快车道：${text}`);
   }
   for (const text of [
-    '帮我查一下订单',
-    '今天天气怎么样',
-    '看看我拍照的这张',
     '订单号是W8665881',
     '我觉得你今天特别好看而且心情看起来也很好呀',
   ]) {
@@ -128,23 +125,24 @@ test('判据：闲聊候选 vs 任务请求', () => {
   }
 });
 
-test('「什么」不进任务词 —— 它会把「你叫什么名字」一起挡掉', () => {
+test('本地判据不再管词 —— 「几点了」也放给模型判（它会 [[DELEGATE]]）', () => {
   assert.equal(isFastCandidate('你叫什么名字'), true);
   assert.equal(isFastCandidate('你好呀今天'), true);
-  // 「几点了」**不再**放行：`qwen-flash` 会直接编一个时间（实测两场都中招）。
-  // 要事实的问题留给 dsh，它有工具。
-  assert.equal(isFastCandidate('几点了'), false, '实时事实类（含时间）必须本地挡住');
+  // 2026-11-19 起不再按词挡：实时事实由 `SYSTEM_PROMPT` 的语义规则约束，
+  // 模型拿不准就输出 [[DELEGATE]]，本地只留形态边界（长度 / 阿拉伯数字）。
+  assert.equal(isFastCandidate('几点了'), true);
 });
 
-test('任务类请求完全不问快模型', async () => {
+test('模型判 [[DELEGATE]] 时交给 dsh，一个字的正文都不出', async () => {
   const inner = fakeInner();
   let asked = 0;
   const agent = agentWith(inner.agent, async () => {
     asked += 1;
-    return sse(['不该被问到。']);
+    return sse(['[[DELEGATE]]']);
   });
-  await agent.reply('帮我查一下订单');
-  assert.equal(asked, 0, '本地判据就该挡住');
+  const reply = await agent.reply('帮我查一下订单');
+  assert.equal(asked, 1, '本地不再按词挡 —— 是模型自己判的委派');
+  assert.equal(reply.path, 'dsh');
   assert.equal(inner.calls.length, 1);
 });
 
@@ -375,7 +373,11 @@ test('快车道赢下的轮次不会在 dsh 那边蒸发（被掐掉的请求不
   // 线上日志：`把缓冲的闲聊轮次补进 dsh 上下文` 紧接着 `path=fast dsh_ms=0.6`
   // —— 注记随一个随后被取消的请求送出，那批轮次在两边都不存在了。
   const inner = slowInner(120);
-  const agent = agentWith(inner.agent, async () => sse(['[平静]', '我在呢。']));
+  let round = 0;
+  const agent = agentWith(inner.agent, async () => {
+    round += 1;
+    return round < 3 ? sse(['[平静]', '我在呢。']) : sse(['[[', 'DELEGATE]]']);
+  });
   agent.attachLiveSink(() => {});
 
   // 两轮闲聊：dsh 那两轮都被快车道掐掉，一批注记也没真正落地
@@ -383,7 +385,7 @@ test('快车道赢下的轮次不会在 dsh 那边蒸发（被掐掉的请求不
   await agent.reply('我可想你了');
   await new Promise((resolve) => setTimeout(resolve, 300));
 
-  // 第三轮命中任务词 → 真的交给 dsh
+  // 第三轮模型判委派 → 真的交给 dsh
   const third = await agent.reply('帮我查一下订单');
 
   assert.equal(third.path, 'dsh');
@@ -471,14 +473,19 @@ test('dsh 上一条在问话：短回话必须交给 dsh，不能被快模型抢
       ...inner.agent,
       reply: async () => ({ text: '确认要删这条备忘录吗？', speech: '确认要删这条备忘录吗？' }),
     },
-    async () => { fastCalls += 1; return sse(['好呀。']); },
+    async () => {
+      fastCalls += 1;
+      // 第一轮模型判委派（本轮不再有本地任务词表）；「好的」不该再问到快模型
+      return fastCalls === 1 ? sse(['[[', 'DELEGATE]]']) : sse(['好呀。']);
+    },
     { speculate: false },
   );
   agent.attachLiveSink(() => {});
 
-  await agent.reply('帮我查一下订单');
+  const first = await agent.reply('帮我查一下订单');
+  assert.equal(first.path, 'dsh', '模型判委派 → 交给 dsh');
   const reply = await agent.reply('好的');
-  assert.equal(fastCalls, 0, '「好的」是对 dsh 那句问话的回答，不是闲聊');
+  assert.equal(fastCalls, 1, '「好的」是对 dsh 那句问话的回答，不是闲聊');
   assert.equal(reply.speech, '确认要删这条备忘录吗？');
 });
 
@@ -487,14 +494,18 @@ test('dsh 上一条不是问话：短回话照旧走快车道（别过度拦）'
   let fastCalls = 0;
   const agent = agentWith(
     inner.agent,
-    async () => { fastCalls += 1; return sse(['嗯，我在。']); },
+    async () => {
+      fastCalls += 1;
+      return fastCalls === 1 ? sse(['[[', 'DELEGATE]]']) : sse(['嗯，我在。']);
+    },
     { speculate: false },
   );
   agent.attachLiveSink(() => {});
 
   await agent.reply('帮我查一下订单');
-  await agent.reply('好的');
-  assert.equal(fastCalls, 1);
+  const reply = await agent.reply('好的');
+  assert.equal(fastCalls, 2, '上一句 dsh 不是问话 → 「好的」照旧问快模型');
+  assert.equal(reply.path, 'fast');
 });
 
 test('暗号前面带了情绪标签也不许播出去', async () => {
@@ -546,7 +557,10 @@ test('审计：agent.ask 落全量 messages，agent.done 落模型原文', async
     fakeInner().agent,
     async () => {
       round += 1;
-      return sse([round === 1 ? '那少穿点吧。' : '你说今天热。']);
+      if (round === 1) return sse(['那少穿点吧。']);
+      if (round === 2) return sse(['你说今天热。']);
+      if (round === 3) return sse(['[[', 'DELEGATE]]']);
+      return sse(['嗯，我在。']);
     },
     { speculate: false, audit: (name, data) => { audit.push({ name, data }); } },
   );
@@ -584,7 +598,11 @@ test('对话窗口：自己答的和 dsh 答的都以 role 进 messages', async 
       const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}'));
       seen.push(body.messages as Array<{ role: string; content: string }>);
       round += 1;
-      return sse([round === 1 ? '那少穿点吧。' : '你说今天热。']);
+      if (round === 1) return sse(['那少穿点吧。']);
+      if (round === 2) return sse(['你说今天热。']);
+      // 第三轮：模型判委派（本地已无任务词表）
+      if (round === 3) return sse(['[[', 'DELEGATE]]']);
+      return sse(['嗯，我在。']);
     },
     { speculate: false },
   );
@@ -759,7 +777,7 @@ test('没有事实时不追加规则（空串 = 保持原样）', async () => {
   assert.ok(!system.includes('后台任务'), system);
 });
 
-test('状态询问绕过任务词表（有事实才放行）', async () => {
+test('状态询问：本地不再拦，「查到了吗」由模型自己决定答还是委派', async () => {
   const inner = fakeInner();
   const asked: string[] = [];
   const agent = agentWith(
@@ -773,16 +791,16 @@ test('状态询问绕过任务词表（有事实才放行）', async () => {
   );
   agent.attachLiveSink(() => {});
 
-  // 「查」在任务词表里，但这句问的是进度
   const reply = await agent.reply('查到了吗');
-  assert.equal(reply.speech, '还在跑呢。');
+  assert.equal(reply.path, 'fast', '形态合格 → 照常问快模型');
   assert.equal(asked.length, 1);
 
-  // 没有事实来源时不能放行：那样它只会瞎猜
-  const plain = agentWith(fakeInner().agent, async () => sse(['嗯。']), { speculate: false });
+  // 模型自己判委派（比如它没有事实可依据）
+  const plain = agentWith(fakeInner().agent, async () => sse(['[[', 'DELEGATE]]']), { speculate: false });
   plain.attachLiveSink(() => {});
   const delegated = await plain.reply('查到了吗');
   assert.equal(delegated.speech, '慢车道答复。');
+  assert.equal(delegated.path, 'dsh');
 });
 
 test('发起任务的句子不算状态询问', () => {

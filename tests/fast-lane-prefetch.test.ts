@@ -116,15 +116,17 @@ test('判停并了段：预跑作废，按并完的新文本重问', async () =>
   assert.equal(reply.speech, '答的是谢谢你啦', '用户只能听到新文本的答复');
 });
 
-test('任务类句子不预跑：本地判据就该挡住', () => {
+test('预跑只剩形态门槛：含数字/超长不预跑，语义交给模型', () => {
   let asked = 0;
   const agent = makeAgent(async () => {
     asked += 1;
     return sse(['不该被问到。']);
   });
 
-  agent.prefetch('帮我查一下订单');
-  assert.equal(asked, 0, '要工具的句子预跑纯属白花钱');
+  // 2026-11-19 起不再按词挡「帮我查一下订单」这类句子 —— 那是模型的语义判断，
+  // 它会在流里输出 [[DELEGATE]]，预跑那趟作废即可。本地只挡形态不合格的。
+  agent.prefetch('订单号是W8665881');
+  assert.equal(asked, 0, '含阿拉伯数字 → 形态挡掉，预跑白花钱');
 });
 
 // ---------------------------------------------------------------- 生产装配
@@ -199,7 +201,7 @@ test('prefetch 的返回值就是「这一趟已经在跑了」——宿主靠�
 
   assert.equal(agent.prefetch('你好呀'), true, '起跑一次 → true');
   assert.equal(agent.prefetch('你好呀'), true, '同一句再报一次也是 true（那一趟确实在跑）');
-  assert.equal(agent.prefetch('帮我查一下订单'), false, '任务类句子不预跑 → false（TTS 也不该预开）');
+  assert.equal(agent.prefetch('订单号是W8665881'), false, '形态不合格 → false（TTS 也不该预开）');
   assert.equal(asked, 1, '只有第一次真的发了请求');
 
   const withSwitch = new FrontedAgent({
@@ -376,14 +378,14 @@ test('投机：门槛只管「发不发」，认领规则一个字没动', () =>
   );
 });
 
-test('投机：任务类句子同样不投机（与预跑同一组门槛）', () => {
+test('投机：与预跑同一组形态门槛（语义不归本地管）', () => {
   let asked = 0;
   const agent = makeAgent(async () => {
     asked += 1;
     return sse(['不该被问到。']);
   });
-  agent.speculatePartial('帮我查一下订单号');
-  assert.equal(asked, 0, '要工具的句子投机纯属白花钱');
+  agent.speculatePartial('订单号是W8665881');
+  assert.equal(asked, 0, '含阿拉伯数字 → 形态挡掉，投机纯属白花钱');
 });
 
 // ---------------------------------------------------------------- 对冲
