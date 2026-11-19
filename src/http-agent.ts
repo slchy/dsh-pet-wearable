@@ -20,6 +20,9 @@ import { Agent, setGlobalDispatcher } from 'undici';
  * ⚠️ **别把这里设得比服务端的空闲超时长**：复用一条已被对端关掉的连接会直接
  * `ECONNRESET`/`EPIPE`，那比多等 100 ms 糟得多。真要调大，先重跑那个测量。
  * 复用失败的样本会落进 `agent.conn`（见 `fronted-agent.ts`）。
+  *
+  * **实测（2026-11-19，线上同款 `fetch`）**：装了这个 dispatcher 之后，空闲
+  * 5 / 8 / 15 / 30 / 45 秒后的响应头全在 133–258 ms；不装则 5 秒后跳到 436 ms。
  */
 export const DEFAULT_KEEPALIVE_MS = 50_000;
 
@@ -35,8 +38,13 @@ export const DEFAULT_KEEPALIVE_MS = 50_000;
 export function installHttpAgent(keepAliveMs = DEFAULT_KEEPALIVE_MS): Agent {
   const agent = new Agent({
     keepAliveTimeout: keepAliveMs,
-    // 服务端若回了 `Keep-Alive: timeout=N`，undici 取 min(N*1000, 这个值) ——
-    // 只设前者的话，服务端一句 `timeout=4` 就能把保活打回原形。
+    // `keepAliveTimeout` 是**我们自己**的默认值。服务端若回了 `Keep-Alive: timeout=N`，
+    // undici 会改用 `min(N*1000, keepAliveMaxTimeout)` —— 也就是说**服务端说了算**，
+    // 这个上限只可能把保活压短，**不可能放长**。（2026-11-19 这里原来写反了，
+    // 当时的注释声称它能「顶住服务端一句 timeout=4」，实际不能。）
+    //
+    // 之所以 50 s 仍然生效，是因为实测 DashScope **不带这个提示头**：
+    // 空闲 20/30/45/60 秒各 10 次全部复用成功、0 次失败。换个厂商要先重测。
     keepAliveMaxTimeout: keepAliveMs,
     connections: 16,
   });
