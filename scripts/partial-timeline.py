@@ -42,6 +42,74 @@ def norm(s: str) -> str:
     return ALL_PUNCT.sub("", s)
 
 
+# 句末标点：ASR 自己认为「这句完了」的直接证据（`stripPartialTail` 会把它去掉，
+# 所以必须在去掉之前看）。
+TERMINAL_PUNCT = re.compile(r"[。.？?！!…]$")
+
+
+def proposal_fire(spec: str) -> bool:
+    """**提议的发出条件**：带句末标点，或者足够长。
+
+    现在的条件只有「去尾标点后 ≥6 字」，短句（「你退下吧。」4 字）永远发不出去 ——
+    而它们恰恰是「partial 早已完整、`asr.sentence` 在等静音」那一类。
+    带上句末标点就能发，且这个信号是 ASR 自己给的。
+    """
+    if TERMINAL_PUNCT.search(spec):
+        return len(norm(spec)) >= 2
+    return len(strip_tail(spec)) >= SPEC_MIN_CHARS
+
+
+def accepts_exact(spec: str, final: str) -> bool:
+    """**提议的认领条件**：去标点后完全一致。
+
+    现在的门槛是「前缀 + 覆盖 ≥60%」，而缺的那 40% 常常正是宾语
+    （「对呀，那你知道」←「那你知道蓝母吗？」），模型只能反问。
+    """
+    s = norm(spec)
+    return len(s) >= 2 and s == norm(final)
+
+
+# 一版 partial 之后这么久没有新版，说明 ASR 自己已经定下来了。
+STABLE_MS = 200
+
+
+def proposal_hit(window, final, sent_t):
+    """**带句末标点就发**，看需要发几版才能命中（完全一致）。
+
+    返回 `(命中时刻, 发了几次)`。「发几次」直接决定 `speculateStarts` 该给多大：
+    每句 2 次不够的话，后面那些「带标点的版本」就轮不到了。
+    """
+    tries = 0
+    for k, (_, p) in enumerate(window):
+        if not TERMINAL_PUNCT.search(p["text"]):
+            continue
+        tries += 1
+        if accepts_exact(p["text"], final):
+            return p["t"], tries
+    return None, tries
+
+
+def stable_hit(window, final, sent_t):
+    """**提议的发出条件**：这一版 partial 已经稳定（200 ms 没新版）就发。
+
+    返回 `(命中时刻, 命中前发了几次)`：命中 = 这版稳定**且去标点后完全一致**。
+    发出时并不知道能不能对上定稿，所以「发了几次」就是配额消耗 ——
+    `speculateStarts` 每句上限 2，超过 2 次的那个命中拿不到。
+
+    「带句末标点就发」试过：认领率只有 22%，因为第一版带标点的常常是很早的错句。
+    稳定是更强的信号 —— ASR 停下来 200 ms，说明它对这段解码有把握了。
+    """
+    tries = 0
+    for k, (_, p) in enumerate(window):
+        nxt = window[k + 1][1]["t"] if k + 1 < len(window) else sent_t
+        if nxt - p["t"] < STABLE_MS:
+            continue
+        tries += 1
+        if accepts_exact(p["text"], final):
+            return p["t"] + STABLE_MS, tries
+    return None, tries
+
+
 def accepts_speculation(spec: str, final: str) -> bool:
     """与 `src/fronted-agent.ts:acceptsSpeculation` 等价。"""
     s = strip_tail(spec)
@@ -129,10 +197,20 @@ def analyze(path: Path):
                 break
         stop = speech_stop_at(events, gate_idx)
 
-        # 本轮的 partial：前一个定稿之后、本轮定稿之前（含）
+        # 本轮的 partial：**本轮话筒门打开之后**、定稿之前。
+        #
+        # 下界必须用 `gate.open`，不能用「上一个定稿」：一段语音说完后 ASR 还会吐
+        # 一版「嗯」之类的尾巴，它落在上一句定稿之后、下一句开口之前 —— 拿它当
+        # 素材会把「稳定 200 ms」算成十几秒（第一版残留之后 3 s 都没有新版）。
+        gate_open_idx = -1
+        for i in range(sent_idx, prev_at, -1):
+            if events[i].get("ev") == "gate.open":
+                gate_open_idx = i
+                break
+        lo = max(prev_sent_idx, gate_open_idx)
         window = [
             (i, events[i])
-            for i in range(prev_sent_idx + 1, sent_idx)
+            for i in range(lo + 1, sent_idx)
             if events[i].get("ev") == "asr.partial"
         ]
         prev_sent_idx = sent_idx
@@ -147,12 +225,27 @@ def analyze(path: Path):
             return None
 
         t60 = first_at(lambda s: accepts_speculation(s, final))
+        # **同口径**的覆盖档：都只看到去标点后的覆盖率，不带字数门槛、不看原始
+        # 标点。原来把 `acceptsSpeculation`（含 `minChars=6` + 原始文本前缀）和
+        # 「覆盖 ≥90%」放在一张表里，才会出现「更严的门槛达标更多」的假矛盾。
+        t60loose = first_at(lambda s: strict_cov(s, final_n) >= 0.6)
         t90 = first_at(lambda s: strict_cov(s, final_n) >= 0.9)
         t100 = first_at(lambda s: strict_cov(s, final_n) >= 1.0)
         # 「短句只在完全一致时认领」：门槛降到 2 字，但要求去标点后与定稿完全相同
         t_exact2 = first_at(
             lambda s: len(norm(s)) >= 2 and strict_cov(s, final_n) >= 1.0
         )
+        # 提议口径：发出用 `proposal_fire`（带句末标点 or 够长），认领用 `accepts_exact`
+        t_prop = first_at(proposal_fire)
+        prop_ok = False
+        if t_prop is not None:
+            for _, p in window:
+                if p["t"] == t_prop:
+                    prop_ok = accepts_exact(p["text"], final)
+                    break
+        # 稳定口径：这版 partial 已经不再变（200 ms 无新版）就发，认领要完全一致
+        t_stable, stable_tries = stable_hit(window, final, sent["t"])
+        t_pay, pay_tries = proposal_hit(window, final, sent["t"])
 
         # 现在这条路径实际能拿到的提前量：
         # `maybeSpeculate` 只在静音满 100 ms 的那个 tick 问一次，那一刻可认领就有，否则整轮没有。
@@ -195,9 +288,16 @@ def analyze(path: Path):
                     None if cov_strict_100 is None else cov_strict_100 >= 0.9
                 ),
                 early60=None if t60 is None else sent["t"] - t60,
+                early60loose=None if t60loose is None else sent["t"] - t60loose,
                 early90=None if t90 is None else sent["t"] - t90,
                 early100=None if t100 is None else sent["t"] - t100,
                 early_exact2=None if t_exact2 is None else sent["t"] - t_exact2,
+                early_prop=None if t_prop is None else sent["t"] - t_prop,
+                prop_ok=prop_ok,
+                early_stable=None if t_stable is None else sent["t"] - t_stable,
+                stable_tries=stable_tries,
+                early_pay=None if t_pay is None else sent["t"] - t_pay,
+                pay_tries=pay_tries,
                 now=now,
                 retry=retry,
                 n_partial=len(window),
@@ -216,14 +316,15 @@ def pct(v):
 
 def report(name, rows):
     print(f"\n{'='*100}\n{name}   n={len(rows)}\n{'='*100}")
-    print(f"{'轮':>3} {'字':>3} {'停→稿':>6} {'+100覆盖':>9} {'+100lcp':>8} "
-          f"{'提前60':>7} {'提前90':>7} {'提前100':>8} {'现拿到':>7} {'重试后':>7}  定稿")
+    print(f"{'轮':>3} {'字':>3} {'停→稿':>6} {'+100覆盖':>9} {'提前60':>7} {'提前100':>8} "
+          f"{'现拿到':>7} {'重试后':>7} {'提议发出':>8} {'认?':>4}  定稿")
     for r in rows:
         print(
             f"{r['n']:>3} {r['chars']:>3} {fmt(r['silence']):>6} "
-            f"{pct(r['cov_strict_100']):>9} {pct(r['cov_lcp_100']):>8} "
-            f"{fmt(r['early60']):>7} {fmt(r['early90']):>7} {fmt(r['early100']):>8} "
-            f"{fmt(r['now']):>7} {fmt(r['retry']):>7}  "
+            f"{pct(r['cov_strict_100']):>9} "
+            f"{fmt(r['early60']):>7} {fmt(r['early100']):>8} "
+            f"{fmt(r['now']):>7} {fmt(r['retry']):>7} {fmt(r['early_prop']):>8} "
+            f"{'✓' if r['prop_ok'] else ('✗' if r['early_prop'] is not None else '—'):>4}  "
             f"{r['final']}"
         )
 
@@ -242,10 +343,33 @@ def report(name, rows):
         )
 
     print()
-    line("提前量 60%（线上可认领）", [r["early60"] for r in rows])
-    line("提前量 90%（接近完整）", [r["early90"] for r in rows])
-    line("提前量 100%（完全一致）", [r["early100"] for r in rows])
-    line("提前量 完全一致·门槛降到2", [r["early_exact2"] for r in rows])
+    print("  【同一把尺：只看到去标点后的覆盖率，不带字数门槛】")
+    line("覆盖 ≥60%", [r["early60loose"] for r in rows])
+    line("覆盖 ≥90%", [r["early90"] for r in rows])
+    line("覆盖 =100%（完全一致）", [r["early100"] for r in rows])
+    print("\n  【线上判据 / 提议判据】")
+    line("线上 acceptsSpeculation", [r["early60"] for r in rows])
+    line("提议：带句末标点即发", [r["early_prop"] for r in rows])
+    props = [r for r in rows if r["early_prop"] is not None]
+    ok = sum(1 for r in props if r["prop_ok"])
+    print(
+        f"  提议口径：认领 {ok}/{len(props)} 轮"
+        "（认不了 = 发出去那一版定稿还更长，投机作废、退回定稿后再问）"
+    )
+    line(f"提议：稳定 {STABLE_MS} ms 才发", [r["early_stable"] for r in rows])
+    st = [r for r in rows if r["early_stable"] is not None]
+    under2 = sum(1 for r in st if r["stable_tries"] <= 2)
+    print(
+        f"  稳定口径：命中 {len(st)}/{len(rows)} 轮，其中配额（2 次）以内能拿到的 {under2} 轮"
+    )
+    line("提议：带句末标点就发（任一版）", [r["early_pay"] for r in rows])
+    pay = [r for r in rows if r["early_pay"] is not None]
+    for cap in (2, 3, 5, 99):
+        n = sum(1 for r in pay if r["pay_tries"] <= cap)
+        if cap == 99:
+            print(f"  带标点口径：命中 {len(pay)}/{len(rows)} 轮（配额不限）")
+        else:
+            print(f"  带标点口径：配额 {cap} 次以内能拿到 {n}/{len(rows)} 轮")
 
     # 「只问一次」vs「每 tick 都问」—— 这两行是「记账顺序该不该修」的判据，
     # 不能预设修了不影响行为。

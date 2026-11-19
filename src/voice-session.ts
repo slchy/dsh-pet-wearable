@@ -616,7 +616,13 @@ class VoiceConnection {
         ? {}
         : {
           commitAfterMs: options.gate.commitMs,
-          onCommit: () => { this.stt.commit?.(); },
+          onCommit: (silenceMs) => {
+            this.archive?.event(EVENTS.asrCommit, {
+              silence_ms: Math.round(silenceMs),
+              want_ms: options.gate.commitMs,
+            });
+            this.stt.commit?.();
+          },
         }),
       // 开轮门槛：提交早 → 定稿也早，可能人还在说。定稿到达时看「截至此刻的
       // 连续静音」，不够就等 —— 那本来就不该开轮。

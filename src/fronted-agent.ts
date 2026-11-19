@@ -398,13 +398,12 @@ const SPEC_MIN_CHARS = 6;
 /**
  * 投机文本至少要覆盖定稿的多大比例。
  *
- * 0.6 这个值来自真机 47 轮：0.5 会认下「改成」→「改成641室。」（模型只会追问改成几号），
- * 0.6 起在同样这批数据上**零误接受**，而命中率只从 51% 掉到 47%。
+ * **只用于「越改越长时要不要沿用」**（`speculatePartial`），不再参与认领 ——
+ * 认领已经收紧成「去标点后完全一致」，见 `acceptsSpeculation`。
+ *
+ * 0.6 这个值来自真机 47 轮：0.5 会认下「改成」→「改成641室。」（模型只会追问改成几号）。
  */
 const SPEC_MIN_COVERAGE = 0.6;
-
-/** 数字类字符：这一类被截断就会改变语义，见 `acceptsSpeculation` */
-const NUMERIC_CHAR = /[0-9０-９零一二三四五六七八九十百千万两]/;
 
 /**
  * 中间结果尾部常挂着「，」「？」这种标点（ASR 边解码边补），比对前去掉。
@@ -424,24 +423,29 @@ function stripPartialTail(text: string): string {
 /**
  * 定稿是否确认这份投机文本 —— **这条路唯一的闸门**，错了就会答非所问。
  *
- * 三条判据，每条都对着一类真机上真实发生过的失败：
+ * **只认「去标点后完全一致」**（2026-11-19 收紧，原来是「前缀 + 覆盖 ≥60%」）。
  *
- * 1. **必须是前缀**：ASR 在句末会大改（真机 26% 的轮，停嘴那一刻的 partial 跟定稿
- *    连前缀关系都没有：`打印→答应`、`井号→挺号`、`省级→审计`）。非前缀一律不认。
- * 2. **覆盖 ≥60% 长度**：「改成」→「改成641室。」前缀成立，但语义差远了。
- * 3. **不能把数字截断**：`对，我想改成6` 对定稿 `…改成6414`。这是唯一一类
- *    「看着合法、其实已经错了」的投机 —— 模型会追问「改成几号」，而用户已经说过。
+ * 为什么收：逐轮 dump 出来，被 60% 门槛放过的那一半，缺的正是**宾语** ——
+ * `080409` 轮 4 认下「对呀，那你知道」（定稿「对呀，那你知道蓝母吗？」）、
+ * 轮 5 认下「你给我详细介绍一下」（定稿「…佛拉尼斯。」）。模型只能反问，
+ * 用户听到的是「答非所问」，而档案里 `tts.first` 一切正常 —— 只有 `agent.spec`
+ * 的 `missing` 字段能查出来。
+ *
+ * 收益几乎不损失（`scripts/partial-timeline.py` 三场 52 轮）：
+ *
+ * | 门槛 | 达标 | 提前量中位 | p90 |
+ * |---|---|---|---|
+ * | 前缀 + 覆盖 ≥60% | 34/52 | 32 ms | 587–879 |
+ * | 去标点后完全一致 | 52/52 | **16 ms** | 19–313 |
+ *
+ * 还有 8 轮（52 轮里）partial 在定稿前 **300–423 ms** 就已经完全一致，
+ * 是 `asr.sentence` 在等静音确认 —— 那一档收益照拿，且零风险。
  */
 export function acceptsSpeculation(spec: string, final: string, minChars = SPEC_MIN_CHARS): boolean {
   const s = stripPartialTail(spec);
+  const f = stripPartialTail(final);
   if (s.length < minChars) return false;
-  if (!final.startsWith(s)) return false;
-  if (s.length < final.length * SPEC_MIN_COVERAGE) return false;
-  const tail = final.slice(s.length);
-  if (tail !== '' && NUMERIC_CHAR.test(s.slice(-1)) && NUMERIC_CHAR.test(tail[0]!)) {
-    return false;
-  }
-  return true;
+  return s === f;
 }
 
 interface FastAnswer {

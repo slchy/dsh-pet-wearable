@@ -34,6 +34,16 @@ export const EVENTS = {
   asrPartial: 'asr.partial',
   /** 一句定稿。**不是**轮次边界，见 `utterance-assembler.ts` */
   asrSentence: 'asr.sentence',
+  /**
+   * 请求 ASR **封段**（`commit()`）—— 端点由我们控时才走这条。
+   *
+   * `silence_ms` = 距最后一个有声帧多久，`want_ms` = 配置的 `commitAfterMs`。
+   * 两数之差就是「静音开始 → 真有音频帧到达」的等待：所有按静音计时的动作
+   * （封段 20 / 投机 100 / 判停预跑 200）都跑在 `trackSilence` 里，而它只在
+   * `addAudio` 时调 —— 上行包多大、设备静音时推不推帧，直接变成每轮的固定开销。
+   * 不记这一条，「停嘴→封段」永远只能靠猜。
+   */
+  asrCommit: 'asr.commit',
   asrError: 'asr.error',
 
   // ---- 一轮对话 ----

@@ -157,8 +157,15 @@ export interface UtteranceAssemblerOptions {
    * 所以这个值要靠真机标定，不要一次压到底。
    */
   readonly commitAfterMs?: number;
-  /** 静音到 {@link commitAfterMs} 时调一次，宿主拿去 `stt.commit()` */
-  readonly onCommit?: () => void;
+  /**
+   * 静音到 {@link commitAfterMs} 时调一次，宿主拿去 `stt.commit()`。
+   *
+   * `silenceMs` = **距最后一个有声帧多久**。它一定 ≥ `commitAfterMs`，多出来的那截
+   * 是「静音开始到真有音频帧到达」的等待 —— 所有按静音计时的动作（封段 / 投机 /
+   * 判停预跑）都跑在 `trackSilence` 里，而它只在 `addAudio` 时调，所以这段等待
+   * 直接变成每一轮的固定开销。落档才知道它有多大（`asr.commit`）。
+   */
+  readonly onCommit?: (silenceMs: number) => void;
   /**
    * 开轮的**静音门槛**：定稿到达时，「截至此刻」的连续静音必须够这么久才开轮。
    *
@@ -548,8 +555,13 @@ export class UtteranceAssembler {
       return;
     }
     this.commitFiredAt = t;
-    this.options.log(`  封段    静音 ${after} ms → ASR 开始解码`);
-    this.options.onCommit();
+    // `after` 是**配置值**，实际静音是 `t - lastVoicedAt` —— 两者之差就是「静音开始
+    // 到真有音频帧到达」的等待。日志和档案都要记实际值，否则永远看不见那截开销。
+    const silenceMs = t - this.lastVoicedAt;
+    this.options.log(
+      `  封段    静音 ${after} ms（实际 ${silenceMs.toFixed(0)} ms）→ ASR 开始解码`,
+    );
+    this.options.onCommit(silenceMs);
   }
 
   /**

@@ -440,7 +440,8 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | **`agent.ask`** | `kind`（`prefetch`/`spec`/`live`）、`model`、`hedge`、`text`、**`msgs`** | **快车道问了什么**：`msgs` 是**全量** messages（system + 历史窗 + 当前句），不截断 |
 | **`agent.done`** | `ok`、`ms`、`first_token_ms`、**`raw`**、`opened`、`delegated` / 失败时 `err` | **模型答了什么**：`raw` 是原文（含情绪标签、可能被 `[[DELEGATE]]` 早退）；`opened` = 有没有已经推给 TTS（推过就撤不回） |
 | **`agent.drop`** / **`agent.claim`** | `why` / `ok` + `ran_for_ms` | 预跑为什么作废、有没有被认领 —— **预跑不一定变成一轮**，只有这两条能看见被丢掉的那几趟 |
-| **`agent.spec`** | `spec`、`final`、`coverage`、**`missing`**、`ran_for_ms` | 投机被定稿确认时，**缺了哪几个字**。认领门槛只要求「前缀 + 覆盖 ≥60%」，缺的常常正是宾语（「那你知道」←「那你知道蓝母吗？」）—— 不并排落档，「模型为什么反问」查不到 |
+| **`agent.spec`** | `spec`、`final`、`coverage`、**`missing`**、`ran_for_ms` | 投机被定稿确认时，**缺了哪几个字**。认领已收紧成「去标点后完全一致」（2026-11-19），所以这一条现在应该几乎总是 `missing: ""`；一旦出现非空，就说明闸门又松了 |
+| **`asr.commit`** | `silence_ms`（实际静音）、`want_ms`（配置的 `commitAfterMs`） | **停嘴→封段**的真实间隔。所有按静音计时的动作（封段 20 / 投机 100 / 判停预跑 200）都跑在 `trackSilence` 里，而它只在 `addAudio` 时调 —— 上行包多大、设备静音时推不推帧，全在这一条上显形 |
 | **`receipt`** | `text`、`chars` | 委派轮先说的那句「嗯，我想想」，它不在 `turn.end.said` 里 |
 
 > **为什么 `agent.*` 单独一组**：预跑/投机可能在 `turn.start` **之前**就被作废（换一句、
