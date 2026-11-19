@@ -346,17 +346,23 @@ test('中间结果**一到就**交给投机，不等静音（静音闸曾把提�
   assembler.notePartial('你好');
   assert.deepEqual(seen, ['你好'], '用户还在说话就先问出去');
 
-  // 同一段语音后面的 partial 不再重发：那会把已经跑起来的那一趟作废重来
+  // 同一段语音里变长了就用更长的版本重来（旧的会被作废）。
+  // 以前这里断言「只投机一次」—— 那是在 `specMinChars=6` 时代的正确做法：
+  // 够 6 字的中间结果对定稿的覆盖率通常已经能过闸。降到 3 之后第一个版本
+  // 只有定稿四分之一长，`SPEC_MIN_COVERAGE=0.6` 一定拒，一次都不发等于白跑。
   assembler.notePartial('你好我想');
+  assert.deepEqual(seen, ['你好', '你好我想'], '还在说话，变长就用更长的版本');
+
+  // 静音之后补来的 partial 不再重起跑：定稿马上到，把在跑的作废等于白跑
   for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
   await delay(30);
-  assert.deepEqual(seen, ['你好'], '同一段语音只投机一次');
+  assert.deepEqual(seen, ['你好', '你好我想'], '静音后不再重投机');
 
   // 并段的第二段：已定稿的部分要接在前面，否则问出去是半句话
   assembler.addSentence('你好呀。');
   for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
   assembler.notePartial('再');
-  assert.deepEqual(seen, ['你好', '你好呀。再']);
+  assert.deepEqual(seen, ['你好', '你好我想', '你好呀。再']);
 });
 
 test('投机比判停预跑**更早**触发（100 vs 200），两条线各走各的', async () => {
