@@ -259,6 +259,30 @@ test('投机闸门：真机档案里的六种情形', () => {
   }
 });
 
+/**
+ * 前两版中间结果**故意不发**（`SPEC_MIN_PARTIAL_VERSION`：第 1/2 版命中率只有 ~40%，
+ * 第 3 版 76%）。所以测【真的投机】之前要先喂两版更早的，把版数推过门槛。
+ */
+function primeVersions(agent: FrontedAgent, ...rest: string[]): void {
+  agent.speculatePartial('你');
+  agent.speculatePartial('你好');
+  for (const text of rest) agent.speculatePartial(text);
+}
+
+test('投机：前两版中间结果不起跑，第 3 版才发（真机 93 句：41% → 76%）', () => {
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['在呢。']);
+  });
+  agent.speculatePartial('你好呀你知');       // 第 1 版
+  assert.equal(asked, 0, '第 1 版命中率 40.9%，发了也是白花钱');
+  agent.speculatePartial('你好呀你知道吗');    // 第 2 版
+  assert.equal(asked, 0, '第 2 版 39.1%，一样不该发');
+  agent.speculatePartial('你好呀你知道吗呢');  // 第 3 版
+  assert.equal(asked, 1, '第 3 版命中 76.1%，重叠还有 597 ms —— 这才值得发');
+});
+
 test('投机：定稿确认是前缀 → 认那一趟，不再重复问模型', async () => {
   let asked = 0;
   const agent = makeAgent(async () => {
@@ -266,8 +290,8 @@ test('投机：定稿确认是前缀 → 认那一趟，不再重复问模型', 
     return sse(['[平静]', '在呢哥。']);
   });
 
-  agent.speculatePartial('你好呀你知道吗');
-  assert.equal(asked, 1, '中间结果一到就该发出去');
+  primeVersions(agent, '你好呀你知道吗');
+  assert.equal(asked, 1, '第 3 版中间结果一到就该发出去');
 
   agent.prefetch('你好呀你知道吗呢');
   assert.equal(asked, 1, '定稿确认了这份投机，不该重问');
@@ -288,7 +312,7 @@ test('投机：定稿对不上 → 作废并按定稿重问', async () => {
     return sse([`[平静]答的是${last}`]);
   });
 
-  agent.speculatePartial('你好呀你知道吗');
+  primeVersions(agent, '你好呀你知道吗');
   agent.prefetch('喂喂喂喂喂喂');
   const reply = await agent.reply('喂喂喂喂喂喂');
 
@@ -303,7 +327,7 @@ test('投机：一句话最多起跑两次，中间结果被改写就收掉', as
     return sse(['[平静]在呢哥。']);
   });
 
-  agent.speculatePartial('你好呀你知道吗');
+  primeVersions(agent, '你好呀你知道吗');
   assert.equal(asked, 1);
   // 越改越长：允许再起跑一次（文本更接近定稿）
   agent.speculatePartial('你好呀你知道吗呢');
@@ -336,7 +360,7 @@ test('投机：默认门槛 6 —— 2–3 字的短句不发请求', () => {
     asked += 1;
     return sse(['在呢。']);
   });
-  agent.speculatePartial('你好');
+  primeVersions(agent, '你好');
   assert.equal(asked, 0, '默认 specMinChars=6，2 个字不发');
   agent.speculatePartial('你好呀你知道吗');
   assert.equal(asked, 1, '够 6 个字才发');
@@ -355,7 +379,7 @@ test('投机：specMinChars 调小到 2 才会让 2–3 字的短句起跑', () 
     specMinChars: 2,
     log: () => {},
   });
-  agent.speculatePartial('你好');
+  primeVersions(agent, '你好');
   assert.equal(asked, 1, 'minChars=2 时 2 个字就发');
   agent.speculatePartial('那。');
   assert.equal(asked, 1, '剥掉句尾标点后只剩 1 字，仍然不发');
@@ -382,7 +406,7 @@ test('投机：任务类句子同样不投机（与预跑同一组门槛）', ()
     asked += 1;
     return sse(['不该被问到。']);
   });
-  agent.speculatePartial('帮我查一下订单号');
+  primeVersions(agent, '帮我查一下订单号');
   assert.equal(asked, 0, '要工具的句子投机纯属白花钱');
 });
 

@@ -134,6 +134,23 @@ export function isStatusQuestion(text: string): boolean {
 const RECENT_TURNS = 2;
 
 /**
+ * 投机最早从**第几版**中间结果起跑。
+ *
+ * 真机 6 场 / 93 句实测（每句中间结果中位 6 版）：
+ *
+ * | 起跑用第几版 | 命中率 | 定稿时模型已跑 |
+ * |---|---|---|
+ * | 第 1 版 | 40.9% | 943 ms |
+ * | 第 2 版 | 39.1% | 839 ms |
+ * | 第 3 版 | **76.1%** | 597 ms |
+ * | 最后一版 | 92.5% | 9 ms（来不及） |
+ *
+ * 前两版是 ASR 刚出字，几乎必然和定稿对不上；第 3 版是拐点，重叠仍有 ~600 ms，
+ * 而快车道短答整段才 362 ms。所以跳过前两版：请求数不变，命中率翻倍。
+ */
+const SPEC_MIN_PARTIAL_VERSION = 3;
+
+/**
  * 对话窗口的预算（字符）。中文约 1 token/字，800 字 ≈ 800 token。
  *
  * 窗口按**整对**丢弃（用户+回答一起走），不然会出现「有回答没提问」的孤儿开头，
@@ -486,6 +503,8 @@ export class FrontedAgent implements AgentProvider {
   private readonly partialSpeculate: boolean;
   /** 投机已经起跑几次（同一条「越改越长」的链最多 2 次，别让 ASR 抖动变成请求风暴） */
   private speculateStarts = 0;
+  /** 这一句已经收到第几版中间结果（每轮清零，见 `SPEC_MIN_PARTIAL_VERSION`） */
+  private partialVersion = 0;
   private readonly hedge: number;
   private readonly cancelMode: 'rpc' | 'interrupt' | 'off';
   private readonly statusFacts: (() => string) | undefined;
@@ -716,10 +735,22 @@ export class FrontedAgent implements AgentProvider {
    * 为什么要限次：一句话 ASR 能给 5–14 版中间结果，每版都发就是十几倍请求。
    * 只在「越改越长」时重来，且同一条链最多 2 次；中间结果被改写（不是变长）
    * 就收掉 —— 那说明 ASR 在纠错，早期那版大概率跟定稿对不上。
+   *
+   * **前两版不值得起跑**（真机 6 场 93 句实测）：第 1 版命中率 40.9%、第 2 版 39.1%，
+   * 到第 3 版直接跳到 **76.1%**（重叠还有 597 ms，短答够用）。前两版都是刚开始出字，
+   * 几乎必然和定稿对不上。所以先数版数，够 `SPEC_MIN_PARTIAL_VERSION` 才起跑 ——
+   * 请求数不变（仍然只起跑 1–2 次），命中率翻倍。
    */
   speculatePartial(text: string): void {
     if (!this.prefetchEnabled || !this.partialSpeculate) return;
     const trace = process.env['FAST_LANE_TRACE'] === '1';
+    this.partialVersion += 1;
+    if (this.partialVersion < SPEC_MIN_PARTIAL_VERSION) {
+      if (trace) {
+        this.log(`  快车道    投机跳过：第 ${this.partialVersion} 版还太早 ${JSON.stringify(text)}`);
+      }
+      return;
+    }
     // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱
     if (stripPartialTail(text).length < this.specMinChars) {
       // tracer 上和「真的发出去了」区分开：「投机 静音…」那行是宿主打算投，这行才是结果
@@ -870,6 +901,7 @@ export class FrontedAgent implements AgentProvider {
     const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
     // 新一轮：投机的次数配额按轮算（上一轮用完不能让下一轮一直没法投机）
     this.speculateStarts = 0;
+    this.partialVersion = 0;
     this.currentGen = ticket.gen;
     this.currentTicket = ticket;
     this.innerMode = 'pass';

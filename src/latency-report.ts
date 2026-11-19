@@ -107,6 +107,8 @@ export interface TurnLatency {
   readonly ttsSynthMs: number | null;
   /** 是否被用户插话中断 */
   readonly interrupted: boolean;
+  /** 这一轮谁回答的：`fast`（快车道）/ `dsh`（慢车道）；旧档案记不下来给 `null` */
+  readonly path: string | null;
   /** 这一轮对应的 ASR 文本（截断，便于人肉对上） */
   readonly text: string;
   /**
@@ -376,6 +378,7 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       ttsSetupMs: ttsSetup,
       ttsSynthMs: ttsSynth,
       interrupted: end?.interrupted === true,
+      path: typeof end?.path === 'string' ? end.path : null,
       text: preview(asrAt < 0 ? undefined : events[asrAt]?.text),
       missing,
     });
@@ -435,6 +438,41 @@ export const FIRST_WORD_BUDGET_MS = 1200;
 /** 把一个数字列成表格单元；`null` 显示为 `-`。 */
 function cell(value: number | null, unit = ''): string {
   return value === null ? '-' : `${Math.round(value)}${unit}`;
+}
+
+/**
+ * 按「谁回答」分组（`path=fast` 快车道 / `path=dsh` 慢车道）。
+ *
+ * 为什么要单独看：两条路的构成完全不同 —— 快车道是「模型首字 + TTS 首包」，
+ * 慢车道还多一层 agent 排队和工具调用。混在一起取中位，等于把两件不同的事
+ * 糊成一个数，谁也优化不了。
+ *
+ * @param turns - {@link computeTurns} 的输出
+ */
+export function formatPathSplit(turns: readonly TurnLatency[]): string {
+  const groups = new Map<string, TurnLatency[]>();
+  for (const turn of turns) {
+    const key = turn.path ?? '(未记)';
+    const list = groups.get(key) ?? [];
+    list.push(turn);
+    groups.set(key, list);
+  }
+  const head = '路径        n      ①      ②      ③   闭嘴→出声 p50 / p90';
+  const rows = [head];
+  for (const [key, list] of [...groups].sort((a, b) => b[1].length - a[1].length)) {
+    const a1 = summarize(list.map((t) => t.silenceToAsr));
+    const a2 = summarize(list.map((t) => t.asrToTurn));
+    const a3 = summarize(list.map((t) => t.turnToAudio));
+    const total = summarize(list.map((t) => t.firstWordMs));
+    rows.push(
+      `${key.padEnd(8)} ${String(list.length).padStart(3)}`
+      + `  ${cell(a1.median).padStart(6)}  ${cell(a2.median).padStart(6)}  ${cell(a3.median).padStart(6)}`
+      + `   ${cell(total.median).padStart(6)} / ${cell(total.p90)}`,
+    );
+  }
+  rows.push('');
+  rows.push('口径：每列都是该组内的中位；「闭嘴→出声」是**逐轮相加后再取中位**，不是三个中位相加。');
+  return rows.join('\n');
 }
 
 /**

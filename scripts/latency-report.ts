@@ -11,10 +11,10 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { computeTurns, formatReport, parseEvents } from '../src/latency-report.ts';
+import { computeTurns, formatPathSplit, formatReport, parseEvents } from '../src/latency-report.ts';
 
 /** 读出单个会话目录的报告文本；没有 `events.jsonl` 时返回一段说明。 */
-function reportOne(dir: string): string {
+function reportOne(dir: string, split: boolean): string {
   const file = join(dir, 'events.jsonl');
   let text: string;
   try {
@@ -22,7 +22,9 @@ function reportOne(dir: string): string {
   } catch (error) {
     return `# ${dir}\n\n读不到 events.jsonl：${(error as Error).message}`;
   }
-  return formatReport(computeTurns(parseEvents(text)), dir);
+  const turns = computeTurns(parseEvents(text));
+  const report = formatReport(turns, dir);
+  return split ? `${report}\n\n${formatPathSplit(turns)}` : report;
 }
 
 /** 入口。 */
@@ -34,6 +36,7 @@ function main(argv: readonly string[]): number {
   }
 
   const all = argv.includes('--all');
+  const split = argv.includes('--split');
   let ok: boolean;
   try {
     ok = statSync(target).isDirectory();
@@ -48,7 +51,7 @@ function main(argv: readonly string[]): number {
 
   const reports: string[] = [];
   if (!all) {
-    reports.push(reportOne(target));
+    reports.push(reportOne(target, split));
   } else {
     const entries = readdirSync(target).sort();
     for (const name of entries) {
@@ -60,7 +63,7 @@ function main(argv: readonly string[]): number {
       } catch {
         continue;
       }
-      reports.push(reportOne(dir));
+      reports.push(reportOne(dir, split));
     }
     if (reports.length === 0) {
       console.error(`目录下没有会话: ${target}`);
