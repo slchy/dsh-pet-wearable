@@ -218,6 +218,7 @@ stateDiagram-v2
 | 事件 | 条件 | 结果 |
 |---|---|---|
 | `push(text)` | 任意 | 追加到 `pending`，重置定时器 |
+| `notePartial(text)` | 任意 | 只更新 `lastPartialText`（不拼文本，中间结果会反复改写）。**静音满 `speculateMs`（100 ms）时**用它给快车道投机，见 §5 |
 | 定时器到期 → `evaluate()` | 预测器说「说完」且不满足「等下文」 | `accept`：整句交给上层 |
 | 同上 | 结尾像没说完（数字、井号、连词…）或刚收到中间结果 | `extend`：再等 `extendMs`（默认 400 ms），最多 `maxExtensions` 次 |
 | 同上 | 预测器不在 | `predictor-unavailable`：按固定时长兜底 |
@@ -226,7 +227,7 @@ stateDiagram-v2
 
 | 门 | 何时 | 做什么 |
 |---|---|---|
-| `commitAfterMs`（`VOICE_COMMIT_MS`，默认 40） | 上行静音到点、且这段有音频 | 让 ASR 封段开始解码（`SttSession.commit()`），一段只封一次 |
+| `commitAfterMs`（`VOICE_COMMIT_MS`，代码默认 40 / **线上 20**） | 上行静音到点、且这段有音频 | 让 ASR 封段开始解码（`SttSession.commit()`），一段只封一次 |
 | `openQuietMs` / `openQuietShortMs`（`VOICE_OPEN_QUIET_MS`，300 / 200；p ≥ 0.8 走短档） | 定稿到达时 | 要求「**截至此刻**」的连续静音 ≥ 门槛才允许 `accept`；不够就 `extend` 差额（`why=silence`）。防的是「换气被当成句尾」 |
 
 配套的**静音去抖**：单帧（20 ms）有声不算重新开口，连续两帧才算 —— 这段录音里 20 ms 的
@@ -250,6 +251,11 @@ stateDiagram-v2
 「再等一拍」是这里主要的延迟来源，**与状态机无关**：回放里同一句话的
 「② 判停→开轮」在 151 ms 和 625 ms 之间跳，就是这一拍要不要等。
 （开轮门槛例外：定稿本身就晚于停嘴 ~260 ms，多数轮次它不花时间。）
+
+**这 400 ms 和投机的命中率是同一枚硬币**：判停愿意等满预算的轮次，投机一定命中
+（`agent 段 0–15 ms`）；判停立即收的轮次，投机一定来不及（`340–570 ms`）。
+两者的合计都是 1000–1175，所以「缩短预算」并不会让端到端更快 —— 它只是把钱从
+「等判停」挪到「等模型」。实测账与回滚记录见 §5 的「投机什么时候起跑」。
 
 ```mermaid
 stateDiagram-v2
@@ -304,6 +310,43 @@ stateDiagram-v2
 `commit` 之后 dsh 那一轮**一定**要接住 rejection：它被掐时经常以「清洗后没有可朗读的
 内容」收场，而 `commit`/`abandon` 挂得比「掐」晚，中间这段窗口里没人接就是进程级未捕获
 （线上真挂过一次，见 [fsm-align-report](fsm-align-report.md)）。
+
+### 投机什么时候起跑（**别改成「中间结果一到就发」**）
+
+投机由 `UtteranceAssembler.maybeSpeculate` 在**静音满 100 ms**（`VOICE_SPECULATE_MS`）
+时触发，用手里已有的 `lastPartialText` 发出去；一段语音只投一次
+（`lastVoicedAt > specFiredAt`），每句最多 2 次（`specCount`，`addSentence` 归零）。
+
+2026-11-19 试过两条改法并**全部 revert**，真机实测都是负优化：
+
+| 线上代码 | fast p50 | 档案 |
+|---|---|---|
+| **静音 100 ms（现状）** | **1032** | `20261119-071340`，8 轮 |
+| `notePartial` 一到就发（`1272bc1`） | 1176 | `20261119-080409`，11 轮 |
+| 再加「说话中变长重来」（`bbf15ae`） | 1172 | `20261119-081608`，8 轮 |
+
+原因是 **qwen-realtime 的中间结果本身就是停嘴后几毫秒才到**：
+
+```
+16:17:40  投机（第 1/2 次，不等静音）
+16:17:40  投机（第 2/2 次，不等静音）
+16:17:40  封段 静音 20 ms → ASR 开始解码
+16:17:41  认领预跑（已经跑了 3 ms）     ← 一次都没提前，还把 2 次配额烧光
+```
+
+而静音那条路能拿到 498 ms（`投机 静音 100 ms` → `认领预跑（已经跑了 498 ms）`）——
+它不等新 partial，直接用已经到手的那一版，反而更早。
+
+**投机的提前量其实等于「判停愿意等多久」**，跟触发时机几乎无关：
+
+| 判停行为 | ②定稿→开轮 | 投机命中 | agent 段 |
+|---|---|---|---|
+| 立即收（p 高） | 1–4 ms | ✗ | 340–570 |
+| 等满 400 ms 预算 | 476–602 | ✓ | 0–15 |
+
+两条路的**合计都落在 1000–1175**：判停等出来的 500 ms 正好被模型省下的 400–570 ms
+抵掉。这就是「1 秒进不去」的结构性原因，账见
+[LATENCY-CLOSURE](LATENCY-CLOSURE.md) §8。
 
 **判不出就给回执**：`delegate` / `abandon` 走到 dsh 时，`FrontedAgent` 叫一次
 `setDelegateHook(reason)`，`DialogRuntime` 据此让 `TurnRunner.speakReceipt()` 说一句
