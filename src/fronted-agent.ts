@@ -278,7 +278,7 @@ export interface FastLaneOptions {
   readonly now?: () => number;
   readonly log?: (line: string) => void;
   /**
-   * 中间结果至少几个字才起跑投机，默认 {@link SPEC_MIN_CHARS}（2）。
+   * 中间结果至少几个字才起跑投机，默认 {@link SPEC_MIN_CHARS}（6）。
    *
    * 只控制「发不发请求」，不控制认不认（认领永远要过三条闸）。调大 = 省钱少猜，
    * 调小 = 多发请求赌命中。对应环境变量 `FAST_LANE_SPEC_MIN_CHARS`。
@@ -313,18 +313,15 @@ export function isFastCandidate(text: string, maxChars = 14): boolean {
 }
 
 /**
- * 中间结果最少几个字才值得投机。**默认 2**（2026-11-18 从 6 降下来）。
+ * 中间结果最少几个字才值得投机。**默认 6**。
  *
- * 原来写 6，理由是「短于 6 字的 partial 基本覆盖不到定稿的 60%，发了也是白花」。
- * 但真机归因反过来看：**② 被压到 100 ms 之后，唯一还能藏 agent 的地方就是 ①**
- * （停嘴→定稿 ~342 ms），而 ②≈0 的那批轮次恰恰全是 **2–5 字的短句**
- * （「你好呀。」「嗯，不错哦。」「好。」）—— 6 字门槛把唯一还能救的那批全挡在门外。
- *
- * 放宽的**只有「发不发请求」这一侧**；认领仍要过 {@link acceptsSpeculation} 的三条
- * （前缀 / 覆盖 ≥60% / 数字尾不许截断），所以**不影响正确性**，只多花请求。
- * 用 `FAST_LANE_SPEC_MIN_CHARS` 覆盖（默认 2）。
+ * 2026-11-18 试过降到 2（`42ac09e`），想在「2–5 字短句」上把 agent 藏进 ① 里。
+ * **真机向量 14 场回放测下来不成立**：`agent.ask(kind=spec)` 从 11 次涨到 27 次，
+ * 端到端 p50 1047 → 1048（没动），同句配对的差还在噪声里 —— 花 2.5 倍请求买不到中位。
+ * 账见 `docs/OPS-RECORD.md` §12.8。所以退回 6；要再试就改 `FAST_LANE_SPEC_MIN_CHARS`，
+ * 不用改代码。
  */
-const SPEC_MIN_CHARS = 2;
+const SPEC_MIN_CHARS = 6;
 
 /**
  * 投机文本至少要覆盖定稿的多大比例。

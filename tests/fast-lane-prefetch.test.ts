@@ -299,32 +299,21 @@ test('投机：太短的中间结果一个请求都不发', () => {
   assert.equal(asked, 0);
 });
 
-test('投机：门槛 6 → 2 之后，2–3 字的短句也起跑', () => {
-  // 归因逼出来的：② 被压到 100 ms 后，唯一还能藏 agent 的地方只剩 ①（停嘴→定稿 ~342 ms），
-  // 而 ②≈0 的那批轮次恰好全是 2–5 字短句（「你好呀。」「好。」）。6 字门槛把它们全挡在门外。
+test('投机：默认门槛 6 —— 2–3 字的短句不发请求', () => {
+  // 曾经降到 2（想在 2–5 字短句上把 agent 藏进 ①），真机向量 14 场回放测下来
+  // 请求涨 2.5 倍、端到端 p50 没动，已退回 6（见 docs/OPS-RECORD.md §12.8）。
   let asked = 0;
   const agent = makeAgent(async () => {
     asked += 1;
     return sse(['在呢。']);
   });
   agent.speculatePartial('你好');
-  assert.equal(asked, 1, '2 个字就该发出去（默认 specMinChars=2）');
-  agent.speculatePartial('那。');
-  assert.equal(asked, 1, '剥掉句尾标点后只剩 1 字，仍然不发');
+  assert.equal(asked, 0, '默认 specMinChars=6，2 个字不发');
+  agent.speculatePartial('你好呀你知道吗');
+  assert.equal(asked, 1, '够 6 个字才发');
 });
 
-test('投机：放宽的只是「发不发请求」，认领规则一个字没动', () => {
-  // 3 字能过门槛（≥minChars），但覆盖不到定稿的 60% —— 仍然不许认领。
-  assert.equal(acceptsSpeculation('改成', '改成641室。'), false, '覆盖率 29%，不许认');
-  assert.equal(
-    acceptsSpeculation('改成', '改成641室。', 2),
-    false,
-    'specMinChars 调小也不能让低覆盖的猜测被认下',
-  );
-  assert.equal(acceptsSpeculation('你好', '你好。'), true, '2 字、前缀、覆盖 67% → 认');
-});
-
-test('投机：specMinChars 可注入（调大就退回旧行为）', async () => {
+test('投机：specMinChars 调小到 2 才会让 2–3 字的短句起跑', () => {
   let asked = 0;
   const agent = new FrontedAgent({
     inner: fakeInner(),
@@ -334,13 +323,28 @@ test('投机：specMinChars 可注入（调大就退回旧行为）', async () =
       return sse(['在呢。']);
     },
     speculate: false,
-    specMinChars: 6,
+    specMinChars: 2,
     log: () => {},
   });
-  agent.speculatePartial('你好呀');
-  assert.equal(asked, 0, 'minChars=6 时 3 字不发');
-  agent.speculatePartial('你好呀你知道吗');
-  assert.equal(asked, 1);
+  agent.speculatePartial('你好');
+  assert.equal(asked, 1, 'minChars=2 时 2 个字就发');
+  agent.speculatePartial('那。');
+  assert.equal(asked, 1, '剥掉句尾标点后只剩 1 字，仍然不发');
+});
+
+test('投机：门槛只管「发不发」，认领规则一个字没动', () => {
+  // 3 字能过 minChars=2 这道门槛，但覆盖不到定稿的 60% —— 仍然不许认领。
+  assert.equal(acceptsSpeculation('改成', '改成641室。'), false, '覆盖率 29%，不许认');
+  assert.equal(
+    acceptsSpeculation('改成', '改成641室。', 2),
+    false,
+    'specMinChars 调小也不能让低覆盖的猜测被认下',
+  );
+  assert.equal(
+    acceptsSpeculation('你好', '你好。', 2),
+    true,
+    '2 字、前缀、覆盖 67% → 认（但默认门槛下它压根发不出去）',
+  );
 });
 
 test('投机：任务类句子同样不投机（与预跑同一组门槛）', () => {
