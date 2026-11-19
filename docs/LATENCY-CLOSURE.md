@@ -198,12 +198,24 @@ ASR 在定稿时改写文本，救它就得拿答错换速度。**
   符号检验 p = 6.4e-15，认领率 144/144。`首包` 两边不变（309 / 302），省的就是
   `建立`；它比 66 ms 少 13 ms，因为预开的 task 闲置后服务端首个合成块略晚一点
   （`setup` 报 67 对 53），而那段已经不在关键路径上了。
-- **回放测不出来，而且不是样本量的问题**：手上那批真机向量是 `stt: aliyun` 录的
-  （`meta.json`），回放跑 `qwen-realtime`，两条 ASR 切句不同 —— 逐轮 ③ 从原理上不可比
-  （ASR 逐字一致 2–4/12 是必然）。另外 bench harness 从第二趟起会卡死：第 1 轮
-  `turn.start` 之后没有 `turn.end`、`tts.task` 0 个，模型答复回来了却没进 TTS，
-  后面的说话连 turn.start 都进不去（A/B 两组都有，与预开无关）。
-  所以这条的判据是上面的配对微基准 + 线上 `tts.task.prewarmed` 与 ③ 分布。
+- **回放的两种比较，一种能用一种不能用**（这是踩过的坑，写清楚）：
+  - **和源档案逐轮比 —— 不成立**。那批真机向量是 **aliyun 录的**：原始档案
+    `~/miai-archive/20261117-221010-*/meta.json` 写 `"stt": "aliyun:cn-shanghai"`，
+    而且该场 `events.jsonl` 里 **`commit` 出现 0 次**（qwen 手动模式每次封段都 commit，
+    14 个 `asr.sentence` 不可能一次都没有）。`meta.stt` 取的是**实际生效的 provider name**
+    （`voice-session.ts` `stt: options.stt.name`），不是 `.env` 的默认值 ——
+    服务器上 `.env` 是 `MIAI_STT=aliyun`、systemd 用 `--stt qwen-realtime` 覆盖，
+    两者都真实存在，只是录音那一刻生效的是 aliyun。
+    所以「① 372 → 275」「ASR 逐字一致 2–4/12」都是**跨 ASR 的比较**，没有意义。
+  - **两个配置在同一批回放上互比 —— 仍然成立**，因为两边跑的是同一个 ASR、同一份音频。
+    之前 hedge / `SPEC_MIN_CHARS` / `VOICE_SPECULATE_MS` 那几组 A/B 的**组间**结论不受影响，
+    只是绝对数值不能当线上数。
+- 那 52 ms 在回放里为什么测不出来：它比轮级噪声小一个量级（模型首字 p50 278、判停 p90 272、
+  外加 dsh 偶发长挂），而回放一轮只出一个 ③ 样本，有效轮次只有 3–12。
+  要分辨它得几十轮 × 多趟 —— 而 bench harness 第二趟起会卡死（第 1 轮 `turn.start` 之后
+  没有 `turn.end`、`tts.task` 0 个，模型答复回来了却没进 TTS，后面连 turn.start 都进不去；
+  A/B 两组都有，与预开无关），所以实际上做不到。
+- 结论：这条的判据是上面的配对微基准 + 线上真机的 `tts.task.prewarmed` 分组比较。
 - 退路：`COSYVOICE_PREWARM=0`（默认开）。
 
 ---
