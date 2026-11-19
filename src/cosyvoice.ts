@@ -241,8 +241,8 @@ class Connection {
     /** 预开时用的语气 —— 开 task 时定死，这一轮的语气对不上就不能认领 */
     readonly emotion: Emotion;
   } | null = null;
-  /** 预开的 task 到点没人认领就作废（探针实测服务端能容忍的空窗只验到 1.2 s） */
-  private static readonly PREWARM_TTL_MS = 1_000;
+  /** 预开的 task 到点没人认领就作废（探针实测空窗 4.5 s 内首包都持平，留 1.5 s 余量） */
+  private static readonly PREWARM_TTL_MS = 3_000;
   private warmTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
@@ -387,10 +387,9 @@ class Connection {
   /**
    * **预开一个 task**：只发 `run-task` 并等 `task-started`，一个字都不送。
    *
-   * 为什么能这么做：探针实测 run-task 之后等 **300 / 600 / 1200 ms** 再 `continue-task`
-   * 都正常，首包不受影响（`--gap` 见 `scripts/probe-cosyvoice-warm.mjs` 那一系）。
-   * 而 `建立`（run-task → task-started）p50 **66 ms** 本来是串在「模型→合成」中间的，
-   * 定稿时正文还没到，正好拿这段空窗把它吞掉。
+   * 为什么能这么做：探针实测 run-task 之后等 **0.3 / 1 / 2 / 3 / 4.5 s** 再 `continue-task`
+   * 都正常，首包 296–318 ms 持平。而 `建立`（run-task → task-started）p50 **66 ms**
+   * 本来是串在「模型→合成」中间的，定稿时正文还没到，正好拿这段空窗把它吞掉。
    *
    * **但空 task 不能收尾**：`finish-task` 一个字都没有时服务端回
    * `task-failed: Please ensure input text is valid.`，然后这条连接上后续 task 全部
@@ -969,7 +968,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
      * 直接接管，不用配对。
      *
      * 三条边界，都是探针实测出来的：
-     * - 服务端能容忍 run-task 之后等 **≥1.2 s** 再送文本，首包不变；
+     * - 服务端能容忍 run-task 之后等 **≥4.5 s** 再送文本，首包不变（实测 296–318）；
      * - **空 task 不能 `finish-task`**（`Please ensure input text is valid.`，之后整条
      *   连接静默挂死），所以 `PREWARM_TTL_MS` 到点没被认领就**弃连接**；
      * - `instruction` 模式下语气是**开 task 时定死**的，而定稿时还不知道这一轮的情绪，

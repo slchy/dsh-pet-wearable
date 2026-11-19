@@ -303,15 +303,15 @@ test('预开：整段合成也认领同一条 task', { timeout: 5000 }, async ()
   }
 });
 
-test('预开：一直没人认领就到点弃连接（空 task 不能 finish-task）', { timeout: 8000 }, async () => {
+test('预开：一直没人认领就到点弃连接（空 task 不能 finish-task）', { timeout: 12000 }, async () => {
   const server = await fakeCosyVoice();
   try {
     const tts = cosyVoiceTts({ apiKey: 'sk-test', url: server.url, useInstruction: false });
     tts.prewarm?.();
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.deepEqual(server.runs, [1], '预开应当已经发出 run-task');
-    // TTL 1 s：到点没人要，只能弃连接（发 finish-task 会让服务端判非法并弄死连接）
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    // TTL 3 s：到点没人要，只能弃连接（发 finish-task 会让服务端判非法并弄死连接）
+    await new Promise((resolve) => setTimeout(resolve, 3200));
     let bytes = 0;
     for await (const chunk of tts.synthesize('在，哥。')) bytes += chunk.length;
     assert.ok(bytes > 0, '弃连接之后下一句仍要能出声');

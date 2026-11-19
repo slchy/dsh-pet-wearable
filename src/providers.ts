@@ -263,7 +263,7 @@ export interface TtsProvider {
    * 且它与合成**串行** —— `runFeed` 要等第一段文本才发 run-task，`continue-task`
    * 又要等 task-started。定稿时正文还没到，正好能把这 66 ms 吞掉。
    *
-   * 探针实测：run-task 之后等 300 / 600 / 1200 ms 再送文本都正常，首包不受影响。
+   * 探针实测：run-task 之后等 0.3 / 1 / 2 / 3 / 4.5 s 再送文本都正常，首包 296–318 持平。
    * **但空 task 不能 `finish-task`**（服务端回 `Please ensure input text is valid.`
    * 并让整条连接后续 task 静默挂死），所以没被认领的预开只能**弃连接**。
    *
