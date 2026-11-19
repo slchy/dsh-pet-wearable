@@ -55,17 +55,33 @@ const ANNOUNCE_QUIET_MS = 800;
  *
  * 只有**四个字**（一句 4.8 字/秒 ≈ 0.83 s）：太长了答案就得等它，反而更慢。
  */
-const RECEIPTS: Record<DelegateReason, string> = {
-  task: '我看看。',
+const RECEIPTS: Record<DelegateReason, readonly string[]> = {
+  task: ['我看看。', '嗯，我查查。', '哦，稍等。'],
   // 用户刚回答了 dsh 的问话，回执只是填空 —— 「我看看」在这里听着像没听懂
-  answer: '嗯。',
-  memory: '我看看。',
-  overcap: '我看看。',
-  delegate: '我看看。',
-  timeout: '嗯，我想想。',
-  empty: '嗯，我想想。',
-  error: '我看看。',
+  answer: ['嗯。', '嗯嗯。'],
+  memory: ['我记着。', '嗯，记住了。'],
+  overcap: ['我看看。', '嗯，稍等。'],
+  delegate: ['我看看。', '嗯，等一下。', '哦，好。'],
+  // 「嗯，我想想」实测 1288 ms，答案 700 ms 就到了 —— 永远只播半句，所以换短的
+  timeout: ['嗯…', '稍等。'],
+  empty: ['嗯…', '让我想想。'],
+  error: ['我看看。', '嗯，稍等。'],
 };
+
+/**
+ * 挑一条回执。
+ *
+ * 为什么要**多条**：真机 19 次回执里 18 次都是「我看看。」—— 委派轮占四成，
+ * 用户听出来就是「这东西张口就是我看看」，还以为是快模型在说（其实快车道轮
+ * 一次回执都不播，见 `delegation-receipt.test.ts`）。
+ *
+ * 每条都会被 `TurnRunner.speakReceipt` 的缓存按文案 key 记住（第一次合成、之后
+ * 0 ms 首块），所以多几条只是首次多合成几次，播放时没有代价。
+ */
+function pickReceipt(reason: DelegateReason): string {
+  const options = RECEIPTS[reason];
+  return options[Math.floor(Math.random() * options.length)] ?? options[0]!;
+}
 
 /** 播报时怎么开麦。设备没有 `listen.start` 就不给这个。 */
 export interface AnnounceMic {
@@ -253,7 +269,7 @@ export class DialogRuntime {
       if (this.disposed) {
         return;
       }
-      this.runner.speakReceipt(RECEIPTS[reason]);
+      this.runner.speakReceipt(pickReceipt(reason));
     });
   }
 
