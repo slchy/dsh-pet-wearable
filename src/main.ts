@@ -87,12 +87,17 @@ async function buildStt(
     if (!apiKey) {
       throw new Error('STT=qwen-realtime 需要 DASHSCOPE_API_KEY（和 CosyVoice 用的是同一个 key）');
     }
-    // 端点由我们控（`turn_detection: null`），静音窗见 `VOICE_COMMIT_MS`。
+    // 端点由谁判：默认我们控（`turn_detection: null`，静音窗见 `VOICE_COMMIT_MS`）；
+    // `QWEN_ASR_TURN_DETECTION=vad` 交给服务端（`speech_stopped → 定稿` 139–204 ms，
+    // 比手动 commit 的 261 ms 快，但拿走了封段权，`VOICE_COMMIT_MS` 等旋钮全部失效）
+    const turnDetection = process.env['QWEN_ASR_TURN_DETECTION'] === 'vad' ? 'vad' : 'manual';
     return qwenRealtimeStt(
       {
         apiKey,
         ...(process.env['QWEN_ASR_URL'] ? { url: process.env['QWEN_ASR_URL'] } : {}),
         ...(process.env['QWEN_ASR_MODEL'] ? { model: process.env['QWEN_ASR_MODEL'] } : {}),
+        turnDetection,
+        vadSilenceMs: envNumber('QWEN_ASR_VAD_SILENCE_MS', 200),
       },
       (line) => { console.log(`  [asr] ${line}`); },
     );

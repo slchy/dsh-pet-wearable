@@ -47,6 +47,22 @@ export interface QwenRealtimeAsrOptions {
   apiKey: string;
   url?: string;
   model?: string;
+  /**
+   * 端点（句尾）归谁判：
+   *
+   * - `manual`（默认）：`turn_detection: null`，我们发 `input_audio_buffer.commit`
+   *   才解码这一段。实测 `commit → 定稿` 中位 **261 ms**。
+   * - `vad`：开服务端 VAD（`server_vad`），它自己判句尾，`speech_stopped → 定稿`
+   *   实测 **139–204 ms**，比手动 commit 快。
+   *
+   * 为什么默认还是 `manual`：端点在谁手里决定了一堆旋钮的语义
+   * （`VOICE_COMMIT_MS`、`VOICE_PAUSE_DETECT_MS`、组装器的封段逻辑）。
+   * 走 `vad` 时那些旋钮**全都不生效**，静音窗变成服务端的下限 200 ms ——
+   * 换之前先按 `docs/QWEN-REALTIME-ASR-PROBED.md` 的口径量一遍。
+   */
+  readonly turnDetection?: 'manual' | 'vad';
+  /** `vad` 模式下的静音窗（服务端下限 200，填更小不生效 —— 见探针） */
+  readonly vadSilenceMs?: number;
   /** 一句封段后的定稿 */
   onSentence: (text: string, index: number) => void;
   /** 段内增量（`.text` 的 `stash`），会反复改写，不能拼 */
@@ -158,18 +174,22 @@ export class QwenRealtimeAsr {
   }
 
   /**
-   * 建会话：**关掉服务端 VAD**。
+   * 建会话。
    *
-   * `turn_detection` 的 `silence_duration_ms` 下限是 200（文档 + 实测），
-   * 传 null 才是「端点归我」。
+   * 默认 `turn_detection: null`：**关掉服务端 VAD，端点归我们**——
+   * `silence_duration_ms` 的下限是 200（文档 + 实测），传 null 才拿得到「更快的封段」。
+   * `turnDetection: 'vad'` 时反过来：交给服务端判，换它 139–204 ms 的 `speech_stopped`。
    */
   private startSession(): void {
+    const vad = this.opts.turnDetection === 'vad';
     this.sendRaw({
       type: 'session.update',
       session: {
         modalities: ['text'],
         input_audio_format: 'pcm',
-        turn_detection: null,
+        turn_detection: vad
+          ? { type: 'server_vad', silence_duration_ms: this.opts.vadSilenceMs ?? 200 }
+          : null,
       },
     });
   }
@@ -267,7 +287,9 @@ export class QwenRealtimeAsr {
 
     if (ev.type === 'session.updated') {
       this.ready = true;
-      this.log('[asr] 已就绪（服务端 VAD 关闭）');
+      this.log(this.opts.turnDetection === 'vad'
+        ? '[asr] 已就绪（服务端 VAD 开，端点归服务端）'
+        : '[asr] 已就绪（服务端 VAD 关闭）');
       for (const b of this.backlog) this.sendAudio(b);
       this.backlog = [];
       if (this.commitWhenReady) {
