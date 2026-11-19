@@ -213,6 +213,7 @@ def spawn_harness(port: int, bench_dir: str, repo: str, base_env: dict[str, str]
         # 这条 ssh 命令自己的命令行里就含那串字，pkill 会把当前 shell 一起杀掉，
         # 表现是「启动脚本悄悄什么都没做」（实测踩过）。
         f"{kill_on_port(port)}; "
+        f"{kill_orphan_clients()}; "
         f": > {bench_dir}/harness.log; "
         # 参数照抄生产的 ExecStart（`--agent dsh --dsh-sdk` 是必须的：流式识别
         # 收到 SentenceEnd 就要接一轮对话，没 agent 直接退出）。`--stt/--tts`
@@ -232,6 +233,20 @@ def kill_on_port(port: int) -> str:
         f"PID=$(ss -ltnp 2>/dev/null | grep ':{port} ' | grep -oP 'pid=\\K[0-9]+' | head -1); "
         "[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null || true"
     )
+
+
+def kill_orphan_clients() -> str:
+    """杀掉上一次被中断留下的回放客户端。
+
+    客户端**不监听端口**，`kill_on_port` 看不见它；但它会一直重连到新起的 harness 上，
+    把新一趟的第一轮吃掉 —— 现象是 `turn.end` 一个都没有、`tts.task` 零个，
+    看起来像「第二趟必卡死」。实测就是这么来的：中断一次 `run.py` 只杀了本地进程，
+    远端的 `miai-replay-client.mjs` 变成孤儿，下一趟连上的是它还没退出的那条会话。
+
+    `[-]` 是为了让这条命令**不匹配到自己**：内联脚本的命令行里就含这段字面量，
+    普通的 `pkill -f miai-replay-client.mjs` 会把自己一起杀掉，看起来像「什么都没做」。
+    """
+    return "pkill -f 'node /tmp/miai-replay[-]client.mjs' 2>/dev/null || true"
 
 
 def export_str(pairs: dict[str, str]) -> str:
@@ -307,6 +322,20 @@ def resolve_config(meta: dict, overrides: dict[str, str]) -> tuple[dict[str, str
         effective[key] = value
         rows.append((key, value, "MIAI_BENCH_ENV"))
 
+    # 上行增益也拿 meta：同一段音频进 ASR 的电平不同，识别结果就会漂。
+    # 真机 `micGain=4`，回放若落到 `.env` 里别的值（或以后被改掉），
+    # 「逐轮 ASR 对比」就在拿两个不同的声学条件互比。
+    recorded_gain = meta.get("micGain")
+    if recorded_gain not in (None, ""):
+        override = overrides.get("MIAI_MIC_GAIN", "")
+        gain_value = override or str(recorded_gain)
+        effective["MIAI_MIC_GAIN"] = gain_value
+        rows.append((
+            "MIAI_MIC_GAIN",
+            gain_value,
+            "**覆盖向量 meta** ← MIAI_BENCH_ENV" if override else f"向量 meta（micGain={recorded_gain}）",
+        ))
+
     return effective, rows, cross_asr
 
 
@@ -345,9 +374,9 @@ def show_config(
 
 
 def stop_harness(port: int) -> None:
-    """收尾：只杀本次回放起的那个实例（按端口认）。"""
+    """收尾：只杀本次回放起的那个实例（按端口认）+ 客户端。"""
     try:
-        ssh(kill_on_port(port), timeout=60)
+        ssh(f"{kill_orphan_clients()}; {kill_on_port(port)}", timeout=60)
     except RuntimeError:
         pass  # 收尾失败不该盖住结果
 
@@ -432,7 +461,7 @@ def show(title: str, rows: list[dict]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--archive", default="", help="会话档案名（不给就用最新一场）")
-    ap.add_argument("--turns", type=int, default=3, help="回放前几轮（0 = 全部）")
+    ap.add_argument("--turns", type=int, default=0, help="回放前几轮（0 = 全部，默认全跑）")
     ap.add_argument("--mode", default="utterance", choices=["utterance", "stream"],
                     help="utterance=一轮一轮（可逐轮对账，默认）；stream=整段原速重放（验打断）")
     ap.add_argument("--list", action="store_true", help="只列出可回放的会话")
@@ -564,7 +593,7 @@ def main() -> int:
     try:
         for rep in range(max(1, args.repeat)):
             before_list = bench_archives(args.bench_dir) if args.spawn else list_archives()
-            out = ssh(cmd, timeout=600)
+            out = ssh(cmd, timeout=1800)
             if args.repeat > 1:
                 print(f"\n--- 第 {rep + 1}/{args.repeat} 次 ---")
             print("  " + "\n  ".join(out.strip().splitlines()[-4:]))

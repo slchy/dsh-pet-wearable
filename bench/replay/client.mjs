@@ -368,14 +368,27 @@ async function replayVector() {
         sent = end;
       }
       turn.lastVoicedAt = Date.now() - t0;
+      turn.voicedEndAt = Date.now();
       console.log(`   [${i + 1}] 说完，等回复…`);
 
-      // 等到下行安静下来（这一轮播完）
-      const hardStop = Date.now() + 25000;
+      // 等到下行安静下来（这一轮播完）。
+      //
+      // 45 s 是**服务端自己的规则**（`fsm-trace` 里「一轮不许挂超过 45 s」）。
+      // 之前这里是 25 s，而 dsh 偶发 21–27 s 才答完（实测 `dsh 27.04 s`）——
+      // 客户端先放弃、把下一轮音频送了进去，服务端那轮还挂着，于是
+      // `turn.end` 丢失、后面的轮次全部错位，看起来像「回放跑两趟就卡死」。
+      const hardStop = Date.now() + 45000;
+      // 连首块都没有的轮次不用等满 45 s：8 s 没下行就按「这一轮哑了」记一笔再推进
+      const muteIfSilentMs = 8000;
       while (Date.now() < hardStop) {
         sock.write(frame(UP.Audio, silence));
         await new Promise((r) => setTimeout(r, CHUNK_MS));
         if (turn.firstDownAt !== null && lastDownAt > 0 && Date.now() - lastDownAt > 1500) {
+          break;
+        }
+        if (turn.firstDownAt === null && Date.now() - turn.voicedEndAt > muteIfSilentMs) {
+          turn.noDownlink = true;
+          console.log(`   [${i + 1}] 无下行 ${muteIfSilentMs} ms，判哑，推进下一轮`);
           break;
         }
       }
