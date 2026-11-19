@@ -225,8 +225,13 @@ export interface UtteranceAssemblerOptions {
    * 给快车道**投机**用：比定稿早 p50 731 ms（真机 47 轮），先拿它问出去，定稿确认
    * 是前缀才认。文本是**猜的**（中间结果在句末会大改），所以这里只传文本、不做判断 ——
    * 闸门在接收方（`FrontedAgent.speculatePartial` / `acceptsSpeculation`）。
+   *
+   * **返回值 = 这一次到底有没有投出去**。必须回传，因为长度门槛、候选判据、
+   * 配额全在接收方：以前这里无条件记 `specFiredAt`，一句「嗯」被门槛挡掉，却把
+   * 整段语音的投机机会用完了 —— 真机 `20261119-071340` 轮 2/3/11 三轮全栽在这
+   * （那三条 partial 是**上一段语音**残留的「嗯」，`+100 ms` 时真实覆盖 0%）。
    */
-  readonly onPartial?: (text: string) => void;
+  readonly onPartial?: (text: string) => boolean;
   /** 一轮定稿 */
   readonly onUtterance: (text: string) => void;
   /**
@@ -376,6 +381,8 @@ export class UtteranceAssembler {
    * 不是布尔），静音期内反复进 `trackSilence` 只封一次。
    */
   private commitFiredAt = Number.NEGATIVE_INFINITY;
+  /** 上一次问过、但接收方没发出去的那一版（同一版不重复问，免得每个静音帧刷一次） */
+  private specTriedText = '';
   /** 上一次投机的时刻 / 这一句已经投机几次（`addSentence` 归零） */
   private specFiredAt = Number.NEGATIVE_INFINITY;
   private specCount = 0;
@@ -551,12 +558,15 @@ export class UtteranceAssembler {
    * 和判停预跑分开是因为**两者的等待理由完全不同**：判停要等够音频才敢判「说完了」，
    * 投机只是猜，猜早了作废就是，猜晚了一无所得。
    *
-   * 防呆：
-   * - **一段语音只投机一次**（`lastVoicedAt > specFiredAt`）。静音之后 ASR 还会补
-   *   一两版 partial，如果让它们重投机，等于把已经跑了 160 ms 的那一趟作废重来 ——
-   *   实测认领时"已经跑了 6 ms"，还不如不提前（踩过）；
-   * - 一句最多 2 次（`specCount`，`addSentence` 归零）—— 覆盖「说-停-说」的多段；
-   * - 触发过就记 `specFiredAt`，长时间静音不会反复烧模型。
+   * 防呆（每一条都对应一次真机踩坑）：
+   * - **这一版 partial 必须属于本段语音**（`lastPartialAt > lastUtteranceAt`）。
+   *   `lastPartialText` 不会跟着语音结束自动清空，上一段最后那版「嗯」能一直留到
+   *   下一段开口 —— 拿它去投机就是拿别人那句话猜这一句。
+   * - **接收方说发出去了才算一次**（`onPartial` 的返回值）。门槛（`specMinChars`、
+   *   候选判据）都在接收方，这边记账早一步就会把机会记成「已用」。
+   * - 发出去了就不再问（`lastVoicedAt <= specFiredAt`）：静音之后 ASR 还会补一两版
+   *   partial，让它们重投机等于把已经跑掉的时间作废重来（实测认领时只跑了 6 ms）。
+   * - 一句最多 2 次（`specCount`，`addSentence` 归零）—— 覆盖「说-停-说」的多段。
    */
   private maybeSpeculate(t: number): void {
     if (this.options.onPartial === undefined) {
@@ -579,17 +589,30 @@ export class UtteranceAssembler {
     if (this.specCount >= 2) {
       return;
     }
+    // 本段语音还没吐过字：`lastPartialText` 是上一段的残留，不能用
+    if (this.lastPartialAt <= this.lastUtteranceAt) {
+      return;
+    }
     const latest = this.lastPartialText;
     if (latest === '') {
       return;
     }
+    const text = this.pendingText + latest;
+    // 同一版 partial 问过一次就够了：静音帧是每 20 ms 一个，不去重会刷成一片
+    if (text === this.specTriedText) {
+      return;
+    }
+    if (!this.options.onPartial(text)) {
+      this.specTriedText = text;
+      return;
+    }
+    this.specTriedText = '';
     this.specFiredAt = t;
     this.specCount += 1;
     this.options.log(
       `  投机    静音 ${pause} ms → 交出中间结果（第 ${this.specCount}/2 次，判停还等 `
         + `${this.options.silencePauseMs ?? 200} ms）`,
     );
-    this.options.onPartial(this.pendingText + latest);
   }
 
   /** 静音满 `silencePauseMs` 就先把判停算掉，定稿时直接取用。 */
@@ -647,6 +670,9 @@ export class UtteranceAssembler {
     const seq = this.seq;
     // 新的一句：投机的次数配额按句重置（下一段语音可以再投机两次）
     this.specCount = 0;
+    this.specTriedText = '';
+    // 中间结果属于上一段语音，不能留给下一段当素材（见 `maybeSpeculate` 的 `lastPartialAt` 判据）
+    this.lastPartialText = '';
     // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
     // 先把它交出去起跑，真并了下一段再换 —— 见 `VoiceSession` 的接线。
     this.options.onSentence?.(this.pendingText);

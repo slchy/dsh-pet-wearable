@@ -650,9 +650,9 @@ class VoiceConnection {
       },
       // 中间结果投机：比定稿再往前提 p50 731 ms（真机 47 轮）。文本是猜的，
       // 定稿确认是前缀才认领 —— 认不了就作废，退回上面那条路，等于没做。
-      onPartial: (text) => {
-        this.options.agent.speculatePartial?.(text);
-      },
+      // 返回 false（没投出去）时组装器不会记「这段语音已投机」，下一个静音 tick
+      // 还会再问一次 —— 否则「静音 100 ms 时只凑到 2 个字」就等于整轮放弃。
+      onPartial: (text) => this.options.agent.speculatePartial?.(text) ?? false,
       log,
     });
 

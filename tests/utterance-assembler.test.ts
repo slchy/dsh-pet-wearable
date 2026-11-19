@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 判停组装层：**一句话被 ASR 切成两句**时不要拿后半截当一轮。
  *
  * 真机（2026-11-15）：用户问「…你是怎么答的？」，ASR 断成
@@ -338,7 +338,7 @@ test('中间结果在**静音那一刻**交给投机，且带的是最新一版 
     speculateMs: 40,
     now: () => clock,
     predict: async () => 0.99,
-    onPartial: (text) => { seen.push(text); },
+    onPartial: (text) => { seen.push(text); return true; },
   });
 
   for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
@@ -369,7 +369,7 @@ test('投机比判停预跑**更早**触发（100 vs 200），两条线各走各
     silencePauseMs: 120,
     now: () => clock,
     predict: async () => 0.99,
-    onPartial: (text) => { seen.push(text); },
+    onPartial: (text) => { seen.push(text); return true; },
     log: (line) => { fired.push(line); },
   });
 
@@ -402,7 +402,7 @@ test('投机：静音期间补来的 partial**不许顶掉**在跑的那一趟',
     speculateMs: 40,
     silencePauseMs: 200,
     now: () => clock,
-    onPartial: (text) => { seen.push(text); },
+    onPartial: (text) => { seen.push(text); return true; },
   });
 
   for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
@@ -426,7 +426,7 @@ test('一句话最多投机 2 次（ASR 能给 5–14 版，别变成请求风�
     speculateMs: 40,
     silencePauseMs: 200,
     now: () => clock,
-    onPartial: (text) => { seen.push(text); },
+    onPartial: (text) => { seen.push(text); return true; },
   });
 
   const sayThenPause = (partial: string): void => {
@@ -445,8 +445,73 @@ test('一句话最多投机 2 次（ASR 能给 5–14 版，别变成请求风�
   assert.deepEqual(seen, ['你', '你好']);
 });
 
-// ---------------------------------------------------------------- 判停提前（与 ASR 静音窗并行）
+// ---------------------------------------------------------------- 投机记账（接收方说了算）
 //
+// 门槛（`specMinChars`、候选判据、配额）全在 `FrontedAgent`，组装器这边只负责
+// 「到点了就问一句」。所以**它说没有真的发出去，就不能记成已投机** —— 以前无条件
+// 记账，一句被挡掉的「嗯」会把整段语音的机会用光（真机 `20261119-071340` 轮 2/3/11）。
+
+test('投机：接收方说没发出去，下一版 partial 还要再问一次', async () => {
+  const tried: string[] = [];
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    speculateMs: 40,
+    silencePauseMs: 400,
+    now: () => clock,
+    // 模拟「中间结果太短被门槛挡掉」：够 4 个字才真发
+    onPartial: (text) => { tried.push(text); return text.length >= 4; },
+  });
+
+  const sayThenPause = (partial: string): void => {
+    assembler.notePartial(partial);
+    for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  };
+
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  sayThenPause('你');
+  sayThenPause('你好');
+  assert.deepEqual(tried, ['你', '你好'], '前两版都被挡了，但每次都要真的问出去');
+
+  sayThenPause('你好我想');
+  assert.deepEqual(tried, ['你', '你好', '你好我想'], '够长度了就发');
+
+  sayThenPause('你好我想问');
+  assert.deepEqual(tried, ['你', '你好', '你好我想'], '发出去了就不再问，补充的 partial 不许重起跑');
+});
+
+test('投机：上一段语音残留的中间结果不能拿来猜这一句', async () => {
+  const tried: string[] = [];
+  let clock = 1000;
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    speculateMs: 40,
+    silencePauseMs: 400,
+    now: () => clock,
+    predict: async () => 0.99,
+    onPartial: (text) => { tried.push(text); return true; },
+  });
+
+  // 第一段：说完、留下一版 partial「嗯」、定稿收下
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  assembler.notePartial('嗯');
+  assembler.addSentence('你好。');
+  assembler.flush();
+  assert.deepEqual(tried, [], '定稿之前就静音了那么久，本来也不该投机');
+
+  // 第二段：开口了，但 ASR 还没吐这一段的字
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+  for (let i = 0; i < 4; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  await delay(30);
+  assert.deepEqual(tried, [], '「嗯」属于上一段，拿它去猜这一句等于乱猜');
+
+  // 这一段的字到了才发
+  assembler.notePartial('你看过吗');
+  for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+  assert.deepEqual(tried, ['你看过吗']);
+});
+
+// ---------------------------------------------------------------- 判停提前（与 ASR 静音窗并行）
 // ASR 要等 200 ms 静音才发 SentenceEnd，而判停器看的是音频 —— 那 200 ms 里音频
 // 早就够了。所以静音一到就先把判停跑掉，SentenceEnd 到时直接取用。
 

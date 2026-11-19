@@ -764,6 +764,20 @@ export class FrontedAgent implements AgentProvider {
     const prev = this.prefetched;
     if (prev !== null && prev.speculative && acceptsSpeculation(prev.text, text, this.specMinChars)) {
       this.speculateStarts = 0;
+      // 投机缺掉的那截尾巴必须落档：认领门槛只要求前缀 + 覆盖 ≥60%，
+      // 缺的常常是宾语（「那你知道」← 「那你知道蓝母吗？」）。不记下来，
+      // 「模型为什么反问」就永远查不到（见 `EVENTS.agentSpec`）。
+      const specCore = stripPartialTail(prev.text);
+      this.auditSink(EVENTS.agentSpec, {
+        ok: true,
+        spec: prev.text,
+        final: text,
+        spec_chars: specCore.length,
+        final_chars: text.length,
+        coverage: Number((specCore.length / Math.max(1, text.length)).toFixed(3)),
+        missing: text.slice(specCore.length),
+        ran_for_ms: Math.round(this.now() - prev.startedAt),
+      });
       this.log(
         `  快车道    投机被定稿确认（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}，`
         + `已跑 ${(this.now() - prev.startedAt).toFixed(0)} ms）`,
@@ -793,24 +807,28 @@ export class FrontedAgent implements AgentProvider {
    * 为什么要限次：一句话 ASR 能给 5–14 版中间结果，每版都发就是十几倍请求。
    * 只在「越改越长」时重来，且同一条链最多 2 次；中间结果被改写（不是变长）
    * 就收掉 —— 那说明 ASR 在纠错，早期那版大概率跟定稿对不上。
+   *
+   * **返回值 = 这一次到底有没有投出去**，宿主据此决定「这段语音还算不算有投机机会」。
+   * 不能无条件当成功：长度门槛、候选判据、配额全在这边，宿主记账早一步就会把
+   * 一句被挡掉的「嗯」记成「已投过」，整段语音再没机会。
    */
-  speculatePartial(text: string): void {
-    if (!this.prefetchEnabled || !this.partialSpeculate) return;
+  speculatePartial(text: string): boolean {
+    if (!this.prefetchEnabled || !this.partialSpeculate) return false;
     const trace = process.env['FAST_LANE_TRACE'] === '1';
     // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱
     if (stripPartialTail(text).length < this.specMinChars) {
       // tracer 上和「真的发出去了」区分开：「投机 静音…」那行是宿主打算投，这行才是结果
       if (trace) this.log(`  快车道    投机跳过：中间结果太短 ${JSON.stringify(text)}`);
-      return;
+      return false;
     }
     const prev = this.prefetched;
     if (prev !== null) {
-      // 定稿后才起的那一趟文本是确定的，别用猜测顶掉它
-      if (!prev.speculative) return;
-      if (prev.text === text) return;
+      // 定稿后才起的那一趟文本是确定的，别用猜测顶掉它（它已经比投机更准，不必再投）
+      if (!prev.speculative) return true;
+      if (prev.text === text) return true;
       if (text.length > prev.text.length && text.startsWith(prev.text)
         && prev.text.length / text.length >= SPEC_MIN_COVERAGE) {
-        return;
+        return true;
       }
       // **已经在跑的那趟覆盖得够多 → 沿用，既不重发也不消耗配额。**
       // 认领的门槛本来就是「覆盖 ≥ `SPEC_MIN_COVERAGE`」（`acceptsSpeculation`），所以照
@@ -822,16 +840,17 @@ export class FrontedAgent implements AgentProvider {
           `中间结果被改写（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}）`,
         );
         this.speculateStarts = 0;
-        return;
+        return false;
       }
     }
-    if (this.speculateStarts >= 2) return;
+    if (this.speculateStarts >= 2) return prev !== null && prev.speculative;
     if (!this.isPrefetchable(text)) {
       if (trace) this.log(`  快车道    投机跳过：不是快车道候选 ${JSON.stringify(text)}`);
-      return;
+      return false;
     }
     this.speculateStarts += 1;
     this.startPrefetch(text, true);
+    return true;
   }
 
   /**

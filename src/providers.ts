@@ -151,8 +151,12 @@ export interface AgentProvider {
    *
    * 实现必须容忍「问了却没人来认领」，也不能每版中间结果都发一次请求
    * （一句话能有 5–14 版）。
+   *
+   * **返回「这一次到底有没有投出去」**。长度门槛、候选判据、次数配额全在实现侧，
+   * 宿主靠这个返回值判断「这段语音还算不算有投机机会」—— 无条件当成功的话，
+   * 一句被门槛挡掉的「嗯」会把整段语音的机会用光（真机 `20261119-071340` 三轮）。
    */
-  speculatePartial?(text: string): void;
+  speculatePartial?(text: string): boolean;
   /**
    * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
    *
