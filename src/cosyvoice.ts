@@ -839,15 +839,30 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
     }
   };
 
-  const acquire = async (): Promise<Connection> => {
+  /**
+   * 建连接 / 复用。
+   *
+   * **同一时刻只建一条**：`warm()`（设备连上）和 `prewarm()`（定稿）都可能在这一刻
+   * 发现没有连接，各自建一条的话，后写进 `conn` 的那条活着，另一条没人关（TCP 泄漏）。
+   */
+  let connecting: Promise<Connection> | null = null;
+  const acquire = (): Promise<Connection> => {
     if (conn && conn.isUsable) {
-      return conn;
+      return Promise.resolve(conn);
     }
+    if (connecting !== null) return connecting;
     drop();
-    const fresh = new Connection(url, apiKey, options.onTask);
-    await fresh.open();
-    conn = fresh;
-    return fresh;
+    const make = (async (): Promise<Connection> => {
+      const fresh = new Connection(url, apiKey, options.onTask);
+      await fresh.open();
+      conn = fresh;
+      return fresh;
+    })();
+    connecting = make;
+    void make.catch(() => { /* 失败由调用方处理 */ }).finally(() => {
+      if (connecting === make) connecting = null;
+    });
+    return make;
   };
 
   const touchIdle = (): void => {
