@@ -405,6 +405,42 @@ test('投机：变长就重发（认领要完全一致，沿用的前缀永远�
   assert.equal(asked, 2, '配额用满 → 沿用，不再发');
 });
 
+test('keepTurns=0：攒满也不按计数转交，但真正需要 dsh 时把攒下的轮次带上', async () => {
+  // 真机 `20261119-112330`：`keepTurns=4` 让每 5 轮就强制交给 dsh 一次，
+  // 用户说一句「可以。」要等 6.8 秒，整体 p90 全靠它。`pending` 的注入本来就在
+  // `startInner` 里，不需要借强制转交来触发。
+  let fast = 0;
+  const seenNotes: string[] = [];
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: async (_text, _image, note): Promise<AgentReplyView> => {
+      seenNotes.push(note ?? '');
+      return { text: '慢车道答复。', speech: '慢车道答复。' };
+    },
+    attachLiveSink: () => {},
+  };
+  const agent = new FrontedAgent({
+    inner, apiKey: 'k', keepTurns: 0, speculate: false, log: () => {},
+    fetchImpl: async () => { fast += 1; return sse(['[平静]', '在呢哥。']); },
+  });
+
+  // 连着 6 句短闲聊（都不含阿拉伯数字，否则 `isFastCandidate` 会挡）：全都该走快车道
+  const lines = ['你好呀', '在吗在吗', '聊会儿吧', '今天咋样', '陪我会儿', '说说话呀'];
+  for (const line of lines) {
+    const r = await agent.reply(line);
+    assert.equal(r.path, 'fast', `${line} 不该因为攒满被转交`);
+  }
+  assert.equal(fast, 6);
+  assert.equal(seenNotes.length, 0, '一次都没走 dsh');
+
+  // 一句「像长期事实」的：这时才走 dsh，攒下的 6 轮要一并带上
+  await agent.reply('我叫刘培强，记住了');
+  assert.equal(seenNotes.length, 1, '这一句该交给 dsh');
+  const note = seenNotes[0] ?? '';
+  assert.match(note, /下面几轮是刚才由快车道直接答给用户的/, '攒下的轮次要注入');
+  assert.match(note, /说说话呀/, '注入里应该有刚才那几轮');
+});
+
 test('投机：与预跑同一组形态门槛（语义不归本地管）', () => {
   let asked = 0;
   const agent = makeAgent(async () => {

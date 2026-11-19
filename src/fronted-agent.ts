@@ -273,7 +273,14 @@ export interface FastLaneOptions {
   readonly totalMs?: number;
   /** 超过这么多字不当闲聊（默认 14） */
   readonly maxChars?: number;
-  /** 最多攒几轮快车道对话就强制刷进 dsh（默认 4） */
+  /** 最多攒几轮快车道对话就强制刷进 dsh（默认 4）。
+   *
+   * **设 0 = 永不因计数强制委派**：`pending` 会在下一次真正需要 dsh 的轮次
+   * （判据命中 / 记忆提议 / dsh 在等回话）一并注入，用户永远不用为「刷上下文」等。
+   * 纯聊天模式（`delegate=OFF`）建议设 0 —— 那时 dsh 根本不参与，强制转交只是让
+   * 用户白等一次完整 agent 往返（真机实测 1.2 秒到 7.6 秒不等，见 `docs/LATENCY-CLOSURE.md`）。
+   * 对应环境变量 `FAST_LANE_KEEP_TURNS`。
+   */
   readonly keepTurns?: number;
   /** 投机双轨：与 dsh 同时发（默认 true） */
   readonly speculate?: boolean;
@@ -571,6 +578,16 @@ export class FrontedAgent implements AgentProvider {
   private readonly totalMs: number;
   private readonly maxChars: number;
   private readonly keepTurns: number;
+  /**
+   * `pending` 的硬上限（轮）。超过就丢最老的，见 `rememberFast`。
+   *
+   * 不设上限的话，`keepTurns=0`（永不因计数转交）时数组会一直长。
+   * 取 `keepTurns` 的 4 倍，且至少 8 轮 —— 真正需要 dsh 的那一轮带上几轮上下文就够了。
+   */
+  private readonly pendingCap: number;
+  /** 累计丢掉的轮次（落 `agent.trim` 用） */
+  private droppedTurns = 0;
+  private reportedDropped = 0;
   private readonly windowChars: number;
   /** 中间结果投机的最小字数（见 {@link FrontedOptions.specMinChars}） */
   private readonly specMinChars: number;
@@ -681,6 +698,7 @@ export class FrontedAgent implements AgentProvider {
     this.totalMs = options.totalMs ?? 2_800;
     this.maxChars = options.maxChars ?? 14;
     this.keepTurns = options.keepTurns ?? 4;
+    this.pendingCap = Math.max(8, this.keepTurns > 0 ? this.keepTurns * 4 : 16);
     this.windowChars = Math.max(200, options.windowChars ?? WINDOW_CHARS);
     this.specMinChars = Math.max(1, options.specMinChars ?? SPEC_MIN_CHARS);
     this.speculate = options.speculate ?? true;
@@ -885,7 +903,7 @@ export class FrontedAgent implements AgentProvider {
     if (this.lastDsh?.asked === true && looksLikeAnswer(text)) return false;
     if (looksMemorable(text)) return false;
     if (!isFastCandidate(text, this.maxChars)) return false;
-    if (this.pending.length / 2 >= this.keepTurns) return false;
+    if (this.keepTurns > 0 && this.pending.length / 2 >= this.keepTurns) return false;
     return true;
   }
 
@@ -1012,7 +1030,7 @@ export class FrontedAgent implements AgentProvider {
       && image === undefined
       && (isFastCandidate(userText, this.maxChars)
         || (hasFacts && isStatusQuestion(userText)));
-    const overCap = this.pending.length / 2 >= this.keepTurns;
+    const overCap = this.keepTurns > 0 && this.pending.length / 2 >= this.keepTurns;
     // 判停之前就已经问出去的那一轮：**文本一字不差**才认领，见 `prefetch()`
     const pre = this.takePrefetch(
       userText,
@@ -1123,6 +1141,19 @@ export class FrontedAgent implements AgentProvider {
     const { emotion, rest } = parseEmotion(raw);
     const speech = cleanForSpeech(rest);
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
+    // **硬上限**：纯聊天模式下 `keepTurns=0`（永不因计数转交），`pending` 会一直长 ——
+    // 快车道的 prompt 本来有 `windowChars` 截断，但数组本身不封顶就会吃内存。
+    // 丢最老的几轮必须落档：这是**静默丢上下文**，dsh 以后永远看不到那几轮。
+    while (this.pending.length / 2 > this.pendingCap) {
+      this.pending.splice(0, 2);
+      this.droppedTurns += 1;
+    }
+    if (this.droppedTurns > 0 && this.droppedTurns !== this.reportedDropped) {
+      this.auditSink(EVENTS.agentTrim, {
+        dropped_turns: this.droppedTurns, cap_turns: this.pendingCap,
+      });
+      this.reportedDropped = this.droppedTurns;
+    }
     this.remember(userText, speech);
     this.log(`  快车道    ${firstTokenMs} ms 首字（流式） ：${JSON.stringify(speech)}`);
     // `path` 必须由这里报：编排层分不出「预跑被认领」和「qwen 现场回」——

@@ -94,6 +94,14 @@ export const EVENTS = {
    * 这条事件是那个数的唯一依据，一旦出现就该往下调。
    */
   agentConn: 'agent.conn',
+  /**
+   * `pending` 触到硬上限、丢掉最老的几轮。
+   *
+   * 这是**静默丢上下文**：那几轮 dsh 以后永远看不到。`keepTurns=0`（永不因计数
+   * 强制委派）时 `pending` 只在真正需要 dsh 的轮次才清空，长时间纯聊天就会触顶。
+   * 落档是为了以后能回答「dsh 知不知道刚才聊了什么」。
+   */
+  agentTrim: 'agent.trim',
   /** 委派轮先说的那句「嗯，我想想」（`text` + `chars`），它不在 `turn.end.said` 里 */
   receipt: 'receipt',
   /**

@@ -603,6 +603,11 @@ async function main(): Promise<void> {
         specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
         // 窗口越小首字越快（快车道只答短句）
         windowChars: envNumber('FAST_LANE_WINDOW_CHARS', 800),
+        // 攒几轮快车道对话就强制委派一次「顺便刷 dsh 上下文」。
+        // **设 0 = 永不因计数转交**：那几轮会在下一次真正需要 dsh 的轮次一并注入
+        // （`startInner` 的 `pending` 逻辑），用户不用为刷上下文白等一次完整 agent 往返。
+        // 纯聊天模式建议 0 —— 那时 dsh 不参与，强制转交只是让「可以。」这种话等 6 秒。
+        keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 4),
         // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
         // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
         hedge: envNumber('FAST_LANE_HEDGE', 2),
