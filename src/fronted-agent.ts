@@ -751,6 +751,15 @@ export class FrontedAgent implements AgentProvider {
       // 定稿后才起的那一趟文本是确定的，别用猜测顶掉它
       if (!prev.speculative) return;
       if (prev.text === text) return;
+      if (text.length > prev.text.length && text.startsWith(prev.text)
+        && prev.text.length / text.length >= SPEC_MIN_COVERAGE) {
+        return;
+      }
+      // **已经在跑的那趟覆盖得够多 → 沿用，既不重发也不消耗配额。**
+      // 认领的门槛本来就是「覆盖 ≥ `SPEC_MIN_COVERAGE`」（`acceptsSpeculation`），所以照
+      // 现有这版问出来的答案，跟拿新文本重问是一样的 —— 而重来会把已经跑掉的时间全扔掉。
+      // 真机 `20261119-080409` 轮 11：投机提前 **1370 ms** 发出，ASR 又补了一版等于定稿的
+      // partial，被判成「判停并了段」重起 —— 开轮时站在起跑线上的那趟只跑了 **2 ms**。
       if (!text.startsWith(prev.text) || text.length <= prev.text.length) {
         this.dropPrefetch(
           `中间结果被改写（${JSON.stringify(prev.text)} → ${JSON.stringify(text)}）`,

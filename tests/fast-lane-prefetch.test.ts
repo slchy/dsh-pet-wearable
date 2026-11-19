@@ -307,16 +307,18 @@ test('投机：一句话最多起跑两次，中间结果被改写就收掉', as
 
   agent.speculatePartial('你好呀你知道吗');
   assert.equal(asked, 1);
-  // 越改越长：允许再起跑一次（文本更接近定稿）
+  // 只多一个语气词（覆盖 7/8 = 88%）→ **沿用**，不为多的字重起
   agent.speculatePartial('你好呀你知道吗呢');
+  assert.equal(asked, 1, '覆盖够就别重起，重来会把已经跑的时间扔掉');
+  // 覆盖掉到 60% 以下 → 才允许重起一次
+  agent.speculatePartial('你好呀你知道吗呢啊嗯那个事情');
   assert.equal(asked, 2);
-  // 第三次不许再发
-  agent.speculatePartial('你好呀你知道吗呢啊');
-  assert.equal(asked, 2, '一句话最多两次：ASR 能给 5–14 版中间结果');
+  // 配额用满（2/2）后再变长：覆盖够就沿用，**不消耗**配额
+  agent.speculatePartial('你好呀你知道吗呢啊嗯那个事情啊');
+  assert.equal(asked, 2, '沿用不消耗配额');
 
   // 被改写（不是变长）→ 收掉，且不重发
-  agent.speculatePartial('你好呀你知道吗呢啊嗯');
-  agent.speculatePartial('你号呀你知道吗呢啊嗯');
+  agent.speculatePartial('你号呀你知道吗呢啊嗯那个事情啊');
   assert.equal(asked, 2, '改写说明 ASR 在纠错，早期那版大概率对不上定稿');
 });
 
@@ -376,6 +378,28 @@ test('投机：门槛只管「发不发」，认领规则一个字没动', () =>
     true,
     '2 字、前缀、覆盖 67% → 认（但默认门槛下它压根发不出去）',
   );
+});
+
+test('投机已跑起来时，更长的 partial 不该重起（覆盖够就沿用）', () => {
+  // 真机 `20261119-080409` 轮 11：投机提前 1370 ms 发出，ASR 又补了一版等于定稿的
+  // partial，被判成「判停并了段」重起 —— 开轮时站在起跑线上的那趟只跑了 2 ms。
+  // 认领门槛本来就是覆盖 ≥ 60%，所以照旧那版问出来的答案与新文本重问一样。
+  let asked = 0;
+  const agent = makeAgent(async () => {
+    asked += 1;
+    return sse(['在呢。']);
+  });
+
+  agent.speculatePartial('你喜欢三体里');
+  assert.equal(asked, 1, '中间结果先跑起来');
+
+  // 6 → 10 字：覆盖 60%，正好卡在门槛上 → 沿用那一趟
+  agent.speculatePartial('你喜欢三体里面哪个人');
+  assert.equal(asked, 1, '覆盖够 → 不重起');
+
+  // 6 → 11 字：覆盖 55% < 60%，这时必须重问，旧的那版答不了新问题
+  agent.speculatePartial('你喜欢三体里面哪个人物');
+  assert.equal(asked, 2, '覆盖不够 → 重起');
 });
 
 test('投机：与预跑同一组形态门槛（语义不归本地管）', () => {
