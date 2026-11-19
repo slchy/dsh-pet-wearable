@@ -337,6 +337,28 @@ test('预开：instruction 模式不预热（语气是开 task 时定死的）',
   }
 });
 
+test('预开：参数等价的情绪（happy / calm 都是 1.00）共用一条 task，不弃连接', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  const tasks: { prewarmed: boolean }[] = [];
+  try {
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      useInstruction: false,
+      onTask: (i) => { tasks.push({ prewarmed: i.prewarmed }); },
+    });
+    tts.prewarm?.();   // 用 calm 预开
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('在，哥。', 'happy')) bytes += chunk.length;
+    assert.ok(bytes > 0, '应当出声');
+    assert.deepEqual(server.texts, [['在，哥。']], 'happy 与 calm 参数相同 → 复用同一条连接，别弃');
+    assert.deepEqual(tasks, [{ prewarmed: true }], '这一趟应当认领预开');
+  } finally {
+    await server.close();
+  }
+});
+
 test('预开：这一轮语气和预开的不一样就不认领（宁可多花一次握手，也别把语气压平）', { timeout: 5000 }, async () => {
   const server = await fakeCosyVoice();
   const tasks: { prefix: string; prewarmed: boolean }[] = [];

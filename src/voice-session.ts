@@ -637,9 +637,14 @@ class VoiceConnection {
       // 句子定稿那一刻就让快车道起跑，把判停那一拍从关键路径上挪走。
       // 判停若并了下一段，组装器会拿更长的文本再调一次；认领时按文本比对。
       onSentence: (text) => {
-        // 既有模型在跑 → 只差文字，顺手把 TTS 的 `run-task → task-started`
-        // 那段（p50 66 ms，串在首包之前）预开掉。
-        if (this.options.agent.prefetch?.(text) === true) this.options.tts.prewarm?.();
+        this.options.agent.prefetch?.(text);
+        // TTS 预热**和谁答无关**：这一轮不管由快车道还是 dsh 答，都要合成。
+        // 所以不跟着 `prefetch` 的返回值走（任务轮、长句根本不预跑快车道，以前就漏掉了
+        // 一整类轮次），定稿就预开 —— 两条车道谁赢都能直接认领。
+        //
+        // 代价是「定稿了但这一轮没答」（插话、断连）会白开一个 task，靠 3 s TTL 弃连接。
+        // 判停并段会再调一次，`prewarm()` 自己幂等（在途/已在等认领就直接返回）。
+        this.options.tts.prewarm?.();
       },
       // 中间结果投机：比定稿再往前提 p50 731 ms（真机 47 轮）。文本是猜的，
       // 定稿确认是前缀才认领 —— 认不了就作废，退回上面那条路，等于没做。

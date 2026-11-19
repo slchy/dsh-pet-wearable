@@ -263,9 +263,13 @@ export interface TtsProvider {
    * 且它与合成**串行** —— `runFeed` 要等第一段文本才发 run-task，`continue-task`
    * 又要等 task-started。定稿时正文还没到，正好能把这 66 ms 吞掉。
    *
+   * **和谁回答无关**：快车道和 dsh（`speculate` 双轨）都要经过同一个 TTS，所以宿主在
+   * **定稿**那一刻就调一次，两条车道谁赢都由下一个 `synthesize*` 直接认领。
+   * 幂等：在途、或已有一条等着被认领，再调直接返回。
+   *
    * 探针实测：run-task 之后等 0.3 / 1 / 2 / 3 / 4.5 s 再送文本都正常，首包 296–318 持平。
    * **但空 task 不能 `finish-task`**（服务端回 `Please ensure input text is valid.`
-   * 并让整条连接后续 task 静默挂死），所以没被认领的预开只能**弃连接**。
+   * 并让整条连接后续 task 静默挂死），所以没被认领的预开只能**弃连接**（TTL 3 s）。
    *
    * 调用方不用配对认领：下一个 `synthesize` / `synthesizeStream` 自动接管。
    */

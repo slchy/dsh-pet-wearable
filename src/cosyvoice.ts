@@ -136,6 +136,12 @@ export interface CosyVoiceOptions {
 /** 阿里云的 task_id 必须 32 位无横线；`randomUUID()` 默认带横线会被拒。 */
 const hex32 = (): string => randomUUID().replace(/-/g, '');
 
+/** 两条情绪在 prosody 模式下是否**等价**（rate/pitch 相同 → 能共用同一条预开 task） */
+export function sameProsody(a: Emotion, b: Emotion): boolean {
+  return EMOTION_PROSODY[a].rate === EMOTION_PROSODY[b].rate
+    && EMOTION_PROSODY[a].pitch === EMOTION_PROSODY[b].pitch;
+}
+
 /**
  * 一块音频是不是**数字静音**。
  *
@@ -886,8 +892,15 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
     if (warming !== null) await warming;
     // 预开的 task 把语气**定死在开 task 那一刻**。这一轮的语气不一样就不能认领，
     // 而空 task 又不能 finish-task —— 只能弃连接重来（那 ~170 ms 落在等模型开口里）。
-    // 生产 91% 无标签（calm）、8% 开心（与 calm 同为 1.00/1.00），所以这条极少走到。
-    if (conn?.hasPending === true && conn.pendingEmotion !== emotion) drop();
+    // 判据用**参数**而不是情绪名：happy 和 calm 都是 1.00/1.00，共用一条 task 完全没问题
+    // （按名字比会把 8% 的开心轮次白白弃掉，比省下的 66 ms 还亏）。
+    // instruction 模式的语气是 task 参数里的文本，必须同名。
+    if (conn?.hasPending === true) {
+      const asked = conn.pendingEmotion;
+      const reusable = asked !== null
+        && (useInstruction ? asked === emotion : sameProsody(asked, emotion));
+      if (!reusable) drop();
+    }
     const previous = chain;
     let release!: () => void;
     chain = new Promise<void>((resolve) => { release = resolve; });
@@ -978,9 +991,9 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
      * **预开一条 task**：把 `建立`（run-task → task-started，实测 p50 66 ms）从
      * 「模型 → 合成」中间挪到「正文还没到」的空窗里。
      *
-     * 调用点：宿主在**定稿**那一刻、且确认这一句会走快车道时调（那时正文还没开始流，
-     * 但已经知道要答了）。认领是自动的 —— 下一个 `synthesize`/`synthesizeStream`
-     * 直接接管，不用配对。
+     * 调用点：宿主在**定稿**那一刻调（`voice-session` 的 `onSentence`），**不看**这一轮
+     * 由谁回答 —— 快车道和 dsh 都要经过同一个 TTS，两条车道谁赢都能认领。
+     * 认领是自动的 —— 下一个 `synthesize`/`synthesizeStream` 直接接管，不用配对。
      *
      * 三条边界，都是探针实测出来的：
      * - 服务端能容忍 run-task 之后等 **≥4.5 s** 再送文本，首包不变（实测 296–318）；
