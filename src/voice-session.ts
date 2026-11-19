@@ -637,7 +637,9 @@ class VoiceConnection {
       // 句子定稿那一刻就让快车道起跑，把判停那一拍从关键路径上挪走。
       // 判停若并了下一段，组装器会拿更长的文本再调一次；认领时按文本比对。
       onSentence: (text) => {
-        this.options.agent.prefetch?.(text);
+        // 既有模型在跑 → 只差文字，顺手把 TTS 的 `run-task → task-started`
+        // 那段（p50 66 ms，串在首包之前）预开掉。
+        if (this.options.agent.prefetch?.(text) === true) this.options.tts.prewarm?.();
       },
       // 中间结果投机：比定稿再往前提 p50 731 ms（真机 47 轮）。文本是猜的，
       // 定稿确认是前缀才认领 —— 认不了就作废，退回上面那条路，等于没做。

@@ -138,8 +138,11 @@ export interface AgentProvider {
    * 的同一句话时认领结果，文本变了就丢掉重问。
    *
    * 实现必须容忍「问了却没人来认领」（用户插话、判停并段、进程退出）。
+   *
+   * 返回 `true` 表示**这一趟已经在跑了**（新起跑、命中已有的、或投机被确认），
+   * 宿主据此决定要不要顺手预开一条 TTS task —— 那一趟的结果马上就会来。
    */
-  prefetch?(text: string): void;
+  prefetch?(text: string): boolean;
   /**
    * 可选能力：**中间结果投机**。
    *
@@ -253,6 +256,20 @@ export interface TtsProvider {
    * 「用户还没开口」的空窗里。失败必须自己咽掉，下次合成会重建。
    */
   warm?(): void;
+  /**
+   * 可选能力：**预开一条合成 task**（`run-task` → `task-started`，先不送文本）。
+   *
+   * 为什么：`tts.task` 拆出来，`建立`（run-task → task-started）p50 **66 ms**，
+   * 且它与合成**串行** —— `runFeed` 要等第一段文本才发 run-task，`continue-task`
+   * 又要等 task-started。定稿时正文还没到，正好能把这 66 ms 吞掉。
+   *
+   * 探针实测：run-task 之后等 300 / 600 / 1200 ms 再送文本都正常，首包不受影响。
+   * **但空 task 不能 `finish-task`**（服务端回 `Please ensure input text is valid.`
+   * 并让整条连接后续 task 静默挂死），所以没被认领的预开只能**弃连接**。
+   *
+   * 调用方不用配对认领：下一个 `synthesize` / `synthesizeStream` 自动接管。
+   */
+  prewarm?(): void;
   /**
    * 边生成边合成（可选）：文本块一进来就送服务端，首包与模型生成重叠。
    * 没实现就退回 {@link synthesize} 整段合成。

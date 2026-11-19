@@ -128,6 +128,8 @@ export interface CosyVoiceOptions {
     readonly setup_ms: number;
     readonly first_ms: number;
     readonly stream: boolean;
+    /** 这一趟是不是认领了 `prewarm()` 预开的 task（判「预热省没省下来」就看它） */
+    readonly prewarmed: boolean;
   }) => void;
 }
 
@@ -226,18 +228,35 @@ class Connection {
   private traceStartedAt = 0;
   private traceFirstAt: number | null = null;
   private readonly onTask: CosyVoiceOptions['onTask'];
+  /**
+   * **预开好的 task**：`run-task` 已发、`task-started` 已回，但一个字都没送。
+   *
+   * task 只绑参数、不绑文本，所以谁来认领都行（正文和回执都走 `run`/`runFeed`）。
+   * 一旦被认领就清空；到点没被认领只能**弃连接**（见 `beginTask` 的注释）。
+   */
+  private pending: {
+    readonly taskId: string;
+    readonly sentAt: number;
+    readonly startedAt: number;
+    /** 预开时用的语气 —— 开 task 时定死，这一轮的语气对不上就不能认领 */
+    readonly emotion: Emotion;
+  } | null = null;
+  /** 预开的 task 到点没人认领就作废（探针实测服务端能容忍的空窗只验到 1.2 s） */
+  private static readonly PREWARM_TTL_MS = 1_000;
+  private warmTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * 把这一次 task 的两段耗时交给宿主（`tts.task` 事件，常开）。
    *
    * 缺时刻就报 -1，**不拿 0 冒充** —— 0 会被当成「瞬间完成」混进统计里。
    */
-  private reportTask(setup: number, first: number, stream: boolean): void {
+  private reportTask(setup: number, first: number, stream: boolean, prewarmed: boolean): void {
     if (this.onTask === undefined) return;
     this.onTask({
       setup_ms: Number.isFinite(setup) ? Math.round(setup) : -1,
       first_ms: Number.isFinite(first) ? Math.round(first) : -1,
       stream,
+      prewarmed,
     });
   }
 
@@ -337,8 +356,126 @@ class Connection {
     return !this.closed && this.ws.readyState === WebSocket.OPEN;
   }
 
-  get isIdle(): boolean {
+  /** 这条连接上能新开一个 task 吗（**不管**有没有预开的等着认领） */
+  get canStartTask(): boolean {
     return this.isUsable && this.sink === null && this.settleWaiters.size === 0;
+  }
+
+  get isIdle(): boolean {
+    // `pending` 也算「不空闲」：预开的 task 已经在服务端占着这条连接，
+    // 这时再 run-task 会撞「连接正忙」。想认领它的路走 `canStartTask`。
+    return this.canStartTask && this.pending === null && this.starting === null;
+  }
+
+  get hasPending(): boolean {
+    return this.pending !== null;
+  }
+
+  /** 预开那条 task 的语气（没预开给 `null`）。语气对不上就得弃连接，见 `pump` */
+  get pendingEmotion(): Emotion | null {
+    return this.pending?.emotion ?? null;
+  }
+
+  /**
+   * 预开的那趟还在等 `task-started`（run-task 已发出、`pending` 还没落地）。
+   *
+   * 这段空窗里谁都不能再 run-task —— 服务端会认为连接正忙。所以 `run`/`runFeed`
+   * 先 `await` 它，之后多半就能直接认领刚落地的那条 task。
+   */
+  private starting: Promise<void> | null = null;
+
+  /**
+   * **预开一个 task**：只发 `run-task` 并等 `task-started`，一个字都不送。
+   *
+   * 为什么能这么做：探针实测 run-task 之后等 **300 / 600 / 1200 ms** 再 `continue-task`
+   * 都正常，首包不受影响（`--gap` 见 `scripts/probe-cosyvoice-warm.mjs` 那一系）。
+   * 而 `建立`（run-task → task-started）p50 **66 ms** 本来是串在「模型→合成」中间的，
+   * 定稿时正文还没到，正好拿这段空窗把它吞掉。
+   *
+   * **但空 task 不能收尾**：`finish-task` 一个字都没有时服务端回
+   * `task-failed: Please ensure input text is valid.`，然后这条连接上后续 task 全部
+   * 静默挂死（探针 C 组实测三次全 timeout）。所以没被认领的预开只能**弃连接**。
+   */
+  async beginTask(opts: {
+    readonly sampleRate: number;
+    readonly model: string;
+    readonly voice: string;
+    readonly useInstruction: boolean;
+    readonly emotion: Emotion;
+  }): Promise<boolean> {
+    if (!this.isIdle || this.starting !== null) return false;
+    const taskId = hex32();
+    const sentAt = performance.now();
+    this.ws.send(JSON.stringify({
+      header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
+      payload: {
+        task_group: 'audio',
+        task: 'tts',
+        function: 'SpeechSynthesizer',
+        model: opts.model,
+        parameters: {
+          text_type: 'PlainText',
+          voice: opts.voice,
+          format: 'pcm',
+          sample_rate: opts.sampleRate,
+          volume: 50,
+          rate: EMOTION_PROSODY[opts.emotion].rate,
+          pitch: EMOTION_PROSODY[opts.emotion].pitch,
+          ...(opts.useInstruction ? { instruction: EMOTION_INSTRUCTIONS[opts.emotion] } : {}),
+        },
+        input: {},
+      },
+    }));
+    let markReady!: () => void;
+    this.starting = new Promise<void>((resolve) => { markReady = resolve; });
+    try {
+      const started = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => { resolve(false); }, 3000);
+        this.startedWaiters.set(taskId, () => { clearTimeout(timer); resolve(true); });
+      });
+      this.startedWaiters.delete(taskId);
+      if (!started) return false;
+      this.pending = { taskId, sentAt, startedAt: performance.now(), emotion: opts.emotion };
+      // 到点没人要：**不能** finish-task（空 task 会被服务端判非法，之后整条连接
+      // 静默挂死），只能弃连接。定时器挂在这里而不是工厂里，才不会出现「预开了却
+      // 没有回收」的窗口。
+      this.warmTimer = setTimeout(() => {
+        this.warmTimer = null;
+        if (this.pending === null) return;
+        this.pending = null;
+        this.close();
+      }, Connection.PREWARM_TTL_MS);
+      this.warmTimer.unref?.();
+      return true;
+    } finally {
+      this.starting = null;
+      // 必须在 `pending` 落地**之后**才放开：`run`/`runFeed` 等的就是这一刻
+      markReady();
+    }
+  }
+
+  /** 认领预开的 task；没有（或连接已经不可用）就给 `null` */
+  takePending(): { readonly taskId: string; readonly sentAt: number; readonly startedAt: number } | null {
+    const picked = this.pending;
+    this.pending = null;
+    this.clearWarmTimer();
+    if (picked === null || !this.isUsable) return null;
+    return picked;
+  }
+
+  /** 丢掉预开的 task（返回有没有丢掉）。**调用方负责弃连接**，别在这发 finish-task */
+  clearPending(): boolean {
+    const had = this.pending !== null;
+    this.pending = null;
+    this.clearWarmTimer();
+    return had;
+  }
+
+  private clearWarmTimer(): void {
+    if (this.warmTimer !== null) {
+      clearTimeout(this.warmTimer);
+      this.warmTimer = null;
+    }
   }
 
   async open(): Promise<void> {
@@ -359,17 +496,24 @@ class Connection {
     voice: string,
     useInstruction: boolean,
   ): Promise<void> {
-    if (!this.isIdle) {
+    // 预开那趟可能正等着 `task-started`：等它落地，多半就能直接认领
+    if (this.starting !== null) await this.starting;
+    // 判「能不能开新 task」用 `canStartTask`，不用 `isIdle` —— 后者把预开的 task
+    // 算作忙，而预开的那个正是要在这里认领的。
+    if (!this.canStartTask) {
       throw new CosyVoiceError('连接正忙');
     }
-    const taskId = hex32();
+    const adopted = this.takePending();
+    const taskId = adopted?.taskId ?? hex32();
     // 探针（`COSYVOICE_TRACE=1`）：把 346 ms 拆成「task 建立」与「首包合成」。
     // 连接已复用（见类注释），所以这段全是服务端时间，只能靠提前 run-task 或
     // 流式 continue-task 重叠掉。
     const tracing = process.env['COSYVOICE_TRACE'] === '1';
-    // 两个时刻**总是**记：console 那行只在 tracing 时打，但 `tts.task` 事件常开
-    this.traceSentAt = performance.now();
-    this.traceStartedAt = 0;
+    // 两个时刻**总是**记：console 那行只在 tracing 时打，但 `tts.task` 事件常开。
+    // 认领了预开的 task 时，起点仍是**当初发 run-task 的那一刻** —— 这样 `建立`
+    // 报的始终是真实开销（能验证预热到底省了多少），而不是被抹成 0。
+    this.traceSentAt = adopted?.sentAt ?? performance.now();
+    this.traceStartedAt = adopted?.startedAt ?? 0;
     this.traceFirstAt = null;
     const probed = (chunk: Buffer): void => {
       if (this.traceFirstAt === null) {
@@ -382,7 +526,7 @@ class Connection {
             + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
           );
         }
-        this.reportTask(setup, first, false);
+        this.reportTask(setup, first, false, adopted !== null);
       }
       onChunk(chunk);
     };
@@ -390,26 +534,28 @@ class Connection {
     this.sink = probed;
     const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
 
-    this.ws.send(JSON.stringify({
-      header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
-      payload: {
-        task_group: 'audio',
-        task: 'tts',
-        function: 'SpeechSynthesizer',
-        model,
-        parameters: {
-          text_type: 'PlainText',
-          voice,
-          format: 'pcm',
-          sample_rate: sampleRate,
-          volume: 50,
-          rate: prosody.rate,
-          pitch: prosody.pitch,
-          ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[args.emotion] } : {}),
+    if (adopted === null) {
+      this.ws.send(JSON.stringify({
+        header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
+        payload: {
+          task_group: 'audio',
+          task: 'tts',
+          function: 'SpeechSynthesizer',
+          model,
+          parameters: {
+            text_type: 'PlainText',
+            voice,
+            format: 'pcm',
+            sample_rate: sampleRate,
+            volume: 50,
+            rate: prosody.rate,
+            pitch: prosody.pitch,
+            ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[args.emotion] } : {}),
+          },
+          input: {},
         },
-        input: {},
-      },
-    }));
+      }));
+    }
     this.ws.send(JSON.stringify({
       header: { action: 'continue-task', task_id: taskId, streaming: 'duplex' },
       payload: { input: { text: args.text } },
@@ -456,26 +602,31 @@ class Connection {
     batches: AsyncIterable<string>,
     onChunk: (chunk: Buffer) => void,
   ): Promise<void> {
-    if (!this.isIdle) {
+    // 同 `run()`：不能用 `isIdle`，预开的 task 正等着被认领
+    if (this.starting !== null) await this.starting;
+    if (!this.canStartTask) {
       throw new CosyVoiceError('连接正忙');
     }
     const iterator = batches[Symbol.asyncIterator]();
     // 先取第一段文本：取不到就**根本不开 task**（见方法注释里的空 task 问题）。
     // 但要抛出来让调用方走兜底 —— 否则这一轮正文就是哑的。
+    // 预开的 task 也等到这里才认领：上面那个 throw 一旦发生，那条 task 不能算数。
     const first = await iterator.next();
     if (first.done === true) {
       throw new CosyVoiceError('流式无正文（侧通道一个字都没放出来）');
     }
-    const taskId = hex32();
+    const adopted = this.takePending();
+    const taskId = adopted?.taskId ?? hex32();
     const prosody = EMOTION_PROSODY[emotion];
     // 探针（`COSYVOICE_TRACE=1`），和 `run` 打同一行、同样两段，两条路才比得了：
     //   建立 = run-task → task-started
     //   首包 = **首批文本送出** → 首块音频
-    // 首包不能从 run-task 算：流式的 run-task 在本轮一开始就发了，中间夹着等模型开口。
+    // 首包不能从 run-task 算：流式的 run-task 是拿到第一段文本才发的，中间夹着等模型开口。
     // 所以这里也没有「合计」—— 那个数在流式下量的是模型，不是 TTS。
     const tracing = process.env['COSYVOICE_TRACE'] === '1';
-    const sentAt = performance.now();
-    this.traceStartedAt = 0;
+    // 认领了预开的 task 时起点仍是当初那一趟 run-task（理由同 `run`）
+    const sentAt = adopted?.sentAt ?? performance.now();
+    this.traceStartedAt = adopted?.startedAt ?? 0;
     let firstTextAt = 0;
     let reported = false;
     this.sink = (chunk: Buffer): void => {
@@ -490,32 +641,34 @@ class Connection {
             + '（流式：首包自首批文本送出起算）',
           );
         }
-        this.reportTask(setup, first, true);
+        this.reportTask(setup, first, true, adopted !== null);
       }
       onChunk(chunk);
     };
     const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
 
-    this.ws.send(JSON.stringify({
-      header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
-      payload: {
-        task_group: 'audio',
-        task: 'tts',
-        function: 'SpeechSynthesizer',
-        model,
-        parameters: {
-          text_type: 'PlainText',
-          voice,
-          format: 'pcm',
-          sample_rate: sampleRate,
-          volume: 50,
-          rate: prosody.rate,
-          pitch: prosody.pitch,
-          ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[emotion] } : {}),
+    if (adopted === null) {
+      this.ws.send(JSON.stringify({
+        header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
+        payload: {
+          task_group: 'audio',
+          task: 'tts',
+          function: 'SpeechSynthesizer',
+          model,
+          parameters: {
+            text_type: 'PlainText',
+            voice,
+            format: 'pcm',
+            sample_rate: sampleRate,
+            volume: 50,
+            rate: prosody.rate,
+            pitch: prosody.pitch,
+            ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[emotion] } : {}),
+          },
+          input: {},
         },
-        input: {},
-      },
-    }));
+      }));
+    }
 
     const send = (text: string): void => {
       if (firstTextAt === 0) firstTextAt = performance.now();
@@ -529,14 +682,18 @@ class Connection {
     try {
       // 必须等 task-started 再送文本：服务端在分配完成前收到 continue-task 会报
       // `Please ensure input text is valid.`（实测踩过，看起来像文本有问题，其实是时序）
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 3000);
-        // 按 task_id 注册：回执与正文在同一条连接上先后跑，共用一个槽位会让
-        // 前一个 task 的 task-started 落到后一个头上，于是后者在自己的 task
-        // 尚未 started 时就送文本，服务端报上面那个错（生产 7 天 2 次）。
-        this.startedWaiters.set(taskId, () => { clearTimeout(timer); resolve(); });
-      });
-      this.startedWaiters.delete(taskId);
+      //
+      // 认领了预开的 task 就**不用等** —— 它的 task-started 早就回来了，这正是预热省下的那段。
+      if (adopted === null) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 3000);
+          // 按 task_id 注册：回执与正文在同一条连接上先后跑，共用一个槽位会让
+          // 前一个 task 的 task-started 落到后一个头上，于是后者在自己的 task
+          // 尚未 started 时就送文本，服务端报上面那个错（生产 7 天 2 次）。
+          this.startedWaiters.set(taskId, () => { clearTimeout(timer); resolve(); });
+        });
+        this.startedWaiters.delete(taskId);
+      }
       send(first.value);
       for (;;) {
         const next = await iterator.next();
@@ -559,6 +716,7 @@ class Connection {
 
   close(): void {
     this.closed = true;
+    this.clearWarmTimer();
     try { this.ws.close(); } catch { /* 已经关了 */ }
   }
 }
@@ -662,12 +820,16 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
    */
   const envMode = process.env['COSYVOICE_EMOTION_MODE'] ?? 'instruction';
   const useInstruction = options.useInstruction ?? envMode === 'instruction';
+  /** `COSYVOICE_PREWARM=0` 关掉预开（A/B 与出事时的退路，默认开） */
+  const PREWARM_ENABLED = process.env['COSYVOICE_PREWARM'] !== '0';
   const idleCloseMs = options.idleCloseMs ?? 5 * 60_000;
 
   let conn: Connection | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** 串行闸门：上一个 task 收尾完才开下一个 */
   let chain: Promise<unknown> = Promise.resolve();
+  /** 正在预开的那一趟（`prewarm` 用）。`pump` 必须先等它落定，否则会撞「连接正忙」 */
+  let warming: Promise<void> | null = null;
 
   const drop = (): void => {
     conn?.close();
@@ -704,7 +866,14 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
    */
   async function* pump(
     start: (connNow: Connection, onChunk: (chunk: Buffer) => void) => Promise<void>,
+    emotion: Emotion,
   ): AsyncGenerator<Buffer> {
+    // 预开还在路上就先等它 —— 否则这一趟会在同一个连接上再发一个 run-task，撞「连接正忙」
+    if (warming !== null) await warming;
+    // 预开的 task 把语气**定死在开 task 那一刻**。这一轮的语气不一样就不能认领，
+    // 而空 task 又不能 finish-task —— 只能弃连接重来（那 ~170 ms 落在等模型开口里）。
+    // 生产 91% 无标签（calm）、8% 开心（与 calm 同为 1.00/1.00），所以这条极少走到。
+    if (conn?.hasPending === true && conn.pendingEmotion !== emotion) drop();
     const previous = chain;
     let release!: () => void;
     chain = new Promise<void>((resolve) => { release = resolve; });
@@ -790,15 +959,53 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
     warm() {
       void acquire().catch(() => { /* 预热失败按懒加载处理 */ });
     },
+
+    /**
+     * **预开一条 task**：把 `建立`（run-task → task-started，实测 p50 66 ms）从
+     * 「模型 → 合成」中间挪到「正文还没到」的空窗里。
+     *
+     * 调用点：宿主在**定稿**那一刻、且确认这一句会走快车道时调（那时正文还没开始流，
+     * 但已经知道要答了）。认领是自动的 —— 下一个 `synthesize`/`synthesizeStream`
+     * 直接接管，不用配对。
+     *
+     * 三条边界，都是探针实测出来的：
+     * - 服务端能容忍 run-task 之后等 **≥1.2 s** 再送文本，首包不变；
+     * - **空 task 不能 `finish-task`**（`Please ensure input text is valid.`，之后整条
+     *   连接静默挂死），所以 `PREWARM_TTL_MS` 到点没被认领就**弃连接**；
+     * - `instruction` 模式下语气是**开 task 时定死**的，而定稿时还不知道这一轮的情绪，
+     *   所以那种模式**不预热**（否则整轮语气被压成默认）。
+     */
+    prewarm(): void {
+      if (!PREWARM_ENABLED) return;
+      if (useInstruction) return;
+      if (warming !== null) return;
+      if (conn?.hasPending === true) return;
+      warming = (async () => {
+        try {
+          // 别插队到正在跑的那一趟前面：等它收尾
+          await chain;
+          const connNow = await acquire();
+          // 到点没人认领的回收（弃连接）在 `Connection` 自己身上，这里不管
+          await connNow.beginTask({
+            sampleRate, model, voice, useInstruction, emotion: 'calm',
+          });
+        } catch {
+          // 预热失败按懒加载处理：下一次合成自己会建
+        } finally {
+          warming = null;
+        }
+      })();
+    },
     synthesize(text: string, emotion?: string) {
+      const em = asEmotion(emotion);
       return pump((connNow, onChunk) => connNow.run(
-        { text, emotion: asEmotion(emotion) },
+        { text, emotion: em },
         onChunk,
         sampleRate,
         model,
         voice,
         useInstruction,
-      ));
+      ), em);
     },
 
     /**
@@ -846,15 +1053,16 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
           if (ready !== null) yield ready;
         }
       };
+      const em = asEmotion(emotion);
       return pump((connNow, onChunk) => connNow.runFeed(
-        asEmotion(emotion),
+        em,
         sampleRate,
         model,
         voice,
         useInstruction,
         batches(),
         onChunk,
-      ));
+      ), em);
     },
   };
 }

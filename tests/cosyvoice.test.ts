@@ -110,9 +110,12 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
   url: string;
   /** 每条连接收到的 continue-task 文本，按连接建立顺序 */
   texts: string[][];
+  /** 每条连接收到的 run-task 次数，按连接建立顺序（预开省没省就看它） */
+  runs: number[];
   close: () => Promise<void>;
 }> {
   const texts: string[][] = [];
+  const runs: number[] = [];
   const loud = Buffer.alloc(4800);
   for (let i = 0; i < loud.length; i += 2) {
     loud.writeInt16LE(Math.round(3000 * Math.sin(i / 20)), i);
@@ -122,6 +125,8 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
   wss.on('connection', (socket) => {
     const mine: string[] = [];
     texts.push(mine);
+    runs.push(0);
+    const myRuns = runs.length - 1;
     socket.on('message', (data) => {
       const msg = JSON.parse(String(data)) as {
         header: { action: string; task_id: string };
@@ -130,7 +135,10 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
       const reply = (event: string): void => {
         socket.send(JSON.stringify({ header: { event, task_id: msg.header.task_id } }));
       };
-      if (msg.header.action === 'run-task') reply('task-started');
+      if (msg.header.action === 'run-task') {
+        runs[myRuns] = (runs[myRuns] ?? 0) + 1;
+        reply('task-started');
+      }
       if (msg.header.action === 'continue-task') {
         mine.push(msg.payload.input.text ?? '');
         for (const frame of options.frames ?? [loud]) socket.send(frame);
@@ -152,6 +160,7 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
   return {
     url: `ws://127.0.0.1:${address.port}`,
     texts,
+    runs,
     close: async () => {
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((resolve) => { wss.close(() => { resolve(); }); });
@@ -235,6 +244,116 @@ test('整段合成：正常念完的连接要复用（弃连接只发生在中�
       assert.ok(bytes > 0);
     }
     assert.deepEqual(server.texts, [['第一句。', '第二句。']], '两句应当落在同一条连接上 —— 首包那 ~170 ms 就省在这');
+  } finally {
+    await server.close();
+  }
+});
+
+test('预开：流式合成认领那条 task，不再发第二个 run-task', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  const tasks: { prewarmed: boolean; setup_ms: number }[] = [];
+  try {
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      // 预开只在 prosody 模式做：instruction 模式的语气是开 task 时定死的，
+      // 而定稿时还不知道这一轮是什么情绪
+      useInstruction: false,
+      onTask: (info) => { tasks.push({ prewarmed: info.prewarmed, setup_ms: info.setup_ms }); },
+    });
+    tts.prewarm?.();
+    // 给预开一点时间（真机上是 66 ms 量级）
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const queue = new TokenQueue();
+    queue.push('这一句要够长才会当成一批送出去。');
+    queue.close();
+    let bytes = 0;
+    for await (const chunk of tts.synthesizeStream!(queue)) bytes += chunk.length;
+    assert.ok(bytes > 0, '应当出声');
+    assert.deepEqual(server.runs, [1], 'run-task 只该发一次 —— 第二次就是预热没生效');
+    assert.equal(server.texts.flat().join(''), '这一句要够长才会当成一批送出去。');
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0]!.prewarmed, true, '这一趟应当是认领预开的 task');
+    // 建立时间仍是**真实开销**（从当初发 run-task 算起），只是它落在模型出字之前了
+    assert.ok(tasks[0]!.setup_ms >= 0, `建立耗时不该缺仪表：${tasks[0]!.setup_ms}`);
+  } finally {
+    await server.close();
+  }
+});
+
+test('预开：整段合成也认领同一条 task', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  const prewarmed: boolean[] = [];
+  try {
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      useInstruction: false,
+      onTask: (info) => { prewarmed.push(info.prewarmed); },
+    });
+    tts.prewarm?.();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('在，哥。')) bytes += chunk.length;
+    assert.ok(bytes > 0, '应当出声');
+    assert.deepEqual(server.runs, [1]);
+    assert.deepEqual(prewarmed, [true]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('预开：一直没人认领就到点弃连接（空 task 不能 finish-task）', { timeout: 8000 }, async () => {
+  const server = await fakeCosyVoice();
+  try {
+    const tts = cosyVoiceTts({ apiKey: 'sk-test', url: server.url, useInstruction: false });
+    tts.prewarm?.();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(server.runs, [1], '预开应当已经发出 run-task');
+    // TTL 1 s：到点没人要，只能弃连接（发 finish-task 会让服务端判非法并弄死连接）
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('在，哥。')) bytes += chunk.length;
+    assert.ok(bytes > 0, '弃连接之后下一句仍要能出声');
+    assert.deepEqual(server.texts, [[], ['在，哥。']], '预开那条连接被弃，第二句走新连接');
+  } finally {
+    await server.close();
+  }
+});
+
+test('预开：instruction 模式不预热（语气是开 task 时定死的）', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  try {
+    const tts = cosyVoiceTts({ apiKey: 'sk-test', url: server.url, useInstruction: true });
+    tts.prewarm?.();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(server.texts, [], '一条连接都不该建起来');
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('在，哥。')) bytes += chunk.length;
+    assert.ok(bytes > 0);
+    assert.deepEqual(server.runs, [1]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('预开：这一轮语气和预开的不一样就不认领（宁可多花一次握手，也别把语气压平）', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  const tasks: { prefix: string; prewarmed: boolean }[] = [];
+  try {
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      useInstruction: false,
+      onTask: (info) => { tasks.push({ prefix: info.stream ? 'stream' : 'whole', prewarmed: info.prewarmed }); },
+    });
+    tts.prewarm?.();   // 预开用 calm（rate/pitch 1.00）
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('在，哥。', 'sulk')) bytes += chunk.length;
+    assert.ok(bytes > 0, '应当出声');
+    assert.deepEqual(tasks, [{ prefix: 'whole', prewarmed: false }], '这条不能算认领预开');
+    assert.deepEqual(server.texts, [[], ['在，哥。']], '语气对不上 → 弃连接重来');
   } finally {
     await server.close();
   }

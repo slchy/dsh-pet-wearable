@@ -667,9 +667,9 @@ export class FrontedAgent implements AgentProvider {
    *
    * 不抛错、不阻塞：所有失败都在 `reply()` 认领时才浮出来（那时才有人处理）。
    */
-  prefetch(text: string): void {
-    if (!this.prefetchEnabled) return;
-    if (this.prefetched?.text === text) return;
+  prefetch(text: string): boolean {
+    if (!this.prefetchEnabled) return this.prefetched !== null;
+    if (this.prefetched?.text === text) return true;
     // 投机起跑的那一趟对上了定稿：**认它**。它已经跑了几百毫秒，从头再问等于
     // 把投机白送的时间还回去。文本改写成定稿，后面 `takePrefetch` 按一字不差认领。
     const prev = this.prefetched;
@@ -683,11 +683,12 @@ export class FrontedAgent implements AgentProvider {
       // 定稿之后这一趟就是「预跑」了：再来更长的文本（判停并段）走原来的重问路径，
       // 不能再用这段确认逻辑把它当成「还是同一句」
       prev.speculative = false;
-      return;
+      return true;
     }
     this.speculateStarts = 0;
-    if (!this.isPrefetchable(text)) return;
+    if (!this.isPrefetchable(text)) return false;
     this.startPrefetch(text, false);
+    return true;
   }
 
   /**
