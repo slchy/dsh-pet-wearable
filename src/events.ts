@@ -85,6 +85,15 @@ export const EVENTS = {
    * 只有把 `spec` / `missing` 并排落档，事后才知道「答非所问」是不是投机认下来的。
    */
   agentSpec: 'agent.spec',
+  /**
+   * 一条**复用失败**的 HTTP 连接（`ECONNRESET` / `EPIPE` / `UND_ERR_SOCKET`）。
+   *
+   * 这类错误和「模型超时」「429」是两件事：它说明客户端的保活时长
+   * （`MIAI_HTTP_KEEPALIVE_MS`，见 `http-agent.ts`）压过了服务端的空闲超时。
+   * 2026-11-19 实测 DashScope 在空闲 60 秒后仍复用成功，所以线上取 50 秒；
+   * 这条事件是那个数的唯一依据，一旦出现就该往下调。
+   */
+  agentConn: 'agent.conn',
   /** 委派轮先说的那句「嗯，我想想」（`text` + `chars`），它不在 `turn.end.said` 里 */
   receipt: 'receipt',
   /**

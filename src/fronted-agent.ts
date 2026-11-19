@@ -1468,10 +1468,17 @@ export class FrontedAgent implements AgentProvider {
       });
       return answer;
     } catch (error) {
+      const message = (error as Error).message;
       this.auditSink(EVENTS.agentDone, {
         kind, ok: false, ms: Math.round(this.now() - startedAt),
-        err: (error as Error).message,
+        err: message,
       });
+      // **复用一条已被对端关掉的连接**会以这些错误出现，和「模型超时/429」完全不同：
+      // 它说明 `MIAI_HTTP_KEEPALIVE_MS` 设得比服务端的空闲超时还长（见 `http-agent.ts`）。
+      // 不单列出来，这类失败会被当成普通网络抖动，调那个数就没有依据。
+      if (/ECONNRESET|EPIPE|UND_ERR_SOCKET|socket hang up|other side closed/i.test(message)) {
+        this.auditSink(EVENTS.agentConn, { kind, err: message.slice(0, 100) });
+      }
       throw error;
     } finally {
       clearTimeout(timer);

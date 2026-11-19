@@ -44,6 +44,7 @@ import { TurnJudge } from './turn-judge.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
+import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './http-agent.ts';
 import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
 import {
   describeTokenProblem,
@@ -453,6 +454,12 @@ let auditSink: ((name: string, data: Record<string, unknown>) => void) | null = 
 async function main(): Promise<void> {
   installLogClock();
   loadDotEnv();
+  // 必须在这里（`loadDotEnv` 之后、任何 fetch 之前）：`fetch` 默认 4 秒就关连接，
+  // 而真机两轮间隔 4–16 秒 —— 等于每轮重做一次 TCP+TLS，实测多花 130–190 ms。
+  // 见 `http-agent.ts` 的实测账。
+  const keepAliveMs = envNumber('MIAI_HTTP_KEEPALIVE_MS', DEFAULT_KEEPALIVE_MS);
+  installHttpAgent(keepAliveMs);
+  console.log(`HTTP     连接保活 ${keepAliveMs} ms（默认 4 秒会让每轮重新握手）\n`);
   const argv = process.argv.slice(2);
 
   const opt = (flag: string, def: string): string => {
