@@ -257,6 +257,17 @@ export class DialogRuntime {
     });
   }
 
+  /**
+   * 把回执预合成进 `TurnRunner` 的缓存（设备连上、用户还没开口时调一次）。
+   *
+   * 目的不是让回执更快（它本来就有缓存），而是**别让回执抢走 TTS 预热** ——
+   * 预热只能被第一个合成认领，回执先合成就把正式回答的那 66 ms 抵消掉了。
+   * 详见 `TurnRunner.primeReceipts`。
+   */
+  primeReceipts(): void {
+    this.runner.primeReceipts(Object.values(RECEIPTS));
+  }
+
   // ---------------------------------------------------------------- 输入面
 
   /**

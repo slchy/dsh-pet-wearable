@@ -325,6 +325,45 @@ export class TurnRunner {
     return true;
   }
 
+  /**
+   * 预合成回执进缓存（设备刚连上、用户还没开口时调一次）。
+   *
+   * 为什么非要在缓存里备好：回执和正式回答**共用一条 TTS 连接**，而预开的 task 只能
+   * 被第一个合成认领。回执先合成就会把预热吃掉（实测委派轮：`stream:false
+   * prewarmed:true` 紧跟着 `stream:true prewarmed:false`）。预热本来是给正式回答的，
+   * 而回执恰恰最不需要它 —— 短、只听半句、还有这层缓存。
+   *
+   * 串行链是有代价的：TTS 一条连接一次一个 task，所以预合成期间正式回答要排队。
+   * 因此调用方要**等设备连上之后稍晚一点**再调，且这里的循环一旦发现这一轮已经开始
+   * （`playingTicket` / 已经出过音频）就立刻退出。
+   */
+  primeReceipts(texts: readonly string[]): void {
+    const rate = this.options.tts.sampleRate;
+    const todo = [...new Set(texts)].filter((text) => this.receiptCache.get(text)?.rate !== rate);
+    if (todo.length === 0) {
+      return;
+    }
+    void (async () => {
+      for (const text of todo) {
+        if (this.playingTicket !== null || this.firstAudioSeen) {
+          return;   // 用户已经在说话了 —— 别占着 TTS
+        }
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of this.options.tts.synthesize(text)) {
+            chunks.push(chunk);
+          }
+          if (chunks.length > 0) {
+            this.receiptCache.set(text, { rate, chunks });
+            this.log(`  回执    ${JSON.stringify(text)} 预合成进缓存（${chunks.length} 块）`);
+          }
+        } catch {
+          return;   // 预合成失败就算了，真到用时现场合成
+        }
+      }
+    })();
+  }
+
   /** 回执下发完之后，按音频时长占住「还在说」的状态，直到播完或被顶掉。 */
   private async holdReceipt(current: { sentBytes: number; cancelled: boolean }): Promise<void> {
     const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
