@@ -376,14 +376,6 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
 const DEFAULT_SENTENCE_SILENCE_MS = 200;
 
 /**
- * TurnJudge 判为「没说完」时再多等多久。
- *
- * 700 → 400：日志里「没说完，再等 700 ms」出现得极密，一轮叠 2–3 次就是
- * 1.4–2.1 秒的纯等待。400 仍够覆盖正常换气，且 `maxExtensions` 会给上限。
- */
-const TURN_JUDGE_EXTEND_MS = Number(envString('TURN_JUDGE_EXTEND_MS') ?? 400);
-
-/**
  * 读 `cloud/.env`（KEY=VALUE，忽略 # 注释与空行）。
  *
  * 不引依赖：格式就这么点。**已存在的环境变量优先**，所以命令行临时覆盖仍然有效。
@@ -817,7 +809,15 @@ async function main(): Promise<void> {
           // 概率早就算好了，这段静候只是白等 —— 回放实测 ② 从 113 → 41 ms，
           // 把这里归零后只剩取缓存的那一下。
           quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
-          extendMs: TURN_JUDGE_EXTEND_MS,
+          // TurnJudge 判为「没说完」时再多等多久。700 → 400：日志里「没说完，再等 700 ms」
+          // 出现得极密，一轮叠 2–3 次就是 1.4–2.1 秒纯等待。400 → 200：真机 17 次 extend
+          // **全部等到放行、0 次用户接着说**，而且第二次评估的 p 与第一次几乎相同 ——
+          // 那 400 ms 没换到任何信息（见 `docs/LATENCY-CLOSURE.md`）。
+          //
+          // ⚠️ 必须在这里读，不能在模块顶层：`loadDotEnv()` 是在 `main()` 里调的，
+          // 模块顶层的 `envString()` 早于它执行，`.env` 里的值读不到 —— 2026-11-19
+          // 线上设 200 后日志仍打「再等 400 ms」，就是这个顺序问题。
+          extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 400),
           // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
           // TurnJudge `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
           // 的兜底，而我们原来只有 3×400=1.2 s —— 触发点比人家快、兜底却只有一半，
