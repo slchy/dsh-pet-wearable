@@ -638,13 +638,15 @@ class VoiceConnection {
       // 判停若并了下一段，组装器会拿更长的文本再调一次；认领时按文本比对。
       onSentence: (text) => {
         this.options.agent.prefetch?.(text);
-        // TTS 预热**和谁答无关**：这一轮不管由快车道还是 dsh 答，都要合成。
-        // 所以不跟着 `prefetch` 的返回值走（任务轮、长句根本不预跑快车道，以前就漏掉了
-        // 一整类轮次），定稿就预开 —— 两条车道谁赢都能直接认领。
+        // 预热**只跟快车道起跑走**，不跟「这一轮会不会答」走。
         //
-        // 代价是「定稿了但这一轮没答」（插话、断连）会白开一个 task，靠 3 s TTL 弃连接。
-        // 判停并段会再调一次，`prewarm()` 自己幂等（在途/已在等认领就直接返回）。
-        this.options.tts.prewarm?.();
+        // 因为委派轮一定先出回执（`RECEIPTS`），而回执和正式回答共用同一条 TTS 连接
+        // —— 连接上一次只有一个 task，预热会被回执认领掉。测试过「定稿无条件预热」：
+        // 委派轮里 `stream:false prewarmed:true`（回执）紧跟着
+        // `stream:true prewarmed:false`（正式回答），白开一条 task。
+        // 试过把回执预合成进缓存来腾出预热，代价是设备刚连上就要占 TTS 约 2 秒，
+        // 与用户第一句话抢连接 —— 为 66 ms 不值得，已回滚（`5500c47`）。
+        if (this.options.agent.prefetch?.(text) === true) this.options.tts.prewarm?.();
       },
       // 中间结果投机：比定稿再往前提 p50 731 ms（真机 47 轮）。文本是猜的，
       // 定稿确认是前缀才认领 —— 认不了就作废，退回上面那条路，等于没做。
