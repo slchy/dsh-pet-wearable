@@ -9,12 +9,14 @@
 
 ## 一、环境变量（`.env` 可调）
 
-共 23 项。
+共 25 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
 | `QWEN_ASR_VAD_SILENCE_MS` | 200 | wall（服务端） | `src/main.ts:101` | 无（已关：`turn_detection: null`，端点由 `VOICE_COMMIT_MS` 控） | — |
+| `MIAI_HTTP_KEEPALIVE_MS` | DEFAULT_KEEPALIVE_MS | wall（连接空闲） | `src/main.ts:454` | 无（不产生延迟，只在超过服务端空闲时导致失败） | — |
 | `FAST_LANE_TIMEOUT_MS` | 1200 | wall | `src/main.ts:588` | 模型段（它就是那一轮的上限） | FAST_LANE > 0 时固定；超时转 dsh |
+| `KEEPALIVE_MINUTES` | 180 | wall | `src/main.ts:647` | 无关首声（不在停嘴→出声路径上） | — |
 | `TURN_JUDGE_QUIET_MS` | 0 | wall | `src/main.ts:825` | 模型段 | — |
 | `TURN_JUDGE_EXTEND_MS` | 200 | wall | `src/main.ts:834` | 模型段（模型 >200 ms 时几乎全遮住；模型变快后变成纯成本） | TURN_JUDGE_MAX_EXT 拍 / WAIT_BUDGET_MS 预算 / MAX_OPEN_SILENCE_MS |
 | `TURN_JUDGE_TRIM_MS` | 20 | audio | `src/main.ts:848` | 判停侧车输入预处理（不额外等） | — |
@@ -51,12 +53,13 @@
 
 ## 三、硬编码常量（改要动代码）
 
-共 27 项。
+共 28 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
 | `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:39` | 无关首声（不在停嘴→出声路径上） | — |
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
+| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:303` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:70` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |

@@ -424,6 +424,26 @@ def parse(path: Path) -> list[dict]:
         if gate is not None:
             g = events[gate]
             stop = g["t"] - (g.get("gapMs") or 0)
+        # 这一轮谁答的（`turn.end.path`）——两条车道的预算完全不同，基线必须分开对
+        path = None
+        # 送批节奏（`tts.done`）：首批/末批相对 run-task 的毫秒数。
+        # **这一项回放里有效** —— 它只取决于我们怎么把模型吐的字送给 TTS，
+        # 与连接冷热无关（③ 的首包才受冷热影响）。
+        batches = None
+        first_text = None
+        last_text = None
+        for i in range(at, nxt):
+            ev = events[i]
+            if ev.get("ev") == "turn.end" and path is None:
+                if isinstance(ev.get("path"), str):
+                    path = ev["path"]
+            if ev.get("ev") == "tts.done" and batches is None:
+                if isinstance(ev.get("batches"), int):
+                    batches = ev["batches"]
+                if isinstance(ev.get("first_text_ms"), int):
+                    first_text = ev["first_text_ms"]
+                if isinstance(ev.get("last_text_ms"), int):
+                    last_text = ev["last_text_ms"]
         out.append({
             "turn": n + 1,
             "asr": "".join(pieces) if pieces else None,
@@ -431,12 +451,127 @@ def parse(path: Path) -> list[dict]:
             "a2": (events[at]["t"] - events[asr]["t"]) if asr is not None else None,
             "a3": (events[tts]["t"] - events[at]["t"]) if tts is not None else None,
             "total": (events[tts]["t"] - stop) if (tts is not None and stop is not None) else None,
+            "path": path,
+            "batches": batches,
+            "first_text": first_text,
+            "last_text": last_text,
         })
     return out
 
 
 def cell(v) -> str:
     return "—" if v is None else str(round(v))
+
+# ---------------------------------------------------------------------------
+# L3：回放基线（回放 vs 回放）
+#
+# **为什么不跟真机比**：同一份向量回放出来 ③ 是 648，真机当时是 543 —— 回放**更慢**。
+# 差的那 300 ms 主要在 TTS `setup`（回放 348 常数、真机 54 常数）：回放轮与轮之间
+# 没有间隔，预热 task 的 run-task 正好落在上一轮还在合成的时候，于是排队。
+# 两边各自是常数，所以**回放只能对回放**。
+#
+# 判什么：①（ASR 封段）、②（判停）、送批节奏（tts.done）、走哪条腿。
+# 不判 ③：它含厂商合成，长尾（>900 ms 占一成）会把单轮判断变成抛硬币；
+# 而且它受上面那个 setup 差异影响。③ 只记录，供人看趋势。
+# ---------------------------------------------------------------------------
+
+#: 每个字段的容差（ms）。来源：同向量回放的**单次内** MAD（①≈?, ② 极小,
+#: 送批 ≈16），取 2–3 倍作为跨次容差。**跨次噪声底尚未实测**
+#: （需要 `--repeat 3` 跑同一份代码），所以这里偏保守；实测后应收紧。
+TOLERANCE = {
+    "a1": 80,
+    "a2": 60,
+    "first_text": 60,
+    "last_text": 60,
+    "a1_p50": 60,
+    "a2_p50": 40,
+}
+
+
+def baseline_rows(rows: list[dict]) -> dict:
+    """把一次回放折成基线：逐轮字段 + 汇总。"""
+    a1 = [r["a1"] for r in rows if r["a1"] is not None]
+    a2 = [r["a2"] for r in rows if r["a2"] is not None]
+    return {
+        "turns": [
+            {
+                "turn": r["turn"],
+                "asr": r["asr"],
+                "path": r["path"],
+                "a1": r["a1"],
+                "a2": r["a2"],
+                "batches": r["batches"],
+                "first_text": r["first_text"],
+                "last_text": r["last_text"],
+                # ③ 记下来给人看趋势，但不参与判定
+                "a3": r["a3"],
+            }
+            for r in rows
+        ],
+        "summary": {
+            "turns": len(rows),
+            "a1_p50": pct(a1, 0.5),
+            "a1_p90": pct(a1, 0.9),
+            "a2_p50": pct(a2, 0.5),
+            "a2_p90": pct(a2, 0.9),
+            "a3_p50": pct([r["a3"] for r in rows], 0.5),
+        },
+    }
+
+
+def compare_baseline(base: dict, now: dict) -> list[str]:
+    """比对。返回问题列表；空 = 通过。"""
+    problems: list[str] = []
+    old = {t["turn"]: t for t in base.get("turns", [])}
+    new = {t["turn"]: t for t in now["turns"]}
+
+    for turn in sorted(set(old) - set(new)):
+        problems.append(f"轮{turn}：基线有、这次没有（轮次变少了 —— 切句或识别变了？）")
+    for turn in sorted(set(new) - set(old)):
+        problems.append(f"轮{turn}：这次多了基线没有的一轮（**多半是被切开的半句**）")
+
+    for turn in sorted(set(old) & set(new)):
+        a, b = old[turn], new[turn]
+        if a["asr"] != b["asr"]:
+            problems.append(f"轮{turn}：ASR 文本变了「{a['asr']}」→「{b['asr']}」")
+        if a["path"] != b["path"]:
+            problems.append(f"轮{turn}：车道变了 {a['path']} → {b['path']}")
+        if a["batches"] != b["batches"]:
+            problems.append(f"轮{turn}：送批次数变了 {a['batches']} → {b['batches']}")
+        for field, label in (("a1", "①"), ("a2", "②"), ("first_text", "首批文本"), ("last_text", "末批文本")):
+            x, y = a.get(field), b.get(field)
+            if x is None or y is None:
+                if x != y:
+                    problems.append(f"轮{turn}：{label} 从 {cell(x)} 变成 {cell(y)}（缺仪表？）")
+                continue
+            if abs(y - x) > TOLERANCE[field]:
+                problems.append(
+                    f"轮{turn}：{label} {cell(x)} → {cell(y)}（差 {y - x:+.0f}，容差 ±{TOLERANCE[field]}）"
+                )
+
+    for field, label in (("a1_p50", "① p50"), ("a2_p50", "② p50")):
+        x = base.get("summary", {}).get(field)
+        y = now["summary"].get(field)
+        if x is None or y is None or x == "—":
+            continue
+        if abs(float(y) - float(x)) > TOLERANCE[field]:
+            problems.append(
+                f"{label} {x} → {y}（差 {float(y) - float(x):+.0f}，容差 ±{TOLERANCE[field]}）"
+            )
+    return problems
+
+
+def show_baseline_result(problems: list[str], base_path: str) -> None:
+    print("\n=== 回放基线比对（回放 vs 回放）===")
+    print(f"  基线：{base_path}")
+    if not problems:
+        print("  ✓ 通过：①/②/送批节奏/车道 全部在容差内")
+        print("  （③ 不判 —— 含厂商合成长尾，只记录）")
+        return
+    for line in problems:
+        print(f"  ✗ {line}")
+    print(f"\n  {len(problems)} 处不一致。逐条确认是「改进」还是「回归」，"
+          f"再决定改代码还是 `--baseline-save` 更新基线。")
 
 
 def pct(values: list, p: float) -> str:
@@ -486,6 +621,11 @@ def main() -> int:
     ap.add_argument("--allow-cross-asr", action="store_true",
                     help="允许回放用的 ASR 与向量 meta 不同（跨 ASR 时 ① 与逐轮对比无效，"
                          "只有两个配置在同一批回放上互比可信）。默认拒跑，逼你显式承认")
+    ap.add_argument("--baseline", default="",
+                    help="与基线 JSON 比对（**回放 vs 回放**）：判 ①/②/送批节奏/车道，"
+                         "任一超容差 exit 1。绝对 ③ 不与真机比，见 docs/QOS.md §5")
+    ap.add_argument("--baseline-save", default="",
+                    help="把这次回放存成基线（确认这是一次「已知良好」的运行再用）")
     args = ap.parse_args()
 
     if not SSH_KEY.exists():
@@ -655,6 +795,38 @@ def main() -> int:
             print(f"  {label}  源 p50 {pct(src, 0.5)} p90 {pct(src, 0.9)}"
                   f"   |  回放 n={len(new)} p50 {pct(new, 0.5)} p90 {pct(new, 0.9)}")
 
+    # L3：基线（回放 vs 回放）。放在最后，前面的表先打出来 —— 红了也要有人看得到现场。
+    now_base = baseline_rows(after)
+    code = 0
+    if args.baseline:
+        base_path = Path(args.baseline)
+        if not base_path.is_file():
+            raise SystemExit(f"找不到基线文件：{base_path}")
+        base = json.loads(base_path.read_text(encoding="utf-8"))
+        problems = compare_baseline(base, now_base)
+        show_baseline_result(problems, str(base_path))
+        if problems:
+            code = 1
+    if args.baseline_save:
+        save_path = Path(args.baseline_save)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_text(
+            json.dumps(
+                {
+                    # 基线必须自带「哪个工作点」：向量、配置、代码。引用基准数字前先看这里
+                    "vector": source,
+                    "config": [{"key": k, "value": v, "source": s} for k, v, s in cfg_rows],
+                    "cross_asr": cross_asr,
+                    "taken_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                    **now_base,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\n基线已写入 {save_path}")
+
     (OUT / "last.json").write_text(
         json.dumps(
             {
@@ -676,7 +848,8 @@ def main() -> int:
         encoding="utf-8",
     )
     print(f"明细 → {OUT / 'last.json'}")
-    return 0
+    # 基线红时不吞掉：退出码是给 CI / 脚本看的唯一信号
+    return code
 
 
 if __name__ == "__main__":

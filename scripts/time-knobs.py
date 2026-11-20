@@ -145,6 +145,8 @@ SHADED_BY: dict[str, str] = {
     "ASSEMBLER_TRAILING_TRIM_MS": "判停侧车输入预处理（不额外等）",
     "FIRST_WORD_BUDGET_MS": "无（它是报警线，不约束任何环节）",
     "FAST_LANE_TIMEOUT_MS": "模型段（它就是那一轮的上限）",
+    # 保活：它只在「两轮间隔 > 保活时长」时才变成问题，而那种间隔在真机上从没出现
+    "MIAI_HTTP_KEEPALIVE_MS": "无（不产生延迟，只在超过服务端空闲时导致失败）",
     # 统计判据：它们不约束任何环节，只决定报告怎么分组/计数
     "WAITED_THRESHOLD_MS": "无（报告分组门槛，不参与调度）",
     "SLOW_TURN_MS": "无（报告里的「慢轮」门槛）",
@@ -207,15 +209,12 @@ NOT_ON_PATH = {
     "COSYVOICE_PREWARM",
 }
 
-ENV_RE = re.compile(r"envNumber\(\s*'([A-Z0-9_]+)'\s*,\s*(.+?)\)\s*[,)]")
+ENV_RE = re.compile(r"envNumber\(\s*'([A-Z0-9_]+)'\s*,\s*(.+?)\)\s*[,);]")
 CONST_RE = re.compile(
-    r"^\s*(?:export\s+)?const\s+([A-Z][A-Z0-9_]*_(?:MS|MINUTES|POLL_MS|GRACE_MS))\s*=\s*(.+?);"
-)
-PROCESS_RE = re.compile(r"process\.env\['([A-Z0-9_]+)'\]\s*(!==|===)\s*'([^']*)'")
-
-
-CONST_RE = re.compile(
-    r"^\s*(?:export\s+)?const\s+([A-Z][A-Z0-9_]*_(?:MS|MINUTES|POLL_MS|GRACE_MS))\s*=\s*(.+?);"
+    # `const X_MS = ...` 和 `private static readonly X_MS = ...` 两种写法都要认：
+    # 后者没有 `const` 关键字（`PREWARM_TTL_MS` 就是这么写的，漏了会让不变量查不到）
+    r"^\s*(?:export\s+)?(?:(?:private|public|protected|static|readonly)\s+)*(?:const\s+)?"
+    r"([A-Z][A-Z0-9_]*_(?:MS|MINUTES|POLL_MS|GRACE_MS))\s*=\s*(.+?);"
 )
 PROCESS_RE = re.compile(r"process\.env\['([A-Z0-9_]+)'\]\s*(!==|===)\s*'([^']*)'")
 
@@ -351,6 +350,103 @@ def scan() -> list[Knob]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# L1：跨参数不变量
+#
+# 每个模块的单测只守自己。这一节守的是**两个模块之间**的关系 —— 改了一个数，
+# 另一个模块会静默失效的那类。它们都从源码扫出来，所以测的是**真正会上线**的值，
+# 不是文档里抄的。
+#
+# `(左, 关系, 右, 违反后的后果)`
+# ---------------------------------------------------------------------------
+
+INVARIANTS: list[tuple[str, str, str, str]] = [
+    (
+        "VOICE_COMMIT_MS", "<=", "VOICE_SPECULATE_MS",
+        "投机跑到封段前面：拿还没定稿的中间结果去认领，静默失效",
+    ),
+    (
+        "VOICE_SPECULATE_MS", "<=", "VOICE_PAUSE_DETECT_MS",
+        "判停预跑跑到投机前面：投机那 100 ms 的提前量白丢",
+    ),
+    (
+        "TURN_JUDGE_WAIT_BUDGET_MS", ">=", "TURN_JUDGE_EXTEND_MS",
+        "预算比一拍还短，等于没有预算；`EXTEND_MS` 一改就会撞",
+    ),
+    (
+        "TURN_JUDGE_MAX_OPEN_SILENCE_MS", ">=", "VOICE_OPEN_QUIET_MS",
+        "开轮静音门槛永远够不着，只能撞上限放行",
+    ),
+    (
+        "TURN_JUDGE_MAX_OPEN_SILENCE_MS", ">=", "VOICE_OPEN_QUIET_SHORT_MS",
+        "同上（p ≥ 0.8 那条短门槛）",
+    ),
+    (
+        "PREWARM_TTL_MS", ">", "TURN_JUDGE_SEQUENCE_BUDGET_MS",
+        "序列句等满预算时预热 task 已过期，那类轮次要付一次冷启动",
+    ),
+    (
+        "MIAI_HTTP_KEEPALIVE_MS", "<", "SERVER_IDLE_TIMEOUT_MS",
+        "复用到一条服务端已关的连接 —— 那一次请求**直接失败**，比多 100 ms 糟得多",
+    ),
+]
+
+#: 服务端空闲超时（秒级），来自实测：`https.Agent` 空闲 60 s 仍能复用；
+#: `fetch` 只验到 45 s。取 60 s 作为硬上限。
+SERVER_IDLE_TIMEOUT_MS = 60_000
+
+#: **警告**（不是失败）：保活超过这个值就落进「没实测过」的区间。
+#: 目前 50 s > 45 s —— 真机最大轮间隔 16.7 s 从没触及，但没人验证过 50 s 还行。
+KEEPALIVE_VERIFIED_MS = 45_000
+
+
+def numeric(knobs: list[Knob]) -> dict[str, int]:
+    """扫出来的默认值 → 整数。
+
+    两种间接都要解开：
+    - `20（仅 qwen-realtime）` 这类带注释的，取前导数字；
+    - `MIAI_HTTP_KEEPALIVE_MS` 的默认值是**标识符** `DEFAULT_KEEPALIVE_MS`，
+      要回到常量表里取值 —— 不解析它，不变量就查不到这个参数。
+    """
+    by_name = {knob.name: knob.default for knob in knobs}
+    out: dict[str, int] = {}
+    for name, raw in by_name.items():
+        seen: set[str] = set()
+        value = raw
+        while re.fullmatch(r"[A-Z][A-Z0-9_]*", value) and value in by_name and value not in seen:
+            seen.add(value)
+            value = by_name[value]
+        m = re.match(r"(\d+)", value)
+        if m is not None:
+            out[name] = int(m.group(1))
+    return out
+
+
+def check_invariants(knobs: list[Knob]) -> tuple[list[str], list[str]]:
+    """校验 L1 不变量。返回 `(错误, 警告)` 两组文本。"""
+    values = numeric(knobs)
+    values["SERVER_IDLE_TIMEOUT_MS"] = SERVER_IDLE_TIMEOUT_MS
+    fails: list[str] = []
+    warns: list[str] = []
+
+    for left, op, right, why in INVARIANTS:
+        a, b = values.get(left), values.get(right)
+        if a is None or b is None:
+            fails.append(f"缺参数：`{left}` 或 `{right}` 没扫到（名字改了？）")
+            continue
+        ok = a <= b if op == "<=" else a >= b if op == ">=" else a < b if op == "<" else a > b
+        if not ok:
+            fails.append(f"{left}={a} {op} {right}={b} 不成立 —— {why}")
+
+    keepalive = values.get("MIAI_HTTP_KEEPALIVE_MS")
+    if keepalive is not None and KEEPALIVE_VERIFIED_MS < keepalive < SERVER_IDLE_TIMEOUT_MS:
+        warns.append(
+            f"MIAI_HTTP_KEEPALIVE_MS={keepalive} 超过实测验证过的 "
+            f"{KEEPALIVE_VERIFIED_MS}（`fetch` 只验到空闲 45 s；60 s 是 `https.Agent` 的结果）"
+        )
+    return fails, warns
+
+
 def read_prod(path: Path) -> dict[str, str]:
     """读线上 `.env`。只用键值，值绝不会出现在生成物里（只用于比数字）。"""
     out: dict[str, str] = {}
@@ -439,12 +535,28 @@ def render(knobs: list[Knob], prod: dict[str, str] | None) -> str:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="生成时间参数总表")
+    ap = argparse.ArgumentParser(description="生成时间参数总表 / 校验跨参数不变量")
     ap.add_argument("--write", action="store_true", help="写回 docs/TIME-KNOBS.md")
+    ap.add_argument("--check", action="store_true",
+                    help="只校验 L1 不变量（跨参数关系），不生成表；有违反时 exit 1")
     ap.add_argument("--prod", type=Path, default=None, help="与线上 .env 对照（标出默认值差异）")
     args = ap.parse_args(argv)
 
     knobs = scan()
+
+    if args.check:
+        fails, warns = check_invariants(knobs)
+        for line in warns:
+            print(f"警告: {line}")
+        for line in fails:
+            print(f"违反: {line}")
+        if fails:
+            print(f"\n{len(fails)} 条不变量不成立（共 {len(INVARIANTS)} 条）", file=sys.stderr)
+            return 1
+        print(f"{len(INVARIANTS)} 条不变量全部成立"
+              + (f"（{len(warns)} 条警告）" if warns else ""))
+        return 0
+
     prod = read_prod(args.prod) if args.prod is not None else None
     text = render(knobs, prod)
 
