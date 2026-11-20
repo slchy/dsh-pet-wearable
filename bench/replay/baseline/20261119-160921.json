@@ -1,0 +1,193 @@
+{
+  "vector": "20261119-160921",
+  "config": [],
+  "cross_asr": false,
+  "taken_at": "2026-11-20T03:15:00",
+  "note": "由 arch_replay（16 轮回放）生成；config 待用 --baseline-save 重建",
+  "turns": [
+    {
+      "turn": 1,
+      "asr": "你好啊。",
+      "path": "fast",
+      "a1": 251,
+      "a2": 123,
+      "batches": 2,
+      "first_text": 302,
+      "last_text": 348,
+      "a3": 608
+    },
+    {
+      "turn": 2,
+      "asr": "今天过得怎么样？",
+      "path": "fast",
+      "a1": 249,
+      "a2": 23,
+      "batches": 3,
+      "first_text": 115,
+      "last_text": 205,
+      "a3": 573
+    },
+    {
+      "turn": 3,
+      "asr": "还行。",
+      "path": "fast",
+      "a1": 208,
+      "a2": 64,
+      "batches": 2,
+      "first_text": 180,
+      "last_text": 248,
+      "a3": 611
+    },
+    {
+      "turn": 4,
+      "asr": "我刚下班回来，有点累。",
+      "path": "fast",
+      "a1": 262,
+      "a2": 112,
+      "batches": 2,
+      "first_text": 112,
+      "last_text": 113,
+      "a3": 313
+    },
+    {
+      "turn": 5,
+      "asr": "先说一会儿。",
+      "path": "fast",
+      "a1": 217,
+      "a2": 61,
+      "batches": 2,
+      "first_text": 354,
+      "last_text": 354,
+      "a3": 602
+    },
+    {
+      "turn": 6,
+      "asr": "你说我要不要先去睡一会儿？",
+      "path": "fast",
+      "a1": 296,
+      "a2": 5,
+      "batches": 2,
+      "first_text": 690,
+      "last_text": 759,
+      "a3": 1108
+    },
+    {
+      "turn": 7,
+      "asr": "你喜欢听什么歌？",
+      "path": "fast",
+      "a1": null,
+      "a2": 2,
+      "batches": 2,
+      "first_text": 371,
+      "last_text": 454,
+      "a3": 757
+    },
+    {
+      "turn": 8,
+      "asr": "那你觉得哪首音乐好听？",
+      "path": "fast",
+      "a1": 1181,
+      "a2": 2,
+      "batches": 3,
+      "first_text": 349,
+      "last_text": 367,
+      "a3": 644
+    },
+    {
+      "turn": 9,
+      "asr": "我在想晚上吃什么。",
+      "path": "fast",
+      "a1": 995,
+      "a2": 2,
+      "batches": 2,
+      "first_text": 348,
+      "last_text": 348,
+      "a3": 852
+    },
+    {
+      "turn": 10,
+      "asr": "你会不会觉得无聊？",
+      "path": "fast",
+      "a1": 239,
+      "a2": 360,
+      "batches": 2,
+      "first_text": 358,
+      "last_text": 358,
+      "a3": 341
+    },
+    {
+      "turn": 11,
+      "asr": "星球大战讲的是什么？",
+      "path": "fast",
+      "a1": 866,
+      "a2": 2,
+      "batches": 3,
+      "first_text": 350,
+      "last_text": 350,
+      "a3": 679
+    },
+    {
+      "turn": 12,
+      "asr": "你知道阿索卡吗？",
+      "path": "fast",
+      "a1": 500,
+      "a2": 4,
+      "batches": 2,
+      "first_text": 348,
+      "last_text": 352,
+      "a3": 651
+    },
+    {
+      "turn": 13,
+      "asr": "有意思。",
+      "path": "fast",
+      "a1": 693,
+      "a2": 1,
+      "batches": 2,
+      "first_text": 352,
+      "last_text": 426,
+      "a3": 734
+    },
+    {
+      "turn": 14,
+      "asr": "我有点想吃火锅。",
+      "path": "fast",
+      "a1": null,
+      "a2": 2,
+      "batches": 2,
+      "first_text": 164,
+      "last_text": 219,
+      "a3": 545
+    },
+    {
+      "turn": 15,
+      "asr": "冬天吃火锅是不是很合适？",
+      "path": "fast",
+      "a1": 1662,
+      "a2": 3,
+      "batches": 2,
+      "first_text": 620,
+      "last_text": 620,
+      "a3": 954
+    },
+    {
+      "turn": 16,
+      "asr": "你今天心情好不好？",
+      "path": "fast",
+      "a1": 1764,
+      "a2": 2,
+      "batches": 2,
+      "first_text": 344,
+      "last_text": 344,
+      "a3": 806
+    }
+  ],
+  "summary": {
+    "turns": 16,
+    "a1_p50": "398",
+    "a1_p90": "1518",
+    "a2_p50": "4",
+    "a2_p90": "118",
+    "a3_p50": "648"
+  }
+}
