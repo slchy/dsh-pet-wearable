@@ -4,6 +4,7 @@
  * ```bash
  * node scripts/latency-report.ts ../docs/archive/20261114-015500-203.0.113.20_2421
  * node scripts/latency-report.ts <root> --all      # root 下每个会话目录各出一份
+ * node scripts/latency-report.ts <dir> --standard # 只出标准三表（按车道/等待/台词）
  * ```
  *
  * 纯读，不改档案。分段口径与缺仪表语义见 `src/latency-report.ts`。
@@ -11,10 +12,10 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { computeTurns, formatReport, parseEvents } from '../src/latency-report.ts';
+import { computeTurns, formatReport, formatStandard, parseEvents } from '../src/latency-report.ts';
 
 /** 读出单个会话目录的报告文本；没有 `events.jsonl` 时返回一段说明。 */
-function reportOne(dir: string): string {
+function reportOne(dir: string, standard: boolean): string {
   const file = join(dir, 'events.jsonl');
   let text: string;
   try {
@@ -22,18 +23,23 @@ function reportOne(dir: string): string {
   } catch (error) {
     return `# ${dir}\n\n读不到 events.jsonl：${(error as Error).message}`;
   }
-  return formatReport(computeTurns(parseEvents(text)), dir);
+  const turns = computeTurns(parseEvents(text));
+  if (standard) {
+    return [`# ${dir}`, '', formatStandard(turns)].join('\n');
+  }
+  return formatReport(turns, dir);
 }
 
 /** 入口。 */
 function main(argv: readonly string[]): number {
   const target = argv.find((a) => !a.startsWith('--'));
   if (!target) {
-    console.error('用法: node scripts/latency-report.ts <会话目录|档案根目录> [--all]');
+    console.error('用法: node scripts/latency-report.ts <会话目录|档案根目录> [--all] [--standard]');
     return 2;
   }
 
   const all = argv.includes('--all');
+  const standard = argv.includes('--standard');
   let ok: boolean;
   try {
     ok = statSync(target).isDirectory();
@@ -48,7 +54,7 @@ function main(argv: readonly string[]): number {
 
   const reports: string[] = [];
   if (!all) {
-    reports.push(reportOne(target));
+    reports.push(reportOne(target, standard));
   } else {
     const entries = readdirSync(target).sort();
     for (const name of entries) {
@@ -60,7 +66,7 @@ function main(argv: readonly string[]): number {
       } catch {
         continue;
       }
-      reports.push(reportOne(dir));
+      reports.push(reportOne(dir, standard));
     }
     if (reports.length === 0) {
       console.error(`目录下没有会话: ${target}`);

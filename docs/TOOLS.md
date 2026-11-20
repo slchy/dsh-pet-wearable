@@ -9,6 +9,9 @@
 
 ## 0. 四条硬规矩
 
+> **口径、原则、改动流程以 [`QOS.md`](./QOS.md) 为准。** 这份文档管的是「跑哪个脚本」
+> 和「档案字段是什么意思」；「该信哪个数字」在 `QOS.md`。
+
 **① `p50` / `p90` 不加限定 = 「闭嘴 → 出声」。** 这是项目级约定，唯一实现是
 `src/latency-report.ts` 的 `firstWordMs`（① + ② + ③）。其余一律不许裸叫 p50：
 
@@ -123,11 +126,12 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | 脚本 | 作用 |
 |---|---|
 | `scripts/observe.ts` | **单入口**：分段 + 审计 + dsh 对齐，头部列出这场会话有哪些事实源可用 |
-| `scripts/latency-report.ts` | 档案 → 逐轮 ①②③④（**分段口径的唯一实现**） |
+| `scripts/latency-report.ts` | 档案 → 逐轮 ①②③④（**分段口径的唯一实现**）。加 `--standard` 出标准三表：按车道 / 按判停是否等待 / 按台词类别 |
 | `scripts/fsm-trace-check.ts` | 档案 → 状态轮转违规 |
 | `scripts/dsh-timeline.ts` | Miai 档案 × dsh session log 同轴对齐（**一轮内部/工具/作业的唯一源**） |
 | **`scripts/partial-timeline.py`** | partial 时序：投机到底能提前多少。给三个覆盖口径、按句长分组，`--asks` 直接对 `agent.ask` 的实际发出账 |
 | **`scripts/silence-runs.py`** | 封段统计：句内静音段长度分布 + **当前实际门槛**（「等一整包」）作为基线，再按 75/25 ms 包长模拟各门槛会误封多少次、封段能提前多少 |
+| **`scripts/time-knobs.py`** | **时间参数总表生成器**：从源码扫出所有旋钮与常量，输出 `docs/TIME-KNOBS.md`。`--write` 写回；`--prod .env` 对照线上、标出默认值差异。五列：默认值 / 时钟（音频 or 墙上）/ 持有者 / 被谁遮住 / 上限。**改了旋钮忘了重新生成会测试红灯** |
 | `bench/tau2/segment_split.py` | 客户端打点 + 档案，五段（含 ⑤TTS首块→客户端首帧） |
 | `bench/tau2/lat_summary.py` | 合并 `/tmp/tau2-lat-*.json` 出 p50/p90/p95，折真机体感 |
 | `bench/tau2/reply_breakdown.py` | ③ 拆成模型侧 `dsh_ms` 与 TTS 握手 `tts_first_ms` |

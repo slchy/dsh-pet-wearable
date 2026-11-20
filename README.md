@@ -336,19 +336,25 @@ node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录>
 # 5. 逐轮审计模型行为：用户说了什么 → 被问了什么 → 答了什么 → 听到多少
 node --experimental-strip-types scripts/said-audit.ts <档案目录>
 
-# 6. 生成或管理设备配对凭证
+# 6. 标准报告：按车道 / 按判停是否等待 / 按台词类别 三张表（口径见 docs/QOS.md）
+node --experimental-strip-types scripts/latency-report.ts <档案目录> --standard
+
+# 7. 时间参数总表：从源码生成，改了旋钮要重新生成（测试会红）
+python scripts/time-knobs.py --write
+
+# 8. 生成或管理设备配对凭证
 npm run pair -- new
 
-# 7. partial 时序：投机到底能提前多少（三个覆盖口径 + 按句长分组）
+# 9. partial 时序：投机到底能提前多少（三个覆盖口径 + 按句长分组）
 python scripts/partial-timeline.py <档案目录>
 
-# 8. 封段统计：句内静音段分布，以及 20/40/60 ms 门槛各会误封多少次
+# 10. 封段统计：句内静音段分布，以及 20/40/60 ms 门槛各会误封多少次
 python scripts/silence-runs.py <档案目录>
 
-# 9. TTS 首包探针：分批送达（首字/标点在不在、后续文本隔多久）对首包的影响
+# 11. TTS 首包探针：分批送达（首字/标点在不在、后续文本隔多久）对首包的影响
 MODE=live ROUNDS=80 IDLE_MS=5000 node bench/latency/probe-cosyvoice-feed.mjs
 
-# 10. 真机向量回放（自己起隔离实例，不打生产端口）
+# 12. 真机向量回放（自己起隔离实例，不打生产端口）
 python bench/replay/run.py --archive <会话名> --turns 16
 ```
 
@@ -382,6 +388,8 @@ dsh-pet-wearable/
 
 | 领域 | 核心文档 | 内容概览 |
 |:---|:---|:---|
+| **QoS（先看这份）** | [QOS.md](./docs/QOS.md) | 指标定义与口径规则、六条原则、改动流程五问、测量方法检查项、在用/已否决/待定三张清单 |
+| | [TIME-KNOBS.md](./docs/TIME-KNOBS.md) | 时间参数总表（**生成物**）：默认值 / 时钟 / 持有者 / 被谁遮住 / 上限 |
 | **状态机与流转** | [state-machines.md](./docs/state-machines.md) | 六大核心状态机（DialogFsm、FloorArbiter 等）时序与真相表 |
 | **工具与度量** | [TOOLS.md](./docs/TOOLS.md) | 观测工具矩阵、延迟口径唯一定义与排障路由表 |
 | **判停基准** | [EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) | 公开中文 EoT 基准上的数字、口径与**修订记录**（含被撤回的归因）；结论：瓶颈在策略不在模型 |

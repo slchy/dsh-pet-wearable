@@ -114,6 +114,37 @@ export interface TurnLatency {
   /** 这一轮对应的 ASR 文本（截断，便于人肉对上） */
   readonly text: string;
   /**
+   * 这一轮谁答的：`fast` / `dsh` / `null`（旧档案没有 `path`）。
+   *
+   * **必须和延迟一起报**：两条车道的预算完全不同，混在一起的 p50 没有意义。
+   */
+  readonly path: string | null;
+  /**
+   * ② 是不是「等了一下」。
+   *
+   * 判停的实际分布是两头：七成接近 0，三成等 400–500。混在一起看，中位会掩盖
+   * 那三成的成本 —— 所以分组表必须按这一列拆。门槛取 100 ms：低于它的差异
+   * 落在测量噪声里，不值得当一档。
+   */
+  readonly waitedInJudge: boolean;
+  /**
+   * 台词的类别，用来回答「多出来的轮次是不是被切开的半句」。
+   *
+   * - `filler`：开头语（「你说」「你觉得」「我想问你」这类，字数少、判停容易判错）
+   * - `noise`：疑似误识别（纯英文短词、单字）
+   * - `normal`：其余
+   *
+   * 这是**启发式**，不是结论 —— 报告里出现可疑样本要回看录音确认。
+   */
+  readonly category: 'normal' | 'filler' | 'noise';
+  /**
+   * 这一轮是不是**坏样本**（`① < 0`，见 `computeTurns` 里的说明）。
+   *
+   * 它的 `firstWordMs` 已经被降成 `null`，所以不会污染中位；这一列只是让报告
+   * 能写出「剔除了几轮」—— 悄悄变小分母和剔错了样本，都看不出来。
+   */
+  readonly badSample: boolean;
+  /**
    * 这一轮缺哪些时刻。
    *
    * 必须逐个记：`firstWordMs` 为 `null` 可能是"旧档案没有 tts.first"，也可能是
@@ -124,6 +155,47 @@ export interface TurnLatency {
 
 /** 报告里文本预览的最大字数。 */
 const TEXT_PREVIEW = 40;
+
+/**
+ * ② 超过多久算「等了一下」。
+ *
+ * 取 100 ms：判停的实际分布是两头（七成接近 0、三成 400–500），100 落在两峰之间
+ * 的空谷里，不会把测量噪声切成两档。
+ */
+const WAITED_THRESHOLD_MS = 100;
+
+/**
+ * 会诱导判停「再等一拍」的开头语。
+ *
+ * 这些词本身是完整的句子，但语义上像是还有后半句 —— 判停给的分往往不高，
+ * 于是要么等到上限（白白多等），要么提前放行（被切成两轮）。两场实测里
+ * 被切开的句子几乎都以此开头。
+ */
+const FILLER_HEADS = ['你说', '你觉得', '我想问你', '那个', '说真的', '我觉得吧', '对了', '我跟你说'];
+
+/** 纯英文短词 / 单字：疑似 ASR 把噪声识别成了文字（`Yeah.` / `Thank you.` / `明。`）。 */
+const NOISE_RE = /^[A-Za-z\s.?!,'"]{1,20}$|^[\u4e00-\u9fff]。?$/u;
+
+/**
+ * 给这一轮的台词分类。
+ *
+ * 用途是回答「多出来的轮次是不是被切开的半句」—— 按类别拆开看 p90 和轮次数，
+ * 比看总体数字有用。这是**启发式**，报告里出现可疑样本要回看录音确认，别拿它当结论。
+ */
+function categorize(text: unknown): 'normal' | 'filler' | 'noise' {
+  if (typeof text !== 'string' || text.trim() === '') {
+    return 'normal';
+  }
+  const bare = text.trim();
+  if (NOISE_RE.test(bare)) {
+    return 'noise';
+  }
+  // 开头语只在「很短」时才算 —— 「你觉得哪首音乐好听？」是完整问句，不是半句
+  if ([...bare].length <= 6 && FILLER_HEADS.some((head) => bare.startsWith(head))) {
+    return 'filler';
+  }
+  return 'normal';
+}
 
 /** 取一个可能是任意 JSON 值的数字；不是有限数就给 `undefined`。 */
 function num(value: unknown): number | undefined {
@@ -341,7 +413,17 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     const turnToAudio = delta(events, firstAt, at);
     const playbackMs = delta(events, endAt, firstAt);
     // 首字延迟必须以「用户停嘴」为起点：缺任何一环都不猜
-    const firstWordMs = stopAt === null || firstEv === undefined ? null : firstEv.t - stopAt;
+    const rawFirstWord = stopAt === null || firstEv === undefined ? null : firstEv.t - stopAt;
+    /**
+     * `① < 0` = `gate.close` 配到了**上一段语音**（能量门要 `holdMs` 才关，所以属于
+     * 本段的门常常晚于 `asr.sentence`，配对时容易抓到上一轮的）。
+     *
+     * 这种样本不能进统计：它不是「延迟很小」，是**算错了**。按 `QOS.md` 口径规则 3
+     * 「坏样本自动剔除，不靠人眼」—— 这里直接把它降成 `null`，让下游分组表自动
+     * 把它从分母里摘掉，同时 `badSample` 留痕，报告能显示「有几轮被剔除」。
+     */
+    const badSample = silenceToAsr !== null && silenceToAsr < 0;
+    const firstWordMs = badSample ? null : rawFirstWord;
 
     const missing: MissingMark[] = [];
     if (gateAt < 0) {
@@ -384,6 +466,10 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       ttsSynthMs: ttsSynth,
       interrupted: end?.interrupted === true,
       text: preview(asrAt < 0 ? undefined : events[asrAt]?.text),
+      path: typeof end?.path === 'string' ? end.path : null,
+      waitedInJudge: asrToTurn !== null && asrToTurn >= WAITED_THRESHOLD_MS,
+      category: categorize(asrAt < 0 ? undefined : events[asrAt]?.text),
+      badSample,
       missing,
     });
   }
@@ -438,6 +524,128 @@ export function summarize(values: readonly (number | null)[]): Sample {
 
 /** 首字延迟的判据（ms）：超过它，宠物就变成"语音问答机"。 */
 export const FIRST_WORD_BUDGET_MS = 1200;
+
+/** 慢轮次的门槛（ms）：超过它用户会明显觉得「卡了一下」。 */
+export const SLOW_TURN_MS = 1500;
+
+/** 一组轮次的汇总。 */
+export interface GroupSummary {
+  readonly label: string;
+  /** 这一组里「三段齐全」的轮次数（其余不进中位，但计入 `total`） */
+  readonly count: number;
+  /** 组内轮次总数，含缺仪表、坏样本 */
+  readonly total: number;
+  readonly p50: number | null;
+  readonly p90: number | null;
+  readonly max: number | null;
+  /** 首声 > {@link SLOW_TURN_MS} 的轮次数与占比 */
+  readonly slow: number;
+  /** 因 `① < 0` 被剔除的坏样本数（见 `TurnLatency.badSample`） */
+  readonly bad: number;
+  /** 各段中位（**只作参考，不许相加**） */
+  readonly seg1: number | null;
+  readonly seg2: number | null;
+  readonly seg3: number | null;
+}
+
+/**
+ * 按一个键把轮次分组并汇总。
+ *
+ * **这是标准报告的核心**：同一份档案按车道 / 按是否等待 / 按台词类别各拆一次，
+ * 三张表放在一起，才知道 p50 是被谁决定的。混在一起看的 p50 会同时被
+ * 「dsh 的 6 秒」和「切开的半句」平均掉。
+ *
+ * 缺 `firstWordMs` 或有 `missing` 的轮次**不进中位**，但仍计入 `total` ——
+ * 「跑了 24 轮、只有 21 轮能算」这件事必须看得见，不能悄悄变小分母。
+ */
+export function groupBy(
+  turns: readonly TurnLatency[],
+  key: (turn: TurnLatency) => string,
+  label = '',
+): GroupSummary[] {
+  const buckets = new Map<string, TurnLatency[]>();
+  for (const turn of turns) {
+    const k = key(turn);
+    const list = buckets.get(k);
+    if (list === undefined) {
+      buckets.set(k, [turn]);
+    } else {
+      list.push(turn);
+    }
+  }
+  const out: GroupSummary[] = [];
+  for (const [name, list] of [...buckets.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const usable = list.filter((t) => t.firstWordMs !== null && t.missing.length === 0);
+    const sums = usable.map((t) => t.firstWordMs as number);
+    const first = summarize(sums);
+    out.push({
+      label: label === '' ? name : `${label}=${name}`,
+      count: first.count,
+      total: list.length,
+      p50: first.median,
+      p90: first.p90,
+      max: first.max,
+      slow: sums.filter((v) => v > SLOW_TURN_MS).length,
+      bad: list.filter((t) => t.badSample).length,
+      seg1: summarize(usable.map((t) => t.silenceToAsr)).median,
+      seg2: summarize(usable.map((t) => t.asrToTurn)).median,
+      seg3: summarize(usable.map((t) => t.turnToAudio)).median,
+    });
+  }
+  return out;
+}
+
+/** 把分组汇总排成一张固定的表。**三种分组共用这一个排版**，所以前后可比。 */
+export function formatGroups(title: string, groups: readonly GroupSummary[]): string {
+  if (groups.length === 0) {
+    return `### ${title}\n\n（没有样本）`;
+  }
+  const lines = [
+    `### ${title}`,
+    '',
+    '| 分组 | 可算 / 总轮 | p50 | p90 | 最大 | 慢轮(>1500) | ① | ② | ③ |',
+    '|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|',
+  ];
+  for (const g of groups) {
+    const ratio = g.bad === 0 ? `${g.count}/${g.total}` : `${g.count}/${g.total}（坏样本 ${g.bad}）`;
+    const slow = `${g.slow}${g.count === 0 ? '' : ` (${Math.round((g.slow / g.count) * 100)}%)`}`;
+    lines.push(
+      `| ${g.label} | ${ratio} | ${cell(g.p50)} | ${cell(g.p90)} | ${cell(g.max)} | ${slow} `
+      + `| ${cell(g.seg1)} | ${cell(g.seg2)} | ${cell(g.seg3)} |`,
+    );
+  }
+  lines.push('');
+  lines.push('> ① ② ③ 是**各段自己的中位**，只用来对份额，**不许相加**（相加 ≠ p50）。');
+  return lines.join('\n');
+}
+
+/** 标准报告：按车道 / 按是否等待 / 按台词类别 三张表 + 多余轮次。 */
+export function formatStandard(turns: readonly TurnLatency[]): string {
+  const byLane = groupBy(turns, (t) => t.path ?? '未知（无 path）');
+  const byWait = groupBy(turns, (t) => (t.waitedInJudge ? '等了' : '没等'), '判停');
+  const byText = groupBy(turns, (t) => t.category, '台词');
+
+  const noise = turns.filter((t) => t.category === 'noise');
+  const filler = turns.filter((t) => t.category === 'filler');
+  const extra = [
+    '### 多余轮次的嫌疑',
+    '',
+    `- 疑似误识别（纯英文 / 单字）**${noise.length} / ${turns.length}** 轮：`
+      + (noise.length === 0 ? '（无）' : noise.map((t) => `轮${t.turn}「${t.text}」`).join('、')),
+    `- 开头语（可能被切开的半句）**${filler.length} / ${turns.length}** 轮：`
+      + (filler.length === 0 ? '（无）' : filler.map((t) => `轮${t.turn}「${t.text}」`).join('、')),
+    '',
+    '> 这两类是**启发式**。要确认「半句是不是被当整句回答」，得回看那一轮的',
+    '> 前后两轮定稿：后半句是否单独成轮、前半句有没有出声。',
+  ].join('\n');
+
+  return [
+    formatGroups('按车道', byLane),
+    formatGroups('按判停是否等待', byWait),
+    formatGroups('按台词类别', byText),
+    extra,
+  ].join('\n\n');
+}
 
 /** 把一个数字列成表格单元；`null` 显示为 `-`。 */
 function cell(value: number | null, unit = ''): string {
