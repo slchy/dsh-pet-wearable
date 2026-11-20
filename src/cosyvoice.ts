@@ -863,7 +863,7 @@ const STREAM_BATCH_CHARS = 10;
  * `queue.close()` —— 也就是整段生成结束之后才开始合成，「边生成边合成」退化成
  * 「等整段再合成」，短答反而比长答更慢。剥掉开头情绪标签之后只要有正文就先送一批。
  */
-const FIRST_BATCH_CHARS = 2;
+const FIRST_BATCH_CHARS = 1;
 
 /** 这一批够不够送：第一批只看有没有正文，之后按 {@link STREAM_BATCH_CHARS} 攒。 */
 export function streamBatchReady(

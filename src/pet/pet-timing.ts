@@ -46,7 +46,15 @@ export interface PetTimingOptions {
  * **不要加新规则** —— 规则越多越难解释它为什么沉默。
  */
 export const DEFAULT_PET_TIMING: PetTimingOptions = {
+  /**
+   * 设计意图：离场 5 分钟后重戴才打招呼。
+   *
+   * **线上 `.env` 现在是 `PET_GREET_AWAY_MS=3000`**（便于观察），但那里也写着
+   * 「测完改回」，而且 `pet-timing.test.ts` 有一条测试守「默认参数是宁可少说的一侧」
+   * （`>= 3 min`）。这条默认值不进代码 —— 它是**观察期的临时覆盖**。
+   */
   greetAfterAwayMs: 5 * 60_000,
+  /** 设计意图 20 分钟。线上 `PET_CHATTER_IDLE_MS=180000` 同理是观察值，见上。 */
   chatterAfterIdleMs: 20 * 60_000,
   minProactiveGapMs: 10 * 60_000,
   quietFromHour: 23,

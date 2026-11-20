@@ -384,8 +384,12 @@ test('预开：这一轮语气和预开的不一样就不认领（宁可多花�
 test('分批门槛：第一批只要有正文就送，短答不再等整段', () => {
   // 快车道的回答常常不到 10 个字；按 10 字门槛，它们要等到 queue.close()
   // （整段生成结束）才开始合成，「边生成边合成」对短答完全不成立。
-  assert.equal(streamBatchReady('行', true), false, '一个字先攒着，等服务端有得合成');
-  assert.equal(streamBatchReady('行啊', true), true, '第一批两个正文字就送');
+  // 首批只送一个字（线上 `COSYVOICE_FIRST_BATCH_CHARS=1`，也是这里的默认）。
+  // 注意**只送 1 个字时服务端不开始合成**，要等后续文本到齐才动 —— 探针实测：
+  // 隔 2 s 送其余 → 首包 2328 ms；隔 50 ms → 371 ms。所以这一项省的是「等第 2 个
+  // token」那 20–35 ms，不是省合成。
+  assert.equal(streamBatchReady('行', true), true, '第一批有正文就送（默认 1 字）');
+  assert.equal(streamBatchReady('行啊', true), true, '两个字当然也送');
   assert.equal(streamBatchReady('行啊', false), false, '后续批次仍按 10 字攒');
   assert.equal(streamBatchReady('一二三四五六七八九十', false), true);
 });

@@ -570,10 +570,18 @@ async function main(): Promise<void> {
     if (fastOff || fastKey === '') {
       console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
     } else {
+      /**
+       * 委派默认**关**（跟随线上）。`FAST_LANE_DELEGATE=1` 才打开。
+       *
+       * 保留 `!== '0'` 那个写法会让「什么都没设」变成打开 —— 而线上一直是关的，
+       * 于是本地跑出来的行为和生产不一样，`[[DELEGATE]]` 在本地还生效。
+       */
+      const delegateEnabled = (process.env['FAST_LANE_DELEGATE'] ?? '0') !== '0';
+      const fastModel = process.env['FAST_LANE_MODEL'] ?? 'qwen-flash';
       agent = new FrontedAgent({
         inner: agent,
         apiKey: fastKey,
-        model: process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat',
+        model: fastModel,
         ...(process.env['FAST_LANE_BASE_URL'] === undefined
           ? {}
           : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
@@ -601,13 +609,17 @@ async function main(): Promise<void> {
         // **设 0 = 永不因计数转交**：那几轮会在下一次真正需要 dsh 的轮次一并注入
         // （`startInner` 的 `pending` 逻辑），用户不用为刷上下文白等一次完整 agent 往返。
         // 纯聊天模式建议 0 —— 那时 dsh 不参与，强制转交只是让「可以。」这种话等 6 秒。
-        keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 4),
+        keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 0),
         // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
         // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
         hedge: envNumber('FAST_LANE_HEDGE', 2),
         // 委派能力：`0` = 快车道只当聊天模型（提示词换成纯聊天版，`[[DELEGATE]]` 不再生效）。
         // 关掉之后「哪些句子根本不进快车道」必须由上游决定 —— 它不会自己让路。
-        delegateEnabled: process.env['FAST_LANE_DELEGATE'] !== '0',
+        //
+        // **默认关，跟随线上**。打开要显式 `FAST_LANE_DELEGATE=1`：写反了的话
+        // 快车道会以为自己能委派，但上游没按那条线分流，`[[DELEGATE]]` 就只落在
+        // 提示词里、没人执行。
+        delegateEnabled,
         // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
         taskStatus: () => dshSession.taskStatus(),
         // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），
@@ -618,15 +630,15 @@ async function main(): Promise<void> {
         audit: (name, data) => { auditSink?.(name, data); },
       });
       console.log(
-        `快车道    开（${process.env['FAST_LANE_DELEGATE'] !== '0' ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
-        + `model=${process.env['FAST_LANE_MODEL'] ?? 'deepseek-chat'}`
+        `快车道    开（${delegateEnabled ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
+        + `model=${fastModel}`
         // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
         + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
         + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
         + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
         + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
         + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
-        + ` delegate=${process.env['FAST_LANE_DELEGATE'] !== '0' ? 'on' : 'OFF（纯聊天）'}`,
+        + ` delegate=${delegateEnabled ? 'on' : 'OFF（纯聊天）'}`,
       );
       // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
       // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
@@ -710,7 +722,7 @@ async function main(): Promise<void> {
         + (vocabularyId ? `  vocab=${vocabularyId}` : '  vocab=(未配置)')
       : resolvedStt === 'qwen-realtime'
         ? `model=${process.env['QWEN_ASR_MODEL'] ?? 'qwen3-asr-flash-realtime'}`
-          + `  端点由我们控（commit=${envNumber('VOICE_COMMIT_MS', 40)} ms）`
+          + `  端点由我们控（commit=${envNumber('VOICE_COMMIT_MS', 20)} ms）`
         : '(外部/内置实现，无需凭据)';
     console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
@@ -763,7 +775,7 @@ async function main(): Promise<void> {
 
     // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」
     const ttsGain = envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1));
-    const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1));
+    const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 4));
     /**
      * 能量门限（按**放大后**算）。
      *
@@ -790,7 +802,7 @@ async function main(): Promise<void> {
     console.log(
       proactiveOn
         ? '宠物环   开（主动开口）：心跳每 '
-          + `${envNumber('PET_TICK_MS', 30_000)} ms，离场 ${envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs)} ms 后重戴会打招呼\n`
+          + `${envNumber('PET_TICK_MS', 3_000)} ms，离场 ${envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs)} ms 后重戴会打招呼\n`
         : '宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口\n',
     );
 
@@ -819,17 +831,17 @@ async function main(): Promise<void> {
           // ⚠️ 必须在这里读，不能在模块顶层：`loadDotEnv()` 是在 `main()` 里调的，
           // 模块顶层的 `envString()` 早于它执行，`.env` 里的值读不到 —— 2026-11-19
           // 线上设 200 后日志仍打「再等 400 ms」，就是这个顺序问题。
-          extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 400),
+          extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 200),
           // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
           // TurnJudge `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
           // 的兜底，而我们原来只有 3×400=1.2 s —— 触发点比人家快、兜底却只有一半，
           // 用户说半句停下来想一下就会被强制收下。7×400 ≈ 2.8 s，对齐业界。
-          maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 7),
+          maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 2),
           // 「判停说没说完」单独一个上限：那条分支不看任何文本信号，只按 p 再等
           // 一拍，而 p 是噪声（同一段音频两次回放，同一句 0.549 vs 0.189）。
           // 真机实测要 4 拍（1600 ms）才收下；这里收到 2 拍（800 ms），
           // 仍能覆盖正常换气 200–400 ms。另三类文本判据不受影响，照旧吃 7 的额度。
-          maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 2),
+          maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 1),
           // 快照尾部最多留多少静音。官方约定是「音频顶到输入向量的末尾」——
           // 尾巴留静音等于把语音从窗口末尾推开，p 会被拉低（0 ms → 0.95，
           // 800 ms → 0.04）。留多少在噪声里，取小值只为方向正确。
@@ -844,11 +856,11 @@ async function main(): Promise<void> {
           // QoS：`②`（定稿→开轮）的总等待预算，兜底上限。0 = 不设。
           // 目的不是省时间，是让 `②` 有一个可预测的天花板 —— 真机 2026-11-18
           // 有 7/29 轮把分支额度吃干净，单轮白等 1.4 s。
-          waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 0),
+          waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 200),
           // QoS：句尾像未完成的序列（数字/字母/「然后」…）时的豁免预算。
           // 这类句尾 p 判「没说完」是对的（念手机号每次停顿都真没说完），
           // 别让总预算把它掐掉。0 = 不启用。
-          waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 0),
+          waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 1_200),
           // **统一上限**：开轮静音的最大值，任何分支都不许绕过。
           // 取 650 的依据是真机 54 轮实测（`docs/EOT-SUPPLEMENT.md` §8）：
           // 开轮静音 500–1200 ms 的 7 轮**一次都没有**被用户接着说，而 <300 ms
@@ -870,7 +882,7 @@ async function main(): Promise<void> {
         // 服务端自己判句的 provider（NLS）必须留 0 —— 否则会在句子中间插一刀，
         // 把一个整句切成两段。40 ms 是标定后的默认值（配合下面的开轮门槛
         // 300/200，有声拆句 0）；单独用 40 而不要门槛会把「换气」当句尾。
-        commitMs: envNumber('VOICE_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 40 : 0),
+        commitMs: envNumber('VOICE_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 20 : 0),
         // 开轮门槛：定稿到达时「截至此刻」的连续静音够不够。SOTA 那边按「40 ms 窗
         // + 261 ms 解码 ≈ 301 ms」推的起点，中位数上几乎不增加等待；p 高的轮次用
         // 短档（听起来完整就不必等那么久）。只对 commit 路径生效。
@@ -908,8 +920,9 @@ async function main(): Promise<void> {
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),
-      // 高清链路要等手机建 P2P + 设备写相册，20 s 可能不够（`MIAI_PHOTO_TIMEOUT_MS` 可调）
-      photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 20_000),
+      // 高清链路要等手机建 P2P + 设备写相册，20 s 不够（线上实测要 50 s+，
+      // 那个 25 s 的 `MIAI_HQ_SHUTTER_TIMEOUT_MS` 只是快门，不含回传）
+      photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 60_000),
       // 要人动手的拍照只设一个兜底总时长（分段计时归设备）。
       // 兼容旧的两段变量：给了就相加
       confirmTimeoutMs: process.env['MIAI_CONFIRM_TIMEOUT_MS'] !== undefined
@@ -933,7 +946,7 @@ async function main(): Promise<void> {
             micOpenTimeoutMs: envNumber('PET_MIC_OPEN_TIMEOUT_MS', 1500),
           },
           listenMs: envNumber('PET_LISTEN_MS', DEFAULT_PROACTIVE.listenMs),
-          tickMs: envNumber('PET_TICK_MS', 30_000),
+          tickMs: envNumber('PET_TICK_MS', 3_000),
         }
         : null,
     });
