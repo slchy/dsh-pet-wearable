@@ -51,6 +51,7 @@
     "sim": "node src/pet/sim/run.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.ts",
+    "mutate": "python scripts/mutation-check.py",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {

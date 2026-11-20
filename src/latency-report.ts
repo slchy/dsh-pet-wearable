@@ -575,7 +575,14 @@ export function groupBy(
   }
   const out: GroupSummary[] = [];
   for (const [name, list] of [...buckets.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const usable = list.filter((t) => t.firstWordMs !== null && t.missing.length === 0);
+    /**
+     * 只按「能不能算出首字」筛，**不按 `missing` 是否为空**。
+     *
+     * 变异测试发现的：原来写成 `firstWordMs !== null && missing.length === 0`，
+     * 那会把「只缺 `turn.end`」的轮次也剔掉 —— 而 `turn.end` 只影响
+     * 「有没有被打断」和「播了多久」，**不影响首字延迟**。剔掉它是白丢样本。
+     */
+    const usable = list.filter((t) => t.firstWordMs !== null);
     const sums = usable.map((t) => t.firstWordMs as number);
     const first = summarize(sums);
     out.push({

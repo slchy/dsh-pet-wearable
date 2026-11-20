@@ -43,6 +43,8 @@ interface Spec {
    * 自己以为在测坏样本，其实什么都没测。
    */
   gateAt?: number;
+  /** 不给 `turn.end`（构造「只缺这一个标记」的轮次） */
+  end?: false;
 }
 
 const SPECS: Spec[] = [
@@ -57,9 +59,9 @@ const SPECS: Spec[] = [
 ];
 
 /** 把 SPECS 展开成按时间排序的事件行（真机档案就是这个顺序） */
-function archive(): string {
+function archiveOf(specs: Spec[]): string {
   const lines: Array<{ t: number; body: Record<string, unknown> }> = [];
-  for (const s of SPECS) {
+  for (const s of specs) {
     const asrAt = s.stop + s.asr;
     const openAt = asrAt + s.open;
     const audioAt = openAt + s.audio;
@@ -67,16 +69,19 @@ function archive(): string {
     lines.push({ t: asrAt, body: { ev: 'asr.sentence', text: s.text } });
     lines.push({ t: openAt, body: { ev: 'turn.start' } });
     lines.push({ t: audioAt, body: { ev: 'tts.first', ms: s.audio } });
-    lines.push({
-      t: audioAt + 400,
-      body: {
-        ev: 'turn.end',
-        interrupted: false,
-        dsh_ms: 180,
-        loop_max_ms: 2,
-        ...(s.path === undefined ? {} : { path: s.path }),
-      },
-    });
+    // `end: false` 用来构造「只缺 turn.end」的轮次 —— 它不影响首字延迟
+    if (s.end !== false) {
+      lines.push({
+        t: audioAt + 400,
+        body: {
+          ev: 'turn.end',
+          interrupted: false,
+          dsh_ms: 180,
+          loop_max_ms: 2,
+          ...(s.path === undefined ? {} : { path: s.path }),
+        },
+      });
+    }
   }
   return lines
     .sort((a, b) => a.t - b.t)
@@ -84,7 +89,7 @@ function archive(): string {
     .join('\n');
 }
 
-const turns = computeTurns(parseEvents(archive()));
+const turns = computeTurns(parseEvents(archiveOf(SPECS)));
 
 test('口径基线：逐轮分段与合计钉死', () => {
   const got = turns.map((t) => ({
@@ -142,4 +147,45 @@ test('口径基线：三张表都存在，且各自提醒「不许相加」', ()
 test('口径基线：坏样本在表里显式标出「坏样本 N」', () => {
   const text = formatStandard(turns);
   assert.match(text, /4\/5（坏样本 1）/, '剔除必须留痕 —— 悄悄变小分母看不出来');
+});
+
+/**
+ * 边界值：四个「恰好落在判据上」的轮次。
+ *
+ * 这一组是**变异测试逼出来的**。第一版 golden 只有 ①=−317（远离 0）、②∈{0,450}
+ * （远离 100）、合计 ≤1050 或 8300（远离 1500），于是四个判据改成相邻值都能通过：
+ *
+ * | 变异 | 第一版为什么放过它 |
+ * |---|---|
+ * | `①<0` → `①<=0` | 样本里没有 `① == 0`（那是合法的，不该算坏样本） |
+ * | 等待门槛 100 → 50 | ② 只有 0 和 450，两边都跨得过去 |
+ * | 慢轮门槛 1500 → 3000 | 样本最大 1050、次大 8300，中间是空的 |
+ * | 「只缺 turn.end」也被剔除 | 没有这种轮次 |
+ */
+const BOUNDARY: Spec[] = [
+  // ① 恰好 0：ASR 与停嘴同一毫秒。合法，**不能**算坏样本
+  { stop: 1_000, asr: 0, open: 0, audio: 500, text: '嗯。', path: 'fast' },
+  // ② = 70：在 50 与 100 之间 → 按 100 的门槛算「没等」
+  { stop: 5_000, asr: 300, open: 70, audio: 500, text: '好。', path: 'fast' },
+  // 合计 = 2000：在 1500 与 3000 之间 → 必须算慢轮
+  { stop: 9_000, asr: 300, open: 0, audio: 1_700, text: '那行吧。', path: 'fast' },
+  // 只缺 turn.end：首字延迟仍然算得出来，**必须进分母**
+  { stop: 13_000, asr: 300, open: 0, audio: 500, text: '先这样。', path: 'fast', end: false },
+];
+
+test('口径基线：边界值（变异测试逼出来的四条）', () => {
+  const b = computeTurns(parseEvents(archiveOf(BOUNDARY)));
+  assert.deepEqual(
+    b.map((t) => ({ a1: t.silenceToAsr, a2: t.asrToTurn, total: t.firstWordMs, bad: t.badSample, wait: t.waitedInJudge })),
+    [
+      { a1: 0, a2: 0, total: 500, bad: false, wait: false }, // ①=0 不是坏样本
+      { a1: 300, a2: 70, total: 870, bad: false, wait: false }, // 70 < 100 → 没等
+      { a1: 300, a2: 0, total: 2_000, bad: false, wait: false }, // 2000 → 慢轮
+      { a1: 300, a2: 0, total: 800, bad: false, wait: false }, // 缺 turn.end 仍可算
+    ],
+  );
+  const g = groupBy(b, () => 'all')[0];
+  assert.equal(g?.count, 4, '缺 turn.end 的轮次不该被剔出分母');
+  assert.equal(g?.total, 4);
+  assert.equal(g?.slow, 1, '2000 ms 必须算慢轮（门槛 1500，不是 3000）');
 });
