@@ -126,6 +126,8 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/latency-report.ts` | 档案 → 逐轮 ①②③④（**分段口径的唯一实现**） |
 | `scripts/fsm-trace-check.ts` | 档案 → 状态轮转违规 |
 | `scripts/dsh-timeline.ts` | Miai 档案 × dsh session log 同轴对齐（**一轮内部/工具/作业的唯一源**） |
+| **`scripts/partial-timeline.py`** | partial 时序：投机到底能提前多少。给三个覆盖口径、按句长分组，`--asks` 直接对 `agent.ask` 的实际发出账 |
+| **`scripts/silence-runs.py`** | 封段统计：句内静音段长度分布 + **当前实际门槛**（「等一整包」）作为基线，再按 75/25 ms 包长模拟各门槛会误封多少次、封段能提前多少 |
 | `bench/tau2/segment_split.py` | 客户端打点 + 档案，五段（含 ⑤TTS首块→客户端首帧） |
 | `bench/tau2/lat_summary.py` | 合并 `/tmp/tau2-lat-*.json` 出 p50/p90/p95，折真机体感 |
 | `bench/tau2/reply_breakdown.py` | ③ 拆成模型侧 `dsh_ms` 与 TTS 握手 `tts_first_ms` |
@@ -248,6 +250,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 | 脚本 | 作用 |
 |---|---|
+| **`bench/latency/probe-cosyvoice-feed.mjs`** | **分批送达对首包的影响**。四组：`base`（整句一次送）、`live`（预热 + 空闲 + 首 1 字 + 50 ms）、`lag`（首 1 字后隔 N 秒）、`idle`（预热后空转）。实测结论：**只送 1 个字时服务端不开始合成**，首包 = 等文本时间 + 318（300/800/1500/2000 四档误差 10 ms 内）；服务端 `run-task` 后约 23 s 报 `request timeout` |
 | `scripts/probe-cosyvoice.mjs` | CosyVoice 首包拆解（DashScope `api-ws/v1/inference`） |
 | `scripts/probe-cosyvoice-warm.mjs` | 同一连接连跑 N 个 task，看稳态首包 |
 | `scripts/probe-aliyun-tts.mjs` | NLS `SpeechSynthesizer` 首包（另一家，换供应商时比） |
@@ -432,6 +435,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `llm.first` | `ms` | 模型首字 |
 | `tts.first` | `ms` | TTS 首块（③ 的终点） |
 | **`tts.task`** | `setup_ms`、`feed_ms`、`first_ms`、`stream`、`prewarmed` | **TTS 那一段拆三截**，常开（不是调试探针）：`setup_ms` = run-task → task-started（还没轮到我们 / 进程被卡）；`feed_ms` = task-started → 首批文本送出（**我们这侧**没供上字，等模型吐字 / 等攒够批）；`first_ms` = 首批文本送出 → 首块音频（服务端合成）。三截慢起来长得一样、治法完全不同 —— 见 `OPS-RECORD.md` §12.8.1。`feed_ms` 是 2026-11-19 加的：那之前出现「首包 1690 ms」时只能归到「服务端」这一层，再也下不去。非流式（`stream=false`，回执那条）没有分批送字，`feed_ms = -1`。一轮里可能不止一条（回执 + 回答），**回答那条在最后** |
+| **`tts.done`** | `setup_ms`、`first_ms`、`feed_ms`、`prewarmed`、`batches`、`chars`、`first_text_ms`、`last_text_ms`、`finish_ms`、`head`、`tail` | **流式 task 的分批送达明细**，收尾时落一次。`head`/`tail` 每项是 `[累积字数, 相对 run-task 毫秒, 这批是否以标点结尾]`（只记前 4 批 + 最后一批）。它回答 `tts.task` 答不了的问题：首包慢的时候，**后面那几批文本到底什么时候送上去的**。`first_ms` 是「首批 → 首块」，而 `finish_ms` 是「run-task → finish-task 发出」—— **`first_text_ms + first_ms - finish_ms` 就是 finish 之后纯粹等合成的时间**。2026-11-20 实测：正常轮这段 300 出头（与探针一致），长尾轮 1250/1339，同期 `loop_max_ms` 只有 3 |
 | **`dialog.state`** | `from`、`to`、**`why`** | **为什么进这个状态**。`why` 里写着「回执出声（可打断）」还是「首块音频已下发」—— 没有它，`thinking → speaking` 分不出是回执还是答案（差约 1 s） |
 | **`turn.end`** | `interrupted`、`audio_s`、`heard_s`、`dsh_ms`、`tts_first_ms`、`dsh_session`、**`path`**、**`delegate`**、**`said`**、`said_chars`、**`loop_max_ms`**、**`loop_p99_ms`** | `path` = `fast`/`dsh`：**这一轮谁答的**；`delegate` = `task`/`answer`/`memory`/`overcap`/`delegate`/`timeout`/`empty`/`error`：**为什么交给 dsh**；`dsh_session` 用来定位 dsh 的 session log；**`said` = 这一轮实际念出去的文本**（已剥情绪标签、多步时含全部增量；回执不算）—— 审计「抢话之后模型有没有接上」靠它，因为快车道（qwen-flash）**没有 session log**，dsh 那侧另有 `assistant/message` 可对；**`loop_max_ms` = 这一轮里事件循环被占住的最大时长**——它跟着 TTS 尖峰一起大，说明是**我们自己被卡住**，不是厂商慢 |
 | `call.send` | `json` | 下行原语（`audio.stop` / `listen.stop` …） |

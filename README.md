@@ -4,7 +4,7 @@
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.18.0-brightgreen.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/tests-600%2B%20passing-success.svg)](#-开发与测试)
+[![Tests](https://img.shields.io/badge/tests-638%20passing-success.svg)](#-开发与测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Status: Experimental](https://img.shields.io/badge/status-active%20development-orange.svg)](#)
 
@@ -39,8 +39,8 @@
 ## 💡 核心特性
 
 - ⚡ **快慢双轨投机推理（Fast Lane + dsh）**
-  - **快车道直达**：日常闲聊与短句通过快模型直接响应，真机实测端到端首字 **1032 ms（p50）/ 1224 ms（p90）**（n=8）。
-  - **委派判据是语义，不是字面**：本地只挡三种形态（空、超 `FAST_LANE_MAX_CHARS`、含阿拉伯数字），**其余一律先问快模型**，由它在流里输出 `[[DELEGATE]]` 决定转交。词表判过的时代，「你看过吗」「为什么」这类闲聊因为含「看」「为什么」被一票判成任务，真机 92 轮里 25 轮白走 `dsh`。
+  - **快车道直达**：日常闲聊与短句通过快模型直接响应，真机实测端到端首字 **p50 920–1054 ms**（四场配对，n=17–39；单场受台词影响，见下文基准表）。
+  - **委派判据是语义，不是字面**：本地只挡三种形态（空、超 `FAST_LANE_MAX_CHARS`、含阿拉伯数字），**其余一律先问快模型**，由它在流里输出 `[[DELEGATE]]` 决定转交。词表判过的时代，「你看过吗」「为什么」这类闲聊因为含「看」「为什么」被一票判成任务，真机 92 轮里 25 轮白走 `dsh`。线上另有 `FAST_LANE_KEEP_TURNS=0`：**不按轮数强制转交**（曾让每 4 轮里有 1 轮等 6–8 秒）。
   - **深度思考与工具调度**：复杂逻辑、事实检索与图文问答交由 `dsh` 进行多步推理与 Subagent 任务派发。
   - **投机并发与委派回执**：双轨并行起跑，若快车道超时或判定需转交，立即垫一句自然回执（如「我看看。」）填补空白，答案就绪后即刻顶掉回执并清空下行缓冲。
 - 🎙️ **真正的全双工与自然打断（Full-Duplex & Barge-In）**
@@ -54,7 +54,7 @@
   - 能力缺失时平滑降级（如设备不支持拍照则不触发视觉推理），接入新型号硬件（如[雷鸟 X3 Pro](./docs/devices/RAYNEO-X3-PRO.md)）无需改动核心代码。
 - 🧪 **零密钥本地闭环与可测性**
   - 内置 `canned` 识别、`silent` 合成与 `echo` 代理，单机零配置秒级跑通全链路。
-  - 提供纯虚拟时间模拟器（`npm run sim`），支持状态空间探索与因果回溯，全仓 500+ 测试用例保障时序稳定性。
+  - 提供纯虚拟时间模拟器（`npm run sim`），支持状态空间探索与因果回溯，全仓 638 个测试用例保障时序稳定性。
 
 ---
 
@@ -188,32 +188,41 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 
 ### 基准实测数据
 
-**真机**（`20261119-071340`，15:13，11 轮，线上 `qwen-realtime` + `cosyvoice`）：
+**真机**（快车道直答、0 次委派，线上 `qwen-realtime` + `cosyvoice`）。
+四场台词不同，**单场绝对值不可比**，只做前后配对；`①+②+③` 按**逐轮合计**取中位，不是各段中位相加：
 
-| 链路分支 | 闭嘴→出声 (p50) | p90 | 最大 | 样本 | 说明 |
-|:---|:---:|:---:|:---:|:---:|:---|
-| **快车道（短句闲聊直答）** | **1032 ms** | 1224 ms | 1757 ms | 8 轮（73%） | ① ~340 + ② ~2 + ③ 742（模型 TTFT 374 + TTS 382）|
-| **`dsh` 复杂推理 / 工具调用** | **1479 ms** | 1757 ms | 1757 ms | 3 轮 | 三个原因：`overcap` 刷上下文 / `answer` 接 dsh 的问话 / `task` 超 14 字 |
-| **全链路综合** | **1144 ms** | **1479 ms** | 1757 ms | 11 轮 | 预算 1200 ms（`FIRST_WORD_BUDGET_MS`）|
+| 场次 | 有效轮 | **p50** | ① 停嘴→定稿 | ② 定稿→开轮 | ③ 开轮→首块 | 配置差异 |
+|:---|:---:|:---:|:---:|:---:|:---:|:---|
+| `20261119-153754` | 39 | 1054 | 300 | 8 | 597 | ② 预算 400 |
+| `20261119-160012` | 22 | 1257 | 324 | 4 | 817 | ② 预算 400 |
+| `20261119-160921` | 21 | **920** | 295 | 25 | 567 | ② 预算 200 |
+| `20261120-031505` | 17 | 991 | 300 | 26 | 643 | ② 预算 200 |
 
-> **同一份向量回放**（`20261119-055744`，7 轮，改判据后）：路径分布 `fast` 5/7。
+> **p50 的波动主要来自两次改动**：连接保活（每轮省 130–190 ms，见下）把 `③` 压到
+> 模型段 ~184 ms；`②` 的等待预算从 400 收到 200 后，那三成「等了一下」的轮次不再
+> 每轮多付 200 ms。两场 200 预算的差（920 / 991）来自台词与 `③` 的服务端抖动。
+
+> **同一份向量回放**（7 轮）：路径分布 `fast` 5/7。
 > 但回放的 ASR 与真机**逐字一致只有 1/7**（同一 `qwen-realtime`，音量链不同），
 > 所以回放只看**走哪条腿**，绝对延迟一律以真机档案为准。
 
-> **链路收敛分析**：
-> `② 定稿→开轮` 已压到 **1–6 ms**（判停窗口按句裁剪后）。
-> 8 个快车道轮**全部命中预跑**，但提前量从 2 ms 到 477 ms 不等 —— 提前 477 ms 那轮
-> agent 段只花 **2.8 ms**，只提前 7 ms 那轮仍要等 508 ms。
-> **这是残余 374 ms 的唯一来源**：不是模型慢，是中间结果起跑得太晚（`FAST_LANE_SPEC_MIN_CHARS=6`
-> 对短句来说已经等于定稿）。
+> **残余的大头**：
+> `①` 已到 300 ms 上下，其中约 68 ms 是封段等的「一整个上行包」——静音帧在同一包里
+> 不参与计时，配置的 `VOICE_COMMIT_MS=20` 实际从未生效（见 [docs/TOOLS.md](./docs/TOOLS.md) 的 `silence-runs.py`）。
+> `③` 里模型段约 184 ms、TTS 首包约 320–400 ms；**偶发长尾在 TTS 侧**，
+> 真机 112 轮里 8 次超过 900 ms，`tts.done` 显示文本都在 100 ms 内送完，
+> 慢在 `finish-task` 之后的合成。
 
 ### 核心延迟优化技术
 
+- 🔌 **HTTP 连接保活 50 s**：`fetch` 默认的 `keepAliveTimeout` 是 **4 s**，而真机上两轮间隔 p50 就有 5–7 s —— 等于**每轮重做一次 TLS 握手**（复用 146–296 ms vs 新建 375–434 ms）。全局 dispatcher 把它拉到 50 s 后，模型段从 ~300 ms 回到 ~184 ms（`MIAI_HTTP_KEEPALIVE_MS`，见 `src/http-agent.ts`）。
 - 🏎️ **判停前起跑（Prefetch）**：ASR 识别定稿瞬间即预先发起推理请求，不再等待判停静默期结束，开轮至模型首字缩减 ~220ms。
-- 🔮 **中间结果投机（Partial Speculation）**：能量门静音瞬间抓取最新 partial 提前请求，覆盖率达标时直接认领，坏情况下退回定稿不影响正确性。
+- 🔮 **中间结果投机（Partial Speculation）**：能量门静音瞬间抓取最新 partial 提前请求；认领要求**去全部标点后完全一致**，坏情况下退回定稿不影响正确性。
+- 🚫 **不按期强制转交**：攒满 N 轮就整句交给 `dsh` 曾让**每 4 轮就有 1 轮**（用户只是想聊两句）等 6–8 秒。改成 `FAST_LANE_KEEP_TURNS=0`（永不因计数转交）后，这类轮次归零；`pending` 有硬上限，丢最老的轮次会落 `agent.trim`。
 - ✂️ **TTS 首包静音裁剪**：对 CosyVoice 合成音频首包执行 5ms 窗口能量裁切，下行开头无效静音从 146ms 压缩至 11ms。
 - 🎯 **判停窗口按句裁剪 + 尾部静音削减**：判停输入仅喂单句音频，尾部静音保留 20ms，与训练特征对齐；`出句→开轮` 从 1.9s 骤降至 2ms。
 - 🌏 **中文字符判停阈值优化**：针对中文判停偏保守的特点，引入 `TURN_JUDGE_THRESHOLD_CJK=0.35`，防止短句误判未完成。
+- ⏱️ **判停的等待有预算**：`②` 的等待藏在模型段后面时是免费的，模型快了以后就变成纯空等。`TURN_JUDGE_WAIT_BUDGET_MS=200`（一拍 `TURN_JUDGE_EXTEND_MS=200`）把上限封死在模型段附近。
 - ⚡ **ASR 端点自控（实验中，尚未全量验证）**：支持关掉云端服务端 200ms VAD 窗，改由宿主本地在静音到点发 `commit`，再由「开轮静音门槛」挡住换气；同一份 13 轮向量上 `① 停嘴→出句` **400 → 254–302 ms**、有声拆句 1 → 0（见 [docs/QWEN-REALTIME-ASR-PROBED.md](./docs/QWEN-REALTIME-ASR-PROBED.md)）。
 - 🧪 **判停器有公开基准可对账（实验中）**：在 [livekit/eot-bench](https://github.com/livekit/eot-bench) 中文子集上，本项目的判停器 AUC 0.754 / 5% 误切预算下等待 0.918 s，比「纯静音死等」的 1.100 s 省 **182 ms**（这个增量列已不作判断，见文档）。榜单的**跨模型排名待核实**（其余行是上游公开结果、口径未必一致），本文不据此排序。**真正的结论是：瓶颈不在模型而在策略**（重复询问/宽限/预算可绕过，2026-11-18 已修），详见 [docs/EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) §0。
 
@@ -260,6 +269,7 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 | **网络与鉴权** | `--listen` / `PORT` | `8766` | 监听端口 |
 | | `MIAI_TOKENS` | - | 设备鉴权 Token 列表（逗号分隔；外网必配） |
 | | `MIAI_TLS_KEY` / `_CERT` | - | TLS 私钥与证书路径（监听非本机时必配） |
+| | `MIAI_HTTP_KEEPALIVE_MS` | `50000` | 出站 HTTP 连接的**保活上限**。`fetch` 默认 4 s，而真机两轮间隔常有 5–7 s，等于每轮重做 TLS 握手（多 130–190 ms）。**必须短于服务端的空闲超时**——服务端先关、我们恰好复用时那一次会直接失败 |
 | **语音链路** | `MIAI_STT` / `--stt` | (空) | 流式识别选型：`aliyun`（现网 NLS）、`qwen-realtime`（实验）、`canned` / `noop` / `<path>`；不给则不启用流式识别 |
 | | `MIAI_TTS` / `--tts` | (空) | 合成选型：`cosyvoice`、`mimo`、`silent`、`<path>` |
 | | `VOICE_PAUSE_DETECT_MS` | `200` | 静音到这么久先预跑判停侧车（不等提交，纯提速） |
@@ -273,16 +283,23 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 | | `FAST_LANE_PREFETCH` | `1` | 判停前预跑开关（`1` 开启，`0` 关闭） |
 | | `FAST_LANE_SPECULATE` | `1` | 快车道与 dsh 双轨投机开关 |
 | | `FAST_LANE_PARTIAL_SPECULATE` | `1` | 拿 ASR **中间结果**先起跑（定稿确认是前缀才认领） |
-| | `FAST_LANE_SPEC_MIN_CHARS` | `6` | 中间结果至少几个字才起跑。只控制「发不发请求」，认领仍要过前缀/覆盖 ≥60%/数字尾三条闸。降到 2 试过，请求涨 2.5 倍、端到端 p50 没动，已退回 |
+| | `FAST_LANE_SPEC_MIN_CHARS` | `6` | 中间结果至少几个字才起跑。只控制「发不发请求」，认领另有一条硬闸：**去全部标点后必须与定稿完全一致**。降到 2 试过，请求涨 2.5 倍、端到端 p50 没动，已退回 |
 | | `FAST_LANE_HEDGE` | `2` | 并发发几份**完全相同**的请求抢首个响应头（方差全在服务端排队，实测「响应头→首 token」只差 ~1 ms）；落败的在拿到响应头前就 abort |
+| | `FAST_LANE_KEEP_TURNS` | `4`（线上 `0`） | 攒满几轮就**整句交给 `dsh`**（顺便刷它的上下文）。线上设 `0` = 永不因计数转交——这条曾让每 4 轮就有 1 轮等 6–8 秒。`pending` 另有硬上限，丢最老的会落 `agent.trim` |
+| | `FAST_LANE_DELEGATE` | `1`（线上 `0`） | 是否认模型自己写的 `[[DELEGATE]]` 暗号。`0` 时判暗号的闸门也一起关掉，首字不必等第二个字符 |
 | **语义判停** | `TURN_JUDGE_THRESHOLD` | `0.5` | 语义说完置信度阈值 |
 | | `TURN_JUDGE_THRESHOLD_CJK` | `0.35` | 针对中文短句的判停阈值（防止过早等待） |
 | | `TURN_JUDGE_QUIET_MS` | `0` | 定稿后额外静默期（ms） |
-| | `TURN_JUDGE_MAX_UNSURE` | `2` | 判停未决时的最大延拍次数 |
+| | `TURN_JUDGE_EXTEND_MS` | `400`（线上 `200`） | 判停未决时**每一拍**等多久。改小 = 更早开轮，但留给「用户接着说」的窗口更短 |
+| | `TURN_JUDGE_MAX_UNSURE` | `2`（线上 `1`） | 判停未决时最多延几拍（`MAX_EXT` 是另一条上限，两条取小） |
+| | `TURN_JUDGE_MAX_EXT` | `2`（线上 `2`） | 延拍次数的硬上限 |
 | | `TURN_JUDGE_TRIM_MS` | `20` | 判停快照尾部保留的最大静音（ms） |
-| | `TURN_JUDGE_WAIT_BUDGET_MS` | `0`（线上 400） | **QoS**：`②` 定稿→开轮的总等待预算，用完就收下。0 = 不设 |
-| | `TURN_JUDGE_SEQUENCE_BUDGET_MS` | `0`（线上 1200） | **QoS**：句尾像未完成的序列（数字/字母/「然后」）时的**更大预算**（不再给更多拍数）。0 = 不启用 |
+| | `TURN_JUDGE_WAIT_BUDGET_MS` | `0`（线上 `200`） | **QoS**：`②` 定稿→开轮的总等待预算，用完就收下。0 = 不设。线上的 200 约等于模型段时长，于是等待基本藏在模型后面 |
+| | `TURN_JUDGE_SEQUENCE_BUDGET_MS` | `0`（线上 `1200`） | **QoS**：句尾像未完成的序列（数字/字母/「然后」）时的**更大预算**（不再给更多拍数）。0 = 不启用 |
 | | `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | `650` | **QoS 统一上限**：开轮时连续静音的天花板，任何分支都不许绕过。0 = 不设 |
+| **TTS（CosyVoice）** | `COSYVOICE_PREWARM` | `1` | 定稿那一刻就把 task 开好（`run-task` → `task-started` 约 66 ms 挪进空窗）。`instruction` 模式下自动不预热——语气是开 task 时定死的 |
+| | `COSYVOICE_FIRST_BATCH_CHARS` | `2`（线上 `1`） | 首批送几个字。**实测只送 1 个字时服务端不开始合成**，要等后续文本到齐才动（等 2 s 送其余 → 首包 2328 ms，等 50 ms → 371 ms），所以这一项省的只是「等第 2 个 token」 |
+| | `COSYVOICE_EMOTION_MODE` | `instruction` | `prosody` 表示只用 rate/pitch 表达情绪，可以在定稿前预开 task |
 | **主动开口** | `PET_PROACTIVE` | `0` | 是否开启主动开口（`1` 开启） |
 | | `VOICE_HOLD_MS` | `2000` | 能量门判定静音至关门的维持时间（ms） |
 
@@ -304,7 +321,7 @@ npm run sim -- --trace out/          # 导出完整时序时间线（JSONL 格�
 ## 🛠️ 开发与测试
 
 ```bash
-# 1. 运行完整单元测试套件（600+ 测试）
+# 1. 运行完整单元测试套件（638 个测试）
 npm test
 
 # 2. 静态 TypeScript 类型检查
@@ -321,6 +338,18 @@ node --experimental-strip-types scripts/said-audit.ts <档案目录>
 
 # 6. 生成或管理设备配对凭证
 npm run pair -- new
+
+# 7. partial 时序：投机到底能提前多少（三个覆盖口径 + 按句长分组）
+python scripts/partial-timeline.py <档案目录>
+
+# 8. 封段统计：句内静音段分布，以及 20/40/60 ms 门槛各会误封多少次
+python scripts/silence-runs.py <档案目录>
+
+# 9. TTS 首包探针：分批送达（首字/标点在不在、后续文本隔多久）对首包的影响
+MODE=live ROUNDS=80 IDLE_MS=5000 node bench/latency/probe-cosyvoice-feed.mjs
+
+# 10. 真机向量回放（自己起隔离实例，不打生产端口）
+python bench/replay/run.py --archive <会话名> --turns 16
 ```
 
 > [!TIP]
