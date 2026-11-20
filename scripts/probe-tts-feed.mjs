@@ -53,8 +53,10 @@ const LAG_MS = Number(process.env['LAG_MS'] ?? 2_000);
 const HEAD_CHARS = Math.max(1, Number(process.env['HEAD_CHARS'] ?? 1));
 /** 轮与轮之间的间隔，别把服务端挤出排队 */
 const ROUND_GAP_MS = Number(process.env['ROUND_GAP_MS'] ?? 300);
-/** 单轮看门狗 */
-const TURN_TIMEOUT_MS = Number(process.env['TURN_TIMEOUT_MS'] ?? 20_000);
+/** 单轮看门狗：必须长于「空转 + 送字」的总和，否则 idle 组会先被自己掐掉 */
+const TURN_TIMEOUT_MS = Number(
+  process.env['TURN_TIMEOUT_MS'] ?? Math.max(20_000, IDLE_MS + LAG_MS + 20_000),
+);
 
 /**
  * 真实的快车道回复（「哥，」开头，12–18 字），轮换取用。
