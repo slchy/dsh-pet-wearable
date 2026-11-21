@@ -329,7 +329,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | 脚本 | 作用 |
 |---|---|
 | **`bench/latency/probe-cosyvoice-feed.mjs`** | **分批送达对首包的影响**。四组：`base`（整句一次送）、`live`（预热 + 空闲 + 首 1 字 + 50 ms）、`lag`（首 1 字后隔 N 秒）、`idle`（预热后空转）。实测结论：**只送 1 个字时服务端不开始合成**，首包 = 等文本时间 + 318（300/800/1500/2000 四档误差 10 ms 内）；服务端 `run-task` 后约 23 s 报 `request timeout` |
-| **`bench/latency/probe-cosyvoice-matrix.mjs`** | **首包长尾是不是连接用法造成的**（2026-11-21 加）。四组**交替**跑：`longconn`（一条长寿连接串行 N 个任务）/ `shortconn`（同节奏但每任务新连接）/ `realtext`（长寿连接 + 线上真实短回复）/ `quota`（每轮同时两个任务）。每个任务记**连接年龄、连接上跑过几个任务、厂商 `task_id`**。真机 29% 长尾 vs 老探针 140 次 0 长尾，区别最可能在连接寿命上 —— 这个探针就是量它。要跑在服务器上（`DASHSCOPE_API_KEY` 在那边，且网络路径与生产一致） |
+| **`bench/latency/probe-cosyvoice-matrix.mjs`** | **首包长尾是不是连接用法造成的**（2026-11-21 加）。四组**交替**跑（`PROBE_GROUPS` 选组；**不能叫 `GROUPS`** —— bash 里那是只读特殊变量，`export` 会被静默吞掉，实测踩过）：`longconn`（一条长寿连接串行 N 个任务）/ `shortconn`（同节奏但每任务新连接）/ `realtext`（长寿连接 + 线上真实短回复）/ `quota`（每轮同时两个任务）。每个任务记**连接年龄、连接上跑过几个任务、厂商 `task_id`**。**2026-11-21 19:26 CST 跑 150 次：四组全部 0 长尾**（longconn 59 个任务、334 s 连接寿命，最大 819）→ 连接寿命不是长尾的原因 |
 | `scripts/probe-cosyvoice.mjs` | CosyVoice 首包拆解（DashScope `api-ws/v1/inference`） |
 | `scripts/probe-cosyvoice-warm.mjs` | 同一连接连跑 N 个 task，看稳态首包 |
 | `scripts/probe-aliyun-tts.mjs` | NLS `SpeechSynthesizer` 首包（另一家，换供应商时比） |

@@ -5,7 +5,8 @@
  * 两者最大的区别不是文本、也不是节奏，而是**连接寿命**：真机一个会话用同一条连接
  * 连跑几十个任务、持续几分钟；探针一直是短跑。所以这里把「连接寿命」当主变量。
  *
- * 四组（`GROUPS`，逗号分隔，默认全跑）：
+ * 四组（`PROBE_GROUPS`，逗号分隔，默认全跑）。**不叫 `GROUPS`**：bash 里 `GROUPS` 是
+ * **只读**特殊变量（当前用户的组 ID），`export GROUPS=...` 会被静默忽略 —— 实测踩过。
  *
  * | 组 | 做法 | 回答什么 |
  * |---|---|---|
@@ -22,7 +23,7 @@
  *
  * 用法：
  *   DASHSCOPE_API_KEY=... node bench/latency/probe-cosyvoice-matrix.mjs
- *   GROUPS=longconn,shortconn ROUNDS=60 GAP_MS=7000 RUN_TAG=morning ...
+ *   PROBE_GROUPS=longconn,shortconn ROUNDS=60 GAP_MS=7000 RUN_TAG=morning ...
  *   OUTPUT=out.jsonl node ...            # 逐条 JSON 写文件（默认只打人看的一行）
  */
 import { randomUUID } from 'node:crypto';
@@ -52,7 +53,7 @@ const OUTPUT = process.env['OUTPUT'] ?? '';
 const SINGLE_TIMEOUT_MS = Number(process.env['TURN_TIMEOUT_MS'] ?? 30_000);
 
 const ALL_GROUPS = ['longconn', 'shortconn', 'realtext', 'quota'];
-const GROUPS = (process.env['GROUPS'] ?? ALL_GROUPS.join(','))
+const GROUPS = (process.env['PROBE_GROUPS'] ?? ALL_GROUPS.join(','))
   .split(',')
   .map((g) => g.trim())
   .filter((g) => g !== '');
