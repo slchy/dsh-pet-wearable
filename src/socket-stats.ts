@@ -38,15 +38,22 @@ export interface SocketStat {
 /** `ss -tin` 的一行块 → 一条连接。块的第一行是地址，后面缩进的行是计数。 */
 export function parseSsOutput(text: string): SocketStat[] {
   const out: SocketStat[] = [];
-  /** `ss` 的表头行与不认识的块要跳过 —— 否则会把 `Local Address:Port` 当成一条连接 */
-  const STATE = /^(ESTAB|SYN-SENT|SYN-RECV|FIN-WAIT-1|FIN-WAIT-2|TIME-WAIT|UNCONN|CLOSE-WAIT|LAST-ACK|CLOSING|LISTEN)$/;
+  /**
+   * 地址 token：`1.2.3.4:443` / `[::1]:443` / `*:63993`。
+   *
+   * **不能靠状态列**：`ss -tin state established …` 的输出里**没有 `ESTAB` 列**
+   * （只有不带过滤的默认列表才打状态），拿状态列当块首判据会把所有连接都丢掉 ——
+   * 2026-11-21 实测踩过：探针给了 0 条，同一时刻 `ss` 原始输出里明明有连接。
+   */
+  const ADDR = /^(?:\[[0-9a-fA-F:.]+\]|[\d.a-fA-F:%]+|\*):(\d+)$/;
   for (const block of text.split(/\n(?=\S)/)) {
     const lines = block.trim().split('\n');
     const head = lines[0] ?? '';
-    // 形如：`ESTAB 0 0 10.0.0.1:41234 203.0.113.24:443`
-    const parts = head.trim().split(/\s+/);
-    if (parts.length < 5 || !STATE.test(parts[0] ?? '')) continue;
-    const peer = parts[4] ?? '';
+    // 表头行：`Recv-Q Send-Q Local Address:Port Peer Address:Port Process`（或带 State 的老格式）
+    if (/^(?:State|Recv-Q)\b/.test(head)) continue;
+    const addrs = head.trim().split(/\s+/).filter((t) => ADDR.test(t));
+    if (addrs.length < 2) continue;
+    const peer = addrs[1] ?? '';
     const metrics = lines.slice(1).join(' ');
     const num = (re: RegExp): number | null => {
       const m = re.exec(metrics);

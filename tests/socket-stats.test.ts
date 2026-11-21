@@ -13,6 +13,31 @@ const SS = [
   '\t cubic wscale:7,7 rto:204 rtt:12.3/1.1 ato:40 mss:1448 unacked:1460 retrans:4/388',
 ].join('\n');
 
+/**
+ * 带 `state established` 过滤时的真实形状：**没有状态列**。
+ *
+ * 2026-11-21 服务器实测抓的：`ss -tin state established '( dport = :443 )'`
+ * 第一行直接是 `0 0 10.0.0.8:32986 203.0.113.49:443`。按状态列判块会把
+ * 所有连接静默丢掉（表现为「采到 0 条」）。
+ */
+const SS_FILTERED = [
+  'Recv-Q Send-Q Local Address:Port   Peer Address:PortProcess',
+  '0      0      10.0.0.8:32986   203.0.113.49:443',
+  '\t cubic rto:256 rtt:55.963/6.892 ato:40 mss:1460 unacked:0 retrans:0/0',
+  '0      0      10.0.0.8:33002   203.0.113.49:443',
+  '\t cubic rto:259 rtt:58.1/5.2 ato:40 mss:1460 unacked:1460 retrans:0/1',
+].join('\n');
+
+test('带 state 过滤的输出（无状态列）也要解析出来 —— 这条是实测踩过的坑', () => {
+  const out = parseSsOutput(SS_FILTERED);
+  assert.equal(out.length, 2, '过滤模式下没有 ESTAB 列，不能拿状态列当判据');
+  assert.deepEqual(out[0], {
+    peer: '203.0.113.49:443', retrans: 0, rto: 256, rtt: 56, unacked: 0,
+  });
+  assert.equal(out[1]?.retrans, 1);
+  assert.equal(out[1]?.unacked, 1460);
+});
+
 test('按块解析：对端地址、retrans（取斜杠后面那个总数）、rto、rtt、unacked', () => {
   const out = parseSsOutput(SS);
   assert.equal(out.length, 3);
