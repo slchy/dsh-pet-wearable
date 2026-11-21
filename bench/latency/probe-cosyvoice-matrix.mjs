@@ -5,7 +5,7 @@
  * 两者最大的区别不是文本、也不是节奏，而是**连接寿命**：真机一个会话用同一条连接
  * 连跑几十个任务、持续几分钟；探针一直是短跑。所以这里把「连接寿命」当主变量。
  *
- * 四组（`PROBE_GROUPS`，逗号分隔，默认全跑）。**不叫 `GROUPS`**：bash 里 `GROUPS` 是
+ * 五组（`PROBE_GROUPS`，逗号分隔，默认全跑）。**不叫 `GROUPS`**：bash 里 `GROUPS` 是
  * **只读**特殊变量（当前用户的组 ID），`export GROUPS=...` 会被静默忽略 —— 实测踩过。
  *
  * | 组 | 做法 | 回答什么 |
@@ -14,8 +14,13 @@
  * | `shortconn` | 同样的节奏，但**每个任务新开连接** | 同上的对照 |
  * | `realtext` | 和 `longconn` 同一条长寿连接，但用**线上那几轮的真实回复** | 文本内容本身会不会触发长尾 |
  * | `quota` | 每轮**同时**发两个任务（两条连接），模拟同一把 key 的并发 | 并发会不会挤占合成服务 |
+ * | `asr` | 长寿连接 + **一条一直在上行的 ASR 流**（75 ms 一包静音） | 多流同时上行会不会触发长尾 / `setup` 335 双峰 |
  *
- * **四组交替进行**（每轮各跑一次），不是先跑完一组再跑下一组 —— 这样「时段」的影响
+ * 第五组为什么是它：连接寿命、任务数、文本、并发任务、协议字段全部排掉之后，
+ * 生产与探针之间**只剩这一个结构差异**（生产进程同时跑 ASR 长连接 + LLM + 下行音频）。
+ * 见 `docs/QOS.md` §2.4 / §2.7。
+ *
+ * **各组交替进行**（每轮各跑一次），不是先跑完一组再跑下一组 —— 这样「时段」的影响
  * 会均匀落到每一组上。想比时段，就在两个时间点各跑一次，用 `RUN_TAG` 区分。
  *
  * 每个任务都记：组名、轮序号、**连接已存活多久**、**这条连接上跑过几个任务**、
@@ -39,6 +44,10 @@ const INPUT_RATE = Number(process.env['COSYVOICE_RATE'] ?? 1);
 const INPUT_PITCH = Number(process.env['COSYVOICE_PITCH'] ?? 1);
 const SAMPLE_RATE = 24_000;
 
+/** 第五组要开的 ASR 流：地址/模型默认值与生产一致（见 `src/qwen-realtime-asr.ts`） */
+const ASR_URL = process.env['ASR_URL'] ?? 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
+const ASR_MODEL = process.env['ASR_MODEL'] ?? 'qwen3-asr-flash-realtime';
+
 /** 每组跑几轮 */
 const ROUNDS = Number(process.env['ROUNDS'] ?? 60);
 /** 同一组里两轮之间的间隔 —— 真机上轮间隔 4–10 s（长尾那 4 轮落在 24/67/73/92 s） */
@@ -52,7 +61,7 @@ const RUN_TAG = process.env['RUN_TAG'] ?? '';
 const OUTPUT = process.env['OUTPUT'] ?? '';
 const SINGLE_TIMEOUT_MS = Number(process.env['TURN_TIMEOUT_MS'] ?? 30_000);
 
-const ALL_GROUPS = ['longconn', 'shortconn', 'realtext', 'quota'];
+const ALL_GROUPS = ['longconn', 'shortconn', 'realtext', 'quota', 'asr'];
 const GROUPS = (process.env['PROBE_GROUPS'] ?? ALL_GROUPS.join(','))
   .split(',')
   .map((g) => g.trim())
@@ -306,10 +315,111 @@ const summarise = () => {
   }
 };
 
-/** 长寿连接（`realtext` / `longconn` 共用一条） */
+/** 长寿连接（`realtext` / `longconn` / `asr` 共用一条） */
 const longConn = new Conn();
 /** `quota` 组的两条并行连接 */
 const quotaConns = [];
+
+/**
+ * 一条**一直在上行音频**的 ASR 流 —— 第五组的全部意义就是它。
+ *
+ * 为什么只差这一项：`20261121-113439` 与探针的对照里，连接寿命、任务数、文本、并发
+ * 任务、协议字段全部排掉了（见 `docs/QOS.md` §2.4 / §2.7），生产与探针之间**剩下的
+ * 唯一结构差异**就是「生产进程里同时有一条 ASR 长连接在 75 ms 一包地往上送」。
+ * 所以这一组把 TTS 和它一起跑：如果 TTS 的 `setup` 也跳到 ~335、或首包开始出现
+ * 0.9/2.0/3.9 s 三档，那两条疑案就都落在「多流同时上行」上。
+ *
+ * 音频用**静音**而不是真语音：我们量的不是识别结果，是「这条流占着上行」这件事
+ * 本身（带宽 + 包频 + 网关上的并发流数）。静音同样每 75 ms 一包，字节数一样。
+ */
+class AsrStream {
+  constructor() {
+    /** 建立（`session.updated`）花了多久 —— 它自己也可能被同样的机制拖慢 */
+    this.setupMs = -1;
+    /** 送出了多少包 / 字节，用来确认它真的在跑 */
+    this.packets = 0;
+    this.bytes = 0;
+    this.timer = null;
+    this.dirty = false;
+    this.ready = false;
+  }
+
+  /** 每条包长 = 75 ms × 16 kHz × 2 字节（和真机上行同一个节奏） */
+  static PACKET_BYTES = 75 * 16 * 2;
+
+  async open() {
+    const url = `${ASR_URL}?model=${encodeURIComponent(ASR_MODEL)}`;
+    this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${KEY}` } });
+    const sentAt = Date.now();
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { reject(new Error('ASR 建连超时')); }, 15_000);
+      this.ws.once('error', (e) => { clearTimeout(timer); reject(e); });
+      this.ws.once('open', () => {
+        this.ws.send(JSON.stringify({
+          type: 'session.update',
+          session: { modalities: ['text'], input_audio_format: 'pcm', turn_detection: null },
+        }));
+      });
+      this.ws.on('message', (data) => {
+        let msg;
+        try {
+          msg = JSON.parse(String(data));
+        } catch {
+          return;
+        }
+        if (msg?.type === 'session.updated') {
+          if (!this.ready) {
+            this.ready = true;
+            this.setupMs = Date.now() - sentAt;
+            clearTimeout(timer);
+            resolve();
+          }
+          return;
+        }
+        // 服务端自己也会回 `error`（比如空缓冲 commit），吃掉即可 —— 探针不为它中止
+        if (msg?.type === 'error') this.errors = (this.errors ?? 0) + 1;
+        if (msg?.type === 'conversation.item.input_audio_transcription.completed') {
+          this.commits = (this.commits ?? 0) + 1;
+        }
+      });
+    });
+    const silence = Buffer.alloc(AsrStream.PACKET_BYTES);
+    this.timer = setInterval(() => {
+      if (!this.ready) return;
+      this.ws.send(JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: silence.toString('base64'),
+      }));
+      this.packets += 1;
+      this.bytes += AsrStream.PACKET_BYTES;
+      this.dirty = true;
+    }, 75);
+    this.timer.unref?.();
+    // 每 5 s 封一次段：不封会一直攒在服务端缓冲里，封了才是「持续跑一轮一轮」的形态。
+    // 空缓冲 commit 会报 `maybe no invalid audio stream` —— 所以带 `dirty` 闸。
+    this.commitTimer = setInterval(() => {
+      if (!this.ready || !this.dirty) return;
+      this.dirty = false;
+      this.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    }, 5_000);
+    this.commitTimer.unref?.();
+  }
+
+  close() {
+    if (this.timer !== null) clearInterval(this.timer);
+    if (this.commitTimer !== null) clearInterval(this.commitTimer);
+    this.timer = null;
+    this.commitTimer = null;
+    try {
+      this.ws?.close();
+    } catch {
+      // 关不上就算了，进程要退了
+    }
+  }
+}
+
+/** 第五组用的那条 ASR 流（整组只开一条，和真机一样长期挂着） */
+let asrStream = null;
 
 const textsFor = (group, index) => {
   if (group === 'realtext') return REAL_TEXTS[index % REAL_TEXTS.length];
@@ -335,13 +445,12 @@ const runOne = async (group, index) => {
   const r = await longConn.runTask(text);
   record(group, index, text, r);
 };
-
 const main = async () => {
   console.log(
     `MODE=matrix RUN_TAG=${RUN_TAG === '' ? '（未设）' : RUN_TAG} 组=${GROUPS.join(',')}`
     + ` ROUNDS=${ROUNDS} GAP_MS=${GAP_MS} 开始 ${new Date().toISOString()}`,
   );
-  if (GROUPS.includes('longconn') || GROUPS.includes('realtext')) {
+  if (GROUPS.includes('longconn') || GROUPS.includes('realtext') || GROUPS.includes('asr')) {
     await longConn.open();
   }
   if (GROUPS.includes('quota')) {
@@ -350,6 +459,11 @@ const main = async () => {
       await c.open();
       quotaConns.push(c);
     }
+  }
+  if (GROUPS.includes('asr')) {
+    asrStream = new AsrStream();
+    await asrStream.open();
+    console.log(`ASR 流已建（建立 ${asrStream.setupMs} ms，每 75 ms 一包上行）`);
   }
   for (let index = 0; index < ROUNDS; index += 1) {
     // 交替：每轮把各组各跑一次，时段影响均匀落到每一组
@@ -361,6 +475,13 @@ const main = async () => {
   summarise();
   longConn.close();
   for (const c of quotaConns) c.close();
+  if (asrStream !== null) {
+    console.log(
+      `ASR 流收尾：${asrStream.packets} 包 / ${(asrStream.bytes / 1024).toFixed(0)} KB`
+      + ` / 封段 ${asrStream.commits ?? 0} 次 / 服务端 error ${asrStream.errors ?? 0} 次`,
+    );
+    asrStream.close();
+  }
   setTimeout(() => { process.exit(0); }, 200);
 };
 

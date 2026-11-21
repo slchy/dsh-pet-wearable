@@ -460,7 +460,10 @@
 两边也都「等 `task-started` 回来再送文本」。
 
 → **剩下的结构差异只有一个：生产进程里同时跑 ASR 长连接（75 ms 一包上行）+ LLM SSE +
-下行音频，探针是独立进程只连 TTS。** 这就是 `probe-cosyvoice-matrix.mjs` 还缺的第五组。
+下行音频，探针是独立进程只连 TTS。** 这就是 `probe-cosyvoice-matrix.mjs` 的第五组
+`asr`（已实现：75 ms 一包静音上行 + 长寿连接跑 TTS）。**跑完这一组就能定案**：
+`asr` 组也出 335 / 长尾 → 落在「多流同时上行」；`asr` 组仍然 0 → 生产那条链路上还有
+别的东西，回到双位置探针 + 重传计数去分。
 
 **顺带纠正一处旧说法**：`asr.error` 在这份档案里有 2 次（t=214.9 / 229.1 s），原文是
 `服务端错误: Error committing input audio buffer, maybe no invalid audio stream.`
