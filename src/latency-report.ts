@@ -99,7 +99,13 @@ export interface TurnLatency {
    * 这是 ASR 那侧的时间。**回放里它会膨胀 2 倍以上**（回放 446 / 真机 222），
    * 且与同一轮 TTS 的 `setup_ms` 同向 —— 见 `docs/QOS.md` §2.5。
    */
+  /** **①b** 封段 → 定稿（`asr.commit` → `asr.sentence`，ms）。
+   *
+   * 本句有多条 `asr.commit` 时为 `null`（说不清该从哪条算，见 `commitCount`）。
+   */
   readonly commitToFinalMs: number | null;
+  /** 本句窗口里有几条 `asr.commit`。>1 表示「封段之后又来了有声帧、又封了一次」*/
+  readonly commitCount: number;
   /** ② ASR 定稿 → 开跑一轮（ms） */
   readonly asrToTurn: number | null;
   /** ③ 开跑 → 首块音频（agent + TTS 首块，ms） */
@@ -406,6 +412,16 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     //
     // 往前找、到上一条 `asr.sentence` 为止：`asr.commit` 必然在它自己的定稿之前，
     // 而上一句的 commit 在上一句的定稿之前，越过 `asr.sentence` 就会抢到别人的。
+    // `commitAt` 取**最近的**一条 —— 它就是最可能触发这次定稿的那条。
+    //
+    // **可能找到不止一条**：`UtteranceAssembler.maybeCommit` 的守卫是「同一段语音只封
+    // 一次」（`lastVoicedAt <= commitFiredAt` 就不封），所以**封段之后又有新的有声帧**
+    // 就会再封一次。真机实测一句 2 条的比例：0/14（11:10）、2/18（03:15）、6/30（11:34）。
+    // 这时 `①b` 该从哪条算**说不清**：
+    // - 从最近一条算 → 43–261 ms（把二次封段前的等待抹掉了，明显偏小）
+    // - 从最早一条算 → ①a 会变成 −800…−4980（那条 commit 属于更早的碎片）
+    // 按 QOS 口径规则「缺数据记 null，不拿猜的冒充」→ 多条时 **①b 记 null**，只留条数。
+    let commitCount = 0;
     let commitAt = -1;
     for (let i = asrAt - 1; i > prevAt; i -= 1) {
       const ev = events[i];
@@ -416,8 +432,10 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
         break;
       }
       if (ev.ev === EVENTS.asrCommit) {
-        commitAt = i;
-        break;
+        commitCount += 1;
+        if (commitAt < 0) {
+          commitAt = i;
+        }
       }
     }
 
@@ -445,7 +463,10 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     // ① 的两段。缺 `asr.commit`（旧档案 / 主动播报）就都是 `null` —— 不拿 0 冒充。
     const commitEv = commitAt < 0 ? undefined : events[commitAt];
     const stopToCommitMs = stopAt === null || commitEv === undefined ? null : commitEv.t - stopAt;
-    const commitToFinalMs = commitEv === undefined || asrEv === undefined ? null : asrEv.t - commitEv.t;
+    // 多条 commit 时 ①b 说不清从哪条算（见上面的注释）→ 记 null，不猜
+    const commitToFinalMs = commitEv === undefined || asrEv === undefined || commitCount !== 1
+      ? null
+      : asrEv.t - commitEv.t;
     const asrToTurn = delta(events, at, asrAt);
     const turnToAudio = delta(events, firstAt, at);
     const playbackMs = delta(events, endAt, firstAt);
@@ -505,6 +526,7 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       silenceToAsr,
       stopToCommitMs,
       commitToFinalMs,
+      commitCount,
       asrToTurn,
       turnToAudio,
       firstWordMs,
@@ -708,7 +730,31 @@ export function formatStandard(turns: readonly TurnLatency[]): string {
     formatGroups('按判停是否等待', byWait),
     formatGroups('按台词类别', byText),
     extra,
+    formatCommitCount(turns),
   ].join('\n\n');
+}
+
+/**
+ * 一句被我们**封了不止一次段**的轮次有多少。
+ *
+ * `UtteranceAssembler.maybeCommit` 只在「封段之后又来了有声帧」时才二次封段，所以这
+ * 不是 bug，是「说完了 → 又出了点声」。它的问题是**①b 该从哪条 commit 算说不清**，
+ * 所以那些轮的 ①b 记 `null`（见 `computeTurns`）。这一行让它保持在视野里。
+ */
+function formatCommitCount(turns: readonly TurnLatency[]): string {
+  const multi = turns.filter((t) => t.commitCount > 1);
+  const none = turns.filter((t) => t.commitCount === 0);
+  return [
+    '### 封段次数',
+    '',
+    `- 一句封了 2 次及以上 **${multi.length} / ${turns.length}** 轮：`
+      + (multi.length === 0 ? '（无）' : multi.map((t) => `轮${t.turn}(${t.commitCount})`).join('、')),
+    `- 完全没有 \`asr.commit\` **${none.length} / ${turns.length}** 轮`
+      + '（旧档案，或这轮不是由我们控时封的）',
+    '',
+    '> 多条 commit 的轮次 **①b 记 `null`** —— 从最近一条算会偏小（43–261 ms），',
+    '> 从最早一条算 ①a 会变成负数（那条 commit 属于更早的碎片），两头的数都不可信。',
+  ].join('\n');
 }
 
 /** 把一个数字列成表格单元；`null` 显示为 `-`。 */

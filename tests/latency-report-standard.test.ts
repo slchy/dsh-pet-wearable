@@ -141,6 +141,27 @@ test('① 再拆两段：① = ①a + ①b（逐轮成立）', () => {
   assert.equal((t?.stopToCommitMs ?? 0) + (t?.commitToFinalMs ?? 0), t?.silenceToAsr);
 });
 
+test('一句封了两次段时 ①b 记 null：从两头算都是错的', () => {
+  // 11:34 场轮 27 的真实形状：66 ms 静音先封一次，之后又来了约 160 ms 有声帧，
+  // 47 ms 静音再封一次。从最后一条算 ①b=43（不可能），从第一条算 249。
+  const turns = archive([
+    [
+      ev(5000, 'gate.close', { gapMs: 2000 }), // 停嘴 = 3000
+      ev(3066, 'asr.commit', { silence_ms: 66, want_ms: 20 }),
+      ev(3206, 'asr.commit', { silence_ms: 47, want_ms: 20 }),
+      ev(3253, 'asr.sentence', { text: '猫和狗哪个？' }),
+      ev(3273, 'turn.start', {}),
+      ev(3873, 'tts.first', { ms: 600 }),
+      ev(4400, 'turn.end', { interrupted: false, dsh_ms: 180, path: 'fast' }),
+    ],
+  ]);
+  const t = turns[0];
+  assert.equal(t?.commitCount, 2, '条数要记下来，不然这种轮次是隐形的');
+  assert.equal(t?.commitToFinalMs, null, '说不清从哪条算 → null，不猜');
+  assert.equal(t?.stopToCommitMs, 206, '①a 取最近的一条（触发这次定稿的那条）');
+  assert.equal(t?.silenceToAsr, 253, '① 本身不受影响');
+});
+
 test('① 拆分不跨句抢 commit：本句没有 commit 就记 null，不拿上一句的顶替', () => {
   const turns = archive([
     turnWithCommit(1, 1000, { commit: 70, final: 230, open: 20, audio: 600 }),

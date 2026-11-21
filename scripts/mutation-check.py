@@ -90,6 +90,13 @@ MUTATIONS: list[Mutation] = [
     ),
     Mutation(
         REPORT,
+        "const commitToFinalMs = commitEv === undefined || asrEv === undefined || commitCount !== 1",
+        "const commitToFinalMs = commitEv === undefined || asrEv === undefined",
+        "多封段轮也照算 ①b（挑最近一条）",
+        "QOS 口径规则 5：多条 asr.commit 时 ①b 记 null —— 挑一条会把 249 算成 43",
+    ),
+    Mutation(
+        REPORT,
         "const usable = list.filter((t) => t.firstWordMs !== null);",
         "const usable = list.filter((t) => t.firstWordMs !== null && t.missing.length === 0);",
         "把「只缺 turn.end」的轮次也剔出分母",

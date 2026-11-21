@@ -92,6 +92,10 @@ gate.close ──①──▶ asr.sentence ──②──▶ turn.start ──�
     粒度是**上行包长**：75 ms 包实测 33–127，20 ms 包 19–39）；
     **①b `commitToFinalMs`** = `asr.commit` → `asr.sentence`（ASR 那侧）。
     `① = ①a + ①b` 逐轮成立。见 `docs/QOS.md` §2.5。
+  - **一句可能配到多条 `asr.commit`**：`maybeCommit` 只保证「同一段语音封一次」，封段
+    之后又来了有声帧就会再封（真机实测 0/14、2/18、6/30）。这时 ①b 说不清该从哪条算，
+    记 `null`，条数在 `commitCount`，`--standard` 末尾单列一行「封段次数」。
+    ①a / ① 不受影响。
   - **坏样本有两条判据**：`① < 0`（门配到了上一段语音）、`① > gapMs`（门落在定稿
     之前 = 抓到本句之外的门）。两条都会把 `firstWordMs` 降成 `null`。
 - ② `asrToTurn` 定稿 → 开跑（同进程排队 / 等判停收口）
