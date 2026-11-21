@@ -15,6 +15,7 @@ import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
 import { loopLagSnapshot } from './loop-lag.ts';
+import { diffNetCounters, netFields, readNetCounters } from './net-counters.ts';
 import type { DownlinkSink } from './transport.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 import type { DeviceCall } from './devices/primitives.ts';
@@ -388,6 +389,9 @@ export class TurnRunner {
    */
   async run(text: string, image?: ImageAttachment, note?: string): Promise<TurnResult | null> {
     const { fsm, agent, downlink } = this.options;
+    // 整机 TCP 计数器在本轮开始/结束时各读一次，增量落 `turn.end`：
+    // 把「多出来的 270 ms」分成「链路丢包」和「服务端内部慢」靠它（见 `net-counters.ts`）。
+    const netBefore = readNetCounters();
     const ticket = fsm.beginTurn();
     if (!ticket) {
       return null;
@@ -628,6 +632,11 @@ export class TurnRunner {
         // 「进程被卡了一下」这一种解释，可这条从来没有仪表。有了 max/p99 就能直接判：
         // 尖峰轮的 `loop_max_ms` 也大 → 是我们自己卡的，跟厂商无关。
         ...loopLagSnapshot(),
+        // 本轮整机 TCP 计数器增量。**出向**（`net_retrans` / `net_timeouts` /
+        // `net_lost_retrans`）算我们发出去的重传；**入向**（`net_ofo_queue` /
+        // `net_dsack`）是「厂商回我们的包丢了」的代理 —— 只看前者会把厂商侧重传
+        // 误判成「厂商应用层慢」。读不到时这些字段根本不出现，不是 0。
+        ...netFields(diffNetCounters(netBefore, readNetCounters())),
       });
 
       return {
@@ -641,7 +650,11 @@ export class TurnRunner {
       };
     } catch (error) {
       // 失败也留一条：否则报告里这一轮的 ④ 会显示"缺仪表"，与"没拿到音频"混在一起
-      this.options.onEvent?.(EVENTS.turnEnd, { failed: true, dsh_ms: agentLatencyMs });
+      this.options.onEvent?.(EVENTS.turnEnd, {
+        failed: true,
+        dsh_ms: agentLatencyMs,
+        ...netFields(diffNetCounters(netBefore, readNetCounters())),
+      });
       this.log(`  ✗ 本轮失败: ${(error as Error).message}`);
       return null;
     } finally {

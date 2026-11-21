@@ -149,6 +149,11 @@ export interface CosyVoiceOptions {
     readonly conn_idle_ms: number;
     /** 这条连接上**已经收尾**的 task 数（0 = 这是第一条） */
     readonly conn_tasks: number;
+    /**
+     * 对端 `IP:端口`。用来把 `setup_ms` 双峰（65 / 335）分成「落到不同节点」
+     * 和「同一节点状态差异」。取不到是空串。
+     */
+    readonly conn_peer: string;
   }) => void;
   /**
    * 流式 task 收尾时回调一次，带**分批送达明细**（`tts.done` 事件）。
@@ -293,6 +298,11 @@ class Connection {
   private failure: Error | null = null;
   /** 建连成功时刻（`performance.now()`），用来报首任务的 `conn_idle_ms` */
   private openedAt = 0;
+  /**
+   * 对端 IP:端口 —— `setup_ms` 双峰（65 / 335）要区分「两次 DNS 解析落到不同节点」
+   * 和「同一节点的状态差异」。没有它就只能猜。取不到记空串。
+   */
+  private peer = '';
   /** 本连接上最后一个 task 的 `task-finished` 时刻；0 = 还没跑完过任务 */
   private lastFinishedAt = 0;
   /** 本连接上已经收尾（`task-finished` / `task-failed`）的 task 数 */
@@ -365,6 +375,7 @@ class Connection {
       conn_new: conn === null ? null : conn.isNew,
       conn_idle_ms: conn === null ? -1 : conn.idleMs,
       conn_tasks: conn === null ? -1 : conn.tasks,
+      conn_peer: this.peer,
     });
   }
 
@@ -383,7 +394,15 @@ class Connection {
     this.onDone = onDone;
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
     this.ready = new Promise((resolve, reject) => {
-      this.ws.once('open', () => { this.openedAt = performance.now(); resolve(); });
+      this.ws.once('open', () => {
+        this.openedAt = performance.now();
+        // `ws` 不上层暴露对端地址，只能从底层 socket 拿（诊断用，取不到就算了）
+        const socket = (this.ws as unknown as { _socket?: { remoteAddress?: string; remotePort?: number } })._socket;
+        this.peer = socket?.remoteAddress === undefined
+          ? ''
+          : `${socket.remoteAddress}:${socket.remotePort ?? 0}`;
+        resolve();
+      });
       this.ws.once('error', (error: Error) => { reject(new CosyVoiceError(`连接失败: ${error.message}`)); });
     });
     // 连接级 error 在 open 之后还要继续接住，否则会变成未处理异常

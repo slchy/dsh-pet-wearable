@@ -45,7 +45,7 @@
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
-| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1007` | 无关首声（不在停嘴→出声路径上） | — |
+| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1026` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_SPECULATE` | 1 | —（开关） | `src/main.ts:560` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PREFETCH` | 1 | —（开关） | `src/main.ts:600` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PARTIAL_SPECULATE` | 1 | —（开关） | `src/main.ts:602` | 无关首声（不在停嘴→出声路径上） | — |
@@ -59,7 +59,7 @@
 |:---|:---:|:---|:---|:---|:---|
 | `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:39` | 无关首声（不在停嘴→出声路径上） | — |
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
-| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:322` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
+| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:332` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:70` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |
@@ -77,8 +77,8 @@
 | `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:66` | 无关首声（不在停嘴→出声路径上） | — |
 | `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:176` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
-| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:36` | 设备播报期间（轮询，不加延迟） | — |
-| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
+| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:37` | 设备播报期间（轮询，不加延迟） | — |
+| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:45` | 无关首声（不在停嘴→出声路径上） | — |
 | `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:105` | ASR 出句之后（兜底，正常不触发） | — |
 | `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:118` | ASR 出句之前 | — |
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:127` | 无关首声（不在停嘴→出声路径上） | — |
