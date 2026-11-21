@@ -147,6 +147,8 @@ export interface CosyVoiceOptions {
     readonly conn_new: boolean | null;
     /** run-task 发出时距上一个 task 的 `task-finished`（厂商自己说做完了）多久 */
     readonly conn_idle_ms: number;
+    /** 这条连接上**已经收尾**的 task 数（0 = 这是第一条） */
+    readonly conn_tasks: number;
   }) => void;
   /**
    * 流式 task 收尾时回调一次，带**分批送达明细**（`tts.done` 事件）。
@@ -293,6 +295,8 @@ class Connection {
   private openedAt = 0;
   /** 本连接上最后一个 task 的 `task-finished` 时刻；0 = 还没跑完过任务 */
   private lastFinishedAt = 0;
+  /** 本连接上已经收尾（`task-finished` / `task-failed`）的 task 数 */
+  private finishedTasks = 0;
   /** 探针时刻（记录**总是**做，console 那行才看 `COSYVOICE_TRACE`） */
   private traceSentAt = 0;
   private traceStartedAt = 0;
@@ -312,7 +316,7 @@ class Connection {
     /** 预开时用的语气 —— 开 task 时定死，这一轮的语气对不上就不能认领 */
     readonly emotion: Emotion;
     /** 预开发出 run-task 那一刻的连接状态（见 `connSnapshot`） */
-    readonly conn: { readonly isNew: boolean; readonly idleMs: number };
+    readonly conn: { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number };
   } | null = null;
   /** 预开的 task 到点没人认领就作废（探针实测空窗 4.5 s 内首包都持平，留 1.5 s 余量） */
   private static readonly PREWARM_TTL_MS = 3_000;
@@ -326,11 +330,16 @@ class Connection {
    * 的 `task-finished`**（厂商自己说「这个 task 做完了」，不是我们的 `tts.done`
    * —— 后者之后音频还在往下发）多久。首任务报距建连多久。
    */
-  private connSnapshot(sentAt: number): { readonly isNew: boolean; readonly idleMs: number } {
+  private connSnapshot(sentAt: number): { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number } {
+    const tasks = this.finishedTasks;
     if (this.lastFinishedAt === 0) {
-      return { isNew: true, idleMs: this.openedAt === 0 ? -1 : Math.round(sentAt - this.openedAt) };
+      return {
+        isNew: true,
+        idleMs: this.openedAt === 0 ? -1 : Math.round(sentAt - this.openedAt),
+        tasks,
+      };
     }
-    return { isNew: false, idleMs: Math.round(sentAt - this.lastFinishedAt) };
+    return { isNew: false, idleMs: Math.round(sentAt - this.lastFinishedAt), tasks };
   }
 
   /**
@@ -344,7 +353,7 @@ class Connection {
     stream: boolean,
     prewarmed: boolean,
     feed = Number.NaN,
-    conn: { readonly isNew: boolean; readonly idleMs: number } | null = null,
+    conn: { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number } | null = null,
   ): void {
     if (this.onTask === undefined) return;
     this.onTask({
@@ -355,6 +364,7 @@ class Connection {
       prewarmed,
       conn_new: conn === null ? null : conn.isNew,
       conn_idle_ms: conn === null ? -1 : conn.idleMs,
+      conn_tasks: conn === null ? -1 : conn.tasks,
     });
   }
 
@@ -406,6 +416,7 @@ class Connection {
       }
       if (event === 'task-finished') {
         this.lastFinishedAt = performance.now();
+        this.finishedTasks += 1;
         this.sink = null;
         this.settleTask(taskId, null);
         return;
@@ -414,6 +425,7 @@ class Connection {
         const detail = message.header?.error_message ?? message.header?.error_code ?? '未知错误';
         this.failure = new CosyVoiceError(`合成失败: ${detail}`);
         this.lastFinishedAt = performance.now();
+        this.finishedTasks += 1;
         this.sink = null;
         this.settleTask(taskId, this.failure);
       }
@@ -569,7 +581,7 @@ class Connection {
     readonly taskId: string;
     readonly sentAt: number;
     readonly startedAt: number;
-    readonly conn: { readonly isNew: boolean; readonly idleMs: number };
+    readonly conn: { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number };
   } | null {
     const picked = this.pending;
     this.pending = null;
