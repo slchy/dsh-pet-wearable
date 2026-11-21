@@ -138,6 +138,15 @@ export interface CosyVoiceOptions {
     readonly stream: boolean;
     /** 这一趟是不是认领了 `prewarm()` 预开的 task（判「预热省没省下来」就看它） */
     readonly prewarmed: boolean;
+    /**
+     * 这条 task 是不是**这条连接上的第一个**（还没有 task 收尾过）。
+     *
+     * 与 `conn_idle_ms` 一起用来切开「`setup_ms` 300+ 是连接状态」和「是厂商侧
+     * 处理」。旧档案没有这两个字段 → `null` / `-1`。
+     */
+    readonly conn_new: boolean | null;
+    /** run-task 发出时距上一个 task 的 `task-finished`（厂商自己说做完了）多久 */
+    readonly conn_idle_ms: number;
   }) => void;
   /**
    * 流式 task 收尾时回调一次，带**分批送达明细**（`tts.done` 事件）。
@@ -280,6 +289,10 @@ class Connection {
   /** 等 `task-finished` / `task-failed` 的等待者，按 task_id 分槽 */
   private readonly settleWaiters = new Map<string, (error: Error | null) => void>();
   private failure: Error | null = null;
+  /** 建连成功时刻（`performance.now()`），用来报首任务的 `conn_idle_ms` */
+  private openedAt = 0;
+  /** 本连接上最后一个 task 的 `task-finished` 时刻；0 = 还没跑完过任务 */
+  private lastFinishedAt = 0;
   /** 探针时刻（记录**总是**做，console 那行才看 `COSYVOICE_TRACE`） */
   private traceSentAt = 0;
   private traceStartedAt = 0;
@@ -298,10 +311,27 @@ class Connection {
     readonly startedAt: number;
     /** 预开时用的语气 —— 开 task 时定死，这一轮的语气对不上就不能认领 */
     readonly emotion: Emotion;
+    /** 预开发出 run-task 那一刻的连接状态（见 `connSnapshot`） */
+    readonly conn: { readonly isNew: boolean; readonly idleMs: number };
   } | null = null;
   /** 预开的 task 到点没人认领就作废（探针实测空窗 4.5 s 内首包都持平，留 1.5 s 余量） */
   private static readonly PREWARM_TTL_MS = 3_000;
   private warmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * run-task 发出那一刻的连接状态。
+   *
+   * 用来切开「`setup_ms` 300+ 是连接状态造成」和「是厂商侧处理造成」：
+   * `conn_new` = 这条连接上还没有 task 收尾过；`conn_idle_ms` = 距**上一个 task
+   * 的 `task-finished`**（厂商自己说「这个 task 做完了」，不是我们的 `tts.done`
+   * —— 后者之后音频还在往下发）多久。首任务报距建连多久。
+   */
+  private connSnapshot(sentAt: number): { readonly isNew: boolean; readonly idleMs: number } {
+    if (this.lastFinishedAt === 0) {
+      return { isNew: true, idleMs: this.openedAt === 0 ? -1 : Math.round(sentAt - this.openedAt) };
+    }
+    return { isNew: false, idleMs: Math.round(sentAt - this.lastFinishedAt) };
+  }
 
   /**
    * 把这一次 task 的两段耗时交给宿主（`tts.task` 事件，常开）。
@@ -314,6 +344,7 @@ class Connection {
     stream: boolean,
     prewarmed: boolean,
     feed = Number.NaN,
+    conn: { readonly isNew: boolean; readonly idleMs: number } | null = null,
   ): void {
     if (this.onTask === undefined) return;
     this.onTask({
@@ -322,6 +353,8 @@ class Connection {
       feed_ms: Number.isFinite(feed) ? Math.round(feed) : -1,
       stream,
       prewarmed,
+      conn_new: conn === null ? null : conn.isNew,
+      conn_idle_ms: conn === null ? -1 : conn.idleMs,
     });
   }
 
@@ -340,7 +373,7 @@ class Connection {
     this.onDone = onDone;
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
     this.ready = new Promise((resolve, reject) => {
-      this.ws.once('open', () => { resolve(); });
+      this.ws.once('open', () => { this.openedAt = performance.now(); resolve(); });
       this.ws.once('error', (error: Error) => { reject(new CosyVoiceError(`连接失败: ${error.message}`)); });
     });
     // 连接级 error 在 open 之后还要继续接住，否则会变成未处理异常
@@ -372,6 +405,7 @@ class Connection {
         this.wakeStarted(taskId);
       }
       if (event === 'task-finished') {
+        this.lastFinishedAt = performance.now();
         this.sink = null;
         this.settleTask(taskId, null);
         return;
@@ -379,6 +413,7 @@ class Connection {
       if (event === 'task-failed') {
         const detail = message.header?.error_message ?? message.header?.error_code ?? '未知错误';
         this.failure = new CosyVoiceError(`合成失败: ${detail}`);
+        this.lastFinishedAt = performance.now();
         this.sink = null;
         this.settleTask(taskId, this.failure);
       }
@@ -510,7 +545,7 @@ class Connection {
       });
       this.startedWaiters.delete(taskId);
       if (!started) return false;
-      this.pending = { taskId, sentAt, startedAt: performance.now(), emotion: opts.emotion };
+      this.pending = { taskId, sentAt, startedAt: performance.now(), emotion: opts.emotion, conn: this.connSnapshot(sentAt) };
       // 到点没人要：**不能** finish-task（空 task 会被服务端判非法，之后整条连接
       // 静默挂死），只能弃连接。定时器挂在这里而不是工厂里，才不会出现「预开了却
       // 没有回收」的窗口。
@@ -530,7 +565,12 @@ class Connection {
   }
 
   /** 认领预开的 task；没有（或连接已经不可用）就给 `null` */
-  takePending(): { readonly taskId: string; readonly sentAt: number; readonly startedAt: number } | null {
+  takePending(): {
+    readonly taskId: string;
+    readonly sentAt: number;
+    readonly startedAt: number;
+    readonly conn: { readonly isNew: boolean; readonly idleMs: number };
+  } | null {
     const picked = this.pending;
     this.pending = null;
     this.clearWarmTimer();
@@ -590,6 +630,7 @@ class Connection {
     this.traceSentAt = adopted?.sentAt ?? performance.now();
     this.traceStartedAt = adopted?.startedAt ?? 0;
     this.traceFirstAt = null;
+    const connState = adopted?.conn ?? this.connSnapshot(this.traceSentAt);
     const probed = (chunk: Buffer): void => {
       if (this.traceFirstAt === null) {
         this.traceFirstAt = performance.now();
@@ -601,7 +642,7 @@ class Connection {
             + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
           );
         }
-        this.reportTask(setup, first, false, adopted !== null);  // 非流式没有「供给」段
+        this.reportTask(setup, first, false, adopted !== null, Number.NaN, connState);  // 非流式没有「供给」段
       }
       onChunk(chunk);
     };
@@ -702,6 +743,7 @@ class Connection {
     // 认领了预开的 task 时起点仍是当初那一趟 run-task（理由同 `run`）
     const sentAt = adopted?.sentAt ?? performance.now();
     this.traceStartedAt = adopted?.startedAt ?? 0;
+    const connState = adopted?.conn ?? this.connSnapshot(sentAt);
     let firstTextAt = 0;
     let lastTextAt = 0;
     let reported = false;
@@ -728,7 +770,7 @@ class Connection {
             + `首包 ${firstMs.toFixed(0)} ms（流式：首包自首批文本送出起算）`,
           );
         }
-        this.reportTask(setupMs, firstMs, true, adopted !== null, feedMs);
+        this.reportTask(setupMs, firstMs, true, adopted !== null, feedMs, connState);
       }
       onChunk(chunk);
     };

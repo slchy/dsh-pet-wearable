@@ -45,7 +45,7 @@
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
-| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:953` | 无关首声（不在停嘴→出声路径上） | — |
+| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:995` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_SPECULATE` | 1 | —（开关） | `src/main.ts:560` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PREFETCH` | 1 | —（开关） | `src/main.ts:600` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PARTIAL_SPECULATE` | 1 | —（开关） | `src/main.ts:602` | 无关首声（不在停嘴→出声路径上） | — |
@@ -59,7 +59,7 @@
 |:---|:---:|:---|:---|:---|:---|
 | `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:39` | 无关首声（不在停嘴→出声路径上） | — |
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
-| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:303` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
+| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:318` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:70` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |

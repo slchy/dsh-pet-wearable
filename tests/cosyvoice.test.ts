@@ -249,8 +249,31 @@ test('整段合成：正常念完的连接要复用（弃连接只发生在中�
   }
 });
 
-test('预开：流式合成认领那条 task，不再发第二个 run-task', { timeout: 5000 }, async () => {
+test('tts.task 带连接状态：首任务标 new，复用任务报距上次收尾多久', { timeout: 5000 }, async () => {
   const server = await fakeCosyVoice();
+  const tasks: { conn_new: boolean | null; conn_idle_ms: number }[] = [];
+  try {
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      onTask: (info) => { tasks.push({ conn_new: info.conn_new, conn_idle_ms: info.conn_idle_ms }); },
+    });
+    for (const text of ['第一句。', '第二句。']) {
+      for await (const chunk of tts.synthesize(text)) void chunk;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(tasks.length, 2);
+    assert.equal(tasks[0]!.conn_new, true, '第一条 task 是新连接上的');
+    assert.ok(tasks[0]!.conn_idle_ms >= 0, `首任务应报距建连多久：${tasks[0]!.conn_idle_ms}`);
+    assert.equal(tasks[1]!.conn_new, false, '第二条 task 复用了同一条连接');
+    // 两条之间有 50 ms 的等待，加上收尾时间，间隔应当明显大于 0
+    assert.ok(tasks[1]!.conn_idle_ms >= 40, `应报距上一次 task-finished 多久：${tasks[1]!.conn_idle_ms}`);
+  } finally {
+    await server.close();
+  }
+});
+
+test('预开：流式合成认领那条 task，不再发第二个 run-task', { timeout: 5000 }, async () => {  const server = await fakeCosyVoice();
   const tasks: { prewarmed: boolean; setup_ms: number }[] = [];
   try {
     const tts = cosyVoiceTts({
