@@ -23,6 +23,12 @@ import { execFile } from 'node:child_process';
 
 /** 一条连接的自述。地址不带端口时是空串。 */
 export interface SocketStat {
+  /**
+   * 本端 `IP:端口`。**必须留着**：同一个对端会有多条连接（重连），只按对端汇总会在
+   * 换代那一刻算出**负增量**（2026-11-21 实测踩过：`220.197.201.66 −3`）。
+   * 按 `local` 识别 socket 才做得对。
+   */
+  readonly local: string;
   /** 对端 `IP:端口`（出向连接用；入向连接这是我们的客户端地址） */
   readonly peer: string;
   /** 这条连接累计重传了多少段 —— 关键字段，>0 才说明它丢过包 */
@@ -53,6 +59,7 @@ export function parseSsOutput(text: string): SocketStat[] {
     if (/^(?:State|Recv-Q)\b/.test(head)) continue;
     const addrs = head.trim().split(/\s+/).filter((t) => ADDR.test(t));
     if (addrs.length < 2) continue;
+    const local = addrs[0] ?? '';
     const peer = addrs[1] ?? '';
     const metrics = lines.slice(1).join(' ');
     const num = (re: RegExp): number | null => {
@@ -60,6 +67,7 @@ export function parseSsOutput(text: string): SocketStat[] {
       return m?.[1] === undefined ? null : Number.parseInt(m[1], 10);
     };
     out.push({
+      local,
       peer,
       // `retrans:0/12` —— 斜杠后面是「连当前这次在内的总重传次数」，取后者
       retrans: (() => {

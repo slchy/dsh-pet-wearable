@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+﻿import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseSsOutput } from '../src/socket-stats.ts';
 
@@ -32,7 +32,7 @@ test('带 state 过滤的输出（无状态列）也要解析出来 —— 这�
   const out = parseSsOutput(SS_FILTERED);
   assert.equal(out.length, 2, '过滤模式下没有 ESTAB 列，不能拿状态列当判据');
   assert.deepEqual(out[0], {
-    peer: '203.0.113.49:443', retrans: 0, rto: 256, rtt: 56, unacked: 0,
+    local: '10.0.0.8:32986', peer: '203.0.113.49:443', retrans: 0, rto: 256, rtt: 56, unacked: 0,
   });
   assert.equal(out[1]?.retrans, 1);
   assert.equal(out[1]?.unacked, 1460);
@@ -42,11 +42,11 @@ test('按块解析：对端地址、retrans（取斜杠后面那个总数）、r
   const out = parseSsOutput(SS);
   assert.equal(out.length, 3);
   assert.deepEqual(out[0], {
-    peer: '203.0.113.24:443', retrans: 2, rto: 246, rtt: 45, unacked: 3,
+    local: '10.0.0.8:41234', peer: '203.0.113.24:443', retrans: 2, rto: 246, rtt: 45, unacked: 3,
   });
   assert.equal(out[1]?.retrans, 14, '`retrans:1/14` 的 14 是这条连接累计重传次数');
   assert.deepEqual(out[2], {
-    peer: '198.51.100.82:51122', retrans: 388, rto: 204, rtt: 12, unacked: 1460,
+    local: '10.0.0.8:63993', peer: '198.51.100.82:51122', retrans: 388, rto: 204, rtt: 12, unacked: 1460,
   }, '手机那条：388 次重传 + 1460 字节没被确认 —— 这才是「整机 388」可能的真身');
 });
 
