@@ -100,6 +100,78 @@ test('① < 0 的样本自动降成 null 并记账（不靠人眼剔除）', () 
   assert.equal(groups[0]?.p50, null, '没有可用样本时给 null，不给 0');
 });
 
+/**
+ * 造一轮**带 `asr.commit`** 的：① 可以再拆成「停嘴→封段」和「封段→定稿」。
+ *
+ * @param segs.commit - 停嘴后多久封段（真机受上行包长量化，66–127；20 ms 包 19–39）
+ * @param segs.final - 封段后多久出定稿（ASR 那侧的时间）
+ */
+function turnWithCommit(
+  n: number,
+  stopAt: number,
+  segs: { commit: number; final: number; open: number; audio: number },
+  extra: { text?: string; path?: string } = {},
+): string[] {
+  const commitAt = stopAt + segs.commit;
+  const asrAt = commitAt + segs.final;
+  const openAt = asrAt + segs.open;
+  const audioAt = openAt + segs.audio;
+  const gap = 2000;
+  return [
+    ev(stopAt + gap, 'gate.close', { gapMs: gap }),
+    ev(commitAt, 'asr.commit', { silence_ms: segs.commit, want_ms: 20 }),
+    ev(asrAt, 'asr.sentence', { text: extra.text ?? `第${n}句。` }),
+    ev(openAt, 'turn.start', {}),
+    ev(audioAt, 'tts.first', { ms: segs.audio }),
+    ev(audioAt + 500, 'turn.end', {
+      interrupted: false,
+      dsh_ms: 180,
+      loop_max_ms: 3,
+      path: extra.path ?? 'fast',
+    }),
+  ];
+}
+
+test('① 再拆两段：① = ①a + ①b（逐轮成立）', () => {
+  const turns = archive([turnWithCommit(1, 1000, { commit: 70, final: 230, open: 20, audio: 600 })]);
+  const t = turns[0];
+  assert.equal(t?.stopToCommitMs, 70, '①a 停嘴→封段');
+  assert.equal(t?.commitToFinalMs, 230, '①b 封段→定稿');
+  assert.equal(t?.silenceToAsr, 300, '① 本身不变');
+  assert.equal((t?.stopToCommitMs ?? 0) + (t?.commitToFinalMs ?? 0), t?.silenceToAsr);
+});
+
+test('① 拆分不跨句抢 commit：本句没有 commit 就记 null，不拿上一句的顶替', () => {
+  const turns = archive([
+    turnWithCommit(1, 1000, { commit: 70, final: 230, open: 20, audio: 600 }),
+    turn(2, 6000, { asr: 300, open: 20, audio: 600 }), // 旧档案：没有 asr.commit
+  ]);
+  assert.equal(turns[0]?.commitToFinalMs, 230);
+  assert.equal(turns[1]?.stopToCommitMs, null, '缺 asr.commit 时必须是 null，不能拿 0 冒充');
+  assert.equal(turns[1]?.commitToFinalMs, null);
+  assert.equal(turns[1]?.silenceToAsr, 300, '缺 commit 不影响 ① 本身');
+});
+
+test('① > gapMs 也是坏样本（门落在定稿之前 = 抓到了本句之外的门）', () => {
+  // 回放 20261121-101318 轮 10 的真实形状：门比定稿早 658 ms，于是
+  // ① = 2000 + 658（`gapMs` 只有 2000）。① 不可能超过 `gapMs` —— 因为属于本句的门
+  // 必然晚于定稿；超过它只说明配对抓错了门。这条以前被当成真值，把 p50 抬到 1328。
+  const bad = [
+    ev(942, 'gate.close', { gapMs: 2000 }),
+    ev(1000, 'asr.sentence', { text: '门抓错的一句。' }),
+    ev(1300, 'turn.start', {}),
+    ev(1900, 'tts.first', { ms: 600 }),
+    ev(2400, 'turn.end', { interrupted: false, dsh_ms: 100, path: 'fast' }),
+  ];
+  const turns = computeTurns(parseEvents(bad.join('\n')));
+  assert.equal(turns[0]?.silenceToAsr, 2058);
+  assert.equal(turns[0]?.badSample, true, '① > gapMs = 算错了，不是「很慢」');
+  assert.equal(turns[0]?.firstWordMs, null);
+  const groups = groupBy(turns, () => 'all');
+  assert.equal(groups[0]?.count, 0, '坏样本不进分母');
+  assert.equal(groups[0]?.bad, 1);
+});
+
 test('按车道分组：两条车道不许混在一起算 p50', () => {
   const turns = archive([
     turn(1, 1000, { asr: 300, open: 0, audio: 600 }, { path: 'fast' }),

@@ -69,10 +69,17 @@ class Mutation:
 MUTATIONS: list[Mutation] = [
     Mutation(
         REPORT,
-        "const badSample = silenceToAsr !== null && silenceToAsr < 0;",
-        "const badSample = silenceToAsr !== null && silenceToAsr <= 0;",
+        "const badSample = (silenceToAsr !== null && silenceToAsr < 0) || impossibleA1;",
+        "const badSample = (silenceToAsr !== null && silenceToAsr <= 0) || impossibleA1;",
         "坏样本判据 < 改 <=",
         "QOS 口径规则 3：①=0 是合法的（ASR 与停嘴同一毫秒），不能算坏样本",
+    ),
+    Mutation(
+        REPORT,
+        "const badSample = (silenceToAsr !== null && silenceToAsr < 0) || impossibleA1;",
+        "const badSample = silenceToAsr !== null && silenceToAsr < 0;",
+        "去掉「① > gapMs」这条判据",
+        "门落在定稿之前时 ① 会算成 2658（实测把回放 p50 从 1189 抬到 1328）",
     ),
     Mutation(
         REPORT,

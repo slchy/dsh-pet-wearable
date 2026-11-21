@@ -84,8 +84,22 @@ export type MissingMark = typeof EVENTS.gateClose | typeof EVENTS.asrSentence | 
 export interface TurnLatency {
   /** 第几轮，从 1 开始，按 `turn.start` 出现顺序 */
   readonly turn: number;
-  /** ① 静音判停 → ASR 定稿一句（ms） */
+  /** ① 静音判停 → ASR 定稿一句（ms）= `stopToCommitMs` + `commitToFinalMs` */
   readonly silenceToAsr: number | null;
+  /**
+   * **①a** 用户停嘴 → 封段（`asr.commit`，我们这侧决定「这句说完了」，ms）。
+   *
+   * 这一段由**上行包长**决定：门槛 `VOICE_COMMIT_MS` 比的是墙上时间、包内尾部静音
+   * 不参与计时，所以真正的粒度是一整个上行包（75 ms 包实测中位 66，20 ms 包 20）。
+   */
+  readonly stopToCommitMs: number | null;
+  /**
+   * **①b** 封段 → 定稿（`asr.commit` → `asr.sentence`，ms）。
+   *
+   * 这是 ASR 那侧的时间。**回放里它会膨胀 2 倍以上**（回放 446 / 真机 222），
+   * 且与同一轮 TTS 的 `setup_ms` 同向 —— 见 `docs/QOS.md` §2.5。
+   */
+  readonly commitToFinalMs: number | null;
   /** ② ASR 定稿 → 开跑一轮（ms） */
   readonly asrToTurn: number | null;
   /** ③ 开跑 → 首块音频（agent + TTS 首块，ms） */
@@ -388,6 +402,25 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       usedGates.add(gateAt);
     }
 
+    // ① 再拆一段：`asr.commit` = 我们这侧「这句说完了」的时刻（判停 → 要定稿）。
+    //
+    // 往前找、到上一条 `asr.sentence` 为止：`asr.commit` 必然在它自己的定稿之前，
+    // 而上一句的 commit 在上一句的定稿之前，越过 `asr.sentence` 就会抢到别人的。
+    let commitAt = -1;
+    for (let i = asrAt - 1; i > prevAt; i -= 1) {
+      const ev = events[i];
+      if (ev === undefined) {
+        continue;
+      }
+      if (ev.ev === EVENTS.asrSentence) {
+        break;
+      }
+      if (ev.ev === EVENTS.asrCommit) {
+        commitAt = i;
+        break;
+      }
+    }
+
     // ③④ 的终点：本轮范围内
     let firstAt = -1;
     for (let i = at; i < nextAt; i += 1) {
@@ -409,6 +442,10 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     const asrEv = asrAt < 0 ? undefined : events[asrAt];
     const firstEv = firstAt < 0 ? undefined : events[firstAt];
     const silenceToAsr = stopAt === null || asrEv === undefined ? null : asrEv.t - stopAt;
+    // ① 的两段。缺 `asr.commit`（旧档案 / 主动播报）就都是 `null` —— 不拿 0 冒充。
+    const commitEv = commitAt < 0 ? undefined : events[commitAt];
+    const stopToCommitMs = stopAt === null || commitEv === undefined ? null : commitEv.t - stopAt;
+    const commitToFinalMs = commitEv === undefined || asrEv === undefined ? null : asrEv.t - commitEv.t;
     const asrToTurn = delta(events, at, asrAt);
     const turnToAudio = delta(events, firstAt, at);
     const playbackMs = delta(events, endAt, firstAt);
@@ -421,8 +458,19 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
      * 这种样本不能进统计：它不是「延迟很小」，是**算错了**。按 `QOS.md` 口径规则 3
      * 「坏样本自动剔除，不靠人眼」—— 这里直接把它降成 `null`，让下游分组表自动
      * 把它从分母里摘掉，同时 `badSample` 留痕，报告能显示「有几轮被剔除」。
+     *
+     * 第二条判据：**① 不可能大于 `gapMs`。** ① = `gapMs` − (`gate.t` − `asr.t`)，
+     * 而属于本句的门必然**晚于**定稿（门要 `holdMs` 才关，ASR 静音只要 0.8 s），
+     * 所以 `gate.t ≥ asr.t` ⇒ ① ≤ `gapMs`。超过它只有一个解释：配对抓到了
+     * **本句之前**的门（旧档案回退那条路）。
+     *
+     * 实测样本：回放 `20261121-101318` 轮 10，门比定稿早 658 ms → ① 算成 2658，
+     * 而该轮 `gapMs` 只有 2000。这种样本此前被当成真值，把整份回放的 p50 从
+     * 1189 抬到 1328。
      */
-    const badSample = silenceToAsr !== null && silenceToAsr < 0;
+    const gateGap = gateAt < 0 ? null : (num(events[gateAt]?.gapMs) ?? null);
+    const impossibleA1 = silenceToAsr !== null && gateGap !== null && silenceToAsr > gateGap;
+    const badSample = (silenceToAsr !== null && silenceToAsr < 0) || impossibleA1;
     const firstWordMs = badSample ? null : rawFirstWord;
 
     const missing: MissingMark[] = [];
@@ -455,6 +503,8 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     out.push({
       turn: n + 1,
       silenceToAsr,
+      stopToCommitMs,
+      commitToFinalMs,
       asrToTurn,
       turnToAudio,
       firstWordMs,
@@ -546,6 +596,9 @@ export interface GroupSummary {
   readonly seg1: number | null;
   readonly seg2: number | null;
   readonly seg3: number | null;
+  /** ① 的两段中位：停嘴→封段、封段→定稿（缺 `asr.commit` 的档案为 `null`） */
+  readonly seg1a: number | null;
+  readonly seg1b: number | null;
 }
 
 /**
@@ -597,6 +650,8 @@ export function groupBy(
       seg1: summarize(usable.map((t) => t.silenceToAsr)).median,
       seg2: summarize(usable.map((t) => t.asrToTurn)).median,
       seg3: summarize(usable.map((t) => t.turnToAudio)).median,
+      seg1a: summarize(usable.map((t) => t.stopToCommitMs)).median,
+      seg1b: summarize(usable.map((t) => t.commitToFinalMs)).median,
     });
   }
   return out;
@@ -610,19 +665,21 @@ export function formatGroups(title: string, groups: readonly GroupSummary[]): st
   const lines = [
     `### ${title}`,
     '',
-    '| 分组 | 可算 / 总轮 | p50 | p90 | 最大 | 慢轮(>1500) | ① | ② | ③ |',
-    '|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|',
+    '| 分组 | 可算 / 总轮 | p50 | p90 | 最大 | 慢轮(>1500) | ① | ①a 停嘴→封段 | ①b 封段→定稿 | ② | ③ |',
+    '|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|',
   ];
   for (const g of groups) {
     const ratio = g.bad === 0 ? `${g.count}/${g.total}` : `${g.count}/${g.total}（坏样本 ${g.bad}）`;
     const slow = `${g.slow}${g.count === 0 ? '' : ` (${Math.round((g.slow / g.count) * 100)}%)`}`;
     lines.push(
       `| ${g.label} | ${ratio} | ${cell(g.p50)} | ${cell(g.p90)} | ${cell(g.max)} | ${slow} `
-      + `| ${cell(g.seg1)} | ${cell(g.seg2)} | ${cell(g.seg3)} |`,
+      + `| ${cell(g.seg1)} | ${cell(g.seg1a)} | ${cell(g.seg1b)} | ${cell(g.seg2)} | ${cell(g.seg3)} |`,
     );
   }
   lines.push('');
   lines.push('> ① ② ③ 是**各段自己的中位**，只用来对份额，**不许相加**（相加 ≠ p50）。');
+  lines.push('> ①a / ①b 是 ① 的两段：① = ①a + ①b（逐轮成立，中位不成立）。');
+  lines.push('> ①a 的粒度是**上行包长**，①b 是 ASR 那侧的时间；回放里 ①b 会膨胀（见 `QOS.md` §2.5）。');
   return lines.join('\n');
 }
 

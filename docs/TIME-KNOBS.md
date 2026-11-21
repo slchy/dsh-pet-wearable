@@ -64,9 +64,9 @@
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:70` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_KEEPALIVE_MS` | 50000 | wall（连接空闲） | `src/http-agent.ts:27` | 无关首声（不在停嘴→出声路径上） | — |
-| `WAITED_THRESHOLD_MS` | 100 | —（统计判据） | `src/latency-report.ts:165` | 无（报告分组门槛，不参与调度） | — |
-| `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:526` | 无（它是报警线，不约束任何环节） | — |
-| `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:529` | 无（报告里的「慢轮」门槛） | — |
+| `WAITED_THRESHOLD_MS` | 100 | —（统计判据） | `src/latency-report.ts:179` | 无（报告分组门槛，不参与调度） | — |
+| `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:576` | 无（它是报警线，不约束任何环节） | — |
+| `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:579` | 无（报告里的「慢轮」门槛） | — |
 | `RESOLUTION_MS` | 25 | wall | `src/loop-lag.ts:29` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio | `src/main.ts:378` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_POLL_MS` | 60000 | wall | `src/pet/battery-cache.ts:20` | 无关首声（不在停嘴→出声路径上） | — |
