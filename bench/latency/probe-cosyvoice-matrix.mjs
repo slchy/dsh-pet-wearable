@@ -269,6 +269,7 @@ const record = (group, index, text, r) => {
     finish: r.finish,
     bytes: r.bytes,
     error: r.error,
+    ...(r.asrPackets === undefined ? {} : { asrPackets: r.asrPackets, asrBytes: r.asrBytes }),
   };
   results.push(row);
   const flag = r.error === null && r.first > 900 ? '  ← 长尾' : '';
@@ -304,6 +305,16 @@ const summarise = () => {
         : `  长尾轮的连接# ${slow.map((r) => r.connTasks).join(',')}`
           + `  年龄 ${slow.map((r) => Math.round(r.connAgeMs / 1000)).join(',')}s`),
     );
+    if (group === 'asr') {
+      const withStream = ok.filter((r) => r.asrPackets !== undefined && r.asrPackets > 0);
+      console.log(
+        `          同时上行的 ASR 流：${withStream.length}/${ok.length} 轮有流`
+        + (withStream.length === 0
+          ? '  ← 没有一条真在跑，这一组的结论不成立'
+          : `  每轮 ${Math.round(withStream.reduce((a, r) => a + r.asrPackets, 0) / withStream.length)} 包`
+            + ` / ${Math.round(withStream.reduce((a, r) => a + r.asrBytes, 0) / withStream.length / 1024)} KB`),
+      );
+    }
   }
   const longSlow = results.filter((r) => r.group === 'longconn' && r.error === null && r.first > 900);
   if (longSlow.length > 0) {
@@ -418,8 +429,7 @@ class AsrStream {
   }
 }
 
-/** 第五组用的那条 ASR 流（整组只开一条，和真机一样长期挂着） */
-let asrStream = null;
+/** 第五组用的那条 ASR 流：**每条 `asr` 轮独立开关**（见 `runOne`） */
 
 const textsFor = (group, index) => {
   if (group === 'realtext') return REAL_TEXTS[index % REAL_TEXTS.length];
@@ -442,6 +452,20 @@ const runOne = async (group, index) => {
     rs.forEach((r) => { record(group, index, text, r); });
     return;
   }
+  if (group === 'asr') {
+    // **每条 asr 轮开一条、跑完就关**：整组共用一条会把同一场里的对照组也污染
+    // （第一版就是这样，`asr` 和 `longconn` 4 个样本全是「带 ASR 流」，比不出差别）。
+    // 逐轮开关才能在同一分钟里做成配对对照。
+    const stream = new AsrStream();
+    await stream.open();
+    // 先把上行跑起来再发 run-task：要量的是「TTS 在一条已经在跑的音频流旁边」，
+    // 不是「TTS 和一条刚开始建连的流抢带宽」。
+    await sleep(1_500);
+    const r = await longConn.runTask(text);
+    record(group, index, text, { ...r, asrPackets: stream.packets, asrBytes: stream.bytes });
+    stream.close();
+    return;
+  }
   const r = await longConn.runTask(text);
   record(group, index, text, r);
 };
@@ -460,11 +484,6 @@ const main = async () => {
       quotaConns.push(c);
     }
   }
-  if (GROUPS.includes('asr')) {
-    asrStream = new AsrStream();
-    await asrStream.open();
-    console.log(`ASR 流已建（建立 ${asrStream.setupMs} ms，每 75 ms 一包上行）`);
-  }
   for (let index = 0; index < ROUNDS; index += 1) {
     // 交替：每轮把各组各跑一次，时段影响均匀落到每一组
     for (const group of GROUPS) {
@@ -475,13 +494,6 @@ const main = async () => {
   summarise();
   longConn.close();
   for (const c of quotaConns) c.close();
-  if (asrStream !== null) {
-    console.log(
-      `ASR 流收尾：${asrStream.packets} 包 / ${(asrStream.bytes / 1024).toFixed(0)} KB`
-      + ` / 封段 ${asrStream.commits ?? 0} 次 / 服务端 error ${asrStream.errors ?? 0} 次`,
-    );
-    asrStream.close();
-  }
   setTimeout(() => { process.exit(0); }, 200);
 };
 
