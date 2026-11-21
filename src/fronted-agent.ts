@@ -76,7 +76,11 @@ const DELEGATE = '[[DELEGATE]]';
 
 
 /**
- * 快车道系统提示词 —— **含委派规则**（`FAST_LANE_DELEGATE=1`，默认）。
+ * 快车道系统提示词 —— **含委派规则**（只有 `FAST_LANE_DELEGATE=1` 才用）。
+ *
+ * 默认是**关**的（`main.ts` 里 `(process.env['FAST_LANE_DELEGATE'] ?? '0') !== '0'`），
+ * 那时走的是下面的 `SYSTEM_PROMPT_PLAIN`。别把「这个类默认 `delegate=true`」当成线上默认
+ * —— 接线处显式传了 `delegateEnabled`，以那里为准。
  *
  * 原文存档见 `docs/fast-lane-prompt-archive.md`（2026-11-19 备份）。
  * 改这里之前先想清楚：这条提示词和 `SYSTEM_PROMPT_PLAIN` 是**两套人格行为**，
@@ -285,7 +289,10 @@ export interface FastLaneOptions {
   /** 投机双轨：与 dsh 同时发（默认 true） */
   readonly speculate?: boolean;
   /**
-   * 快车道有没有**委派能力**（模型输出 `[[DELEGATE]]` 就转 dsh），默认 true。
+   * 快车道有没有**委派能力**（模型输出 `[[DELEGATE]]` 就转 dsh）。
+   *
+   * **线上默认关**：`main.ts` 按 `FAST_LANE_DELEGATE` 算出来显式传进来，默认
+   * `(undefined ?? '0') !== '0'` → `false`。这个类自己的默认值是 `true`，别拿它当线上口径。
    *
    * 关掉（`FAST_LANE_DELEGATE=0`）时做两件事：
    * 1. 提示词换成 `SYSTEM_PROMPT_PLAIN` —— 纯聊天，没有分流规则也没有暗号出口；
