@@ -132,6 +132,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | **`scripts/partial-timeline.py`** | partial 时序：投机到底能提前多少。给三个覆盖口径、按句长分组，`--asks` 直接对 `agent.ask` 的实际发出账 |
 | **`scripts/silence-runs.py`** | 封段统计：句内静音段长度分布 + **当前实际门槛**（「等一整包」）作为基线，再按 75/25 ms 包长模拟各门槛会误封多少次、封段能提前多少 |
 | **`python scripts/time-knobs.py --check`** | **L1 跨参数不变量**（7 条）：改一个数会不会静默让另一个模块失效。进 `npm test`（`tests/qos-invariants.test.ts`） |
+| **`python scripts/sample-size.py`** | **要多少遍回放才有显著性**：从现有回放档案量出「测试-重测噪声」，算出两侧各需几遍才能判出 Δ ms。口径见 `QOS.md` §6.4 |
 | **`npm run mutate`** | **测试有效性**：12 个定向变异体（改判据/改门槛/换分位算法），要求全杀 + 对照组存活。约 20 s。**不能与其他测试并行**（它会改写 `src/`） |
 | **`python bench/replay/run.py --baseline <json>`** | **L3 回放基线**（回放 vs 回放）：超容差 exit 1。`--baseline-save` 更新基线。判据见下方 §3.1 |
 | **`scripts/time-knobs.py`** | **时间参数总表生成器**：从源码扫出所有旋钮与常量，输出 `docs/TIME-KNOBS.md`。`--write` 写回；`--prod .env` 对照线上、标出默认值差异。五列：默认值 / 时钟（音频 or 墙上）/ 持有者 / 被谁遮住 / 上限。**改了旋钮忘了重新生成会测试红灯** |
