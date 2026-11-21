@@ -475,23 +475,51 @@ def cell(v) -> str:
 # 而且它受上面那个 setup 差异影响。③ 只记录，供人看趋势。
 # ---------------------------------------------------------------------------
 
-#: 每个字段的容差（ms）。来源：同向量回放的**单次内** MAD（①≈?, ② 极小,
-#: 送批 ≈16），取 2–3 倍作为跨次容差。**跨次噪声底尚未实测**
-#: （需要 `--repeat 3` 跑同一份代码），所以这里偏保守；实测后应收紧。
+#: 每个字段的容差（ms）。**数值来自实测噪声底，不是估的。**
+#:
+#: 量法：同一份代码、同一次调用、`--repeat 3` 跑同一向量，看逐轮/汇总的极差。
+#: 第一次接进基线时用的是「单次内 MAD 的 2–3 倍」，实测后发现**方向是反的** ——
+#: ① 的跨次极差 p50 就是 280 ms，±80 紧了 3.5 倍，跑一次红 61 处。
+#:
+#: | 字段 | 逐轮极差 p50 | 汇总极差 | 结论 |
+#: |---|---|---|---|
+#: | ① 停嘴→定稿 | **280**（p90 1022） | p50 223 | 判不了：噪声 3–5 倍于信号 |
+#: | ② 定稿→开轮 | 2 | p50 2 | 最稳 |
+#: | ③ 开轮→首块 | 115 | p50 46 / p90 13 | 汇总很稳（比 ① 稳得多） |
+#: | 首批文本 | 34 | — | 中等 |
+#: | 末批文本 | 64 | — | 中等 |
+#:
+#: 所以判定改成**只看汇总**：逐轮一律只打印、不判。容差取「实测极差 × ~2.5」留余量。
 TOLERANCE = {
-    "a1": 80,
-    "a2": 60,
-    "first_text": 60,
-    "last_text": 60,
-    "a1_p50": 60,
-    "a2_p50": 40,
+    "turns": 1,          # 轮数：跨调用见过 16 与 17
+    "asr_diff": 1,       # ASR 文本不一致的轮数：实测 1/17（含停顿那一轮）
+    "path_diff": 0,      # 车道：`FAST_LANE_DELEGATE=0` 时全是 fast，变一个都不正常
+    "a2_p50": 20,        # 实测极差 2
+    "a3_p50": 120,       # 实测极差 46
+    "first_text_p50": 100,  # 实测逐轮极差 p50 34
+    "last_text_p50": 120,   # 实测逐轮极差 p50 64
+}
+
+#: **不判**的字段，附原因。写在这里是为了让「为什么少了 ①」有据可查，
+#: 而不是下一个人以为漏了。
+NOT_JUDGED = {
+    "① 的一切形式": "逐轮跨次极差 p50=280（p90 1022），汇总 p50 极差 223。"
+                    "两个端点都是墙上时间事件，抖动来自包到达与 commit 时机，"
+                    "噪声 3–5 倍于任何我们关心的信号",
+    "逐轮任何字段": "同上 —— 单轮样本的方差远大于系统性变化，判它等于抛硬币",
+    "③ p90": "**n≈17 时 p90 就是第 2 慢的那一轮**。实测：3 次连跑极差只有 13 ms，"
+             "但第 4 次跑到 1039（+298）—— 一条 TTS 长尾就把 p90 整体抬高。"
+             "它是**单点统计量**，要判得让 n≫50；目前回放只有十几轮",
 }
 
 
 def baseline_rows(rows: list[dict]) -> dict:
-    """把一次回放折成基线：逐轮字段 + 汇总。"""
+    """把一次回放折成基线：逐轮字段（只留作诊断）+ 汇总（判定用）。"""
     a1 = [r["a1"] for r in rows if r["a1"] is not None]
     a2 = [r["a2"] for r in rows if r["a2"] is not None]
+    a3 = [r["a3"] for r in rows if r["a3"] is not None]
+    ft = [r["first_text"] for r in rows if r["first_text"] is not None]
+    lt = [r["last_text"] for r in rows if r["last_text"] is not None]
     return {
         "turns": [
             {
@@ -503,7 +531,6 @@ def baseline_rows(rows: list[dict]) -> dict:
                 "batches": r["batches"],
                 "first_text": r["first_text"],
                 "last_text": r["last_text"],
-                # ③ 记下来给人看趋势，但不参与判定
                 "a3": r["a3"],
             }
             for r in rows
@@ -514,45 +541,63 @@ def baseline_rows(rows: list[dict]) -> dict:
             "a1_p90": pct(a1, 0.9),
             "a2_p50": pct(a2, 0.5),
             "a2_p90": pct(a2, 0.9),
-            "a3_p50": pct([r["a3"] for r in rows], 0.5),
+            "a3_p50": pct(a3, 0.5),
+            "a3_p90": pct(a3, 0.9),
+            "first_text_p50": pct(ft, 0.5),
+            "last_text_p50": pct(lt, 0.5),
         },
     }
 
 
 def compare_baseline(base: dict, now: dict) -> list[str]:
-    """比对。返回问题列表；空 = 通过。"""
+    """比对。返回问题列表；空 = 通过。
+
+    **只判汇总**：逐轮一律只打印（`show_turn_drift`），不进问题列表。
+    理由见 `TOLERANCE` 的注释 —— 逐轮噪声是信号的 3–5 倍。
+    """
     problems: list[str] = []
+
+    old_turns, new_turns = base.get("summary", {}).get("turns"), now["summary"]["turns"]
+    if old_turns is not None and abs(int(new_turns) - int(old_turns)) > TOLERANCE["turns"]:
+        problems.append(
+            f"轮数 {old_turns} → {new_turns}（容差 ±{TOLERANCE['turns']}）—— "
+            f"切句或识别变了，先看是不是「半句被切开」"
+        )
+
+    # ASR 文本：允许少数轮不一样（含停顿的那一轮在回放里本来就不稳），但要说清是哪几轮
     old = {t["turn"]: t for t in base.get("turns", [])}
     new = {t["turn"]: t for t in now["turns"]}
+    diff = [
+        (n, old[n]["asr"], new[n]["asr"])
+        for n in sorted(set(old) & set(new))
+        if old[n]["asr"] != new[n]["asr"]
+    ]
+    if len(diff) > TOLERANCE["asr_diff"]:
+        detail = "；".join(f"轮{n}「{a}」→「{b}」" for n, a, b in diff[:4])
+        problems.append(
+            f"ASR 文本有 {len(diff)} 轮不一致（容差 ≤{TOLERANCE['asr_diff']}）：{detail}"
+        )
 
-    for turn in sorted(set(old) - set(new)):
-        problems.append(f"轮{turn}：基线有、这次没有（轮次变少了 —— 切句或识别变了？）")
-    for turn in sorted(set(new) - set(old)):
-        problems.append(f"轮{turn}：这次多了基线没有的一轮（**多半是被切开的半句**）")
+    path_diff = [
+        (n, old[n]["path"], new[n]["path"])
+        for n in sorted(set(old) & set(new))
+        if old[n]["path"] != new[n]["path"]
+    ]
+    if len(path_diff) > TOLERANCE["path_diff"]:
+        detail = "；".join(f"轮{n} {a}→{b}" for n, a, b in path_diff[:4])
+        problems.append(
+            f"车道变了 {len(path_diff)} 轮（容差 {TOLERANCE['path_diff']}）：{detail}"
+        )
 
-    for turn in sorted(set(old) & set(new)):
-        a, b = old[turn], new[turn]
-        if a["asr"] != b["asr"]:
-            problems.append(f"轮{turn}：ASR 文本变了「{a['asr']}」→「{b['asr']}」")
-        if a["path"] != b["path"]:
-            problems.append(f"轮{turn}：车道变了 {a['path']} → {b['path']}")
-        if a["batches"] != b["batches"]:
-            problems.append(f"轮{turn}：送批次数变了 {a['batches']} → {b['batches']}")
-        for field, label in (("a1", "①"), ("a2", "②"), ("first_text", "首批文本"), ("last_text", "末批文本")):
-            x, y = a.get(field), b.get(field)
-            if x is None or y is None:
-                if x != y:
-                    problems.append(f"轮{turn}：{label} 从 {cell(x)} 变成 {cell(y)}（缺仪表？）")
-                continue
-            if abs(y - x) > TOLERANCE[field]:
-                problems.append(
-                    f"轮{turn}：{label} {cell(x)} → {cell(y)}（差 {y - x:+.0f}，容差 ±{TOLERANCE[field]}）"
-                )
-
-    for field, label in (("a1_p50", "① p50"), ("a2_p50", "② p50")):
+    for field, label in (
+        ("a2_p50", "② p50"),
+        ("a3_p50", "③ p50"),
+        ("first_text_p50", "首批文本 p50"),
+        ("last_text_p50", "末批文本 p50"),
+    ):
         x = base.get("summary", {}).get(field)
         y = now["summary"].get(field)
-        if x is None or y is None or x == "—":
+        if x is None or y is None or x == "—" or y == "—":
             continue
         if abs(float(y) - float(x)) > TOLERANCE[field]:
             problems.append(
@@ -561,12 +606,33 @@ def compare_baseline(base: dict, now: dict) -> list[str]:
     return problems
 
 
+def show_turn_drift(base: dict, now: dict, limit: int = 6) -> None:
+    """逐轮漂移 —— **只打印，不判定**。噪声太大，判它等于抛硬币。"""
+    old = {t["turn"]: t for t in base.get("turns", [])}
+    new = {t["turn"]: t for t in now["turns"]}
+    rows = []
+    for n in sorted(set(old) & set(new)):
+        a, b = old[n], new[n]
+        if a["a1"] is None or b["a1"] is None:
+            continue
+        rows.append((abs(b["a1"] - a["a1"]), n, a["a1"], b["a1"], b["asr"]))
+    if not rows:
+        return
+    rows.sort(reverse=True)
+    print("\n  逐轮 ① 漂移（仅供参考，**不判定**）：")
+    for d, n, x, y, text in rows[:limit]:
+        print(f"    轮{n:>2} {x} → {y}（{y - x:+.0f}）  {(text or '')[:20]}")
+    if len(rows) > limit:
+        print(f"    … 另 {len(rows) - limit} 轮")
+    print(f"  ① 的跨次极差实测 p50=280 ms（p90 1022），所以逐轮不设为判据。")
+
+
 def show_baseline_result(problems: list[str], base_path: str) -> None:
-    print("\n=== 回放基线比对（回放 vs 回放）===")
+    print("\n=== 回放基线比对（回放 vs 回放，只判汇总）===")
     print(f"  基线：{base_path}")
     if not problems:
-        print("  ✓ 通过：①/②/送批节奏/车道 全部在容差内")
-        print("  （③ 不判 —— 含厂商合成长尾，只记录）")
+        print("  ✓ 通过：② p50 / ③ p50 / 送批节奏 / 轮数 全部在容差内")
+        print("  （① 与逐轮不判 —— 跨次噪声 280 ms；③ p90 不判 —— n≈17 时它是单点）")
         return
     for line in problems:
         print(f"  ✗ {line}")
@@ -804,6 +870,7 @@ def main() -> int:
             raise SystemExit(f"找不到基线文件：{base_path}")
         base = json.loads(base_path.read_text(encoding="utf-8"))
         problems = compare_baseline(base, now_base)
+        show_turn_drift(base, now_base)
         show_baseline_result(problems, str(base_path))
         if problems:
             code = 1

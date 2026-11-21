@@ -1,193 +1,233 @@
 {
   "vector": "20261119-160921",
-  "config": [],
+  "config": [
+    {
+      "key": "MIAI_STT",
+      "value": "qwen-realtime",
+      "source": "向量 meta（qwen-realtime:qwen3-asr-flash-realtime）"
+    },
+    {
+      "key": "MIAI_TTS",
+      "value": "cosyvoice",
+      "source": "向量 meta（cosyvoice:longanhuan）"
+    },
+    {
+      "key": "MIAI_MIC_GAIN",
+      "value": "4",
+      "source": "向量 meta（micGain=4）"
+    }
+  ],
   "cross_asr": false,
-  "taken_at": "2026-11-20T03:15:00",
-  "note": "由 arch_replay（16 轮回放）生成；config 待用 --baseline-save 重建",
+  "taken_at": "2026-11-20T20:20:00",
+  "noise_floor": {
+    "note": "同代码同调用 --repeat 3 的实测跨次极差（ms）",
+    "a1_per_turn_p50": 280,
+    "a1_per_turn_p90": 1022,
+    "a2_per_turn_p50": 2,
+    "a3_per_turn_p50": 115,
+    "a1_p50": 223,
+    "a2_p50": 2,
+    "a3_p50": 46,
+    "a3_p90": 13
+  },
   "turns": [
     {
       "turn": 1,
       "asr": "你好啊。",
       "path": "fast",
-      "a1": 251,
-      "a2": 123,
+      "a1": 1875,
+      "a2": 2,
       "batches": 2,
-      "first_text": 302,
-      "last_text": 348,
-      "a3": 608
+      "first_text": 337,
+      "last_text": 395,
+      "a3": 714
     },
     {
       "turn": 2,
       "asr": "今天过得怎么样？",
       "path": "fast",
-      "a1": 249,
-      "a2": 23,
+      "a1": 336,
+      "a2": 2,
       "batches": 3,
-      "first_text": 115,
-      "last_text": 205,
-      "a3": 573
+      "first_text": 310,
+      "last_text": 310,
+      "a3": 779
     },
     {
       "turn": 3,
       "asr": "还行。",
       "path": "fast",
-      "a1": 208,
-      "a2": 64,
+      "a1": 368,
+      "a2": 2,
       "batches": 2,
-      "first_text": 180,
-      "last_text": 248,
-      "a3": 611
+      "first_text": 312,
+      "last_text": 378,
+      "a3": 708
     },
     {
       "turn": 4,
       "asr": "我刚下班回来，有点累。",
       "path": "fast",
-      "a1": 262,
-      "a2": 112,
+      "a1": 397,
+      "a2": 4,
       "batches": 2,
-      "first_text": 112,
-      "last_text": 113,
-      "a3": 313
+      "first_text": 311,
+      "last_text": 369,
+      "a3": 702
     },
     {
       "turn": 5,
-      "asr": "先说一会儿。",
+      "asr": "你说。",
       "path": "fast",
-      "a1": 217,
-      "a2": 61,
-      "batches": 2,
-      "first_text": 354,
-      "last_text": 354,
-      "a3": 602
+      "a1": null,
+      "a2": 600,
+      "batches": null,
+      "first_text": null,
+      "last_text": null,
+      "a3": 300
     },
     {
       "turn": 6,
-      "asr": "你说我要不要先去睡一会儿？",
+      "asr": "我要不要先说一会儿。",
       "path": "fast",
-      "a1": 296,
-      "a2": 5,
+      "a1": 410,
+      "a2": 115,
       "batches": 2,
-      "first_text": 690,
-      "last_text": 759,
-      "a3": 1108
+      "first_text": 600,
+      "last_text": 600,
+      "a3": 811
     },
     {
       "turn": 7,
-      "asr": "你喜欢听什么歌？",
+      "asr": "你说我要不要先去睡一会儿？",
       "path": "fast",
-      "a1": null,
+      "a1": 1321,
       "a2": 2,
       "batches": 2,
-      "first_text": 371,
-      "last_text": 454,
-      "a3": 757
+      "first_text": 302,
+      "last_text": 333,
+      "a3": 642
     },
     {
       "turn": 8,
-      "asr": "那你觉得哪首音乐好听？",
+      "asr": "你喜欢听什么歌？",
       "path": "fast",
-      "a1": 1181,
+      "a1": 928,
       "a2": 2,
       "batches": 3,
-      "first_text": 349,
-      "last_text": 367,
-      "a3": 644
+      "first_text": 311,
+      "last_text": 339,
+      "a3": 628
     },
     {
       "turn": 9,
-      "asr": "我在想晚上吃什么。",
+      "asr": "那你觉得哪首音乐好听？",
       "path": "fast",
-      "a1": 995,
-      "a2": 2,
+      "a1": null,
+      "a2": 4,
       "batches": 2,
-      "first_text": 348,
-      "last_text": 348,
-      "a3": 852
+      "first_text": 328,
+      "last_text": 387,
+      "a3": 686
     },
     {
       "turn": 10,
-      "asr": "你会不会觉得无聊？",
+      "asr": "我在想晚上吃什么。",
       "path": "fast",
-      "a1": 239,
-      "a2": 360,
+      "a1": 1336,
+      "a2": 2,
       "batches": 2,
-      "first_text": 358,
-      "last_text": 358,
-      "a3": 341
+      "first_text": 307,
+      "last_text": 307,
+      "a3": 580
     },
     {
       "turn": 11,
-      "asr": "星球大战讲的是什么？",
+      "asr": "你会不会觉得无聊？",
       "path": "fast",
-      "a1": 866,
-      "a2": 2,
-      "batches": 3,
-      "first_text": 350,
-      "last_text": 350,
-      "a3": 679
+      "a1": 563,
+      "a2": 275,
+      "batches": 2,
+      "first_text": 354,
+      "last_text": 416,
+      "a3": 477
     },
     {
       "turn": 12,
-      "asr": "你知道阿索卡吗？",
+      "asr": "星球大战讲的是什么？",
       "path": "fast",
-      "a1": 500,
-      "a2": 4,
-      "batches": 2,
-      "first_text": 348,
-      "last_text": 352,
-      "a3": 651
+      "a1": 318,
+      "a2": 1,
+      "batches": 3,
+      "first_text": 51,
+      "last_text": 137,
+      "a3": 342
     },
     {
       "turn": 13,
-      "asr": "有意思。",
+      "asr": "你知道阿索卡吗？",
       "path": "fast",
-      "a1": 693,
-      "a2": 1,
-      "batches": 2,
-      "first_text": 352,
-      "last_text": 426,
-      "a3": 734
+      "a1": 287,
+      "a2": 9,
+      "batches": 3,
+      "first_text": 356,
+      "last_text": 456,
+      "a3": 715
     },
     {
       "turn": 14,
-      "asr": "我有点想吃火锅。",
+      "asr": "有意思。",
       "path": "fast",
-      "a1": null,
-      "a2": 2,
+      "a1": 356,
+      "a2": 1,
       "batches": 2,
-      "first_text": 164,
-      "last_text": 219,
-      "a3": 545
+      "first_text": 309,
+      "last_text": 368,
+      "a3": 656
     },
     {
       "turn": 15,
-      "asr": "冬天吃火锅是不是很合适？",
+      "asr": "我有点想吃火锅。",
       "path": "fast",
-      "a1": 1662,
-      "a2": 3,
+      "a1": 599,
+      "a2": 2,
       "batches": 2,
-      "first_text": 620,
-      "last_text": 620,
-      "a3": 954
+      "first_text": 309,
+      "last_text": 309,
+      "a3": 647
     },
     {
       "turn": 16,
-      "asr": "你今天心情好不好？",
+      "asr": "冬天吃火锅是不是很合适？",
       "path": "fast",
-      "a1": 1764,
+      "a1": 644,
       "a2": 2,
       "batches": 2,
-      "first_text": 344,
-      "last_text": 344,
-      "a3": 806
+      "first_text": 309,
+      "last_text": 309,
+      "a3": 634
+    },
+    {
+      "turn": 17,
+      "asr": "你今天心情好不好？",
+      "path": "fast",
+      "a1": 927,
+      "a2": 1,
+      "batches": 2,
+      "first_text": 308,
+      "last_text": 308,
+      "a3": 632
     }
   ],
   "summary": {
-    "turns": 16,
-    "a1_p50": "398",
-    "a1_p90": "1518",
-    "a2_p50": "4",
-    "a2_p90": "118",
-    "a3_p50": "648"
+    "turns": 17,
+    "a1_p50": "563",
+    "a1_p90": "1330",
+    "a2_p50": "2",
+    "a2_p90": "179",
+    "a3_p50": "647",
+    "a3_p90": "741",
+    "first_text_p50": "310",
+    "last_text_p50": "354"
   }
 }

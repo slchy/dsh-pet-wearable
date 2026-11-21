@@ -396,6 +396,28 @@ async function replayVector() {
         ? null
         : turn.firstDownAt - turn.lastVoicedAt;
       turn.downMs = Math.round((turn.downBytes / 2 / 24000) * 1000);
+
+      /**
+       * 再等到**这一轮真的播完**才放下一句。
+       *
+       * 只等「下行安静 1.5 s」不够：下行一停，服务端状态机还停在 `speaking`
+       * （它按音频时长估算播完时刻），这时下一句的音频进去就会被当成插话 →
+       * `audio.stop` → **回放凭空制造了一次打断**。
+       *
+       * 真机上用户是听得见的，不会在播完前那一刻开口；回放却会提前 1.5 s 推进。
+       * 实测代价：一次假打断之后，某些轮次会再也开不出来（`turn.start` 停住，
+       * 但 `asr.sentence` 继续来）—— 17 轮只跑出 4 轮。同一形态在 31 例真机档案里
+       * **全部恢复**，所以那是回放的假象，不是线上 bug。
+       */
+      if (turn.firstDownAt !== null) {
+        const playEndAt = turn.firstDownAt + turn.downMs + 500;
+        if (Date.now() < playEndAt) {
+          while (Date.now() < playEndAt) {
+            sock.write(frame(UP.Audio, silence));
+            await new Promise((r) => setTimeout(r, CHUNK_MS));
+          }
+        }
+      }
       console.log(`   [${i + 1}] 说完→首音 ${turn.speechToFirstAudioMs} ms，回复 ${turn.downMs} ms`);
     }
     return;
