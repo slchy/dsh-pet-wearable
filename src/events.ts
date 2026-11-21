@@ -74,6 +74,17 @@ export const EVENTS = {
   llmFirst: 'llm.first',
   /** 一轮结束。带 `dsh_session` 时可与 dsh 自己的会话档案对齐 */
   turnEnd: 'turn.end',
+  /**
+   * 每条 TCP 连接自己的重传 / RTO（`ss -tin` 读出来的每 socket 累计值）。
+   *
+   * **为什么不能只用 `turn.end.net_*`**：那是**整机**计数 —— 分不出是谁在重传。
+   * 2026-11-21 第一场带 `net_*` 的真机里，一轮冒出 `retrans 388 / lost_retrans 149`，
+   * 而那一轮的 TTS 首包完全正常；几百字节的 JSON 不可能重传 388 次。所以那个数字
+   * 里混着服务器→手机的音频下行（或别的连接），**不能拿来给 TTS/ASR 归因**。
+   *
+   * 在 `turn.end` **之后异步**采一次（不占关键路径），按对端地址落盘。
+   */
+  netSockets: 'net.sockets',
 
   // ---- 模型的输入/输出（审计用，全量不截断）----
   //

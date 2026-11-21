@@ -16,6 +16,7 @@ import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
 import { loopLagSnapshot } from './loop-lag.ts';
 import { diffNetCounters, netFields, readNetCounters } from './net-counters.ts';
+import { sampleSockets } from './socket-stats.ts';
 import type { DownlinkSink } from './transport.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 import type { DeviceCall } from './devices/primitives.ts';
@@ -637,6 +638,15 @@ export class TurnRunner {
         // `net_dsack`）是「厂商回我们的包丢了」的代理 —— 只看前者会把厂商侧重传
         // 误判成「厂商应用层慢」。读不到时这些字段根本不出现，不是 0。
         ...netFields(diffNetCounters(netBefore, readNetCounters())),
+      });
+
+      // **每 socket** 的重传/RTO 在 `turn.end` 之后异步采一次（不 await）：
+      // 整机计数分不出是谁在重传，而 `ss` 的子进程开销不能进关键路径。
+      // 只采 443（厂商那三条）—— 手机那条靠**排除法**：整机涨而三条都是 0，
+      // 剩下的就只能是服务器→手机那条（本轮唯一的另一条大流量）。
+      void sampleSockets(443).then((sockets) => {
+        if (sockets.length === 0) return;
+        this.options.onEvent?.(EVENTS.netSockets, { sockets });
       });
 
       return {
