@@ -88,6 +88,12 @@ gate.close ──①──▶ asr.sentence ──②──▶ turn.start ──�
 - ① `silenceToAsr` = `asr.sentence.t − (gate.close.t − gapMs)`
   **别直接减 `gate.close.t`。** 能量门要等 `gapMs`（真机 2.0–2.1 s）走满才记，
   而 `asr.sentence` 常常记在它**之前** 300–400 ms。
+  - ① 再拆两段：**①a `stopToCommitMs`** = 停嘴 → `asr.commit`（我们这侧封段，
+    粒度是**上行包长**：75 ms 包实测 33–127，20 ms 包 19–39）；
+    **①b `commitToFinalMs`** = `asr.commit` → `asr.sentence`（ASR 那侧）。
+    `① = ①a + ①b` 逐轮成立。见 `docs/QOS.md` §2.5。
+  - **坏样本有两条判据**：`① < 0`（门配到了上一段语音）、`① > gapMs`（门落在定稿
+    之前 = 抓到本句之外的门）。两条都会把 `firstWordMs` 降成 `null`。
 - ② `asrToTurn` 定稿 → 开跑（同进程排队 / 等判停收口）
 - ③ `turnToAudio` 开跑 → 首块音频。**含 `dsh` 模型首字**，不是纯 TTS
 - ④ `playbackMs` 播放，不算延迟
