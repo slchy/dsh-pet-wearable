@@ -133,7 +133,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | **`scripts/silence-runs.py`** | 封段统计：句内静音段长度分布 + **当前实际门槛**（「等一整包」）作为基线，再按 75/25 ms 包长模拟各门槛会误封多少次、封段能提前多少 |
 | **`python scripts/time-knobs.py --check`** | **L1 跨参数不变量**（7 条）：改一个数会不会静默让另一个模块失效。进 `npm test`（`tests/qos-invariants.test.ts`） |
 | **`npm run mutate`** | **测试有效性**：12 个定向变异体（改判据/改门槛/换分位算法），要求全杀 + 对照组存活。约 20 s。**不能与其他测试并行**（它会改写 `src/`） |
-| **`python bench/replay/run.py --baseline <json>`** | **L3 回放基线**（回放 vs 回放）：判 ①/②/送批节奏/车道，超容差 exit 1。`--baseline-save` 更新基线。见 `docs/QOS.md` §5.2 |
+| **`python bench/replay/run.py --baseline <json>`** | **L3 回放基线**（回放 vs 回放）：超容差 exit 1。`--baseline-save` 更新基线。判据见下方 §3.1 |
 | **`scripts/time-knobs.py`** | **时间参数总表生成器**：从源码扫出所有旋钮与常量，输出 `docs/TIME-KNOBS.md`。`--write` 写回；`--prod .env` 对照线上、标出默认值差异。五列：默认值 / 时钟（音频 or 墙上）/ 持有者 / 被谁遮住 / 上限。**改了旋钮忘了重新生成会测试红灯** |
 | `bench/tau2/segment_split.py` | 客户端打点 + 档案，五段（含 ⑤TTS首块→客户端首帧） |
 | `bench/tau2/lat_summary.py` | 合并 `/tmp/tau2-lat-*.json` 出 p50/p90/p95，折真机体感 |
@@ -143,6 +143,70 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/latency/analyze-real-archive.mjs` | 真机档案速览（含「等关门」列）。**只用于看 ②，段口径以 `latency-report.ts` 为准** |
 
 `bench/latency/` 下其余四个是 TTS 专项探针（见 §6），两个 `probe-turnjudge-*` 见 §5。
+
+### 3.1 延迟回归的四层闸门（实现细节）
+
+分工与「红了意味着什么」在 [`QOS.md`](./QOS.md) §6.2。这里放**怎么跑、判什么、容差怎么来的**。
+
+**L1 跨参数不变量** —— `python scripts/time-knobs.py --check`（进 `npm test`）
+
+数值**从源码扫**（不是文档抄的），扫不到就报「缺参数」。6 条关系（下表 5 行，
+第 2 行覆盖两个门槛）：
+
+| 关系 | 违反后的后果 |
+|:---|:---|
+| `TURN_JUDGE_WAIT_BUDGET_MS` ≥ `TURN_JUDGE_EXTEND_MS` | 预算比一拍还短，等于没有预算 |
+| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` ≥ `VOICE_OPEN_QUIET_MS`（及 `_SHORT`） | 开轮门槛永远够不着，只能撞上限 |
+| `PREWARM_TTL_MS` > `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 序列句等满预算时预热 task 已过期，付一次冷启动 |
+| `MIAI_HTTP_KEEPALIVE_MS` < 服务端空闲超时（**≥60 s，上界未测**） | 复用到已关的连接，那一次请求**直接失败** |
+| `VOICE_SPECULATE_MS` ≤ `VOICE_PAUSE_DETECT_MS` | 判停预跑抢在投机前起跑，投机那 100 ms 的提前量白丢 |
+
+> 已存在一条**警告**（不是失败）：`MIAI_HTTP_KEEPALIVE_MS=50 s` 超过 `fetch` 实测
+> 验证过的 45 s（60 s 是 `https.Agent` 的结果，不是 `fetch` 的）。真机最大轮间隔
+> 16.7 s 从未触及，所以不拦。
+
+`tests/qos-invariants.test.ts` 里带一条**元测试**：注入一个必然违反的关系，确认检查器
+会红 —— 防止它变成永远绿的摆设。
+
+**L2 口径基线** —— `tests/latency-report-golden.test.ts`（进 `npm test`）
+
+合成档案（无真实地址、无录音）→ 逐轮分段 + 三张分组表的数字全部钉死。另有一组
+**边界值**轮次（①=0、②=70、合计=2000、只缺 `turn.end`）—— 是变异测试逼出来的：
+第一版所有样本都远离判据，于是四个判据改成相邻值都能通过。
+
+**`npm run mutate`** —— 定向变异，12 个变异体，**要求 11/11 全杀 + 1 个对照组存活**
+
+2026-11-20 首跑 **7/12**。存活的五个全是真问题，其中第五个是代码 bug 不是测试漏洞：
+`usable` 过滤器原本「`firstWordMs` 有值**且** `missing` 为空」，把「只缺 `turn.end`」
+的轮次也剔出分母 —— 而 `turn.end` 不影响首字延迟，剔掉是白丢样本。
+
+> **不能进 `npm test`**：它会改写 `src/` 再跑测试，和并行执行直接冲突（首跑就这样撞了）。
+> `npm test` 里只留 `--verify`（只查匹配点，不碰源码），防止改判据后清单静默过期。
+
+**L3 回放基线** —— `python bench/replay/run.py --archive <向量> --baseline <json>`
+
+基线在 `bench/replay/baseline/`，文件名只用时间戳。
+
+**比的是回放 vs 回放，不是回放 vs 真机。** 同一份向量：回放 ③ = 648，真机当时 543
+—— 回放**更慢**。差的 ~300 ms 在 TTS `setup`（回放 348 常数、真机 54 常数）：回放
+轮间没有间隔，预热 task 撞上上一轮合成而排队。
+
+容差是**量出来的**（同代码同调用 `--repeat 3`），不是设计的：
+
+| 字段 | 逐轮跨次极差 p50 | 汇总极差 | 判 |
+|:---|:---:|:---:|:---|
+| ① 停嘴→定稿 | **280**（p90 1022） | p50 223 | ❌ 不判 —— 噪声 3–5 倍于信号 |
+| ② 定稿→开轮 | **2** | p50 2 | ✅ 判 p50（容差 20） |
+| ③ 开轮→首块 | 115 | p50 **46** | ✅ 判 p50（容差 120） |
+| ③ p90 | — | 13（但第 4 次跑到 +298） | ❌ n≈17 时它就是第 2 慢那一轮 |
+| 首/末批文本时刻 | 34 / 64 | — | ✅ 判 p50（容差 100 / 120） |
+
+还判：轮数（±1）、ASR 文本不一致轮数（≤1）、车道（0）。**逐轮一律只打印**。
+
+**L4 探针基线** —— `bench/latency/probe-cosyvoice-feed.mjs`
+
+`base` 60 次 / `live` 80 次。判据：`>1000 ms` 计数 **0**，`p90 ≤ 500`。
+要 key + 外网，不进 CI。
 
 ## 4. 真机回放与端到端
 

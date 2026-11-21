@@ -56,9 +56,10 @@ test('不变量检查真的会失败（不是永远绿的摆设）', { timeout: 
         'knobs = m.scan()',
         'hit = False',
         'for k in knobs:',
-        '    if k.name == "VOICE_COMMIT_MS":',
-        '        k.default = "500"; hit = True',
-        'assert hit, "没扫到 VOICE_COMMIT_MS，扫描器坏了"',
+        '    if k.name == "VOICE_SPECULATE_MS":',
+        '        k.default = "5000"  # 投机调到判停预跑之后：提前量白丢',
+        '        hit = True',
+        'assert hit, "没扫到 VOICE_SPECULATE_MS，扫描器坏了"',
         'fails, _ = m.check_invariants(knobs)',
         'print(len(fails))',
         'print(fails[0] if fails else "")',
@@ -68,6 +69,6 @@ test('不变量检查真的会失败（不是永远绿的摆设）', { timeout: 
   );
   const [count, first] = violated.trim().split('\n');
   assert.ok(Number(count) >= 1, `注入违反后应该有失败项，实际：${violated}`);
-  assert.match(String(first), /VOICE_COMMIT_MS/, '应该点名是哪个参数');
-  assert.match(String(first), /投机/, '应该说明后果，而不只是「不成立」');
+  assert.match(String(first), /VOICE_SPECULATE_MS/, '应该点名是哪个参数');
+  assert.match(String(first), /提前量/, '应该说明后果，而不只是「不成立」');
 });

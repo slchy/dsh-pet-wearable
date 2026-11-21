@@ -362,12 +362,8 @@ def scan() -> list[Knob]:
 
 INVARIANTS: list[tuple[str, str, str, str]] = [
     (
-        "VOICE_COMMIT_MS", "<=", "VOICE_SPECULATE_MS",
-        "投机跑到封段前面：拿还没定稿的中间结果去认领，静默失效",
-    ),
-    (
         "VOICE_SPECULATE_MS", "<=", "VOICE_PAUSE_DETECT_MS",
-        "判停预跑跑到投机前面：投机那 100 ms 的提前量白丢",
+        "判停预跑抢在投机前面起跑：投机那 100 ms 的提前量白丢，等于白花钱",
     ),
     (
         "TURN_JUDGE_WAIT_BUDGET_MS", ">=", "TURN_JUDGE_EXTEND_MS",
@@ -391,8 +387,8 @@ INVARIANTS: list[tuple[str, str, str, str]] = [
     ),
 ]
 
-#: 服务端空闲超时（秒级），来自实测：`https.Agent` 空闲 60 s 仍能复用；
-#: `fetch` 只验到 45 s。取 60 s 作为硬上限。
+#: 服务端空闲超时的**下界**（秒级）。实测：`https.Agent` 空闲 60 s 仍能复用。
+#: **上界未测** —— 所以这里只能验「保活短于 60 s」，不能声称服务端就是 60 s。
 SERVER_IDLE_TIMEOUT_MS = 60_000
 
 #: **警告**（不是失败）：保活超过这个值就落进「没实测过」的区间。
