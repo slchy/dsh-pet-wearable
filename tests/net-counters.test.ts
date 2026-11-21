@@ -44,6 +44,18 @@ test('读不到就给 null，不拿 0 冒充', () => {
   assert.deepEqual(netFields(c), {}, '全 null 时一个字段都不落，档案里看不见它');
 });
 
+test('默认读取路径在 Linux 上真的读到数（否则仪表是死的还不知道）', () => {
+  // 这条是给「默认读取器」本身的：写成运行期 `require` 之类会在这条上炸出来
+  // —— ESM 里 `require` 未定义，异常被 try/catch 吞掉，读数会永远是 null。
+  const c = readNetCounters();
+  if (process.platform === 'linux') {
+    assert.equal(typeof c.retrans, 'number', '/proc/net/snmp 在 Linux 上必须读得到');
+    assert.equal(typeof c.timeouts, 'number', '/proc/net/netstat 在 Linux 上必须读得到');
+  } else {
+    assert.equal(c.retrans, null, '没有 /proc 的平台记 null，不抛');
+  }
+});
+
 test('增量逐项相减；任一侧读不到就 null（不能把「没读成」当没发生）', () => {
   const before = readNetCounters(read);
   const after = { ...before, retrans: (before.retrans ?? 0) + 5, ofoQueue: null };

@@ -30,6 +30,8 @@
  * 「没读成」在档案里长得一样。
  */
 
+import { readFileSync } from 'node:fs';
+
 /** 一组整机 TCP 计数器。读不到的项是 `null`。 */
 export interface NetCounters {
   /** 出向：重传段数（`/proc/net/snmp` `Tcp: RetransSegs`） */
@@ -118,10 +120,7 @@ export function readNetCounters(read: (path: string) => string = defaultRead): N
 }
 
 function defaultRead(path: string): string {
-  // 运行期才 require：这个模块在测试里被当成纯函数用，不该为了读一个文件把 fs 拉进来
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const fs = require('node:fs') as typeof import('node:fs');
-  return fs.readFileSync(path, 'utf8');
+  return readFileSync(path, 'utf8');
 }
 
 /**
