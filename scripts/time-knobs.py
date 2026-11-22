@@ -69,6 +69,7 @@ CLOCK: dict[str, str] = {
     "FAST_LANE_TIMEOUT_MS": "wall",
     # TTS
     "MIAI_HTTP_KEEPALIVE_MS": "wall（连接空闲）",
+    "STALL_PROBE_MS": "wall",
     # 设备
     "MIAI_IDLE_TIMEOUT_MS": "wall",
     "PET_TICK_MS": "wall",
@@ -130,6 +131,7 @@ SHADED_BY: dict[str, str] = {
     "VOICE_PAUSE_DETECT_MS": "ASR 解出句之前（提前起跑，不额外等）",
     "VOICE_SPECULATE_MS": "同上（投机与 ASR 并行）",
     "PREWARM_TTL_MS": "定稿→开轮之间（正常 0–600 ms，用不完）",
+    "STALL_PROBE_MS": "无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待）",
     "ASSEMBLER_PREDICT_LEAD_MS": "ASR 出句之前",
     "PLAYBACK_POLL_MS": "设备播报期间（轮询，不加延迟）",
     # 查源码后补的

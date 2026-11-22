@@ -1,6 +1,6 @@
 ﻿import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSsOutput } from '../src/socket-stats.ts';
+import { parseSsOutput, selectSocket } from '../src/socket-stats.ts';
 const SS = [
   'Recv-Q Send-Q Local Address:Port   Peer Address:PortProcess',
   '0      0      10.0.0.8:41234      203.0.113.24:443',
@@ -15,4 +15,19 @@ test('同对端两条连接：靠 local 区分（只按 peer 汇总会在换代�
   assert.equal(out[1]?.local, '10.0.0.8:41236');
   assert.equal(out[0]?.peer, out[1]?.peer, '对端相同');
   assert.notEqual(out[0]?.local, out[1]?.local, '本端不同 → 两条独立 socket');
+});
+
+test('按本端端口挑一条：必须精确，不能把 :4123 当成 :41234', () => {
+  const out = parseSsOutput(SS);
+  assert.equal(selectSocket(out, 41234)?.local, '10.0.0.8:41234');
+  assert.equal(selectSocket(out, 41236)?.local, '10.0.0.8:41236');
+  assert.equal(selectSocket(out, 4123), null, '前缀相同但不是同一个端口');
+});
+
+test('非法本端端口一律 null —— `ss` 对空端口不报错，而是退回「所有 established」', () => {
+  const out = parseSsOutput(SS);
+  assert.equal(selectSocket(out, 0), null);
+  assert.equal(selectSocket(out, -1), null);
+  assert.equal(selectSocket(out, Number.NaN), null);
+  assert.equal(selectSocket(out, 1.5), null);
 });

@@ -106,7 +106,7 @@ test('静音块判定：数字静音算静音，正常说话不算', () => {
  *   continue-task → 记下文本，回一块有声 PCM
  *   finish-task   → task-finished（可以拖一会儿，模拟「音频还没出完」）
  */
-async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[] } = {}): Promise<{
+async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[]; firstDelayMs?: number } = {}): Promise<{
   url: string;
   /** 每条连接收到的 continue-task 文本，按连接建立顺序 */
   texts: string[][];
@@ -127,6 +127,22 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
     texts.push(mine);
     runs.push(0);
     const myRuns = runs.length - 1;
+    // `firstDelayMs`：在这段时间里**一帧音频都不发**（模拟「文本送上去了，音频整段不回」），
+    // 到点再一次性放出来。只拖第一帧不够 —— 流式会有好几批，后面那批照样把首块带回来。
+    const holdMs = options.firstDelayMs ?? 0;
+    let released = holdMs === 0;
+    let held: Buffer[] = [];
+    /** 音频还压着的时候来的 `finish-task`，等放音之后再回执 —— 否则 task 提前收尾，压根等不到首块 */
+    let pendingFinish: (() => void) | null = null;
+    const flushHeld = (): void => {
+      released = true;
+      for (const frame of held) if (socket.readyState === socket.OPEN) socket.send(frame);
+      held = [];
+      const finish = pendingFinish;
+      pendingFinish = null;
+      finish?.();
+    };
+    if (!released) setTimeout(flushHeld, holdMs);
     socket.on('message', (data) => {
       const msg = JSON.parse(String(data)) as {
         header: { action: string; task_id: string };
@@ -141,16 +157,24 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
       }
       if (msg.header.action === 'continue-task') {
         mine.push(msg.payload.input.text ?? '');
-        for (const frame of options.frames ?? [loud]) socket.send(frame);
+        const frames = options.frames ?? [loud];
+        if (released) {
+          for (const frame of frames) socket.send(frame);
+        } else {
+          held.push(...frames);
+        }
       }
       if (msg.header.action === 'finish-task') {
         const delay = options.finishDelayMs ?? 0;
-        if (delay === 0) {
-          reply('task-finished');
+        const sendFinish = (): void => {
+          if (socket.readyState === socket.OPEN) reply('task-finished');
+        };
+        if (!released) {
+          pendingFinish = sendFinish;
+        } else if (delay === 0) {
+          sendFinish();
         } else {
-          setTimeout(() => {
-            if (socket.readyState === socket.OPEN) reply('task-finished');
-          }, delay);
+          setTimeout(sendFinish, delay);
         }
       }
     });
@@ -531,4 +555,55 @@ test('整块都很轻时不裁（宁可多播，也别削掉轻声开头）', ()
   const soft = Buffer.alloc(Math.round(sr * 2 * 0.1));
   for (let i = 0; i < soft.length; i += 2) soft.writeInt16LE(Math.round(30 * Math.sin(i / 10)), i);
   assert.equal(trimLeadingSilence(soft, sr).length, soft.length);
+});
+
+// ------------------------------------------------------- 「首块迟迟不到」的看门狗
+
+test('首块迟迟不到：看门狗在**事中**报一次，并带上本端端口', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice({ firstDelayMs: 300 });
+  try {
+    const stalls: { elapsed_ms: number; local_port: number }[] = [];
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      stallProbeMs: 80,
+      onStall: (info) => stalls.push({ elapsed_ms: info.elapsed_ms, local_port: info.local_port }),
+    });
+    const queue = new TokenQueue();
+    for (const token of ['[', '平静', ']', '在', '，', '哥', '。']) queue.push(token);
+    queue.close();
+    let bytes = 0;
+    for await (const chunk of tts.synthesizeStream!(queue)) bytes += chunk.length;
+
+    assert.ok(bytes > 0, '这一轮最终还是要出声');
+    assert.equal(stalls.length, 1, '一轮只报一次');
+    assert.ok(stalls[0]!.elapsed_ms >= 80, `elapsed_ms=${stalls[0]!.elapsed_ms} 应 >= 阈值`);
+    // 没有本端端口就没法按 socket 精确采 ss —— 那这个事件等于废的
+    assert.ok(stalls[0]!.local_port > 0, `local_port=${stalls[0]!.local_port}`);
+  } finally {
+    await server.close();
+  }
+});
+
+test('首块按时到达：看门狗一声不响（正常轮零开销）', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  try {
+    const stalls: unknown[] = [];
+    const tts = cosyVoiceTts({
+      apiKey: 'sk-test',
+      url: server.url,
+      stallProbeMs: 200,
+      onStall: (info) => stalls.push(info),
+    });
+    const queue = new TokenQueue();
+    for (const token of ['[', '平静', ']', '在', '，', '哥', '。']) queue.push(token);
+    queue.close();
+    let bytes = 0;
+    for await (const chunk of tts.synthesizeStream!(queue)) bytes += chunk.length;
+
+    assert.ok(bytes > 0);
+    assert.deepEqual(stalls, [], '首块按时到达就不该报');
+  } finally {
+    await server.close();
+  }
 });

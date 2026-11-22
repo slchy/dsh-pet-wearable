@@ -24,6 +24,7 @@ import { cosyVoiceTts } from './cosyvoice.ts';
 import { mimoTts } from './mimo.ts';
 import { EMOTIONS } from './emotion.ts';
 import { EVENTS } from './events.ts';
+import { sampleSocket } from './socket-stats.ts';
 import { BASE_STYLE, DEFAULT_TTS_VOICE } from './mimo.ts';
 import {
   cannedStt,
@@ -127,6 +128,12 @@ async function buildTts(spec: string): Promise<TtsProvider> {
       onTask: (info) => { auditSink?.(EVENTS.ttsTask, { ...info }); },
       // 流式 task 的分批送达明细，收尾时落一次（见 `tts.done`）
       onDone: (info) => { auditSink?.(EVENTS.ttsDone, { ...info }); },
+      // 首块 600 ms 还没回来：**当场**采这一条 socket（`unacked`/`rto` 只在那一瞬有意义）
+      onStall: (info) => {
+        void sampleSocket(info.local_port).then((socket) => {
+          auditSink?.(EVENTS.ttsStall, { ...info, socket });
+        });
+      },
     });
   }
   if (spec === 'mimo') {

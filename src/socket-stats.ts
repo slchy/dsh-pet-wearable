@@ -113,3 +113,46 @@ export function sampleSockets(port = 443, listenPort = 0): Promise<SocketStat[]>
     );
   });
 }
+
+/**
+ * 从一堆连接里挑出**本端端口正好等于 `localPort`** 的那一条。
+ *
+ * 不能用 `includes`：`:4123` 会匹配到 `:41234`。而厂商入口是共享的
+ * （2026-11-22 实测 ASR 和 TTS 都连 `39.96.213.166:443`），只按 IP 挑会把
+ * ASR 的 `retrans` 记到 TTS 头上。
+ */
+export function selectSocket(stats: readonly SocketStat[], localPort: number): SocketStat | null {
+  if (!Number.isInteger(localPort) || localPort <= 0) return null;
+  const suffix = `:${localPort}`;
+  return stats.find((s) => s.local.endsWith(suffix)) ?? null;
+}
+
+/**
+ * 只采**这一条**连接（按本端端口精确定位）—— 卡顿发生**当时**用的。
+ *
+ * 为什么不能等首块回来再采：那一刻重传包已经送达、对方 ACK 已经回来，内核会
+ * 立刻把 `unacked` 清零、把退避上去的 `rto` 退回到 ~250 ms。事后采只能看到
+ * 「恢复后」的样子，而真正要抓的是「还悬在半空」的那一瞬间。
+ *
+ * `localPort <= 0` 直接返回 `null`：`ss` 对 `sport = :`（空端口）**不报错**，
+ * 而是退回「所有 established」—— 2026-11-22 实测过，会把整机连接当成目标那条。
+ *
+ * **永不 reject**：没装 `ss`、没权限、解析不了，都返回 `null`。
+ */
+export function sampleSocket(localPort: number): Promise<SocketStat | null> {
+  if (!Number.isInteger(localPort) || localPort <= 0) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile(
+      'ss',
+      ['-tin', 'state', 'established', `( sport = :${localPort} )`],
+      { timeout: 2_000, maxBuffer: 1 << 20 },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        resolve(selectSocket(parseSsOutput(stdout), localPort));
+      },
+    );
+  });
+}

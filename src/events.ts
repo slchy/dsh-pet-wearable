@@ -85,6 +85,21 @@ export const EVENTS = {
    * 在 `turn.end` **之后异步**采一次（不占关键路径），按对端地址落盘。
    */
   netSockets: 'net.sockets',
+  /**
+   * **首块迟迟不到时**在 600 ms 看门狗里采的那一条连接的现场（`tts.stall`）。
+   *
+   * 为什么不复用 `net.sockets`：那是在 `turn.end` **之后**采的。等首块回来、
+   * 甚至等这一轮结束，内核早就把 `unacked` 清零、`rto` 退回 ~250 ms 了 ——
+   * 2026-11-22 那场 4291 ms 就是因为只在事后采，分不出是链路丢包还是厂商不出音频。
+   *
+   * 字段：`elapsed_ms`（请求送出去多久了）、`local_port`（用来精确采这一条）、
+   * `socket`（`SocketStat`，取不到是 `null`）。
+   *
+   * `socket.retrans` 是**累计值**（`retrans:x/Y` 的 Y，不随恢复归零），所以
+   * 「本轮到底有没有往外重传」= 本条 `socket.retrans` − 上一轮 `net.sockets` 里
+   * **同一个 `local`** 的 `retrans`。这就是 `local` 字段的用途。
+   */
+  ttsStall: 'tts.stall',
 
   // ---- 模型的输入/输出（审计用，全量不截断）----
   //

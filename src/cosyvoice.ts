@@ -177,6 +177,25 @@ export interface CosyVoiceOptions {
     /** 最后一批；批数不超过 `FEED_TRACE_HEAD` 时为 null（已经在 `head` 里了） */
     readonly tail: FeedStep | null;
   }) => void;
+  /**
+   * 首块迟迟不到时**在看门狗里**报一次（`tts.stall`）。
+   *
+   * 触发点是「请求送出去之后 `stallProbeMs` 还没收到首块」，**不是**「首块到达时」——
+   * 后者是**事后**：重传包已送达、ACK 已回，内核立刻把 `unacked` 清零、`rto` 退回
+   * ~250，采到的只能是恢复后的样子（2026-11-22 那场 4291 ms 就是这么看不出原因的）。
+   * 只有在这时候采，`unacked > 0`、`rto` 还挂在退避阶梯上，才是案发现场。
+   */
+  readonly onStall?: (info: {
+    /** 从「请求送出去」到看门狗触发 */
+    readonly elapsed_ms: number;
+    /** 这条连接的本端端口 —— 调用方按它精确采 `ss -tin`（ASR 和 TTS 常连同一个对端） */
+    readonly local_port: number;
+    readonly task_id: string;
+  }) => void;
+  /**
+   * 看门狗多久触发（默认 {@link STALL_PROBE_MS}）。只给测试用，线上不用调。
+   */
+  readonly stallProbeMs?: number;
 }
 
 /** 流式 task 里一次 `continue-task` 的送达明细（`tts.done` 的 `head` / `tail` 元素） */
@@ -205,6 +224,15 @@ export function sameProsody(a: Emotion, b: Emotion): boolean {
  * 后面第 20 批什么时候到不影响首包。所以只记前 4 批 + 最后一批。
  */
 const FEED_TRACE_HEAD = 4;
+
+/**
+ * 「首块迟迟不到」的看门狗阈值。
+ *
+ * 正常首块 330–380 ms（2026-11-22 长连接 15 轮实测中位 352、p90 367），
+ * 取 600 留一倍余量 —— 不会在正常轮误报，而真卡住时（那两轮 2301 / 4292）
+ * 600 ms 早就到了，`unacked` 还挂着、`rto` 还在退避阶梯上。
+ */
+const STALL_PROBE_MS = 600;
 
 /** 一批文本是否以标点结尾（决定 `FeedStep.punct`） */
 const ENDS_WITH_PUNCT = /[。，、！？；：…,.!?;:]\s*$/u;
@@ -313,6 +341,10 @@ class Connection {
   private traceFirstAt: number | null = null;
   private readonly onTask: CosyVoiceOptions['onTask'];
   private readonly onDone: CosyVoiceOptions['onDone'];
+  private readonly onStall: CosyVoiceOptions['onStall'];
+  private readonly stallProbeMs: number;
+  /** 「首块迟迟不到」的看门狗；首块到达就拆 */
+  private stallTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * **预开好的 task**：`run-task` 已发、`task-started` 已回，但一个字都没送。
    *
@@ -353,6 +385,47 @@ class Connection {
   }
 
   /**
+   * 这条连接的**本端端口**。看门狗用它让调用方按端口精确采 `ss -tin`。
+   *
+   * 为什么不能按对端 IP 过滤：ASR 和 TTS 常常连的是同一个厂商入口
+   * （2026-11-22 实测两条都是 `39.96.213.166:443`），只按 IP 采会把 ASR 的
+   * `retrans` 混进 TTS 的判断里。
+   */
+  private get localPort(): number {
+    const socket = (this.ws as unknown as { _socket?: { localPort?: number } })._socket;
+    return socket?.localPort ?? 0;
+  }
+
+  /**
+   * 挂「首块迟迟不到」的看门狗。
+   *
+   * 锚点是**请求送出去的那一刻**（流式 = 首批文本送出，非流式 = run-task 送出），
+   * 首块到达时由 {@link clearStallWatch} 拆掉 —— 正常轮零开销（一个 setTimeout）。
+   */
+  private armStallWatch(taskId: string): void {
+    if (this.onStall === undefined || this.stallTimer !== null) return;
+    const anchor = performance.now();
+    this.stallTimer = setTimeout(() => {
+      this.stallTimer = null;
+      const localPort = this.localPort;
+      if (localPort <= 0) return;
+      this.onStall?.({
+        elapsed_ms: Math.round(performance.now() - anchor),
+        local_port: localPort,
+        task_id: taskId,
+      });
+    }, this.stallProbeMs);
+    this.stallTimer.unref?.();
+  }
+
+  private clearStallWatch(): void {
+    if (this.stallTimer !== null) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
+  }
+
+  /**
    * 把这一次 task 的两段耗时交给宿主（`tts.task` 事件，常开）。
    *
    * 缺时刻就报 -1，**不拿 0 冒充** —— 0 会被当成「瞬间完成」混进统计里。
@@ -387,11 +460,17 @@ class Connection {
   constructor(
     url: string,
     apiKey: string,
-    onTask?: CosyVoiceOptions['onTask'],
-    onDone?: CosyVoiceOptions['onDone'],
+    hooks: {
+      readonly onTask?: CosyVoiceOptions['onTask'];
+      readonly onDone?: CosyVoiceOptions['onDone'];
+      readonly onStall?: CosyVoiceOptions['onStall'];
+      readonly stallProbeMs: number;
+    },
   ) {
-    this.onTask = onTask;
-    this.onDone = onDone;
+    this.onTask = hooks.onTask;
+    this.onDone = hooks.onDone;
+    this.onStall = hooks.onStall;
+    this.stallProbeMs = hooks.stallProbeMs;
     this.ws = new WebSocket(url, { headers: { Authorization: `Bearer ${apiKey}` } });
     this.ready = new Promise((resolve, reject) => {
       this.ws.once('open', () => {
@@ -665,6 +744,7 @@ class Connection {
     const probed = (chunk: Buffer): void => {
       if (this.traceFirstAt === null) {
         this.traceFirstAt = performance.now();
+        this.clearStallWatch();
         const setup = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - this.traceSentAt;
         const first = this.traceFirstAt - (this.traceStartedAt === 0 ? this.traceSentAt : this.traceStartedAt);
         if (tracing) {
@@ -680,6 +760,8 @@ class Connection {
     const prosody = EMOTION_PROSODY[args.emotion];
     this.sink = probed;
     const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
+    // 从这里开始算「等首块」：预开的 task 早就 run-task 了，但等音频是从这一刻起
+    this.armStallWatch(taskId);
 
     if (adopted === null) {
       this.ws.send(JSON.stringify({
@@ -714,6 +796,7 @@ class Connection {
 
     const error = await done;
     this.sink = null;
+    this.clearStallWatch();
     if (error) {
       // 428 = 这个音色不接受这条 instruction。上面那句报错本身不会告诉人怎么改，
       // 这里补上唯一两条出路 —— 否则下次还得再查一遍文档。
@@ -789,6 +872,7 @@ class Connection {
     this.sink = (chunk: Buffer): void => {
       if (!reported) {
         reported = true;
+        this.clearStallWatch();
         // 缺哪个时刻就打 NaN，不拿 0 冒充
         const startedAt = this.traceStartedAt === 0 ? sentAt : this.traceStartedAt;
         setupMs = this.traceStartedAt === 0 ? Number.NaN : this.traceStartedAt - sentAt;
@@ -832,7 +916,8 @@ class Connection {
 
     const send = (text: string): void => {
       const now = performance.now();
-      if (firstTextAt === 0) firstTextAt = now;
+      const isFirst = firstTextAt === 0;
+      if (isFirst) firstTextAt = now;
       lastTextAt = now;
       chars += text.length;
       batchCount += 1;
@@ -847,6 +932,8 @@ class Connection {
         header: { action: 'continue-task', task_id: taskId, streaming: 'duplex' },
         payload: { input: { text } },
       }));
+      // 锚点 = 首批文本送出去的那一刻（流式的 run-task 是更早发的，中间夹着等模型开口）
+      if (isFirst) this.armStallWatch(taskId);
     };
 
     let feedError: Error | null = null;
@@ -882,6 +969,7 @@ class Connection {
 
     const error = await done;
     this.sink = null;
+    this.clearStallWatch();
     // 有正文才报：一批都没送出去的 task 会把 -1 混进「首包」统计里
     if (firstTextAt !== 0) {
       if (tracing) {
@@ -915,6 +1003,7 @@ class Connection {
   close(): void {
     this.closed = true;
     this.clearWarmTimer();
+    this.clearStallWatch();
     try { this.ws.close(); } catch { /* 已经关了 */ }
   }
 }
@@ -1064,7 +1153,12 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
     if (connecting !== null) return connecting;
     drop();
     const make = (async (): Promise<Connection> => {
-      const fresh = new Connection(url, apiKey, options.onTask, options.onDone);
+      const fresh = new Connection(url, apiKey, {
+        onTask: options.onTask,
+        onDone: options.onDone,
+        onStall: options.onStall,
+        stallProbeMs: options.stallProbeMs ?? STALL_PROBE_MS,
+      });
       await fresh.open();
       conn = fresh;
       return fresh;
