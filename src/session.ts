@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh 会话封装：把一段文本交给 DeepSeek Harness，拿回回复文本。
  *
  * 实测事实（2026-11-05，Oracle aarch64，dsh 0.2.1-rc.2）：
@@ -401,18 +401,29 @@ export class DshSession {
    * 还在跑，答完之后没有等待者 —— 由 `onAnnounce` 播出去。
    */
   private detached = false;
-  /** 放手那一轮的答复文本（独立一份：新一轮开起来会清 `assistantText`） */
+  /**
+   * 放手那一轮的答复文本（独立一份：新一轮开起来会清 `assistantText`）
+   */
   private detachedText = '';
   /**
-   * 发出去了几条 `session/prompt`、收到过几条 `idle`。
+   * 轮号：`turn/start` / `turn/end` 的 `data.turn`（dsh 自己发的单调递增整数）。
    *
-   * dsh 是**串行**的，`idle` 按顺序来 —— 所以「这条 idle 属于哪一轮」可以用
-   * 两个计数器算出来：`idlesSeen < promptsSent` 说明后面还有更新的轮次在等，
-   * 那这条 idle 就是更早那一轮（也就是被放手的那一轮）的。
-   * 不用这个就只能靠「有没有等待者」猜，猜错就把上一轮的答案交给新一轮。
+   * **不用 idle 计数认领轮次**：`session.status` 只有 `{sessionId, status}`，没有轮号；
+   * 而「发了几条 prompt / 收了几条 idle」只要错一格（排队的 prompt 被 `outcome:canceled`
+   * 取消时就不会有 turn、也就没有 idle），后面每一轮的答案都会交给错的人。
+   * `turn/start` / `turn/end` 是**逐轮**事件，轮号对得上才结算。
    */
-  private promptsSent = 0;
-  private idlesSeen = 0;
+  private currentTurn: number | null = null;
+  /** 放手那一轮要认领的轮号（`null` = 放手时还没有 turn/start，下一次 turn/end 就是它） */
+  private detachedTurn: number | null = null;
+  /**
+   * 下一条 `idle` 属于刚结算的「放手」那一轮，**不能拿去唤醒新一轮的等待者**。
+   *
+   * `idle` 不带轮号，只能靠顺序：`turn/end` 一定先于同一轮的 `idle`。所以放手那一轮
+   * 结算时打上这个一次性标记，把紧随其后的那条 idle 吃掉。下一轮 `turn/start` 一到
+   * 就清掉（万一那条 idle 压根没发，别把它留到下一轮去误吃）。
+   */
+  private swallowNextIdle = false;
   /**
    * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
    * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
@@ -637,11 +648,69 @@ export class DshSession {
       return;
     }
     this.detached = true;
+    this.detachedTurn = this.currentTurn;
     this.detachedText = this.assistantText.trim();
+    if (this.detachedTurn === null) {
+      // 还没收到 turn/start：下一次 turn/end 就是它的（dsh 串行，不会有别人的）
+      this.log('  放手    放手的时刻还没开轮 → 认下一次 turn/end');
+    }
     // `ask` 的等待者立刻收尾：这一轮已经作废，别让它挂到超时
     const fire = this.onIdle;
     this.onIdle = null;
     fire?.();
+  }
+
+  /**
+   * 认轮次边界：`turn/start` 记住当前轮号，`turn/end` 到达时看是不是「放手」那一轮。
+   *
+   * 这与「等 idle」不等价：`turn/end` 是逐轮事件、带轮号，而 `idle` 不带任何标识。
+   * 放手的一轮跑完时在这里结算（播报或丢弃），`idle` 则照旧只负责唤醒 prompt 的
+   * 等待者 —— 两条互不干扰，也就不会出现「上一轮的答案交给新一轮」。
+   */
+  private observeTurnBoundary(e: Record<string, unknown>, sessionId: string): void {
+    const type = typeof e['type'] === 'string' ? e['type'] : '';
+    if (type !== 'turn/start' && type !== 'turn/end') {
+      return;
+    }
+    if (sessionId !== '' && this.openSessionId !== null && sessionId !== this.openSessionId) {
+      return;
+    }
+    const data = e['data'] as Record<string, unknown> | undefined;
+    const turn = typeof data?.['turn'] === 'number' ? data['turn'] : null;
+    if (type === 'turn/start') {
+      this.currentTurn = turn;
+      // 新一轮开起来了：上一轮那条 idle 要么已经来过、要么不会来了
+      this.swallowNextIdle = false;
+      return;
+    }
+    // turn/end
+    const settles = this.detached
+      && (this.detachedTurn === null || this.detachedTurn === turn);
+    this.currentTurn = null;
+    if (!settles) {
+      return;
+    }
+    this.detached = false;
+    this.detachedTurn = null;
+    // 同一轮的 idle 紧跟着就来，它属于这一轮（不是新一轮的）
+    this.swallowNextIdle = true;
+    const text = (this.detachedText || this.assistantText).trim();
+    this.detachedText = '';
+    this.assistantText = '';
+    if (text === '') {
+      return;
+    }
+    // 用户已经问了新问题时旧答案直接丢掉，别补播一次他不想听的
+    if (this.onIdle !== null) {
+      this.log('  放手    答案回来时用户已经问了新问题 → 丢掉这一条');
+      return;
+    }
+    if (this.onAnnounce) {
+      const reason = data?.['reason'] as Record<string, unknown> | undefined;
+      const kind = typeof reason?.['kind'] === 'string' ? reason['kind'] : '';
+      this.log(`  放手    委派轮跑完了${kind === '' ? '' : `（${kind}）`} → 答案转成播报`);
+      this.onAnnounce(text);
+    }
   }
 
   /**
@@ -762,7 +831,6 @@ export class DshSession {
           ]
         : [{ type: 'text', text }],
     });
-    this.promptsSent += 1;
 
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
@@ -1022,11 +1090,12 @@ export class DshSession {
       this.sdkReady = false;
       // 进程没了，里面的会话也就不在了；下次必须重新 resume
       this.openSessionId = null;
-      // 计数与「放手」状态一起归零：进程都没了，那些 idle 再也不会来
-      this.promptsSent = 0;
-      this.idlesSeen = 0;
+      // 放手状态一起归零：进程都没了，那一轮的 turn/end 再也不会来
       this.detached = false;
       this.detachedText = '';
+      this.detachedTurn = null;
+      this.currentTurn = null;
+      this.swallowNextIdle = false;
       if (this.proc === proc) this.proc = null;
       // 没收到 shutdown 就退出，说明崩了；挂起的请求全部失败
       for (const [, p] of this.pending) p.reject(new DshError(`sdk 进程退出（code=${code}）`));
@@ -1244,7 +1313,10 @@ export class DshSession {
           this.activeTicket,
         );
       }
-      if (e['type'] !== 'assistant/message') return;
+      if (e['type'] !== 'assistant/message') {
+        this.observeTurnBoundary(e, typeof p['sessionId'] === 'string' ? p['sessionId'] : '');
+        return;
+      }
 
       const data = e['data'] as Record<string, unknown> | undefined;
       const message = data?.['message'] as Record<string, unknown> | undefined;
@@ -1282,28 +1354,9 @@ export class DshSession {
 
     if (method === 'session.status') {
       const status = typeof p['status'] === 'string' ? p['status'] : '';
-      if (status === 'idle') {
-        this.idlesSeen += 1;
-      }
-      // 放手的那一轮跑完了（它比最新的 prompt 老）。答案交给播报链路 ——
-      // 同后台任务结算同一口；用户已经问了新问题就算了，别再补播旧的。
-      // **这条 idle 不能拿去唤醒新一轮的等待者**，否则新一轮会拿到上一轮的答案。
-      if (status === 'idle' && this.detached && this.idlesSeen < this.promptsSent) {
-        this.detached = false;
-        const text = (this.detachedText || this.assistantText).trim();
-        this.detachedText = '';
-        this.assistantText = '';
-        if (text === '') {
-          return;
-        }
-        if (this.onIdle !== null) {
-          this.log('  放手    答案回来时用户已经问了新问题 → 丢掉这一条');
-          return;
-        }
-        if (this.onAnnounce) {
-          this.log('  放手    委派轮跑完了，用户早走了 → 答案转成播报');
-          this.onAnnounce(text);
-        }
+      // 这条 idle 属于刚结算的「放手」那一轮 —— 吃掉它，别去唤醒新一轮的等待者
+      if (status === 'idle' && this.swallowNextIdle) {
+        this.swallowNextIdle = false;
         return;
       }
       const waiting = this.onIdle !== null;
@@ -1454,3 +1507,4 @@ export class DshSession {
     });
   }
 }
+

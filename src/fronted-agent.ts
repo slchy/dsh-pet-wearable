@@ -1252,8 +1252,10 @@ export class FrontedAgent implements AgentProvider {
       const audio = this.audioLane.claim();
       if (audio !== null) {
         this.log('  快车道    走 omni 直出音频（不经过文本模型）');
-        // `text` / `speech` 是**活的**：随音频流增长，drain 之后才完整。
-        // 被打断时它们的当前值正好是「已播出去的部分」——审计与续话要的就是它。
+        // `text` / `speech` 是**活的**：取的是 `response.audio_transcript` 的累积，
+        // 跟着**生成**进度长、不跟播放进度。生成比播放快得多（3 s 音频 ~1 s 到齐），
+        // 所以被打断时它通常是**全文**，不是「已播出去的那部分」。
+        // 想知道听到了多少只能看 `playedSeconds`（`dialog.ts` 的续话尾巴就是这么算的）。
         const live = (): string => audio.transcript();
         return {
           get text(): string { return live(); },

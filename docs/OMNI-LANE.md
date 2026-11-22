@@ -229,7 +229,7 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 |:---|:---|:---|
 | `discard()`（这一轮不采纳） | 必删 | 一个字都没播，留着只会污染下一轮 |
 | `cancelCurrent()` 且 `!claimed` | 删 | 同一句第二次封段把上一份顶掉，那份答的是半句话 |
-| `interrupt()`（播到一半被打断） | **不删** | 用户已经听到了一部分；删掉就和快车道 `pending` 里记的半句对不上 |
+| `interrupt()`（播到一半被打断） | **不删** | 用户已经听到了一部分；删掉连那部分也没了 |
 
 ### 4.8 委派轮回注：`role` 必须是 `user`
 
@@ -265,7 +265,7 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 | `conversation.item.delete` | **有效**（三次复现，省 13–39 token） | 洗脏历史可用，**尚未接入** |
 | `conversation.item.create`（**`user` 角色**） | 注入文本 → 下一轮**照做**（3/3） | **回注 dsh 答案可行**，见 §5.2 |
 | `conversation.item.create`（`assistant` 角色） | 回 `created` 和 item id，但模型**当没看见** | 伪造自己的历史被拒。**不能拿 token 数判定**，见 §5.2 |
-| `conversation.item.truncate` | 6 s 无 ack 无 error | **不支持** |
+| `conversation.item.truncate` | **静默忽略**：14.5 s 的回答截到 800 ms → 无 ack、无 error（6 s 超时）；追问「你刚才数到几？」照样答「二十」，追问轮 `in_text_tok` 与对照组**一模一样**（769/769） | 不能用。想对齐「用户听到了多少」只剩 delete + `user` 回注（§5.2） |
 | 上下文上限 | ~**6600 token** 处服务端自动截断（6617→4387） | 漂移有界 |
 | 长尾 | **不是厂商慢**：`cancel_wait_ms` 就是长尾本身（扣掉后 4/5 落回 599–786） | 见 §8.6 |
 

@@ -24,13 +24,45 @@ const wait = async (ms: number): Promise<void> => {
 };
 
 /** 一个只会说一句话的假 dsh；`delayMs` 是 prompt 之后多久才吐答案 */
-function fakeDsh(dir: string, answer: string, delayMs: number): string {
+function fakeDsh(dir: string, answer: string, delayMs: number, skipIdle: readonly number[] = []): string {
   const script = join(dir, 'fake-dsh.mjs');
   writeFileSync(script, `
 process.stdin.setEncoding('utf8');
 let buf = '';
 let turns = 0;
+const queue = [];
+let busy = false;
 const send = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); };
+const event = (sessionId, type, seq, data) => {
+  send({ jsonrpc: '2.0', method: 'session.event', params: { sessionId, event: { type, seq, data } } });
+};
+const status = (sessionId, s) => {
+  send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: s } });
+};
+
+// 真 dsh 是串行的：排队的 prompt 要等前一轮 turn/end + idle 之后才开
+function pump() {
+  if (busy || queue.length === 0) return;
+  const job = queue.shift();
+  busy = true;
+  turns += 1;
+  const n = turns;
+  process.stderr.write('PROMPT ' + n + '\\n');
+  status(job.sessionId, 'running');
+  event(job.sessionId, 'turn/start', 10 * n, { turn: n });
+  setTimeout(() => {
+    event(job.sessionId, 'assistant/message', 10 * n + 1, {
+      message: { content: [{ type: 'text', text: ${JSON.stringify(answer)} + n }] },
+    });
+    event(job.sessionId, 'turn/end', 10 * n + 2, { turn: n, reason: { kind: 'completed' } });
+    if (!${JSON.stringify(skipIdle)}.includes(n)) {
+      status(job.sessionId, 'idle');
+    }
+    busy = false;
+    pump();
+  }, ${delayMs});
+}
+
 process.stdin.on('data', (chunk) => {
   buf += chunk;
   let nl;
@@ -42,26 +74,8 @@ process.stdin.on('data', (chunk) => {
     const { id, method, params } = msg;
     if (method === 'session/prompt') {
       send({ jsonrpc: '2.0', id, result: {} });
-      const sessionId = params.sessionId;
-      turns += 1;
-      const nth = turns;
-      process.stderr.write('PROMPT ' + nth + '\\n');
-      setTimeout(() => {
-        send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: 'running' } });
-        send({
-          jsonrpc: '2.0',
-          method: 'session.event',
-          params: {
-            sessionId,
-            event: {
-              type: 'assistant/message',
-              seq: 9,
-              data: { message: { content: [{ type: 'text', text: ${JSON.stringify(answer)} + nth }] } },
-            },
-          },
-        });
-        send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: 'idle' } });
-      }, ${delayMs});
+      queue.push({ sessionId: params.sessionId });
+      pump();
       continue;
     }
     if (method === 'session/fork') {
@@ -88,7 +102,11 @@ process.stdin.on('data', (chunk) => {
   return shim;
 }
 
-function makeSession(answer = '查到两台，都在跑。', delayMs = 150): {
+function makeSession(
+  answer = '查到两台，都在跑。',
+  delayMs = 150,
+  skipIdle: readonly number[] = [],
+): {
   readonly session: DshSession;
   readonly announced: string[];
   readonly logs: string[];
@@ -100,7 +118,7 @@ function makeSession(answer = '查到两台，都在跑。', delayMs = 150): {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-detach-'));
   const logs: string[] = [];
   const session = new DshSession({
-    program: fakeDsh(dir, answer, delayMs),
+    program: fakeDsh(dir, answer, delayMs, skipIdle),
     workDir: dir,
     sessionFile: join(dir, 'session.json'),
     mode: 'sdk',
@@ -186,6 +204,27 @@ test('放手后又开新一轮：旧答案既不播、也不能串成新一轮�
 
     await wait(300);
     assert.deepEqual(h.announced, [], '已经被新一轮顶掉的旧答案不能再补播一次');
+  } finally {
+    h.dispose();
+  }
+});
+
+test('放手那一轮没发 idle（漏发/异常）也不会把答案串到下一轮', async () => {
+  // 这正是「用计数器认领 idle」的死法：少一条 idle，后面每一轮都错位一格。
+  // 改成按 `turn/end` 的**轮号**认领之后，漏发 idle 只影响「谁来唤醒等待者」，
+  // 不会影响「这条答案是哪一轮的」。
+  const h = makeSession('答案', 120, [1]);
+  try {
+    const first = h.session.ask('查一下机器', undefined, { ticket });
+    await h.waitPrompt();
+    h.session.detachTurn(ticket);
+    await first;
+
+    const second = h.session.ask('那别的事了', undefined, { ticket: { no: 2, gen: 1 } });
+    assert.equal((await second).text, '答案2', '第 2 轮的答案必须是第 2 轮的');
+
+    await wait(200);
+    assert.deepEqual(h.announced, [], '放手的旧答案不补播');
   } finally {
     h.dispose();
   }

@@ -587,14 +587,25 @@ dsh 答完了、一个字没播，用户只好重问一遍。
 
 改成 **`detachTurn()`（放手）**：`ask` 立刻收成空答复（这一轮已经作废，不挂住状态机），
 dsh 继续跑完；回来的答复交给 `setAnnouncer` —— 与「后台任务结算」同一口播报。
-两条硬边界：
+三条硬边界：
 
 - **只在「委派前已经出过声」时才放手**（`receiptSpoken === true`，也就是 omni 说过垫话）。
   那一刻等于**承诺了答案**，得兑现；没出过声的轮次用户插话就是不要了，照旧取消。
-- 「放手」那一轮的 `idle` **不能拿去唤醒新一轮的等待者**。dsh 是串行的、`idle` 按顺序来，
-  所以用 `promptsSent` / `idlesSeen` 两个计数器认定「这条 idle 属于哪一轮」——
-  只看「有没有等待者」会把上一轮的答案交给新一轮（真机那一刻正在：「对。」自己开了新轮）。
+- **认轮次用 `turn/end` 的轮号，不用 idle 计数。** `session.status` 只有
+  `{sessionId, status}`，没有轮号；而「发了几条 prompt / 收了几条 idle」只要错一格
+  （排队的 prompt 被 `outcome:canceled` 取消时压根不会有 turn、也就没有 idle），
+  后面每一轮的答案都会交给错的人。`turn/start` / `turn/end` 的 `data.turn` 是
+  单调递增的轮号，对得上才结算。
+- **放手那一轮的 `idle` 不能唤醒新一轮**。`idle` 不带轮号，只能靠顺序：
+  `turn/end` 一定先于同一轮的 `idle`，所以结算时打一个一次性标记把紧随其后的
+  那条 idle 吃掉（下一轮 `turn/start` 一到就清掉，防止那条 idle 压根没发时误吃下一轮）。
   用户已经问了新问题时，旧答案直接丢掉，不补播。
+
+> **「用户听到多少」只有一处记着**：`playedSeconds`。`reply.text` / `reply.speech`
+> 是**生成**进度（`response.audio_transcript` 累积），被打断时通常是全文。
+> 服务端历史同样是全文 —— 两条轨在这一点上是一致的，只是都跟「听到的」不一致。
+> `conversation.item.truncate` 实测**静默忽略**（见 `docs/OMNI-LANE.md` §5），
+> 所以要对齐只能走 delete + `user` 回注。
 
 **委派轮的第一声是 omni 自己出的**：工具描述里那句「调用之前先用一句话应一声」，
 实测 **6/6** 生效（1.4–2.3 s），线序 `function_call_arguments` → `audio.delta` → `done`。
