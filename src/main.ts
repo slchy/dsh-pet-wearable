@@ -21,6 +21,7 @@ import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { qwenRealtimeStt } from './qwen-realtime-asr.ts';
 import { cosyVoiceTts } from './cosyvoice.ts';
+import { omniTts } from './omni-tts.ts';
 import { mimoTts } from './mimo.ts';
 import { EMOTIONS } from './emotion.ts';
 import { EVENTS } from './events.ts';
@@ -107,7 +108,7 @@ async function buildStt(
   return loadProvider<SttProvider>(spec, 'stt');
 }
 
-/** `--tts cosyvoice|mimo|silent|<path>` */
+/** `--tts cosyvoice|omni|mimo|silent|<path>` */
 async function buildTts(spec: string): Promise<TtsProvider> {
   if (spec === 'silent') return silentTts(24_000);
   if (spec === 'cosyvoice') {
@@ -134,6 +135,19 @@ async function buildTts(spec: string): Promise<TtsProvider> {
           auditSink?.(EVENTS.ttsStall, { ...info, socket });
         });
       },
+    });
+  }
+  if (spec === 'omni') {
+    if (!process.env['DASHSCOPE_API_KEY']) {
+      throw new Error('DASHSCOPE_API_KEY 未设置（omni 朗读机用的是 DashScope API key）');
+    }
+    // 用 omni 念 dsh 的答案 —— 全链路单一音色（S5）。
+    // 代价与门槛见 `omni-tts.ts` 文件头：语速 ~4.0–4.4 字/秒（CosyVoice 5.45–5.66）、
+    // 首块 629–781 ms（CosyVoice 350–390）。
+    return omniTts({
+      apiKey: process.env['DASHSCOPE_API_KEY'],
+      model: process.env['OMNI_SHADOW_MODEL'],
+      log: (line) => { console.log(line); },
     });
   }
   if (spec === 'mimo') {
