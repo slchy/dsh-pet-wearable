@@ -115,6 +115,44 @@ test('喂过音频才 commit，同一段只发一次', async () => {
     '第二段没新音频，不能重复封段',
   );
 
+  // 解码结束之后又来的音频才算**下一段**
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('解码还没回来时喂的音频不算新一段 —— 那一发空 commit 会被服务端拒', async () => {
+  // 真机 5 场 5 次 `maybe no invalid audio stream` 全是这个形状：两次封段隔
+  // 181–292 ms，中间推了 225–300 ms 音频，但那段音频服务端算进**上一条**缓冲
+  // （反证：那 5 次的定稿文本全部完整）。客户端却把它记成新音频 → 提交空缓冲。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1);
+
+  // 解码窗口内继续推音频、再封一次段
+  asr.feed(Buffer.alloc(640));
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    1,
+    '这些音频归正在解的那一条，不该再发 commit',
+  );
+
+  // 解码结束 → 之后再来音频才允许封段
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('服务端报错之后要重新武装，否则再也 commit 不出去', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  socket.message({ type: 'error', error: { message: 'maybe no invalid audio stream' } });
   asr.feed(Buffer.alloc(640));
   asr.commit();
   assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);

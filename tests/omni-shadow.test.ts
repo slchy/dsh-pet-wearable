@@ -653,3 +653,44 @@ test('这一轮没用 omni 时 interrupt 是空操作，不碰别人的回复', 
   h.shadow.interrupt();
   assert.equal(h.shadow.willServe(), true);
 });
+
+test('没人认领就 completed 的回复：下一轮开口时连 user 项一起删（幽灵记忆）', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'item_u1', role: 'user' } });
+  h.at(30);
+  h.socket.message({ type: 'response.output_item.added', item: { id: 'item_a1', role: 'assistant' } });
+  h.at(40);
+  // 答完了，但没人认领（ASR 没给整句 → 那一轮根本没开）
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '当场不删，留到下一轮开口');
+
+  // 下一轮开口
+  h.at(50);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  const deleted = h.socket.sent.filter((s) => s.type === 'conversation.item.delete').map((s) => s.item_id);
+  assert.deepEqual(deleted.sort(), ['item_a1', 'item_u1'],
+    '助手和用户两条都要删：只删助手会留下「用户说了话、助手没答」的假记录');
+});
+
+test('认领过的回复下一轮不删（用户听过）', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  assert.ok(h.shadow.claim() !== null);
+  h.at(20);
+  h.socket.message({ type: 'response.output_item.added', item: { id: 'item_a1', role: 'assistant' } });
+  h.at(30);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  h.at(40);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  assert.equal(h.socket.count('conversation.item.delete'), 0);
+});

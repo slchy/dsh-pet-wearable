@@ -93,12 +93,27 @@ export class QwenRealtimeAsr {
   /** 未就绪时先攒着，别丢音频 */
   private backlog: Buffer[] = [];
   /**
-   * 上次 `commit` 之后有没有新音频。
+   * 上次 `commit` 之后有没有**真正属于下一段**的新音频。
    *
-   * 必须有这道闸：空缓冲 commit 会被服务端回 `maybe no invalid audio stream`，
-   * 而且这一发错误会污染整条连接（后续的 `.completed` 就乱了）。
+   * 必须有这道闸：空缓冲 commit 会被服务端回 `maybe no invalid audio stream`。
+   *
+   * 但它只在**解码结束之后**才允许置位 —— 见 {@link awaitingDecode}。
    */
   private dirty = false;
+  /**
+   * 上一发 `commit` 发出去了、`.completed` 还没回来。
+   *
+   * **这期间 append 的音频属于上一条缓冲**，不属于下一段。实测 5 场 5 次
+   * `maybe no invalid audio stream` 全部是这个原因：客户端把「解码窗口内推上去的
+   * 音频」记成了新音频，于是第二次 commit 提交了一个服务端认为空的缓冲。
+   * 反证在同一批档案里：那 5 次的定稿文本**全部完整**——多出来的那 200–300 ms
+   * 早就被上一发解掉了。
+   *
+   * 清空点有两个，缺一个就会永久卡住：
+   * - `.completed` → 解码结束，之后来的音频才算新的一段
+   * - `.error` → 这一发废了，得重新武装，否则后面再也 commit 不出去
+   */
+  private awaitingDecode = false;
   private seq = 0;
   /** 还有几条 `commit` 的结果要扔掉（打断用，`clear` 不存在） */
   private discardLeft = 0;
@@ -170,6 +185,7 @@ export class QwenRealtimeAsr {
     this.ready = false;
     this.backlog = [];
     this.dirty = false;
+    this.awaitingDecode = false;
     return true;
   }
 
@@ -214,14 +230,16 @@ export class QwenRealtimeAsr {
 
   private sendAudio(pcm: Buffer): void {
     this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
-    this.dirty = true;
+    // 解码窗口内推上去的音频会被服务端算进**正在解的那一条**，不能当新一段
+    // （见 `awaitingDecode`）。真记成 dirty 就是那一发空 commit 的来源。
+    if (!this.awaitingDecode) this.dirty = true;
   }
 
   /**
    * 把「到目前为止的音频」封成一段交给服务端解码。
    *
    * 调用点：宿主静音计时到点（`UtteranceAssembler.onCommit`）。
-   * 没有新音频就**什么都不发** —— 空 commit 会报错。
+   * 没有新音频就**什么都不发** —— 空 commit 会报错，而且只会白挨一发。
    */
   commit(): void {
     if (this.dropping) return;
@@ -230,11 +248,14 @@ export class QwenRealtimeAsr {
       return;
     }
     if (!this.dirty) {
-      this.log('[asr] commit 跳过：这段没有新音频');
+      this.log(this.awaitingDecode
+        ? '[asr] commit 跳过：上一段还在解码，这段音频归它'
+        : '[asr] commit 跳过：这段没有新音频');
       return;
     }
     this.sendRaw({ type: 'input_audio_buffer.commit' });
     this.dirty = false;
+    this.awaitingDecode = true;
     this.log('[asr] commit');
   }
 
@@ -305,6 +326,7 @@ export class QwenRealtimeAsr {
       return;
     }
     if (ev.type === 'conversation.item.input_audio_transcription.completed') {
+      this.awaitingDecode = false;
       const t = (ev.transcript ?? '').trim();
       const index = this.seq;
       this.seq += 1;
@@ -317,6 +339,8 @@ export class QwenRealtimeAsr {
       return;
     }
     if (ev.type === 'error') {
+      // 这一发废了：重新武装，否则 `awaitingDecode` 永远挂着，后面再也 commit 不出去
+      this.awaitingDecode = false;
       const msg = ev.error?.message ?? text.slice(0, 200);
       this.opts.onError?.(new QwenRealtimeAsrError(`服务端错误: ${msg}`));
     }

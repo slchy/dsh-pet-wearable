@@ -59,6 +59,8 @@ const DEFAULT_RING_MILLISECONDS = 150;
 const MAX_INJECT_CHARS = 200;
 /** 回注排队上限。委派轮本来就是低频事件，多了说明哪里不对 */
 const MAX_PENDING_INJECTS = 4;
+/** 「没人认领的回复」最多记几份再一次性清。多了说明上游一直没出整句 */
+const MAX_ORPHANS = 8;
 
 /** 按**字符**截断（中文一个字一个 token 量级，`String.length` 对代理对也不至于切坏） */
 function clipText(text: string, max: number): string {
@@ -175,6 +177,15 @@ interface PendingResponse {
    * 更没有 id。所以这里只记意图，实际删除在 `finish()` 里做。
    */
   deleteOnDone: boolean;
+  /**
+   * 这一份的助手项 id（`conversation.item.delete` 要它）。
+   *
+   * 来源两处：`response.output_item.added`（早，但可能没到）和
+   * `response.done.response.output`（终态，一定有）。
+   */
+  itemIds: string[];
+  /** 这一份对应的 user 项 id（幽灵清理要连它一起删） */
+  userItemId: string | null;
   /** 有没有人认领过（一份只给一个消费者） */
   claimed: boolean;
 }
@@ -265,6 +276,17 @@ export class OmniShadow {
   private claimedResp: PendingResponse | null = null;
   /** 在等「下一份建出来」的读端（`claim()` 的流会挂在这里） */
   private liveWaiters: Array<() => void> = [];
+  /**
+   * **没人认领**就 completed 的那些回复（幽灵）。
+   *
+   * 场景：omni 已经答完了，但 ASR 从没给出整句（只有 partial，或干脆是噪声）——
+   * 那一轮根本不会开，`claim()` / `discard()` 都没人调。钱在 pipe 形态下省不掉，
+   * 但**历史能清**：下一轮 `restart()` 时把这些轮次的 item 删掉，别让
+   * 「用户没听过的一句话」永久躺在 omni 的记忆里。
+   *
+   * 存 id 而不是 `PendingResponse`：那一份对象已经 `closed`，留着只是占内存。
+   */
+  private orphans: Array<{ assistant: string[]; user: string | null }> = [];
   /** 还没跑过任何一份 seal —— 第一条标 `warmup`，分析时排除 */
   private sharedSeals = 0;
 
@@ -382,6 +404,8 @@ export class OmniShadow {
     // 新一轮开口：上一轮预留的那份不再属于任何人
     this.claimReserved = false;
     this.claimedResp = null;
+    // 上一轮那些「答了但没人听过」的回复，趁现在删掉（见 `orphans`）
+    this.flushOrphans();
     this.wakeLive();
 
     if (this.dirtyBytes > 0) {
@@ -662,6 +686,33 @@ export class OmniShadow {
     }
   }
 
+  /**
+   * 删掉「答了但没人听过」的那些回复。
+   *
+   * 为什么必须清：那份回复 `completed` 了，但 ASR 没给整句 → 没开轮 →
+   * `claim()` / `discard()` 谁都没调过。于是 omni 的服务端历史里永久躺着
+   * `[user: 一段音频] → [assistant: 一句用户根本没听见的回答]`。
+   * 下一轮用户换个话题，模型还会拿它当自己说过的话。
+   *
+   * 连 **user 项一起删**：只删 assistant 会留下「用户说了话、助手没答」的半条记录，
+   * 同样是假记忆。
+   */
+  private flushOrphans(): void {
+    const list = this.orphans.splice(0);
+    if (list.length === 0) {
+      return;
+    }
+    for (const one of list) {
+      for (const id of one.assistant) {
+        this.send({ type: 'conversation.item.delete', item_id: id });
+      }
+      if (one.user !== null) {
+        this.send({ type: 'conversation.item.delete', item_id: one.user });
+      }
+    }
+    this.log(`[omni] 清掉 ${list.length} 份没人认领的回复（用户没听过）`);
+  }
+
   /** 排障用：`willServe()` 为 false 时到底卡在哪一条（只进档案，不参与决策） */
   explain(): Record<string, unknown> {
     const resp = this.resp;
@@ -749,6 +800,8 @@ export class OmniShadow {
       created: false,
       cancelPending: false,
       deleteOnDone: false,
+      itemIds: [],
+      userItemId: null,
       claimed: false,
     };
     // `claim()` 可能已经把这一份预留了（它认领时手里那份已经被顶掉）：
@@ -872,6 +925,20 @@ export class OmniShadow {
           this.log('[omni] 影子就绪');
         }
         return;
+      case 'conversation.item.created':
+        // 这一段对应的 user 项 —— 幽灵清理时连它一起删，否则会留下「用户在说话、
+        // 助手没答」的半条记录
+        if (this.resp !== null && ev.item?.role === 'user' && typeof ev.item.id === 'string') {
+          this.resp.userItemId ??= ev.item.id;
+        }
+        return;
+      case 'response.output_item.added':
+        if (this.resp !== null && ev.item?.role === 'assistant' && typeof ev.item.id === 'string') {
+          if (!this.resp.itemIds.includes(ev.item.id)) {
+            this.resp.itemIds.push(ev.item.id);
+          }
+        }
+        return;
       case 'response.created':
         if (this.resp !== null) {
           this.resp.created = true;
@@ -963,9 +1030,22 @@ export class OmniShadow {
     // 删了之后上下文只剩「用户说了什么」，跟级联那边看到的一样；
     // 不删的话下一轮的输入里会一直夹着一段它自己被打断的半句话。
     // **只删 assistant 项**：用户那条是这一轮的内容，后面还要指代它。
-    if (resp !== null && resp.deleteOnDone) {
-      for (const id of assistantItemIds(ev)) {
-        this.send({ type: 'conversation.item.delete', item_id: id });
+    //
+    // 没被 `discard()` 标、也**没人认领**的那份是「幽灵」：omni 答完了，但那一轮
+    // 根本没开起来（ASR 没给整句）。它的话用户一个字都没听过，留在历史里只会
+    // 让下一轮的指代错乱 —— 记进 `orphans`，下一轮开口时删掉（见 `restart()`）。
+    if (resp !== null) {
+      const ids = new Set([...resp.itemIds, ...assistantItemIds(ev)]);
+      resp.itemIds = [...ids];
+      if (resp.deleteOnDone) {
+        for (const id of ids) {
+          this.send({ type: 'conversation.item.delete', item_id: id });
+        }
+      } else if (!resp.claimed) {
+        this.orphans.push({ assistant: [...ids], user: resp.userItemId });
+        if (this.orphans.length > MAX_ORPHANS) {
+          this.orphans.shift();
+        }
       }
     }
 
