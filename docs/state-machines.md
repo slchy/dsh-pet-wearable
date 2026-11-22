@@ -561,6 +561,10 @@ stateDiagram-v2
 2. **`claimedResp` 不能省。** `finish()` 一到就把 `resp` 置 null，而异步 generator 的
    第一个 `next()` 是微任务 —— response 若在消费者开始读之前就 `done`，事后去 `resp` 里
    找只会得到 null，表现是静默等 5 s、零音频。
+3. **并段轮里认领要顺着 `next` 跟到真正那份。** 一句话被切几段就几次 `seal()`，
+   第一份会被下一段取消（`superseded`）；读端在一个字节都没播的情况下跟到 `next`，
+   播过就停在那里（两段回答拼在一起更难听）。跨 `turnEpoch` 的 `next` 不许跟 ——
+   那是下一轮的答案（`restart()` 每次 +1）。
 
 ### 与主链路的接缝（三处，各管一件事）
 

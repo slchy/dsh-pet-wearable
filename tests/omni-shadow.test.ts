@@ -338,6 +338,91 @@ test('认领之前到的那块音频不能丢（判停延拍时认领会晚到 7
   assert.equal(got[0]!.length, 480);
 });
 
+test('并段轮：认领绑的那份被下一段顶掉时，音频跟到新那份（不能 0 音频）', async () => {
+  // 真机 20261122-2243 第 13、16 轮：一句话被 ASR 切成好几段，认领绑在第一份上，
+  // 那份被后面的封段取消 → 这一轮 audio_s=0；真正那份（2.16 s / 6.16 s）没人认领、
+  // 被当幽灵删掉。这里钉住：一个字节都没播出去时，认领要跟到最新的那一份。
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+
+  // 第二段紧跟着封上来：第一份被 cancel，第二份排队
+  h.at(120);
+  h.shadow.feed(Buffer.alloc(MS * 200), true);
+  h.shadow.seal(2, 40);
+  assert.equal(h.socket.count('response.create'), 1, '忙时不许再发 create');
+
+  // 第一份 done（一个字节音频都没出过）→ 排队那份建出来
+  h.at(400);
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  assert.equal(h.socket.count('response.create'), 2, 'done 之后要补发排队那份');
+
+  // 第二份才是真正的答案
+  h.at(900);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(960).toString('base64') });
+  h.at(1000);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await drain;
+
+  assert.equal(
+    got.reduce((n, c) => n + c.length, 0),
+    960,
+    `认领必须跟到第二份，实际拿到 ${got.length} 块`,
+  );
+});
+
+test('并段轮：已经播出去的那份不再跟到下一段（两段回答不能接在一起）', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  // 第一份已经出一块音频（用户听到了），之后才被下一段顶掉
+  h.at(600);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  h.at(700);
+  h.shadow.feed(Buffer.alloc(MS * 200), true);
+  h.shadow.seal(2, 40);
+  h.at(900);
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  h.at(1000);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(960).toString('base64') });
+  h.at(1100);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await drain;
+
+  assert.equal(
+    got.reduce((n, c) => n + c.length, 0),
+    480,
+    '播过的就停在那儿 —— 把第二段的答案接上来会变成两句回答拼在一起',
+  );
+});
+
 test('discard 后立刻不可认领（cancel 要等 created，见下一条）', () => {
   const h = make('full');
   h.ready();

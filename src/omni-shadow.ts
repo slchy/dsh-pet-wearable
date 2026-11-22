@@ -193,6 +193,18 @@ interface PendingResponse {
   /** 还没 created 就被要求取消：等 created 到了立刻补发 */
   cancelPending: boolean;
   /**
+   * 这一份是被**同一轮的下一段**顶掉的（`seal()` 撞 busy），不是新一轮。
+   *
+   * 区别要命：并段轮里一句话会被 ASR 切成好几片，每片一次封段 —— 认领绑上的第一份
+   * 会被后面那片取消。若把这种取消当成「这一轮结束了」，这一轮就 0 音频，而真正
+   * 那份（可能是 6 s 的完整回答）没人认领、被当幽灵删掉。真机 `20261122-2243`
+   * 第 13、16 轮就是这么丢的（`audio_s=0`，同期 `omni.shadow out_s 2.16 / 6.16`）。
+   */
+  superseded: boolean;
+  /** 顶掉它的那一份（同一轮的下一段）；
+ull = 还没有（在 pending 里排队） */
+  next: PendingResponse | null;
+  /**
    * 这一份的助手回复不要留在服务端历史里（`discard()` 时标上）。
    *
    * **必须延迟到 `response.done` 才删**：`conversation.item.delete` 要 item id，
@@ -297,6 +309,14 @@ export class OmniShadow {
    * 一轮只会 claim 一次，所以单槽够；`discard()` / `restart()` 会把它清掉。
    */
   private claimReserved = false;
+  /**
+   * 轮次纪元：estart() 每次 +1。claim() 记下当时的纪元，并段轮被顶掉时
+   * 只肯跟到**同一个纪元**里新封出来的那份 —— 否则就会把下一轮的答案当成自己的。
+   */
+  private turnEpoch = 0;
+  /** 刚被本轮的下一段顶掉、但下一份还没建出来的那一份（sendSeal 里接链） */
+  private supersededPrev: PendingResponse | null = null;
+  private claimEpoch = -1;
   /**
    * 认领落在哪一份上。
    *
@@ -436,6 +456,8 @@ export class OmniShadow {
     this.ringBytes = 0;
     this.turnSeqs = [];
     // 新一轮开口：上一轮预留的那份不再属于任何人
+    this.turnEpoch += 1;
+    this.supersededPrev = null;
     this.claimReserved = false;
     this.claimedResp = null;
     // 上一轮那些「答了但没人听过」的回复，趁现在删掉（见 `orphans`）
@@ -520,7 +542,14 @@ export class OmniShadow {
       return;
     }
     if (this.resp !== null) {
-      // 忙时 create 会被服务端拒掉且永久丢失（实测），所以先 cancel 再排队
+      // 忙时 create 会被服务端拒掉且永久丢失（实测），所以先 cancel 再排队。
+      // 标 `superseded`：这是**同一轮的下一段**，不是新一轮 —— 认领要跟过去（见 `sendSeal`）。
+      this.resp.superseded = true;
+      this.supersededPrev = this.resp;
+      // 一个字节音频都没出过的那份没人听过，删掉；出过的留着（用户可能听到了）
+      if (this.resp.claimed && this.resp.firstAudioAt === null) {
+        this.resp.deleteOnDone = true;
+      }
       this.cancelCurrent();
       this.pending = meta;
       return;
@@ -572,6 +601,8 @@ export class OmniShadow {
     }
     // 上一轮的认领随这一轮作废（一轮一个消费者）
     this.claimedResp = null;
+    // 记下这一轮的 epoch：并段轮被顶掉时，只允许跟到**同一轮**新封出来的那份
+    this.claimEpoch = this.turnEpoch;
     const live = this.liveResp();
     if (live !== null) {
       live.claimed = true;
@@ -604,18 +635,41 @@ export class OmniShadow {
           await self.waitLive();
           resp = current();
         }
+        // 上面那一圈保证非空；单独一个非空变量是为了在「换到下一段」时不丢类型
+        let active: PendingResponse = resp;
+        let yielded = 0;
         for (;;) {
-          if (resp.audio.length > 0) {
-            const next = resp.audio.shift();
+          if (active.audio.length > 0) {
+            const next = active.audio.shift();
             if (next !== undefined) {
+              yielded += next.length;
               yield next;
             }
             continue;
           }
-          if (resp.closed) {
+          if (active.closed || active.cancelled) {
+            // 被**同一轮的下一段**顶掉、而且这段还一个字都没播出去 → 认领跟过去。
+            // 播过就到此为止：两段回答接在一起比「少说一句」更难听。
+            // 只认**同一个 turn epoch** 里新封出来的那一份：`restart()` 之后 `this.resp`
+            // 属于下一轮，跟过去就把人家的答案抢了（`interrupt` 也就掐错人）。
+            if (yielded === 0 && active.superseded && self.claimEpoch === self.turnEpoch) {
+              let next = active.next;
+              if (next === null && self.pending !== null) {
+                // 排队那份还没建出来（inish() 先收尾上一份、再补发）：等它
+                await self.waitLive();
+                next = active.next;
+              }
+              if (next !== null && next !== active) {
+                next.claimed = true;
+                self.claimedResp = next;
+                self.log('[omni] 认领跟到下一段（并段轮）');
+                active = next;
+                continue;
+              }
+            }
             return;
           }
-          await new Promise<void>((resolve) => { resp.audioWaiters.push(resolve); });
+          await new Promise<void>((resolve) => { active.audioWaiters.push(resolve); });
         }
       })(),
     };
@@ -834,17 +888,23 @@ export class OmniShadow {
       delegate: null,
       created: false,
       cancelPending: false,
+      superseded: false,
+      next: null,
       deleteOnDone: false,
       itemIds: [],
       userItemId: null,
       claimed: false,
     };
+    // 接上「谁顶掉了谁」：读端要靠它跟到真正那份答案（见 claim() 的 chunks）
+    if (this.supersededPrev !== null) {
+      this.supersededPrev.next = this.resp;
+      this.supersededPrev = null;
+    }
     // `claim()` 可能已经把这一份预留了（它认领时手里那份已经被顶掉）：
     // 一建出来就标成已认领，别的消费者再也拿不走。
     if (this.claimReserved) {
       this.resp.claimed = true;
       this.claimReserved = false;
-      this.claimedResp = null;
       this.claimedResp = this.resp;
     }
     this.state = 'busy';
@@ -1255,3 +1315,6 @@ function base64Bytes(text: string): number {
   const pad = text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0;
   return Math.floor((text.length * 3) / 4) - pad;
 }
+
+
+
