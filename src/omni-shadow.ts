@@ -61,6 +61,8 @@ const MAX_INJECT_CHARS = 200;
 const MAX_PENDING_INJECTS = 4;
 /** 「没人认领的回复」最多记几份再一次性清。多了说明上游一直没出整句 */
 const MAX_ORPHANS = 8;
+/** 生成期最多暂存多少音频（一份回答通常 2–4 s；8 s 是防挂死的上限） */
+const MAX_HELD_BYTES = BYTES_PER_MILLISECOND * 8000;
 /** 按**字符**截断（中文一个字一个 token 量级，`String.length` 对代理对也不至于切坏） */
 function clipText(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
@@ -259,6 +261,14 @@ export class OmniShadow {
   /** 等 `ready` 再发的回注文本（见 `injectAnswer()`） */
   private injects: string[] = [];
   /**
+   * 生成期攒下的音频（见 `append()`）。
+   *
+   * 与 ASR 那边同一个协议怪癖：commit 在飞时 append 上去的会被服务端丢掉。
+   * 并段轮里用户接着说的 B 段开头正好落在这个窗口里。
+   */
+  private held: Buffer[] = [];
+  private heldBytes = 0;
+  /**
    * `claim()` 认领了「还没建出来的那一份」时置位。
    *
    * 语义是**预留**：`sendSeal()` 一建好就把新那份标成 `claimed`，别的消费者再也拿不走。
@@ -366,6 +376,9 @@ export class OmniShadow {
     this.state = 'broken';
     this.claimReserved = false;
     this.claimedResp = null;
+    // 生成期攒的音频属于这条连接，别漏进下一场
+    this.held = [];
+    this.heldBytes = 0;
     this.wakeLive();
     if (ws !== null) {
       try {
@@ -610,6 +623,8 @@ export class OmniShadow {
     // 或者等不到东西直接结束这一轮）
     this.claimReserved = false;
     this.claimedResp = null;
+    this.held = [];
+    this.heldBytes = 0;
     this.wakeLive();
   }
 
@@ -663,8 +678,7 @@ export class OmniShadow {
     if (this.state === 'broken' || this.state === 'idle') {
       this.log(`[omni] 回注丢弃：车道不在（${this.state}）`);
       return;
-    }
-    if (this.injects.length >= MAX_PENDING_INJECTS) {
+    }    if (this.injects.length >= MAX_PENDING_INJECTS) {
       this.injects.shift();
       this.log('[omni] 回注队列满，丢掉最早的一条');
     }
@@ -850,8 +864,40 @@ export class OmniShadow {
       this.droppedBytes += pcm.length;
       return;
     }
-    this.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+    // 这一段永远算「下一段」的长度（`seal()` 用 dirtyBytes 算 seal_s）
     this.dirtyBytes += pcm.length;
+    if (this.resp !== null) {
+      // commit 在飞 / 正在生成：这期间 append 上来的音频**服务端会直接丢掉** ——
+      // 实测同一个底座（`tmp/omni-probe/omni-drop-probe.cjs`）：同样的 500 ms 语音，
+      // 生成完之后推能听写成「司机拍的。」，生成期推则只剩噪声。
+      // 并段轮的真实形状正是后者（用户接着说的 B 段开头几百毫秒），所以必须暂存、
+      // 等 `finish()` 里推上去、再发下一条 commit（见 `flushHeld`）。
+      this.held.push(pcm);
+      this.heldBytes += pcm.length;
+      while (this.heldBytes > MAX_HELD_BYTES && this.held.length > 0) {
+        this.heldBytes -= this.held.shift()?.length ?? 0;
+        this.log('[omni] 暂存溢出，丢掉最早一帧');
+      }
+      return;
+    }
+    this.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+  }
+
+  /**
+   * 把生成期攒下的音频推上去。
+   *
+   * 必须在 `sendSeal()`（下一段的 commit）**之前**调用 —— 那之后它就不属于这段了。
+   */
+  private flushHeld(): void {
+    if (this.held.length === 0) {
+      return;
+    }
+    const held = this.held.splice(0);
+    this.heldBytes = 0;
+    for (const pcm of held) {
+      this.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+    }
+    this.log(`[omni] 补推生成期暂存的 ${held.length} 帧`);
   }
 
   private pushRing(pcm: Buffer): void {
@@ -1091,8 +1137,14 @@ export class OmniShadow {
       if (this.state === 'broken') {
         this.emitSkipped(pending.seq, 'broken');
       } else {
+        // 生成期攒下的音频要先推上去，否则下一段的 commit 是空缓冲 ——
+        // 那段正是用户接着说的开头（见 `append()`）
+        this.flushHeld();
         this.sendSeal(pending);
       }
+    } else {
+      // 没有排队的段：攒下的音频留在服务端缓冲里等下一次 commit
+      this.flushHeld();
     }
   }
 
@@ -1118,6 +1170,8 @@ export class OmniShadow {
     }
     this.claimReserved = false;
     this.claimedResp = null;
+    this.held = [];
+    this.heldBytes = 0;
     this.wakeLive();
     if (ws !== null) {
       try {

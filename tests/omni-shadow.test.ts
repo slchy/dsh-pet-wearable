@@ -170,9 +170,16 @@ test('封段之后的静音一块都不发（能量门比封段晚关约 2 s）'
     '封段后灌静音 = 白付 token + 下一轮 commit 出空白用户消息',
   );
 
-  // 真又开口了：软起音不该被切掉，ring 里那 100 ms 要补回去
+  // 真又开口了：软起音不该被切掉，ring 里那 100 ms 要跟着一起走。
+  // 但**这一刻不发** —— 生成期的 append 服务端会直接丢掉（见 `append()`），
+  // 所以先攒在本地，`response.done` 到了再补推。
   h.shadow.feed(Buffer.alloc(MS * 50), true);
-  assert.equal(h.socket.count('input_audio_buffer.append'), before + 2, 'ring + 这一块');
+  assert.equal(h.socket.count('input_audio_buffer.append'), before,
+    '生成期先攒着，现在推上去会被丢掉');
+  h.at(200);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.socket.count('input_audio_buffer.append'), before + 2,
+    'done 之后补推：ring 那 100 ms + 这一块');
 });
 
 test('并段：第二次封段能正常再起一份', () => {
@@ -693,4 +700,36 @@ test('认领过的回复下一轮不删（用户听过）', () => {
   h.at(40);
   h.shadow.restart([Buffer.alloc(MS * 100)]);
   assert.equal(h.socket.count('conversation.item.delete'), 0);
+});
+
+test('并段轮：B 段音频在生成期先攒着，done 之后补推再封段', () => {
+  // 实测（omni-drop-probe.cjs）：同样 500 ms 语音，生成完之后推能听写出来，
+  // 生成期推则只剩噪声 —— 服务端把这段 append 丢了。并段轮的真实形状正是后者。
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  const before = h.socket.count('input_audio_buffer.append');
+
+  // 用户接着说 B（生成期）
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  assert.equal(h.socket.count('input_audio_buffer.append'), before, '生成期不直接发');
+
+  // B 说完 → 第二次封段（撞 busy → 排队）
+  h.at(30);
+  h.shadow.seal(2, 40);
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 1, '第二发 commit 要等 done');
+
+  // 第一份 done → 先补推 B，再发第二组 commit+create
+  h.at(40);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const types = h.socket.types();
+  const pushAt = types.lastIndexOf('input_audio_buffer.append');
+  const commitAt = types.lastIndexOf('input_audio_buffer.commit');
+  assert.equal(h.socket.count('input_audio_buffer.append'), before + 1, 'B 段补推上去了');
+  assert.ok(pushAt < commitAt, '补推必须在 commit 之前，否则那一段还是空的');
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 2);
 });

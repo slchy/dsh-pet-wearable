@@ -304,7 +304,7 @@ export class AliyunAsr {
   }
 
   /** 推音频。16 kHz / 单声道 / PCM16 小端。未 ready 时先缓存。 */
-  feed(pcm: Buffer): void {
+  feed(pcm: Buffer, _voiced?: boolean): void {
     if (this.dropping) return;
     // 已经关掉、但 close 事件还没派发的连接不算「还连着」
     if (this.ws && this.ws.readyState === WebSocket.CLOSED) this.drop(this.ws);

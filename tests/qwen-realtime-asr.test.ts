@@ -314,3 +314,69 @@ test('补推出来的音频也要能封段（dirty 由 flush 置位）', async (
   asr.commit();
   assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
 });
+
+test('解码窗口里的纯尾静音不许补推（补上去会换一句幻觉的「嗯。」）', async () => {
+  // 每轮正常对话都在这个形状里：封段 → 能量门还要 2 s 才关 → 窗口里灌进 ~260 ms 尾静音。
+  // 实测 150 ms 纯静音就能让 DashScope 吐一个「嗯。」定稿。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+  for (let i = 0; i < 13; i += 1) asr.feed(Buffer.alloc(640), false); // 260 ms 静音
+  asr.commit(); // 延后，等定稿
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '你好。' });
+
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before,
+    '窗口里全是静音，一个字都不该补推');
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1,
+    '延后的那发也要落空：没有语音可封段');
+});
+
+test('解码窗口里真说了话：补推之后要补发延后的 commit（否则尾巴会粘到下一句句头）', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1);
+
+  asr.feed(Buffer.alloc(640), false); // 静音（进 ring）
+  asr.feed(Buffer.alloc(640), true); // 又开口 → ring 转正
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit(); // 撞在解码期 → 延后
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1,
+    '解码期不该发第二发');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2,
+    '补推之后必须补发延后的 commit，否则这段语音会悬到下一句');
+});
+
+test('软起音：窗口里先到几帧静音、再开口 → ring 里那几帧要一起转正', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+  asr.feed(Buffer.alloc(640), false);
+  asr.feed(Buffer.alloc(640), false);
+  asr.feed(Buffer.alloc(640), true);
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before + 3,
+    '2 帧静音 + 1 帧有声都该补推');
+});
+
+test('断连时把窗口暂存一起清掉，别漏进下一句', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  asr.feed(Buffer.alloc(640), true); // 攒了一份
+  socket.close();
+  // 重连之后的新会话不该背着上一句的尾巴
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  socket.message({ type: 'session.updated', session: {} });
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before + 1,
+    '只有新喂的这一帧');
+});

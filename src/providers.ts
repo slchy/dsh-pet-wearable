@@ -344,8 +344,19 @@ export interface AgentProvider {
 
 /** STT 会话：一次连接一个，流式喂 PCM。 */
 export interface SttSession {
-  /** 喂一块 PCM16 16 kHz mono。 */
-  feed(pcm: Buffer): void;
+  /**
+   * 喂一块 PCM16 16 kHz mono。
+   *
+   * @param voiced 这一帧能量门判为「有声」吗（`EnergyGateDecision.voiced`）。
+   *
+   * 为什么要传：`qwen-realtime-asr` 在 commit 之后、定稿之前的窗口里会**暂存**
+   * 音频（那段时间 append 上来的会被服务端丢掉，见该文件的 `heldDuringDecode`）。
+   * 而尾静音也会被 `onSpeech` 一路灌进来 —— 攒下来的纯静音补推上去会让服务端
+   * 稳定吐一个幻觉定稿（实测 150 ms 纯静音 → 「嗯。」）。所以暂存要能区分有声帧。
+   *
+   * 不传 = 调用方不知道（老路径），实现方按「全都有声」保守处理。
+   */
+  feed(pcm: Buffer, voiced?: boolean): void;
   /** 「这段说完了」：请求厂商出最终结果（不必关闭连接）。 */
   hangup(): void;
   close(): void;

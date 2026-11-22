@@ -34,6 +34,8 @@ const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
 const DEFAULT_MODEL = 'qwen3-asr-flash-realtime';
 /** 解码窗口内最多暂存多少音频（正常解码 ~261 ms；2 s 是防挂死的上限） */
 const MAX_HELD_BYTES = 32 * 2000;
+/** 解码窗口内「还没开口」时保留的最近音频（150 ms，与 omni-shadow 一致） */
+const RING_BYTES = 32 * 150;
 
 /** 只用到这么点成员，抽出来是为了单测能塞假 socket。 */
 export interface RealtimeSocket {
@@ -128,6 +130,26 @@ export class QwenRealtimeAsr {
    */
   private heldDuringDecode: Buffer[] = [];
   private heldBytes = 0;
+  /**
+   * 窗口内「还没开口」时留的最近几帧（防软起音被切掉）。
+   *
+   * 与 `omni-shadow` 的 mute+ring 同一套规则：没见过有声帧之前不攒，[`RING_BYTES`]
+   * 一满就丢最老的。
+   */
+  private ringDuringDecode: Buffer[] = [];
+  private ringBytes = 0;
+  /** 窗口内已经见过有声帧 —— 之后所有帧都转正（含中间的短静音） */
+  private holdActive = false;
+  /**
+   * 解码窗口里有人来要过 commit。
+   *
+   * **不能直接丢**：窗口里的真语音在 `flushHeld()` 之后才算「新的一段」，
+   * 那时若没人再封段，它就悬在缓冲里，直到下一句话开口才被粘到句头
+   * （用户会听到/看到前一句的尾巴跑到后一句前面）。
+   * 所以这里记意图，`flushHeld()` 之后立刻补发 —— 那一发只有在真攒到语音时才
+   * 会发（静音窗口 `flushHeld` 什么都不置，`commit()` 自然跳过）。
+   */
+  private commitDeferred = false;
   private seq = 0;
   /** 还有几条 `commit` 的结果要扔掉（打断用，`clear` 不存在） */
   private discardLeft = 0;
@@ -202,6 +224,10 @@ export class QwenRealtimeAsr {
     this.awaitingDecode = false;
     this.heldDuringDecode = [];
     this.heldBytes = 0;
+    this.ringDuringDecode = [];
+    this.ringBytes = 0;
+    this.holdActive = false;
+    this.commitDeferred = false;
     return true;
   }
 
@@ -226,7 +252,7 @@ export class QwenRealtimeAsr {
     });
   }
 
-  feed(pcm: Buffer): void {
+  feed(pcm: Buffer, voiced?: boolean): void {
     if (this.dropping) return;
     // 只摘**已经关掉**的连接。CONNECTING / OPEN 都不是「死了」——
     // 早期版本这里写的是 `readyState !== OPEN`，结果第一个音频块就在建连
@@ -241,28 +267,70 @@ export class QwenRealtimeAsr {
       if (this.backlog.length > 200) this.backlog.shift();
       return;
     }
-    this.sendAudio(pcm);
+    this.sendAudio(pcm, voiced);
   }
 
-  private sendAudio(pcm: Buffer): void {
+  /**
+   * 推一块音频。
+   *
+   * 解码窗口（`awaitingDecode`）里的音频服务端会丢，所以要暂存 —— 但**只暂存
+   * 说得出话的那部分**。尾静音一样会被 `onSpeech` 灌进来（能量门 `holdMs` 2 s
+   * 关得比 `commitMs` 20 ms 晚得多），攒下来补推上去会让服务端稳定吐一个幻觉定稿：
+   * 实测 150 ms 纯静音 → 「嗯。」。所以窗口内先按 omni-shadow 那套「闭嘴 + 环形
+   * 缓冲」处理：没见过有声帧之前只留最近 150 ms，一旦有声全部转正。
+   */
+  private sendAudio(pcm: Buffer, voiced?: boolean): void {
     if (this.awaitingDecode) {
-      // 现在发上去会被服务端丢掉 —— 先存着，定稿之后再推（见 `heldDuringDecode`）
-      this.heldDuringDecode.push(pcm);
-      this.heldBytes += pcm.length;
-      while (this.heldBytes > MAX_HELD_BYTES && this.heldDuringDecode.length > 0) {
-        const dropped = this.heldDuringDecode.shift();
-        this.heldBytes -= dropped?.length ?? 0;
-        this.log('[asr] 暂存溢出，丢掉最早一帧');
+      const isVoiced = voiced !== false;
+      if (this.holdActive) {
+        this.pushHeld(pcm);
+        return;
       }
+      if (!isVoiced) {
+        // 还没开口：只留最近一小截，防软起音被切掉
+        this.ringDuringDecode.push(pcm);
+        this.ringBytes += pcm.length;
+        while (this.ringBytes > RING_BYTES && this.ringDuringDecode.length > 0) {
+          this.ringBytes -= this.ringDuringDecode.shift()?.length ?? 0;
+        }
+        return;
+      }
+      // 又开口了：软起音那几帧在 ring 里，一起转正
+      this.holdActive = true;
+      for (const part of this.ringDuringDecode.splice(0)) {
+        this.pushHeld(part);
+      }
+      this.ringBytes = 0;
+      this.pushHeld(pcm);
       return;
     }
     this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
     this.dirty = true;
   }
 
+  private pushHeld(pcm: Buffer): void {
+    this.heldDuringDecode.push(pcm);
+    this.heldBytes += pcm.length;
+    while (this.heldBytes > MAX_HELD_BYTES && this.heldDuringDecode.length > 0) {
+      const dropped = this.heldDuringDecode.shift();
+      this.heldBytes -= dropped?.length ?? 0;
+      this.log('[asr] 暂存溢出，丢掉最早一帧');
+    }
+  }
+
   /** 把解码窗口里攒下的音频推上去 —— 它们到这一刻才真正属于下一段 */
   private flushHeld(): void {
+    // 窗口内一直是静音：一个字都没说，推上去只会换来一句「嗯。」
+    this.ringDuringDecode = [];
+    this.ringBytes = 0;
+    this.holdActive = false;
+    const deferred = this.commitDeferred;
+    this.commitDeferred = false;
     if (this.heldDuringDecode.length === 0) {
+      // 没攒到语音 —— 延后的那发也没内容可封，直接落空
+      if (deferred) {
+        this.log('[asr] 延后的 commit 落空：窗口里没有语音');
+      }
       return;
     }
     const held = this.heldDuringDecode.splice(0);
@@ -272,6 +340,11 @@ export class QwenRealtimeAsr {
     }
     this.dirty = true;
     this.log(`[asr] 补推解码期暂存的 ${held.length} 帧`);
+    if (deferred) {
+      // 有人要过 commit：现在缓冲里才有东西，补发它（否则这段语音会一直悬着，
+      // 直到下一句话开口被粘到句头）
+      this.commit();
+    }
   }
 
   /**
@@ -286,10 +359,16 @@ export class QwenRealtimeAsr {
       this.commitWhenReady = true;
       return;
     }
+    if (this.awaitingDecode) {
+      // 窗口里的音频还没推上去（`heldDuringDecode`），这一发现在发也是空缓冲。
+      // 记下意图，`flushHeld()` 之后补发 —— 真攒到语音才有得发，纯静音窗口自动
+      // 落空（那正是 1b 格里「150 ms 纯静音 → 嗯。」的形状）。
+      this.commitDeferred = true;
+      this.log('[asr] commit 延后：上一段还在解码');
+      return;
+    }
     if (!this.dirty) {
-      this.log(this.awaitingDecode
-        ? '[asr] commit 跳过：上一段还在解码，这段音频归它'
-        : '[asr] commit 跳过：这段没有新音频');
+      this.log('[asr] commit 跳过：这段没有新音频');
       return;
     }
     this.sendRaw({ type: 'input_audio_buffer.commit' });

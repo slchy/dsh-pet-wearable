@@ -745,8 +745,10 @@ class VoiceConnection {
         this.omni?.restart(preroll);
       },
       onSpeech: (pcm, voiced) => {
-        this.stt.feed(pcm);
-        // `voiced` 必须透传：门比封段晚关约 2 s，不带它就会往旁路里灌静音
+        // `voiced` 必须透传：门比封段晚关约 2 s，不带它 ASR 的「解码期暂存」
+        // 就会把尾静音攒下来补推，换来一句幻觉定稿（实测 150 ms 静音 → 「嗯。」）
+        this.stt.feed(pcm, voiced);
+        // 同一个理由：不带它就会往旁路里灌静音
         this.omni?.feed(pcm, voiced);
       },
       onSpeechClose: (gapMs) => {
