@@ -67,12 +67,13 @@ class FakeSocket {
 const MS = 32;
 const SILENCE = Buffer.alloc(MS * 100);
 
-function make() {
+function make(serve: 'off' | 'clip' | 'full' = 'off') {
   const socket = new FakeSocket();
   const events: Array<Record<string, unknown>> = [];
   let clock = 0;
   const shadow = new OmniShadow({
     apiKey: 'k',
+    serve,
     now: () => clock,
     emit: (data) => { events.push(data); },
     socketFactory: () => socket as unknown as RealtimeSocket,
@@ -287,4 +288,108 @@ test('restart 时把残留 flush 掉（commit 但不 create），并记在新一
   h.at(500);
   h.socket.message({ type: 'response.done', response: { status: 'completed' } });
   assert.equal(h.events[1]!['flushed_ms'], 50);
+});
+
+test('认领之前到的那块音频不能丢（判停延拍时认领会晚到 700–870 ms）', async () => {
+  const h = make('clip');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  // 首块在 600 ms 到，认领在 800 ms 才发生（模拟 TurnJudge 延拍）
+  h.at(600);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  assert.equal(h.socket.count('response.create'), 1);
+
+  h.at(800);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null, 'clip 档单段轮应当可认领');
+  assert.equal(answer!.sampleRate, 24_000);
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  h.at(900);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await drain;
+  assert.equal(got.length, 1, '认领之前到的那块必须在流里');
+  assert.equal(got[0]!.length, 480);
+});
+
+test('discard 后立刻 cancel，且不再可认领', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  assert.equal(h.shadow.willServe(), true);
+
+  h.shadow.discard();
+  assert.equal(h.socket.count('response.cancel'), 1, '不取消就会在后台把整段废音频生成完');
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.claim(), null);
+});
+
+test('clip 档不认多段轮；full 档认', () => {
+  const clip = make('clip');
+  clip.ready();
+  clip.at(0);
+  clip.shadow.restart([Buffer.alloc(MS * 100)]);
+  clip.at(10);
+  clip.shadow.seal(1, 40);
+  clip.at(20);
+  clip.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  clip.at(30);
+  clip.shadow.feed(Buffer.alloc(MS * 100), true);
+  clip.at(40);
+  clip.shadow.seal(2, 40);
+  assert.equal(clip.shadow.willServe(), false, '并段轮的脏历史还没洗法，先别放量');
+
+  const full = make('full');
+  full.ready();
+  full.at(0);
+  full.shadow.restart([Buffer.alloc(MS * 100)]);
+  full.at(10);
+  full.shadow.seal(1, 40);
+  full.at(20);
+  full.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  full.at(30);
+  full.shadow.feed(Buffer.alloc(MS * 100), true);
+  full.at(40);
+  full.shadow.seal(2, 40);
+  assert.equal(full.shadow.willServe(), true);
+});
+
+test('omni 发 tool_call → delegateReason 非空；正常答 → null', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+  assert.equal(answer!.delegateReason!(), null);
+
+  h.at(700);
+  h.socket.message({ type: 'response.function_call_arguments.delta', delta: '{"reason":"要查设备"}' });
+  h.at(710);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(answer!.delegateReason!(), 'delegate', '本地判据分不出任务，只能靠它');
+});
+
+test('serve=off 时 claim 恒 null（一个字节都不该被认领）', () => {
+  const h = make('off');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.claim(), null);
 });

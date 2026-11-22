@@ -759,8 +759,24 @@ async function main(): Promise<void> {
     const omniWanted = envString('OMNI_SHADOW') === '1';
     const omniKey = process.env['DASHSCOPE_API_KEY'] ?? '';
     const omniModel = envString('OMNI_SHADOW_MODEL');
+    /**
+     * `OMNI_ANSWER`：让 omni 真的答，而不只是量。
+     *
+     * - `off`（默认）/ 未设：纯影子，一个字节都不播
+     * - `clip`：只答**单段**轮 —— 开全量前先验播放/音色/打断
+     * - `full`：与文本快车道同口径（含 omni 自己的 `tool_call` 转交）
+     */
+    const omniAnswer = envString('OMNI_ANSWER') ?? 'off';
+    if (!['off', 'clip', 'full'].includes(omniAnswer)) {
+      console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|clip|full）`);
+      process.exit(2);
+    }
     const omniShadow = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime'
-      ? { apiKey: omniKey, ...(omniModel === undefined ? {} : { model: omniModel }) }
+      ? {
+        apiKey: omniKey,
+        serve: omniAnswer as 'off' | 'clip' | 'full',
+        ...(omniModel === undefined ? {} : { model: omniModel }),
+      }
       : undefined;
     if (omniWanted && omniShadow === undefined) {
       console.log(
@@ -769,7 +785,11 @@ async function main(): Promise<void> {
         + '\n',
       );
     } else if (omniShadow !== undefined) {
-      console.log(`影子    omni 旁路开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`);
+      console.log(
+        `影子    omni 旁路开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
+        + (omniShadow.serve === 'off' ? '只量不发声' : `**会出声** serve=${omniShadow.serve}`)
+        + '）\n',
+      );
     }
 
     /**

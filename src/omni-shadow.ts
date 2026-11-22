@@ -32,6 +32,7 @@
 import WebSocket from 'ws';
 
 import type { RealtimeSocket, RealtimeSocketFactory } from './qwen-realtime-asr.ts';
+import type { AgentAudioAnswer, DelegateReason, FastLaneAudioLane } from './providers.ts';
 
 /** 上行格式：与 `UplinkPipeline` 一致（16 kHz / 单声道 / s16le） */
 const UPSTREAM_RATE = 16_000;
@@ -42,16 +43,39 @@ const DOWNSTREAM_RATE = 24_000;
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
 const DEFAULT_MODEL = 'qwen3.8-omni-flash-realtime';
 /**
- * 输出必须短。
+ * 输出必须短，而且**必须是助手人格**。
  *
- * 实测（40 轮）不加约束时 `out_s` 5–11 s：影子每轮都在后台慢慢吐一长段音频，
- * 既烧输出 token，又让下一轮开口时它还挂着 `busy`。
+ * 实测：写成「你是一个语音助手的**旁路探针**」时，挂着 tools 的模型会连着 3/3
+ * 把闲聊判成工具调用（零音频）—— 措辞里的「探针」比工具描述更能决定它怎么选。
+ * 所以这里就是线上助手该说的话，不做调试人格。
  */
 const DEFAULT_INSTRUCTIONS =
-  '你是一个语音助手的旁路探针。只回一句话，不超过 20 个字，不要解释、不要列举、不要反问。';
+  '你是米馍，一个中文语音助手。只回一句话，不超过 20 个字，不要解释、不要列举、不要反问。';
 
 /** `seal()` 之后、下一次有声之前，最多留多少音频（防软起音被吞） */
 const DEFAULT_RING_MILLISECONDS = 150;
+
+/**
+ * 唯一的工具：把这一轮转给 dsh。
+ *
+ * 描述必须收窄到「**真的要去操作**」—— 只写「操作设备 / 读设备数据 / 长期记忆」，
+ * **绝不能写「查询信息」**：实测写「查询实时信息」之后，一句
+ * 「他还写过哪些作品？」被模型判成「实时信息检索」→ 直接调工具、零音频、整轮报废。
+ * 常识问答是 omni 自己的活，不该转给 dsh。
+ */
+const DELEGATE_TOOL = {
+  type: 'function',
+  name: 'delegate_to_assistant',
+  description:
+    '只在需要**实际动手或读取设备数据**时调用：开关设备/拍照/发消息，'
+    + '读电量/位置/日程等设备信息，或调取以前聊过的长期记忆。'
+    + '闲聊、常识问答、讲个笑话这类都不要调用，自己回答。',
+  parameters: {
+    type: 'object',
+    properties: { reason: { type: 'string', description: '为什么转交（一句话）' } },
+    required: ['reason'],
+  },
+} as const;
 
 export type OmniShadowState = 'idle' | 'connecting' | 'ready' | 'busy' | 'broken';
 
@@ -72,6 +96,16 @@ export interface OmniShadowOptions {
   /** 一份 response 多久没 done 算废（不是性能判据，只是防挂死） */
   readonly responseTimeoutMs?: number;
   readonly ringMs?: number;
+  /**
+   * 认领模式。
+   *
+   * - `off`（默认）：只测不发声 —— 音频仍会攒着（S0 也要用它算 `out_s`），
+   *   但没人认领，`willServe()` 恒 false
+   * - `clip`：只答**单段**轮（`turnSeqs.length === 1`）。开全量之前先用它验
+   *   播放/音色/打断
+   * - `full`：与文本快车道同口径
+   */
+  readonly serve?: 'off' | 'clip' | 'full';
 }
 
 /** 一份 seal 的身份与起点 */
@@ -96,6 +130,22 @@ interface PendingResponse {
   firstAudioAt: number | null;
   outBytes: number;
   cancelled: boolean;
+  /**
+   * 音频**从封段就开始攒**，不是认领才开始。
+   *
+   * 为什么必须这样：认领发生在定稿（~220 ms），但判停延拍时能到 700–870 ms，
+   * 那时首块（600–670 ms）已经发过来了 —— 不做缓冲就会吞掉句首一两个字。
+   */
+  readonly audio: Buffer[];
+  audioWaiters: Array<() => void>;
+  /** 这一份已经不会再产出了（`response.done` 或被取消） */
+  closed: boolean;
+  /** 已收到的转写（活的，用于 `text`/`speech` 的 getter 与审计） */
+  text: string;
+  /** omni 自己决定转 dsh（`tool_call`）；`null` = 它会自己答 */
+  delegate: DelegateReason | null;
+  /** 有没有人认领过（一份只给一个消费者） */
+  claimed: boolean;
 }
 
 interface ServerEvent {
@@ -152,6 +202,8 @@ export class OmniShadow {
   /** 一份 seal 结果里要带的「顺带 flush 掉的残留」 */
   private lastFlushedMs = 0;
   private droppedBytes = 0;
+  /** 这一轮里已经封过几段（并段 > 1）。`restart()` 归零 */
+  private turnSeqs: number[] = [];
   /** 还没跑过任何一份 seal —— 第一条标 `warmup`，分析时排除 */
   private sharedSeals = 0;
 
@@ -262,6 +314,7 @@ export class OmniShadow {
     this.pending = null;
     this.ring = [];
     this.ringBytes = 0;
+    this.turnSeqs = [];
 
     if (this.dirtyBytes > 0) {
       this.lastFlushedMs = Math.round(this.dirtyBytes / BYTES_PER_MILLISECOND);
@@ -326,6 +379,7 @@ export class OmniShadow {
       return;
     }
     this.dirtyBytes = 0;
+    this.turnSeqs.push(seq);
     const meta: SealMeta = {
       seq,
       silenceMs,
@@ -348,6 +402,95 @@ export class OmniShadow {
     this.sendSeal(meta);
   }
 
+  // ---------------------------------------------------------------- 车道接口
+
+  /**
+   * 这一轮能不能由 omni 自己答。纯读、不改账。
+   *
+   * 三重限制叠在一起，每一条都对应一次踩坑：
+   * - `serve === 'off'`：没开的连接一个字节都不该被认领
+   * - `cancelled` / `claimed`：一份只能给一个消费者，取消过的更不能再给（那是死答案）
+   * - `clip` 档只认单段轮 —— 并段轮的脏历史还没洗法，先别放量
+   */
+  willServe(): boolean {
+    if ((this.opts.serve ?? 'off') === 'off') {
+      return false;
+    }
+    const resp = this.resp;
+    if (resp === null || resp.cancelled || resp.claimed) {
+      return false;
+    }
+    if (this.opts.serve === 'clip' && this.turnSeqs.length > 1) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 认领本轮音频。
+   *
+   * 注意：**首块通常还没到**（认领在定稿 ~220 ms，首块 600–670 ms），而判停延拍时
+   * 认领可以晚到 700–870 ms、那时首块已经发过来了 —— 两条路都靠 `resp.audio`
+   * 从封段就开始攒（见 `PendingResponse.audio`）。
+   */
+  claim(): AgentAudioAnswer | null {
+    if (!this.willServe()) {
+      return null;
+    }
+    const resp = this.resp;
+    if (resp === null) {
+      return null;
+    }
+    resp.claimed = true;
+    return {
+      sampleRate: DOWNSTREAM_RATE,
+      transcript: () => resp.text,
+      delegateReason: () => resp.delegate,
+      chunks: (async function* iterate() {
+        for (;;) {
+          if (resp.audio.length > 0) {
+            const next = resp.audio.shift();
+            if (next !== undefined) {
+              yield next;
+            }
+            continue;
+          }
+          if (resp.closed) {
+            return;
+          }
+          await new Promise<void>((resolve) => { resp.audioWaiters.push(resolve); });
+        }
+      })(),
+    };
+  }
+
+  /**
+   * 这一轮不采纳：**立刻 `response.cancel`**。
+   *
+   * 不取消的话它会在后台把整段废音频生成完 —— 既烧输出 token，又让下一轮开口时
+   * 它还挂着 `busy`（那时新的 `response.create` 会被服务端拒掉且永久丢失）。
+   */
+  discard(): void {
+    const resp = this.resp;
+    if (resp !== null) {
+      resp.audio.length = 0;
+      this.wakeAudio(resp);
+      this.cancelCurrent();
+    }
+    this.pending = null;
+  }
+
+  private wakeAudio(resp: PendingResponse | null = this.resp): void {
+    if (resp === null) {
+      return;
+    }
+    const waiters = resp.audioWaiters;
+    resp.audioWaiters = [];
+    for (const wake of waiters) {
+      wake();
+    }
+  }
+
   // ---------------------------------------------------------------- 内部
 
   private sendSeal(meta: SealMeta): void {
@@ -363,6 +506,12 @@ export class OmniShadow {
       firstAudioAt: null,
       outBytes: 0,
       cancelled: false,
+      audio: [],
+      audioWaiters: [],
+      closed: false,
+      text: '',
+      delegate: null,
+      claimed: false,
     };
     this.state = 'busy';
     this.armResponseTimeout();
@@ -395,10 +544,15 @@ export class OmniShadow {
   }
 
   private sendSessionUpdate(): void {
+    const serve = (this.opts.serve ?? 'off') !== 'off';
     this.send({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
+        // **不要**在这加任何「要不要调工具」的暗示。实测：多加一句
+        // 「如果决定调用工具，直接调用，不要先说任何过渡语」之后，闲聊会 3/3
+        // 被判成工具调用（零音频）；去掉它、只留 `DELEGATE_TOOL.description`，
+        // 同一批闲聊 150 轮 `0/150` 误触发。决定权在工具描述，不在提示词。
         instructions: this.opts.instructions ?? DEFAULT_INSTRUCTIONS,
         // 手动端点：我们已经在封段那一刻决定「这句说完了」，服务端 VAD 既多余又更慢
         turn_detection: null,
@@ -417,6 +571,9 @@ export class OmniShadow {
         },
         // 没有它就没有 `input_audio_transcription.completed`，`final_ms` 整列缺失
         input_audio_transcription: { model: 'qwen3-asr-flash-realtime' },
+        // 只有真的要它答时才挂工具：挂在 `session.update` 里会抬高每轮 `in_text_tok`
+        // 基线（实测 150 轮首块没变慢，但那是有 0 次调用的前提下）
+        ...(serve ? { tools: [DELEGATE_TOOL], tool_choice: 'auto' } : {}),
       },
     });
   }
@@ -459,8 +616,17 @@ export class OmniShadow {
         return;
       case 'response.text.delta':
       case 'response.audio_transcript.delta':
-        if (this.resp !== null && this.resp.firstTextAt === null) {
-          this.resp.firstTextAt = this.now();
+        if (this.resp !== null) {
+          if (this.resp.firstTextAt === null) {
+            this.resp.firstTextAt = this.now();
+          }
+          this.resp.text += ev.delta ?? '';
+        }
+        return;
+      case 'response.function_call_arguments.delta':
+        // omni 自己决定转 dsh。音频可能还没出（纯调用），也可能已经说了句垫音。
+        if (this.resp !== null) {
+          this.resp.delegate ??= 'delegate';
         }
         return;
       case 'response.audio.delta':
@@ -468,9 +634,12 @@ export class OmniShadow {
           if (this.resp.firstAudioAt === null) {
             this.resp.firstAudioAt = this.now();
           }
-          // 不 base64 解码，只要字节数
           const delta = ev.delta ?? '';
+          // 字节数必须记（`out_s` / `out_audio_tok` 的交叉校验）；
+          // 音频本体**从封段就攒着**，不等认领 —— 判停延拍时认领会晚到 700–870 ms
           this.resp.outBytes += base64Bytes(delta);
+          this.resp.audio.push(Buffer.from(delta, 'base64'));
+          this.wakeAudio();
         }
         return;
       case 'response.done':
@@ -499,6 +668,11 @@ export class OmniShadow {
     const resp = this.resp;
     this.resp = null;
     this.clearResponseTimer();
+    if (resp !== null) {
+      // 先标 closed 再唤醒：读端要知道「再等也没有了」
+      resp.closed = true;
+      this.wakeAudio(resp);
+    }
     if (this.state !== 'broken') {
       this.state = 'ready';
     }
@@ -561,6 +735,13 @@ export class OmniShadow {
     this.ws = null;
     this.opened = false;
     this.state = 'broken';
+    // 读端不能挂在 await 上等一个永远不会来的块
+    const resp = this.resp;
+    this.resp = null;
+    if (resp !== null) {
+      resp.closed = true;
+      this.wakeAudio(resp);
+    }
     if (ws !== null) {
       try {
         ws.close();

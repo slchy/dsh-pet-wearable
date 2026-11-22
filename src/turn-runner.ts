@@ -442,6 +442,8 @@ export class TurnRunner {
       const agentStartedAt = this.options.clock.now();
       let firstSynthAt = 0;
       let firstAudioAtMs = -1;
+      /** 下行采样率：omni 24 kHz 与 CosyVoice 同值，但**不能假设**，按回答走 */
+      let audioRate = this.options.tts.sampleRate;
       const emit = (chunk: Buffer): void => {
         if (firstChunkAtMs === 0) {
           firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
@@ -468,7 +470,14 @@ export class TurnRunner {
       // 优先走「边生成边合成」：文本一到就 continue-task，首包与生成重叠。
       // 没有流式通道时才退回 SentencePump（按句切，等价于整段）。
       const streamTts = this.options.tts.synthesizeStream?.bind(this.options.tts);
-      const queue = streamTts === undefined || this.options.onLiveAvailable === undefined
+      /**
+       * 这一轮会不会走 omni 直出。
+       *
+       * 必须在**起跑流式 TTS 之前**问：那一步会真的开一个合成 task，而 omni 轮
+       * 没有任何文本可送 —— 服务端会拒空文本，整轮退化成兜底（比不走 omni 还慢）。
+       */
+      const omniTurn = agent.willServeAudio?.(text) === true;
+      const queue = omniTurn || streamTts === undefined || this.options.onLiveAvailable === undefined
         ? null
         : new TokenQueue();
       const pump = queue === null
@@ -537,7 +546,35 @@ export class TurnRunner {
       );
 
       // 补齐没念的部分（没走流式时这一句就是整段合成），并等所有分片落地
-      if (streaming !== null) {
+      if (reply.audio !== undefined) {
+        // omni 直出：音频边到边播，**不走 TTS**。
+        this.log('  流式    分支=omni（音频直出）');
+        audioRate = reply.audio.sampleRate;
+        for await (const chunk of reply.audio.chunks) {
+          if (fsm.isStale(ticket)) {
+            break;
+          }
+          emit(chunk);
+        }
+        // drain 之后 `speech` 才是完整的（它是活的 getter）
+        speech = reply.speech;
+        agent.noteServedTurn?.(text, speech);
+        const why = reply.audio.delegateReason?.() ?? null;
+        if (why !== null) {
+          // omni 自己发了 tool_call：就地切给 dsh。
+          // 已经出过声就不再叠回执（两份不同的声音接在一起很难听，而且收不回来）。
+          this.log('  omni    决定转交 dsh');
+          reply = await agent.reply(text, image, note, {
+            ticket,
+            forceDelegate: why,
+            receiptSpoken: speech.trim() !== '',
+          });
+          replyPath = reply.path;
+          delegateReason = reply.delegate;
+          speech = reply.speech;
+          await pump?.drain(reply.speech);
+        }
+      } else if (streaming !== null) {
         try {
           await streaming;
           // 流式成功：念出去的是**全部增量**，不只是最后一步。用它做 `speech`，
@@ -567,7 +604,7 @@ export class TurnRunner {
       }
 
       interrupted = interrupted || fsm.isStale(ticket);
-      const audioSeconds = pcm16DurationMs(audioBytes, this.options.tts.sampleRate) / 1000;
+      const audioSeconds = pcm16DurationMs(audioBytes, audioRate) / 1000;
       this.log(
         `  回放    ${audioBytes} 字节  ${audioSeconds.toFixed(2)} s`
         + (interrupted ? '（被中断）' : ''),

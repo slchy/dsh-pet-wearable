@@ -220,7 +220,12 @@ export interface VoiceSessionOptions {
    * `onCommit`（NLS 的 `commitMs` 是 0），而封段正是影子的起跑线；没有它，
    * 影子一条数据都出不来（会静默地什么都不发生，所以 `main.ts` 启动时就拦）。
    */
-  readonly omniShadow?: { readonly apiKey: string; readonly model?: string };
+  readonly omniShadow?: {
+    readonly apiKey: string;
+    readonly model?: string;
+    /** 认领模式：`off`（只量）/ `clip`（只答单段轮）/ `full`。缺省 `off` */
+    readonly serve?: 'off' | 'clip' | 'full';
+  };
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
@@ -583,6 +588,7 @@ class VoiceConnection {
     this.omni = options.omniShadow === undefined ? null : new OmniShadow({
       apiKey: options.omniShadow.apiKey,
       ...(options.omniShadow.model === undefined ? {} : { model: options.omniShadow.model }),
+      serve: options.omniShadow.serve ?? 'off',
       // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
       emit: (data) => { this.archive?.event(EVENTS.omniShadow, data); },
       log: (line) => { console.log(line); },
@@ -781,6 +787,11 @@ class VoiceConnection {
 
     // 影子握手（实测 ~1.3 s）与设备握手并行，不占关键路径
     this.omni?.start();
+    // 车道照连接挂：这一条连接答完/断开时必须摘掉，否则下一条连接会认领到
+    // 一条已经死了的 WS（它的 response 永远不会 done）
+    if (this.omni !== null) {
+      this.options.agent.attachAudioLane?.(this.omni);
+    }
 
     // 后台任务完成后的播报落在这条连接上
     this.options.agent.setAnnouncer?.((speech, emotion) => { this.onAnnounce(speech, emotion); });
@@ -1162,6 +1173,9 @@ class VoiceConnection {
     this.dialog.enqueueAnnounce(speech, emotion);
   }
   private onClose(): void {
+    // 先摘车道：`attachAudioLane` 是进程级 agent 上的一个槽，留一条死连接在上面
+    // 会让下一条连接认领到永远不会完成的 response
+    this.options.agent.attachAudioLane?.(null);
     // 有在途开口就记 aborted，然后丢掉执行器手里的计时器
     this.app?.close();
     this.app?.dispose();

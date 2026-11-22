@@ -163,3 +163,21 @@ test('一个字都没出声就不记账（避免窗口里出现「答了空」�
   // 没有抛错即可；下面的断言靠下一轮 prompt 不含空答
   assert.ok(true);
 });
+
+test('forceDelegate：omni 发了 tool_call 就地切 dsh；出过声就不叠回执', async () => {
+  const agent = makeAgent(async () => sse(['在呢哥。']));
+  const hooks: string[] = [];
+  agent.setDelegateHook((reason) => { hooks.push(reason); });
+
+  const spoken = await agent.reply('帮我查一下天气', undefined, undefined, {
+    ticket: { no: 1, gen: 1 }, forceDelegate: 'delegate', receiptSpoken: true,
+  });
+  assert.equal(spoken.path, 'dsh');
+  assert.equal(spoken.delegate, 'delegate');
+  assert.deepEqual(hooks, [], 'omni 已经把话说出去了，再叠一句回执就是两句');
+
+  const silent = await agent.reply('帮我查一下天气', undefined, undefined, {
+    ticket: { no: 2, gen: 2 }, forceDelegate: 'delegate',
+  });
+  assert.deepEqual(hooks, ['delegate'], 'omni 一个字都没说，回执得我们自己出');
+});

@@ -1151,6 +1151,15 @@ export class FrontedAgent implements AgentProvider {
     // 没有票据的调用（单测、保活 ping）自己发一个本地代次 —— 去重照样成立，
     // 只是 session 层没有真票据可比对，会直接照办。
     const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
+    // omni 自己发了 `tool_call`：宿主 drain 完音频才转到这儿，直接进慢车道。
+    // **必须在任何路由判断之前** —— 再判一次会把它送回同一条车道，死循环。
+    if (turn?.forceDelegate !== undefined) {
+      this.log(`  快车道    omni 决定转交（${turn.forceDelegate}）`);
+      return await this.delegate(
+        userText, image, note, ticket, turn.forceDelegate,
+        { silent: turn.receiptSpoken === true },
+      );
+    }
     // 新一轮：投机的次数配额按轮算（上一轮用完不能让下一轮一直没法投机）
     this.speculateStarts = 0;
     this.turnStartedAt = this.now();
@@ -1458,9 +1467,16 @@ export class FrontedAgent implements AgentProvider {
     note: string | undefined,
     ticket: TurnTicket,
     reason: DelegateReason,
+    opts?: { silent?: boolean },
   ): Promise<AgentReplyView> {
+    // 这一轮交给 dsh 了 → omni 那份立刻作废。不取消的话它会在后台把整段废音频
+    // 生成完（烧输出 token），并且让下一轮开口时它还挂着 busy。
+    this.audioLane?.discard();
     this.innerMode = 'pass';
-    this.reportDelegate(reason);
+    // `silent`：omni 已经替我们说过一句话（垫音），再叠一句回执就是两句
+    if (opts?.silent !== true) {
+      this.reportDelegate(reason);
+    }
     const answer = await this.startInner(userText, image, note, ticket);
     this.rememberDsh(answer.speech, userText);
     return { ...answer, path: 'dsh', delegate: reason };

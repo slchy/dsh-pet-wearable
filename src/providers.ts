@@ -15,6 +15,20 @@ import type { TurnTicket } from './dialog-fsm.ts';
 /** 一轮的上下文：现在只有票据，将来要加东西就放这里，别再加位置参数。 */
 export interface TurnContext {
   readonly ticket: TurnTicket;
+  /**
+   * 强制走慢车道。
+   *
+   * 用在「omni 自己发了 `tool_call`」：音频已经/正在播，宿主 drain 完才知道要转交，
+   * 那时不能再走一次路由判断 —— 判断会把它又送回同一条车道。
+   */
+  readonly forceDelegate?: DelegateReason;
+  /**
+   * 这一轮已经有人替我们说过话（omni 的垫音）→ **不要再叠一句回执**。
+   *
+   * 两份不同的声音接在一起，用户听到的是「我帮你查一下。我看看。」；而且
+   * 垫音一旦播出去就收不回来，所以只能压自己的回执。
+   */
+  readonly receiptSpoken?: boolean;
 }
 
 /**
@@ -71,6 +85,13 @@ export interface AgentAudioAnswer {
    * 的当前值正好是「已播出去的部分」，审计与续话要的就是它。
    */
   transcript(): string;
+  /**
+   * 流结束后：omni 自己决定转 dsh 吗（`tool_call`）。`null` = 它自己答。
+   *
+   * 有这个才敢放量 —— 本地判据只挡**形态**（空串 / 超字数 / 阿拉伯数字），
+   * 判不出「这事得问助手」。
+   */
+  delegateReason?(): DelegateReason | null;
 }
 
 /**
