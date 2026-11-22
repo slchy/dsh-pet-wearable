@@ -578,6 +578,11 @@ stateDiagram-v2
 | `cancelCurrent()` 且 `!claimed`（同句第二次封段顶掉） | ✅ | ✅ | 那份答的是半句话，没人听过 |
 | `interrupt()`（播到一半被插话） | ✅ | ❌ | 用户已经听到了一部分，删了就和 `pending` 里记的半句对不上 |
 
+**`interrupt()` 只动 `claimedResp`，不是 `this.resp`。** 插话的处理常常晚于下一段的封段：
+那时 `this.resp` 已经是**新那句话**的回复了（旧的被 cancel、排队那份被 `done` 提升上来），
+盲掐 `this.resp` 会把还没开口的新答案一起杀掉 —— 下一轮只能退回级联，用户听到换嗓子。
+真机实测**每次插话都中招**（`20261122-200901` 的 TURN n=10 → n=11）。
+
 `item.delete` 只能**延迟**到 `response.done`：要 item id，而 id 在
 `response.done.response.output` 里，discard 当场通常连 `created` 都没到。
 
