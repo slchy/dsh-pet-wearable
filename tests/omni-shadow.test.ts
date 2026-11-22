@@ -20,6 +20,10 @@ interface Sent {
   audio?: string;
   item_id?: string;
   item?: { role?: string; content?: Array<{ type?: string; text?: string }> };
+  session?: {
+    instructions?: string;
+    tools?: Array<{ name?: string; description?: string }>;
+  };
 }
 
 class FakeSocket {
@@ -563,6 +567,22 @@ test('等「下一份」的时候车道断了：流正常结束，不挂死', as
   assert.equal(got.length, 0);
 });
 
+test('serve=full 的工具描述里必须带「先说一句再调」：委派轮的声音就靠这一句', () => {
+  const h = make('full');
+  h.ready();
+
+  const update = h.socket.sent[0];
+  assert.equal(update?.type, 'session.update');
+  const tool = update?.session?.tools?.[0];
+  assert.equal(tool?.name, 'delegate_to_assistant');
+  // 真服务实测（`tmp/omni-probe/tool-leadin*.mjs`）：这句不写在**工具描述**里，
+  // omni 调工具时就是 0 ms 音频 —— 整轮哑在那里等 dsh。写进 instructions 也不生效。
+  assert.ok(
+    (tool?.description ?? '').includes('应一声'),
+    `缺了这句委派轮就没有声音，得退回预录回执。实际描述：${tool?.description ?? '（没有工具）'}`,
+  );
+});
+
 test('omni 发 tool_call → delegateReason 非空；正常答 → null', async () => {
   const h = make('full');
   h.ready();
@@ -579,6 +599,37 @@ test('omni 发 tool_call → delegateReason 非空；正常答 → null', async 
   h.at(710);
   h.socket.message({ type: 'response.done', response: { status: 'completed' } });
   assert.equal(answer!.delegateReason!(), 'delegate', '本地判据分不出任务，只能靠它');
+});
+
+test('工具调用**之后**才到的音频也要播（真服务顺序是 call→audio）', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  // 实测：`function_call_arguments` 在 ~500 ms 先到，`audio.delta` 在 ~650 ms 后到 ——
+  // 模型先决定调工具，再补一句「我看看。」垫着。这一段就是委派轮唯一的声源。
+  h.at(500);
+  h.socket.message({ type: 'response.function_call_arguments.delta', delta: '{"reason":"关灯"}' });
+  h.at(650);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(24_000).toString('base64') });
+  h.at(800);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of answer!.chunks) {
+    chunks.push(chunk);
+  }
+  assert.equal(
+    chunks.reduce((n, c) => n + c.length, 0),
+    24_000,
+    '工具调用之后到的音频不能丢 —— 那就是用户听到的垫话',
+  );
+  assert.equal(answer!.delegateReason!(), 'delegate');
 });
 
 test('serve=off 时 claim 恒 null（一个字节都不该被认领）', () => {

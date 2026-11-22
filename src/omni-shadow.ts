@@ -69,12 +69,33 @@ function clipText(text: string, max: number): string {
 }
 
 /**
+ * 「先说一句、再调工具」这一句，挂在**工具描述**里而不是 `instructions` 里。
+ *
+ * 委派轮 dsh 要十几秒，中间必须有个人应一声；而那个声音**只能是 omni 自己**：
+ * 换一条链路合成回执就是两句不同的嗓子接在一起。所以不去预录回执，
+ * 直接让它在同一个 response 里先说一句、再发 `tool_call`。
+ *
+ * 实测（`tmp/omni-probe/tool-leadin*.mjs`，真服务 24 格）：
+ * - 现状（描述里不提应声）→ `tool_call` + **0 ms 音频**，一整轮没有声音，必须靠回执补
+ * - 这句写进 `instructions` → 照样 0 ms。**写哪儿比写什么重要**
+ * - 这句写进工具描述 → 4/4 都先出声（1.36 / 1.84 / 1.92 / 2.32 s），再叠上面两轮 = 6/6
+ * - 收得更紧（「六个字以内 + 不要说要查什么」）→ 掉到 2/4。**收紧会把应声整个压没**
+ *
+ * 顺序是 `function_call_arguments` 先到、`audio.delta` 后到，但两者都在同一个
+ * `response.done` 里收尾 —— 所以 `claim()` 的读端照常把音频读完，读完再看
+ * `delegateReason()`，两边都不缺（见 `TurnRunner` 的 `分支=omni` 那一段）。
+ */
+const LEAD_IN_CLAUSE = '调用之前先用一句话应一声（八个字以内）。';
+
+/**
  * 唯一的工具：把这一轮转给 dsh。
  *
  * 描述必须收窄到「**真的要去操作**」—— 只写「操作设备 / 读设备数据 / 长期记忆」，
  * **绝不能写「查询信息」**：实测写「查询实时信息」之后，一句
  * 「他还写过哪些作品？」被模型判成「实时信息检索」→ 直接调工具、零音频、整轮报废。
  * 常识问答是 omni 自己的活，不该转给 dsh。
+ *
+ * 最后那句「先说一句再调用」是**委派轮回执的来源**。见 {@link LEAD_IN_CLAUSE}。
  */
 const DELEGATE_TOOL = {
   type: 'function',
@@ -82,7 +103,8 @@ const DELEGATE_TOOL = {
   description:
     '只在需要**实际动手或读取设备数据**时调用：开关设备/拍照/发消息，'
     + '读电量/位置/日程等设备信息，或调取以前聊过的长期记忆。'
-    + '闲聊、常识问答、讲个笑话这类都不要调用，自己回答。',
+    + '闲聊、常识问答、讲个笑话这类都不要调用，自己回答。'
+    + LEAD_IN_CLAUSE,
   parameters: {
     type: 'object',
     properties: { reason: { type: 'string', description: '为什么转交（一句话）' } },

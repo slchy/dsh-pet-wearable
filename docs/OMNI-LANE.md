@@ -515,17 +515,44 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 
 ## 十、最脆的一处：工具描述
 
-两次踩坑，代价都是**整轮零音频**：
+`description` 是这个车道里唯一一句**改一个字就整轮报废**的东西：
 
 | 写法 | 结果 |
 |:---|:---|
 | `description: '…查询实时信息…'` | 「他还写过哪些作品？」被 3/3 判成工具调用 |
 | 提示词加「需要转交就调工具」 | 闲聊 3/3 被逼调用 |
 | **只写「实际动手 / 读设备数据 / 长期记忆」** | **9/9 正常** |
+| 再加「调用之前先用一句话应一声（八个字以内）」 | **6/6 委派轮先出声**（1.4–2.3 s）再叠 `tool_call` |
 
 **决定权在 `description`，不在提示词。** `instructions` 里任何关于「要不要调工具」的
-暗示都会把闲聊推向调用。见 [omni-shadow.ts:66](../../src/omni-shadow.ts) 的注释与
-[omni-shadow.ts:584](../../src/omni-shadow.ts) 的警告。
+暗示都会把闲聊推向调用；而「调之前先说一句」这句**只有挂在 `description` 上才生效**
+（换到 `instructions`：实测 2/2 仍是 0 ms 音频，白写）。见
+[omni-shadow.ts:66](../../src/omni-shadow.ts) 的注释、`LEAD_IN_CLAUSE` 的实测记录，
+以及 [omni-shadow.ts:584](../../src/omni-shadow.ts) 的警告。
+
+### 10.1 委派轮那一声（垫话）
+
+dsh 要 10 s 上下，中间必须有人应一声。**这个声音只能由 omni 自己出**：另起一条
+TTS 链路合成回执，就是两句不同的嗓子接在一起，而且还多一条连接、多一次合成。
+
+所以这里不走「预录回执」，走 `tool_call` 同轮出声（`tmp/omni-probe/tool-leadin*.mjs`，
+真服务 24 格）：
+
+| 写法 | 委派轮音频 |
+|:---|:---|
+| 现状（描述里不提应声） | **0 ms**（整轮哑着等 dsh） |
+| 应声写进 `instructions` | 0 ms / 0 ms |
+| 应声写进 `description`（八个字以内） | 1.36 / 1.84 / 1.92 / 2.32 s（4/4） |
+| 同一条，收得更紧（六个字 + 「不要说要查什么」） | **2/4 掉回 0 ms** —— 收紧会把应声整个压没 |
+
+线序是 `function_call_arguments.delta`（~500 ms）→ `audio.delta`（~650 ms）→
+`response.done`（~700–960 ms），**两者收在同一个 done 里**。所以读端照常把音频读完、
+读完再看 `delegateReason()`，两边都不缺 —— 这一条由
+`tests/omni-shadow.test.ts` 的「工具调用之后才到的音频也要播」钉住。
+
+另外两件事也顺手验了：闲聊轮不会被这段描述带偏（3/3 不调工具）；
+`tool_call` 之后我们从不回 `function_call_output`（dsh 的答案另走 `injectAnswer` 注入），
+这条 dangling call 不影响下一轮（3/3 照常回答、不重复调工具）。
 
 ---
 

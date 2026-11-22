@@ -567,7 +567,7 @@ stateDiagram-v2
 | 位置 | 做什么 |
 |---|---|
 | `voice-session` 三个回调 | `onSpeechOpen` → `restart(preroll)`；`onSpeech` → `feed(pcm, voiced)`；`onCommit` → `seal(seq, silenceMs)`，**与 `stt.commit()` 同一行** |
-| `FrontedAgent` | `isPrefetchable()` 里压住投机（不压就是每轮双花 LLM 钱）；`reply()` 认领；`delegate()` 先 `discard()`；`noteServedTurn()` 写回 `pending`；`injectAnsweredTurn()` 回注委派轮 |
+| `FrontedAgent` | `isPrefetchable()` 里压住投机（不压就是每轮双花 LLM 钱）；`reply()` 认领；`delegate()` 先 `discard()`（omni 已经说过垫话时它落空，见下）；`noteServedTurn()` 写回 `pending`；`injectAnsweredTurn()` 回注委派轮 |
 | `TurnRunner` | 起跑流式 TTS **之前**问 `willServeAudio()`；`reply.audio !== undefined` 走直出分支；drain 之后才读 `speech` |
 
 三种「不采纳」的语义**不能混**：
@@ -577,6 +577,12 @@ stateDiagram-v2
 | `discard()`（走 dsh / 判据否决） | ✅ | ✅ | 一个字都没播 |
 | `cancelCurrent()` 且 `!claimed`（同句第二次封段顶掉） | ✅ | ✅ | 那份答的是半句话，没人听过 |
 | `interrupt()`（播到一半被插话） | ✅ | ❌ | 用户已经听到了一部分，删了就和 `pending` 里记的半句对不上 |
+
+**委派轮的第一声是 omni 自己出的**：工具描述里那句「调用之前先用一句话应一声」，
+实测 **6/6** 生效（1.4–2.3 s），线序 `function_call_arguments` → `audio.delta` → `done`。
+所以 `delegate()` 里那句 `discard()` 在这个形态下**落空**（`done` 已到、`resp` 已置 null），
+那条领句不会被删 —— 正确，用户听过它。之后 `receiptSpoken:true` 让 `RECEIPTS` 闭嘴，
+不会再叠一句别的声音。见 `docs/OMNI-LANE.md` §10.1。
 
 **`interrupt()` 只动 `claimedResp`，不是 `this.resp`。** 插话的处理常常晚于下一段的封段：
 那时 `this.resp` 已经是**新那句话**的回复了（旧的被 cancel、排队那份被 `done` 提升上来），
