@@ -812,6 +812,8 @@ export class FrontedAgent implements AgentProvider {
   /** 挂/摘音频直出车道（omni）。见 `FastLaneAudioLane` */
   attachAudioLane(lane: FastLaneAudioLane | null): void {
     this.audioLane = lane;
+    // 探针：连接建立时打一行 —— 有它才说明车道真的挂到了这个实例上
+    this.log(`  车道    attachAudioLane(${lane === null ? 'null' : 'omni'})`);
   }
 
   /**
@@ -822,10 +824,22 @@ export class FrontedAgent implements AgentProvider {
    * 内部完全一致，所以两处都走 {@link textEligible} + `lane.willServe()`。
    */
   willServeAudio(text: string): boolean {
-    if (this.audioLane === null || this.audioLane.willServe() !== true) {
-      return false;
+    const lane = this.audioLane;
+    const hasLane = lane !== null;
+    const laneOk = hasLane && lane.willServe();
+    const textOk = this.textEligible(text);
+    // 布尔看不出卡在哪一条，四种原因的修法完全不同 —— 落档（`agent.lane`）
+    this.auditSink(EVENTS.agentLane, {
+      has_lane: hasLane,
+      lane_ok: laneOk,
+      text_ok: textOk,
+      ok: laneOk && textOk,
+      ...(lane?.explain?.() ?? {}),
+    });
+    if (!hasLane) {
+      this.log('  车道    ✗ 没有挂上 omni 车道（`attachAudioLane` 没到这一层）');
     }
-    return this.textEligible(text);
+    return laneOk && textOk;
   }
 
   /**

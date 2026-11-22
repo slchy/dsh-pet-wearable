@@ -856,6 +856,13 @@ async function main(): Promise<void> {
         : '宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口\n',
     );
 
+    // 装配自检：交给服务器的是哪个类、有没有车道方法。
+    // 这一行存在的理由：`trackActivity()` 会把 agent 包成一个普通对象，
+    // 它漏转发可选能力时**不报错**，只表现为「omni 一次都不接管」。
+    console.log(
+      `  装配    agent=${agent?.constructor?.name ?? '?'}`
+      + ` attach=${typeof agent?.attachAudioLane} will=${typeof agent?.willServeAudio}`,
+    );
     const code = await runVoiceServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),

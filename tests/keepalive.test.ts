@@ -213,3 +213,31 @@ test('trackActivity 原样透传 attachLiveSink', () => {
 test('保活输入不像用户的话', () => {
   assert.ok(!KEEPALIVE_PROMPT.includes('？'), '别写成一问一答，模型会当成真实对话去回应');
 });
+
+test('trackActivity 透传**全部**可选能力（漏一个就是静默降级，不报错）', () => {
+  // 这个列表就是 `AgentProvider` 上的可选能力清单。
+  // 加新能力时**这里也要加**——否则线上表现是"那个功能就是不生效"，从现象看不出来。
+  // （2026-11-23：`attachAudioLane` / `willServeAudio` / `noteServedTurn` 漏了，
+  //  omni 一晚上 4 轮全部静默退回文本快车道。）
+  const optional = [
+    'setAnnouncer',
+    'attachLiveSink',
+    'cancelTurn',
+    'setDelegateHook',
+    'interruptTurn',
+    'taskStatus',
+    'prefetch',
+    'speculatePartial',
+    'attachAudioLane',
+    'willServeAudio',
+    'noteServedTurn',
+  ] as const;
+
+  const inner = { name: 'fake', reply: async () => ({ text: '', speech: '' }) } as Record<string, unknown>;
+  for (const key of optional) {
+    inner[key] = () => {};
+  }
+  const wrapped = trackActivity(inner as never, newActivityState(0)) as unknown as Record<string, unknown>;
+  const missing = optional.filter((key) => typeof wrapped[key] !== 'function');
+  assert.deepEqual(missing, [], `这些可选能力没被透传：${missing.join(', ')}`);
+});

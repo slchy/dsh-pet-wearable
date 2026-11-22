@@ -178,6 +178,15 @@ export const EVENTS = {
    */
   omniShadow: 'omni.shadow',
 
+  /**
+   * 「这一轮会不会走 omni 直出」的判据快照（`{has_lane, lane_ok, text_ok, ok}`）。
+   *
+   * 为什么要它：`path=omni` 没出现时，光看档案分不出是「车道没挂上」「还没起跑」
+   * 「被取消了」「并段轮被 clip 档挡掉」还是「文本判据挡掉」—— 五种原因修法完全不同。
+   * 和 `omni.shadow` 配着看：那个说「测到了」，这个说「为什么没用」。
+   */
+  agentLane: 'agent.lane',
+
   // ---- 设备与下行 ----
   /** v2 设备自报能力 */
   deviceLink: 'device.link',

@@ -477,6 +477,11 @@ export class TurnRunner {
        * 没有任何文本可送 —— 服务端会拒空文本，整轮退化成兜底（比不走 omni 还慢）。
        */
       const omniTurn = agent.willServeAudio?.(text) === true;
+      // 这条只在装配坏了时出声：`trackActivity()` 之类的包装层漏转发可选能力时，
+      // 表现是「omni 一次都不接管」而不报错（2026-11-23 线上踩过一整晚）
+      if (typeof agent.willServeAudio !== 'function') {
+        this.log('  车道    ✗ agent 上没有 `willServeAudio`（装配层把可选能力吞了）');
+      }
       const queue = omniTurn || streamTts === undefined || this.options.onLiveAvailable === undefined
         ? null
         : new TokenQueue();

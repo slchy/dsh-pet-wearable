@@ -99,6 +99,18 @@ export function trackActivity(
     ...(agent.speculatePartial === undefined
       ? {}
       : { speculatePartial: agent.speculatePartial.bind(agent) }),
+    // omni 音频直出车道：漏这三条 = **omni 一次都不会接管**，而且不报错 ——
+    // 档案里只有 `path=fast`，看起来像"它就是不快"，排查从现象根本看不出来。
+    // （2026-11-23 线上实测：一晚上 4 轮全部静默走了文本快车道，正是这处漏了。）
+    ...(agent.attachAudioLane === undefined
+      ? {}
+      : { attachAudioLane: agent.attachAudioLane.bind(agent) }),
+    ...(agent.willServeAudio === undefined
+      ? {}
+      : { willServeAudio: agent.willServeAudio.bind(agent) }),
+    ...(agent.noteServedTurn === undefined
+      ? {}
+      : { noteServedTurn: agent.noteServedTurn.bind(agent) }),
   };
 }
 

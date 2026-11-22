@@ -110,6 +110,14 @@ export interface FastLaneAudioLane {
    * 流式合成），再在 `reply()` 里问一次。
    */
   willServe(): boolean;
+  /**
+   * 只进档案的排障信息（`agent.lane`）。**不参与任何决策。**
+   *
+   * 为什么需要：`willServe()` 是个布尔，false 的时候看不出是「没开」「没 response」
+   * 「被取消了」还是「并段轮被 clip 档挡掉」—— 这四种的修法完全不同，而线上
+   * 又没法打日志重放。
+   */
+  explain?(): Record<string, unknown>;
   /** 认领本轮音频；`null` = 此刻拿不到（连接没就绪 / 这一份已经被取消） */
   claim(): AgentAudioAnswer | null;
   /**

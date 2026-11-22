@@ -480,6 +480,19 @@ export class OmniShadow {
     this.pending = null;
   }
 
+  /** 排障用：`willServe()` 为 false 时到底卡在哪一条（只进档案，不参与决策） */
+  explain(): Record<string, unknown> {
+    const resp = this.resp;
+    return {
+      serve: this.opts.serve ?? 'off',
+      state: this.state,
+      has_resp: resp !== null,
+      cancelled: resp?.cancelled ?? null,
+      claimed: resp?.claimed ?? null,
+      turn_seqs: this.turnSeqs.length,
+    };
+  }
+
   private wakeAudio(resp: PendingResponse | null = this.resp): void {
     if (resp === null) {
       return;
