@@ -190,10 +190,11 @@ feed(voiced)  → muted = false，先补 ring 再追加
 | `created` 前 `cancel` | 报 `Cannot cancel response before response.created` | `cancelPending` |
 | 50 ms 短音频 `commit` | **不报错**（空转写、`completed`） | 但会造空白用户消息，所以看 `dirtyBytes` |
 | `conversation.item.delete` | **有效**（三次复现，省 13–39 token） | 洗脏历史可用，**尚未接入** |
-| `conversation.item.create` | 注入 112 字 → 下一轮 `in_tokens` 只多 **5** | 回注 dsh 文本**不可行**（只存不用） |
+| `conversation.item.create`（**`user` 角色**） | 注入文本 → 下一轮**照做**（3/3） | **回注 dsh 答案可行**，见 §5.2 |
+| `conversation.item.create`（`assistant` 角色） | 回 `created` 和 item id，但模型**当没看见** | 伪造自己的历史被拒。**不能拿 token 数判定**，见 §5.2 |
 | `conversation.item.truncate` | 6 s 无 ack 无 error | **不支持** |
 | 上下文上限 | ~**6600 token** 处服务端自动截断（6617→4387） | 漂移有界 |
-| 长尾 | 一簇落在 1785–2130 ≈ 1×RTO(2040) | 疑为链路重传，不是厂商慢 |
+| 长尾 | **不是厂商慢**：`cancel_wait_ms` 就是长尾本身（扣掉后 4/5 落回 599–786） | 见 §8.6 |
 
 ### 5.1 `session.update` 的关键参数
 
@@ -207,6 +208,23 @@ input_audio_transcription: { model: 'qwen3-asr-flash-realtime' },  // 没它就�
 ```
 
 `instructions` 里**不能**写任何「要不要调工具」的暗示，见 §十。
+
+### 5.2 `conversation.item.create` 的角色是不对称的（踩过一次误判）
+
+| 角色 | content type | 结果 |
+|:---|:---|:---|
+| `user` | `input_text` | **生效**：注入「记住：我养的猫叫豆豆。」→ 追问「我的猫叫什么」答「你的猫叫豆豆。」（`in_tokens` 35→64） |
+| `assistant` | `text` / `output_text` / `input_text` | **全部无效**：回 `created` 和 item id，`in_tokens` 停在 35，模型答「我不知道你的猫叫什么」 |
+
+**服务端只允许你伪造用户的输入，不允许你伪造自己的输出。** 三种 content type 都一样，
+所以这不是格式问题，是角色问题。
+
+这条曾经被误判成「`item.create` 只存不用」：当时的探针用的是 `assistant` 角色，
+而且**拿 `in_tokens` 增量（只多 5）当判据**。token 少 ≠ 模型没读 ——
+判断一个原语要用**回答内容**，不能用计费。
+
+生产上要回注 dsh 的答案时，把内容包成一条 `user` 角色的文本项即可；
+实测在**音频上下文**里同样生效（§12.4 有验证方式），代价约 30–50 token/轮。
 
 ---
 
@@ -382,6 +400,28 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 
 （`device.played` **不能**用来算这个：它是**播完回执**，实测「收到最后一批字节就回执」。）
 
+### 8.6 长尾就是 `cancel_wait`，别绕开它找别的原因
+
+真机第 2 场，把 `cancel_wait_ms` 从 `audio_ms` 里减掉：
+
+| seq | `seal_s` | `cancel_wait` | `audio_ms` | 净生成 |
+|:--:|:--:|:--:|:--:|:--:|
+| 8 | 0.45 | 88 | 687 | 599 |
+| 22 | 0.38 | 319 | 961 | **642** |
+| 33 | 0.23 | 282 | 982 | **700** |
+| 25 | 0.23 | 133 | 919 | **786** |
+| 29 | 0.30 | 282 | 1180 | 898 |
+
+**净生成全部落回正常区间（603–844）**。所以 p90 = 932 里那 280–320 ms
+不是厂商慢、不是链路重传，是**等上一条 response 取消**。
+
+它清一色出现在 `seal_s < 0.5` 的短段上，且这些段的相邻 commit 只隔 233–534 ms ——
+即**同一句里的第二次封段**（能量门还开着，assembler 又 commit 了一次），
+上一份 response 还在跑，`seal()` 撞 busy 只能排队。
+
+> 曾经把这个现象归因成「短段本身造成长尾」，是**因果看反**：
+> 短段只是把它暴露出来的场景，代价是 `cancel_wait` 本身。
+
 ---
 
 ## 九、成本
@@ -421,7 +461,7 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 - ❌ 不自动重连、不做指数退避、不做降级（§4.4）
 - ❌ 不做 omni 与级联的 hedge —— 两条腿的**文本和音色都不同**，
   先到先播会说出半句 A 半句 B
-- ❌ 不用 `conversation.item.create` 回注 dsh 的文本答案 —— 实测**只存不用**（112 字仅 +5 token）
+- ❌ 不用 `conversation.item.create` 的 **`assistant` 角色** —— 回 `created` 但不进上下文（伪造自己的历史被拒）
 - ❌ 不用 omni 当纯 TTS 念 dsh 的答案 —— 原生音频模型会擅自改词、漏读数字、
   自己加「好的，结果如下」。真要做必须先测逐字忠实度
 - ❌ 不做 S5（回执预渲染 PCM）—— 收益 66 ms，代价是设备刚连上就占 TTS 约 2 秒
@@ -452,19 +492,30 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 
 ### 12.1 当前空档
 
-1. **脏历史没洗**：`conversation.item.delete` 验证有效但未接入 `discard()`。
-   委派轮和并段轮在 omni 服务端历史里会留「被砍断的半截回复」。
+1. **脏历史没洗**：`conversation.item.delete` 已验到**语义级生效**（删掉用户项后模型
+   真的忘记，见 §5.2），但未接入 `discard()`。
 2. **`clip` 档拒并段轮**，导致约 1/4 轮走级联（第 2 场 7/26）。
-3. **两副嗓子**：omni 轮与级联轮音色不同（omni 是 Tina，级联是龙安欢）。
-4. **`✗ ASR: maybe no invalid audio stream`** 偶发，归属未确认（疑为既有问题，
+   放开它的真实障碍**不是脏历史**（探针实测 V0/V1/V2 回答质量 5/5 无差别），
+   而是**掐半句**：22 个 omni 轮里有 3 轮（14%）在开轮之后还有新的 `asr.commit`，
+   `full` 档下会先播再被 cancel。首块在封段后 ~640 ms、第二次封段在 233–534 ms，
+   所以窗口窄但真实存在。
+3. **委派轮的历史是「缺失」不是「污染」**：omni 不知道自己那一轮由 dsh 答了。
+   可以用 `user` 角色 `item.create` 回注（§5.2 已验证），未接入。
+4. **两副嗓子**：omni 轮与级联轮音色不同（omni 是 Tina，级联是龙安欢）。
+   `full` 之后降成「委派轮偶尔切」（dsh 链路在 S5 之前仍是 CosyVoice），不是完全消失。
+5. **tool_call 自委派从未在真机触发过**：两场 `delegate` 只有 1 个 `task`
+   （本地 `isFastCandidate` 拦的）。代码与单测都在，缺一次真机验证。
+6. **`✗ ASR: maybe no invalid audio stream`** 偶发，归属未确认（疑为既有问题，
    不是 omni —— 分属两条 WS）。
 
 ### 12.2 升级路径
 
 ```text
 现在    OMNI_ANSWER=clip    单段轮由 omni 答，并段轮退回级联
-  ↓     接 conversation.item.delete 进 discard()
-下一档  OMNI_ANSWER=full    并段轮也由 omni 答，接管率 → ~100%
+  ↓     ① item.delete 进 discard()（省 ~18 token/轮 + 洗半句）
+  ↓     ② user 角色 item.create 回注 dsh 的答案（委派轮不再失忆）
+下一档  OMNI_ANSWER=full    并段轮也由 omni 答
+  ↓     但要先解决「掐半句」：留最近一句 PCM，seal#2 时删旧项重发 A+B
   ↓     实测两副嗓子是否可接受
 目标    级联退成 dsh 通道 + 兜底
 ```
@@ -479,6 +530,24 @@ cd <部署路径> && sed -i 's/^OMNI_ANSWER=.*/OMNI_ANSWER=off/' .env && sudo -n
 ```
 
 `off` 仍保留影子测量，只是不发声。
+
+### 12.4 协议原语怎么验（别用 token 数判）
+
+四个原语的判定方法，以及各自**踩过的误判**：
+
+| 原语 | 正确判法 | 误判 |
+|:---|:---|:---|
+| `item.delete` | 删掉后追问答不答得出 | 早期用 `in_tokens` 增量，得出「删了更糟」的假象 |
+| `item.create` | **看回答内容**（注入「以后回答首字必须是『喵』」→ 3/3 照做） | 用 token 增量 + `assistant` 角色，得出「只存不用」 |
+| `truncate` | 发出去看有没有 ack/error | — |
+| `input_audio_buffer.clear` | 发出去看有没有 error | — |
+
+**通用教训**：一个原语`回成功`只说明请求格式对，`token 数`只说明计价方式，
+**都与「模型读没读」无关**。要验「模型读没读」就只能看它会不会照做。
+
+探针在 `tmp/omni-probe/`（gitignore）：`barge-in.cjs`（并段三方案 / delete 语义）、
+`inject.cjs`（四种注入形状）、`inject-audio.cjs`（生产形状：音频上下文 + delete + 回注）、
+`transcribe-clips.cjs`（先确认素材说的是什么）。
 
 ---
 
