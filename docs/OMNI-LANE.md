@@ -80,7 +80,9 @@ omni：     封段 ────── 670 ──────▶ 首块
 interface FastLaneAudioLane {
   willServe(): boolean;               // 纯读
   claim(): AgentAudioAnswer | null;   // 认领，一份只给一个消费者
-  discard(): void;                    // 不采纳，立刻 cancel
+  discard(): void;                    // 这一轮不采纳：cancel + 删半句
+  interrupt?(): void;                 // 播到一半被打断：cancel 但保留
+  injectAnswer?(user: string, said: string): void;  // 委派轮回注
   explain?(): Record<string, unknown>;// 只进档案，不参与决策
 }
 ```
@@ -177,6 +179,50 @@ feed(voiced)  → muted = false，先补 ring 再追加
 3. 有残留就 `commit` 掉但**不发 create**——空缓冲 commit 会回
    `maybe no invalid audio stream`。
 4. 解除闭嘴、推预卷。
+
+### 4.6 删半句：只能延迟到 `response.done`
+
+`conversation.item.delete` 要 **item id**，而 id 在 `response.done.response.output`
+里。`discard()` 的时机（委派轮、同一句的第二次封段）通常连 `response.created`
+都还没到，**当场根本发不出去**。
+
+所以分两步：
+
+```text
+discard()          → resp.deleteOnDone = true，然后 cancelCurrent()
+response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
+                   → 逐个 conversation.item.delete
+```
+
+**只删助手项**：用户那条是这一轮的内容，后面几轮还要指代它。
+
+标记的规则（两个入口语义不同）：
+
+| 谁调 | 标记 | 为什么 |
+|:---|:---|:---|
+| `discard()`（这一轮不采纳） | 必删 | 一个字都没播，留着只会污染下一轮 |
+| `cancelCurrent()` 且 `!claimed` | 删 | 同一句第二次封段把上一份顶掉，那份答的是半句话 |
+| `interrupt()`（播到一半被打断） | **不删** | 用户已经听到了一部分；删掉就和快车道 `pending` 里记的半句对不上 |
+
+### 4.7 委派轮回注：`role` 必须是 `user`
+
+委派轮是 omni 先答了个开头、被掐掉交给 dsh。omni 的服务端历史里只有
+「用户问了什么」，**不知道 dsh 答了什么**——这是「缺失」，不是「污染」。
+
+回注的四条约束（前两条来自实测，后两条来自跑起来的教训）：
+
+1. **`role: 'user'`**。`assistant` 角色三种 content type 全都回 `created` + item id，
+   但模型当没看见（§5.2）。
+2. **带上原问题**。委派轮动辄十几秒，期间用户可能又问了别的，只给答案会让
+   后面几轮的指代全乱。
+3. **硬截断 200 字**。dsh 的答案动辄几百字，整段塞进去只是烧 token，
+   而且它会一直留在上下文里（到 ~6600 token 才被截断）。
+4. **等 `ready` 再发**。忙的时候排队（上限 4 条），`response.done` 之后 flush。
+   插在一条正在生成的回复中间会让它自己那轮的指代也乱。
+
+宿主只在**这一轮真的播完了**时调 `injectAnsweredTurn`（`turn-runner` 的
+`replyPath === 'dsh' && !interrupted && audioBytes > 0`）。被打断的正文不回注——
+用户没听到的东西不该变成 omni 的记忆。
 
 ---
 
@@ -335,12 +381,12 @@ if (reply.audio !== undefined) {
 
 ```json
 { "has_lane": true, "lane_ok": false, "text_ok": true, "ok": false,
-  "serve": "clip", "state": "busy", "has_resp": true,
+  "serve": "full", "state": "busy", "has_resp": true,
   "cancelled": false, "claimed": false, "turn_seqs": 2 }
 ```
 
 **为什么需要**：`willServe()` 是个布尔，false 的时候看不出是「没开」「没 response」
-「被取消了」还是「并段轮被 clip 档挡掉」——四种的修法完全不同，而线上没法打日志重放。
+「被取消了」还是「文本闸拒了」——这几种的修法完全不同，而线上没法打日志重放。
 
 ---
 
@@ -476,7 +522,7 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 
 | S0 稿 | 现形态 | 为什么改 |
 |:---|:---|:---|
-| 不播 omni 音频 | `OMNI_ANSWER=off\|clip\|full` | 量的目的就是接管 |
+| 不播 omni 音频 | `OMNI_ANSWER=off\|full` | 量的目的就是接管 |
 | 不进 `AgentProvider` 契约 | `AgentReplyView.audio` + `FastLaneAudioLane` | 播放要经过编排层 |
 | 不碰 `TurnRunner` | 有独立播放分支 + tool_call 转交 | 同上 |
 | `seed(ms)` / `feed(pcm)` | `seal(seq, silenceMs)` / `feed(pcm, voiced)` | join key + 闭嘴口径 |
@@ -487,41 +533,31 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 | 事件字段 `extended` | 内部 `turnSeqs` + `flushed_ms` | 并段判据改成段数 |
 | 事件字段 `feed_bytes` | `local_port` + `dropped_ms` | 排障用 `ss -ti` 更直接 |
 | 无 `created_ms` | 无（`created` 只是内部布尔） | 没用到 |
-| `~380 行`，`fronted-agent.ts` 零改动 | 850 + 3 处改动 | 记忆复用 `pending` |
+| `~380 行`，`fronted-agent.ts` 零改动 | 850 + 4 处改动 | 记忆复用 `pending` |
+| 无「删半句」 | `discard()` 标 `deleteOnDone`，`done` 到了才删（见 §4.6） | 那会儿才有 item id |
+| 无「回注」 | `injectAnswer()`：`user` 角色 + 带原问题 + 硬截断 + 等 `ready`（见 §4.7） | 委派轮 omni 会失忆 |
 | 写在 `QOS.md` 里 | 独立本文 + `QOS.md` 附录一行 | 篇幅 |
 
 ### 12.1 当前空档
 
-1. **脏历史没洗**：`conversation.item.delete` 已验到**语义级生效**（删掉用户项后模型
-   真的忘记，见 §5.2），但未接入 `discard()`。
-2. **`clip` 档拒并段轮**，导致约 1/4 轮走级联（第 2 场 7/26）。
-   放开它的真实障碍**不是脏历史**（探针实测 V0/V1/V2 回答质量 5/5 无差别），
-   而是**掐半句**：22 个 omni 轮里有 3 轮（14%）在开轮之后还有新的 `asr.commit`，
-   `full` 档下会先播再被 cancel。首块在封段后 ~640 ms、第二次封段在 233–534 ms，
-   所以窗口窄但真实存在。
-3. **委派轮的历史是「缺失」不是「污染」**：omni 不知道自己那一轮由 dsh 答了。
-   可以用 `user` 角色 `item.create` 回注（§5.2 已验证），未接入。
-4. **两副嗓子**：omni 轮与级联轮音色不同（omni 是 Tina，级联是龙安欢）。
-   `full` 之后降成「委派轮偶尔切」（dsh 链路在 S5 之前仍是 CosyVoice），不是完全消失。
-5. **tool_call 自委派从未在真机触发过**：两场 `delegate` 只有 1 个 `task`
+1. **两副嗓子**：omni 轮与级联轮音色不同（omni 是 Tina，级联是龙安欢）。
+   全量之后降成「委派轮偶尔切」（dsh 链路在 S5 之前仍是 CosyVoice），不是完全消失。
+2. **tool_call 自委派从未在真机触发过**：两场 `delegate` 只有 1 个 `task`
    （本地 `isFastCandidate` 拦的）。代码与单测都在，缺一次真机验证。
-6. **`✗ ASR: maybe no invalid audio stream`** 偶发，归属未确认（疑为既有问题，
+3. **`✗ ASR: maybe no invalid audio stream`** 偶发，归属未确认（疑为既有问题，
    不是 omni —— 分属两条 WS）。
+4. **上下文双轨**：omni 的服务端历史与 `FrontedAgent.pending` 各记一份，
+   靠 `noteServedTurn` / `injectAnsweredTurn` 两个口子保持一致。这是 pipe 形态的
+   固有代价，不是缺陷。
 
-### 12.2 升级路径
+### 12.2 已解决的（留作来由）
 
-```text
-现在    OMNI_ANSWER=clip    单段轮由 omni 答，并段轮退回级联
-  ↓     ① item.delete 进 discard()（省 ~18 token/轮 + 洗半句）
-  ↓     ② user 角色 item.create 回注 dsh 的答案（委派轮不再失忆）
-下一档  OMNI_ANSWER=full    并段轮也由 omni 答
-  ↓     但要先解决「掐半句」：留最近一句 PCM，seal#2 时删旧项重发 A+B
-  ↓     实测两副嗓子是否可接受
-目标    级联退成 dsh 通道 + 兜底
-```
-
-**升级前必须复验**：委派轮之后 omni 上下文有没有假记忆（`delete` 未接时必然有）、
-并段轮的续接是否出错、实际听感是否接受两副嗓子。
+| 曾经的空档 | 怎么解决的 |
+|:---|:---|
+| 并段轮被 `clip` 拒（约 27% 轮走级联） | **砍掉 `clip`**：探针实测并段轮回答质量 5/5 与单段轮无差别；真正担心的「掐半句」22 轮里只 3 次、全是用户自己插话 |
+| 半句留在服务端历史 | `discard()` 标 `deleteOnDone` → `response.done` 拿到 item id 再删（§4.6） |
+| 委派轮 omni 失忆 | `user` 角色 `item.create` 回注（§4.7） |
+| 插话时 omni 的 response 没人掐 | `cancelTurn` → `interrupt()`（§4.5） |
 
 ### 12.3 回滚（一直可用）
 

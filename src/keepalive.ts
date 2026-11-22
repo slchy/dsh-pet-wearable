@@ -111,6 +111,11 @@ export function trackActivity(
     ...(agent.noteServedTurn === undefined
       ? {}
       : { noteServedTurn: agent.noteServedTurn.bind(agent) }),
+    // 委派轮回注：漏转发 = omni 永远不知道 dsh 答了什么，下一轮顺着追问就答非所问。
+    // 这条同样是**静默**降级（没有它 omni 照样能答，只是答错）。
+    ...(agent.injectAnsweredTurn === undefined
+      ? {}
+      : { injectAnsweredTurn: agent.injectAnsweredTurn.bind(agent) }),
   };
 }
 

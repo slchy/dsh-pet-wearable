@@ -863,6 +863,24 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
+   * 某个轮次**由别的车道答了**（委派），把答案回注给音频车道。
+   *
+   * 快车道自己的窗口不用管：委派轮走的是 `delegate()` → `rememberDsh()`，
+   * 那边已经记过了。这里补的是**另一半** —— omni 的服务端历史里只有
+   * 「用户问了什么」，不知道 dsh 答了什么，下一轮顺着追问就接不上。
+   *
+   * 只该在**这一轮真的播完了**时叫。被打断的正文不回注：用户没听到的东西
+   * 不该变成 omni 的记忆。
+   */
+  injectAnsweredTurn(userText: string, said: string): void {
+    const speech = said.trim();
+    if (speech === '' || this.audioLane === null) {
+      return;
+    }
+    this.audioLane.injectAnswer?.(userText, speech);
+  }
+
+  /**
    * 编排层挂「这一轮交给慢车道了」的钩子。
    *
    * 只在快车道**真的让步**时叫（本地判据否决 / 暗号 / 超时 / 空答复），快车道胜出时不叫。
@@ -1443,9 +1461,15 @@ export class FrontedAgent implements AgentProvider {
     this.askAbort?.abort(new Error('插话取消'));
     // omni 轮的上游不是 HTTP 请求，是一个还在出的 response：不取消的话它会一直生成到
     // 结束，既烧输出 token，又让下一轮开口时它还挂着 busy。
-    // `discard()` 内部走 `cancelCurrent()`，与 `0caa415` 同一条安全路径
+    // 用 `interrupt` 而不是 `discard`：这一轮用户**已经听到了一部分**，
+    // 删掉那条回复会和快车道 `pending` 里记的半句对不上。
+    // 两者内部都走 `cancelCurrent()`，与 `0caa415` 同一条安全路径
     // （`response.created` 未到就只挂 `cancelPending`，不裸发 cancel）。
-    this.audioLane?.discard();
+    if (this.audioLane?.interrupt !== undefined) {
+      this.audioLane.interrupt();
+    } else {
+      this.audioLane?.discard();
+    }
     try {
       this.inner.cancelTurn?.(ticket);
     } catch (error) {

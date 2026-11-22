@@ -55,6 +55,16 @@ const DEFAULT_INSTRUCTIONS =
 /** `seal()` 之后、下一次有声之前，最多留多少音频（防软起音被吞） */
 const DEFAULT_RING_MILLISECONDS = 150;
 
+/** 回注进 omni 上下文的文本上限（字）。委派轮的答案动辄几百字，整段塞进去只是烧 token */
+const MAX_INJECT_CHARS = 200;
+/** 回注排队上限。委派轮本来就是低频事件，多了说明哪里不对 */
+const MAX_PENDING_INJECTS = 4;
+
+/** 按**字符**截断（中文一个字一个 token 量级，`String.length` 对代理对也不至于切坏） */
+function clipText(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
 /**
  * 唯一的工具：把这一轮转给 dsh。
  *
@@ -101,11 +111,14 @@ export interface OmniShadowOptions {
    *
    * - `off`（默认）：只测不发声 —— 音频仍会攒着（S0 也要用它算 `out_s`），
    *   但没人认领，`willServe()` 恒 false
-   * - `clip`：只答**单段**轮（`turnSeqs.length === 1`）。开全量之前先用它验
-   *   播放/音色/打断
-   * - `full`：与文本快车道同口径
+   * - `full`：与文本快车道同口径，并段轮也答
+   *
+   * 曾经有一个 `clip`（只答单段轮）的中间档。真机两场之后砍掉了：
+   * 它拒掉的并段轮实测回答质量与全量无差别，而真正需要担心的「掐半句」
+   * 22 轮里只出现 3 次、且全是**用户自己插话**（`interrupted=True`）。
+   * 留着中间态只会让「线上到底是哪一档」变成一个要记的事。
    */
-  readonly serve?: 'off' | 'clip' | 'full';
+  readonly serve?: 'off' | 'full';
 }
 
 /** 一份 seal 的身份与起点 */
@@ -154,6 +167,14 @@ interface PendingResponse {
   created: boolean;
   /** 还没 created 就被要求取消：等 created 到了立刻补发 */
   cancelPending: boolean;
+  /**
+   * 这一份的助手回复不要留在服务端历史里（`discard()` 时标上）。
+   *
+   * **必须延迟到 `response.done` 才删**：`conversation.item.delete` 要 item id，
+   * 而 id 是从 `response.output` 里拿的 —— discard 当场那会儿通常还没 created，
+   * 更没有 id。所以这里只记意图，实际删除在 `finish()` 里做。
+   */
+  deleteOnDone: boolean;
   /** 有没有人认领过（一份只给一个消费者） */
   claimed: boolean;
 }
@@ -161,10 +182,12 @@ interface PendingResponse {
 interface ServerEvent {
   type?: string;
   delta?: string;
-  item?: { id?: string };
+  item?: { id?: string; role?: string };
   error?: { code?: string; message?: string; type?: string };
   response?: {
     status?: string;
+    /** `response.done` 的终态产物 —— item id 从这里拿最稳（`output_item.added` 可能没到） */
+    output?: Array<{ id?: string; role?: string; status?: string }>;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -172,6 +195,15 @@ interface ServerEvent {
       output_tokens_details?: { audio_tokens?: number; text_tokens?: number };
     };
   };
+}
+
+/** 一条 `response.done` 里所有助手项的 id（`conversation.item.delete` 要它） */
+function assistantItemIds(ev: ServerEvent): string[] {
+  const output = ev.response?.output ?? [];
+  const ids = output
+    .filter((it) => it.role === 'assistant' && typeof it.id === 'string' && it.id !== '')
+    .map((it) => it.id as string);
+  return [...new Set(ids)];
 }
 
 export class OmniShadow {
@@ -214,6 +246,8 @@ export class OmniShadow {
   private droppedBytes = 0;
   /** 这一轮里已经封过几段（并段 > 1）。`restart()` 归零 */
   private turnSeqs: number[] = [];
+  /** 等 `ready` 再发的回注文本（见 `injectAnswer()`） */
+  private injects: string[] = [];
   /** 还没跑过任何一份 seal —— 第一条标 `warmup`，分析时排除 */
   private sharedSeals = 0;
 
@@ -417,10 +451,13 @@ export class OmniShadow {
   /**
    * 这一轮能不能由 omni 自己答。纯读、不改账。
    *
-   * 三重限制叠在一起，每一条都对应一次踩坑：
+   * 两条限制，每一条都对应一次踩坑：
    * - `serve === 'off'`：没开的连接一个字节都不该被认领
    * - `cancelled` / `claimed`：一份只能给一个消费者，取消过的更不能再给（那是死答案）
-   * - `clip` 档只认单段轮 —— 并段轮的脏历史还没洗法，先别放量
+   *
+   * **并段轮不再挡。** 曾经按 `turnSeqs.length > 1` 挡过（`clip` 档），理由是
+   * 「上下文里夹着被砍掉的半句」；实测两场之后砍掉：并段轮的回答质量与单段轮
+   * 5/5 无差别（`tmp/omni-probe/barge-in.cjs`），半句也已经由 `discard()` 标了删。
    */
   willServe(): boolean {
     if ((this.opts.serve ?? 'off') === 'off') {
@@ -428,9 +465,6 @@ export class OmniShadow {
     }
     const resp = this.resp;
     if (resp === null || resp.cancelled || resp.claimed) {
-      return false;
-    }
-    if (this.opts.serve === 'clip' && this.turnSeqs.length > 1) {
       return false;
     }
     return true;
@@ -475,19 +509,87 @@ export class OmniShadow {
   }
 
   /**
-   * 这一轮不采纳：**立刻 `response.cancel`**。
+   * 这一轮不采纳（走 dsh / 太长 / 判据否决）：**立刻 `response.cancel`**，
+   * 并把这条助手回复标记成「结束后删掉」。
    *
    * 不取消的话它会在后台把整段废音频生成完 —— 既烧输出 token，又让下一轮开口时
    * 它还挂着 `busy`（那时新的 `response.create` 会被服务端拒掉且永久丢失）。
+   *
+   * 删除走 `deleteOnDone`（见 `finish()`）：这里拿不到 item id ——
+   * `conversation.item.delete` 要 id，而 id 在 `response.done.response.output` 里，
+   * 委派轮 discard 的时机通常连 `created` 都还没到。
    */
   discard(): void {
     const resp = this.resp;
     if (resp !== null) {
       resp.audio.length = 0;
       this.wakeAudio(resp);
+      resp.deleteOnDone = true;
       this.cancelCurrent();
     }
     this.pending = null;
+  }
+
+  /**
+   * 播到一半被用户打断：取消生成，但**保留**那条助手回复。
+   *
+   * 与 `discard()` 的差别只有一点，但是要害：这一轮用户**已经听到了一部分**。
+   * 删掉它会让 omni 以为自己没说过，而快车道那边的 `pending` 记的正是这半句
+   * （`noteServedTurn` 用的是活 getter 的当前值）—— 两条上下文轨就分叉了。
+   */
+  interrupt(): void {
+    const resp = this.resp;
+    if (resp !== null) {
+      resp.audio.length = 0;
+      this.wakeAudio(resp);
+    }
+    this.cancelCurrent();
+  }
+
+  /**
+   * 把**别的车道答出来的**内容回注进 omni 的上下文（委派轮用）。
+   *
+   * 为什么必须是 `role:'user'`：实测服务端只允许伪造用户的输入，`role:'assistant'`
+   * 三种 content type 全部回 `created` + item id 但**模型当没看见**
+   * （`in_tokens` 停在基线、追问答「我不知道」）。所以这里包一层用户侧的旁注。
+   *
+   * 带上原问题是有意的：委派轮动辄十几秒，期间用户可能又问了别的，
+   * 只给答案会让后面几轮的指代全乱。
+   *
+   * 忙的时候排队，回到 `ready` 再发 —— `conversation.item.create` 在 `busy` 态
+   * 虽然不报错，但插在一条正在生成的回复中间会让它自己那轮的指代也乱。
+   */
+  injectAnswer(userText: string, said: string): void {
+    const answer = clipText(said.trim(), MAX_INJECT_CHARS);
+    if (answer === '') {
+      return;
+    }
+    const question = clipText(userText.trim(), MAX_INJECT_CHARS);
+    const text = `（系统旁注：用户刚才问的「${question}」已经由另一位助手回答，`
+      + `回答是：${answer}）`;
+    if (this.state === 'broken' || this.state === 'idle') {
+      this.log(`[omni] 回注丢弃：车道不在（${this.state}）`);
+      return;
+    }
+    if (this.injects.length >= MAX_PENDING_INJECTS) {
+      this.injects.shift();
+      this.log('[omni] 回注队列满，丢掉最早的一条');
+    }
+    this.injects.push(text);
+    this.flushInjects();
+  }
+
+  /** 只有 `ready` 才发：忙的时候让它在队列里等 */
+  private flushInjects(): void {
+    if (this.state !== 'ready' || this.injects.length === 0) {
+      return;
+    }
+    for (const text of this.injects.splice(0)) {
+      this.send({
+        type: 'conversation.item.create',
+        item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+      });
+    }
   }
 
   /** 排障用：`willServe()` 为 false 时到底卡在哪一条（只进档案，不参与决策） */
@@ -536,6 +638,7 @@ export class OmniShadow {
       delegate: null,
       created: false,
       cancelPending: false,
+      deleteOnDone: false,
       claimed: false,
     };
     this.state = 'busy';
@@ -547,6 +650,13 @@ export class OmniShadow {
       return;
     }
     this.resp.cancelled = true;
+    // 没人认领过 = 没人听过 = 这条回复不该留在历史里。
+    // 它覆盖的是「同一句里第二次封段」把上一份顶掉的情形（`seal()` 撞 busy、
+    // `restart()` 换段）—— 那份答的是半句话，留着只会污染下一轮。
+    // 认领过的**不动**：用户已经听到了一部分，见 `interrupt()`。
+    if (!this.resp.claimed) {
+      this.resp.deleteOnDone = true;
+    }
     if (!this.resp.created) {
       // `response.cancel` 在 `response.created` 之前发会被服务端拒
       // （`Cannot cancel response before response.created`），所以先记账，
@@ -722,6 +832,19 @@ export class OmniShadow {
     if (this.state !== 'broken') {
       this.state = 'ready';
     }
+
+    // 被 `discard()` 标掉的这份：把助手那条回复从服务端历史里删掉。
+    // 删了之后上下文只剩「用户说了什么」，跟级联那边看到的一样；
+    // 不删的话下一轮的输入里会一直夹着一段它自己被打断的半句话。
+    // **只删 assistant 项**：用户那条是这一轮的内容，后面还要指代它。
+    if (resp !== null && resp.deleteOnDone) {
+      for (const id of assistantItemIds(ev)) {
+        this.send({ type: 'conversation.item.delete', item_id: id });
+      }
+    }
+
+    // 排队中的回注：现在回到 `ready` 了，可以发
+    this.flushInjects();
 
     if (resp !== null) {
       const { meta } = resp;

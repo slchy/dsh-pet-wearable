@@ -650,6 +650,13 @@ export class TurnRunner {
         ? 0
         : Math.min(audioSeconds, (this.options.clock.now() - firstAudioAtMs) / 1000);
 
+      // 委派轮：把 dsh 的答案回注给 omni 的上下文，否则它不知道自己那一轮被接走了。
+      // 只在**真播完了**时注 —— 被打断的正文用户没听到，不该变成 omni 的记忆。
+      // 快车道答的轮次不注：它们走 `reply()`，omni 那边由 `noteServedTurn` 覆盖。
+      if (replyPath === 'dsh' && !interrupted && audioBytes > 0 && speech.trim() !== '') {
+        agent.injectAnsweredTurn?.(text, speech);
+      }
+
       this.options.onEvent?.(EVENTS.turnEnd, {
         interrupted,
         audio_s: Number(audioSeconds.toFixed(2)),

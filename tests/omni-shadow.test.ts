@@ -1,12 +1,13 @@
-/**
- * omni 影子旁路：**只量不发声**。
+﻿/**
+ * omni 一体化车道（客户端这一侧）。
  *
- * 这里只验客户端这一侧的行为 —— 计时口径、闭嘴（mute）、忙时排队、跳过。
- * 真实延迟与成本在 `tmp/omni-probe/` 里量（40 轮单连接：p50 670 / p90 734 / 0 长尾）。
+ * 这里只验客户端行为 —— 计时口径、闭嘴（mute）、忙时排队、延迟删、回注。
+ * 真实延迟 / 成本 / 服务端协议行为在 `tmp/omni-probe/` 里量。
  *
- * 两条最要紧的回归：
+ * 三条最要紧的回归：
  * - **封段之后一块静音都不许发**（能量门 `holdMs` 2 s 比 `commitMs` 20 ms 长得多）
  * - **忙时不许发 `response.create`**（服务端会拒且那一次 create 永久丢失）
+ * - **`delete` 不能当场发**（item id 在 `response.done` 里，那会儿通常连 created 都没到）
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -17,6 +18,8 @@ import type { RealtimeSocket } from '../src/qwen-realtime-asr.ts';
 interface Sent {
   type: string;
   audio?: string;
+  item_id?: string;
+  item?: { role?: string; content?: Array<{ type?: string; text?: string }> };
 }
 
 class FakeSocket {
@@ -67,7 +70,7 @@ class FakeSocket {
 const MS = 32;
 const SILENCE = Buffer.alloc(MS * 100);
 
-function make(serve: 'off' | 'clip' | 'full' = 'off') {
+function make(serve: 'off' | 'full' = 'off') {
   const socket = new FakeSocket();
   const events: Array<Record<string, unknown>> = [];
   let clock = 0;
@@ -295,7 +298,7 @@ test('restart 时把残留 flush 掉（commit 但不 create），并记在新一
 });
 
 test('认领之前到的那块音频不能丢（判停延拍时认领会晚到 700–870 ms）', async () => {
-  const h = make('clip');
+  const h = make('full');
   h.ready();
   h.at(0);
   h.shadow.restart([Buffer.alloc(MS * 100)]);
@@ -308,7 +311,7 @@ test('认领之前到的那块音频不能丢（判停延拍时认领会晚到 7
 
   h.at(800);
   const answer = h.shadow.claim();
-  assert.ok(answer !== null, 'clip 档单段轮应当可认领');
+  assert.ok(answer !== null, '单段轮应当可认领');
   assert.equal(answer!.sampleRate, 24_000);
 
   const got: Buffer[] = [];
@@ -338,34 +341,133 @@ test('discard 后立刻不可认领（cancel 要等 created，见下一条）', 
   assert.equal(h.shadow.claim(), null, '取消过的就是死答案，不能再给出去');
 });
 
-test('clip 档不认多段轮；full 档认', () => {
-  const clip = make('clip');
-  clip.ready();
-  clip.at(0);
-  clip.shadow.restart([Buffer.alloc(MS * 100)]);
-  clip.at(10);
-  clip.shadow.seal(1, 40);
-  clip.at(20);
-  clip.socket.message({ type: 'response.done', response: { status: 'completed' } });
-  clip.at(30);
-  clip.shadow.feed(Buffer.alloc(MS * 100), true);
-  clip.at(40);
-  clip.shadow.seal(2, 40);
-  assert.equal(clip.shadow.willServe(), false, '并段轮的脏历史还没洗法，先别放量');
+test('并段轮也认（clip 档已砍掉：实测并段轮回答质量与单段轮无差别）', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  // 同一句里第二次封段：上一份还在生成，排队等 done
+  h.at(30);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.at(40);
+  h.shadow.seal(2, 40);
+  h.at(50);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.shadow.willServe(), true, '第二份开始了就应当能答');
+});
 
-  const full = make('full');
-  full.ready();
-  full.at(0);
-  full.shadow.restart([Buffer.alloc(MS * 100)]);
-  full.at(10);
-  full.shadow.seal(1, 40);
-  full.at(20);
-  full.socket.message({ type: 'response.done', response: { status: 'completed' } });
-  full.at(30);
-  full.shadow.feed(Buffer.alloc(MS * 100), true);
-  full.at(40);
-  full.shadow.seal(2, 40);
-  assert.equal(full.shadow.willServe(), true);
+test('discard 之后：done 里带着 item id 时才删助手项，且只删助手项', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  // discard 当场拿不到 id（连 created 都还没到），只能记意图
+  h.shadow.discard();
+  assert.equal(h.socket.count('conversation.item.delete'), 0, 'discard 当场不该发 delete');
+
+  h.at(80);
+  h.socket.message({ type: 'response.created', response: { status: 'in_progress' } });
+  assert.equal(h.socket.count('response.cancel'), 1, 'created 到了才补发 cancel');
+
+  h.at(200);
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'cancelled',
+      output: [
+        { id: 'item_q', role: 'user' },
+        { id: 'item_a', role: 'assistant' },
+      ],
+    },
+  });
+  const deleted = h.socket.sent.filter((s) => s.type === 'conversation.item.delete');
+  assert.equal(deleted.length, 1, '只删助手那条：用户那条后面还要指代');
+  assert.equal(deleted[0]!['item_id'], 'item_a');
+});
+
+test('没人认领就被顶掉的那份也删（它答的是半句话，没人听过）', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.at(30);
+  h.shadow.seal(2, 40); // 撞 busy → cancelCurrent
+  h.at(40);
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'cancelled', output: [{ id: 'item_a1', role: 'assistant' }] },
+  });
+  const deleted = h.socket.sent.filter((s) => s.type === 'conversation.item.delete');
+  assert.equal(deleted.length, 1);
+  assert.equal(deleted[0]!['item_id'], 'item_a1');
+});
+
+test('播到一半被打断（interrupt）：取消但**不删**已说出去的那条', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  h.at(60);
+  h.socket.message({ type: 'response.created', response: { status: 'in_progress' } });
+  assert.ok(h.shadow.claim() !== null);
+  h.shadow.interrupt();
+  h.at(200);
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'cancelled', output: [{ id: 'item_a', role: 'assistant' }] },
+  });
+  assert.equal(h.socket.count('conversation.item.delete'), 0,
+    '用户已经听到了一部分，删掉它就和快车道 pending 里记的半句对不上');
+});
+
+test('injectAnswer：忙的时候排队，done 回到 ready 才发；角色必须是 user', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  h.shadow.injectAnswer('塔可夫斯基怎么样', '他很厉害。');
+  assert.equal(h.socket.count('conversation.item.create'), 0, 'busy 时不发，排队等');
+  h.at(30);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const creates = h.socket.sent.filter((s) => s.type === 'conversation.item.create');
+  assert.equal(creates.length, 1);
+  const item = creates[0]!['item'] as { role?: string; content?: Array<{ type?: string; text?: string }> };
+  assert.equal(item.role, 'user', 'assistant 角色服务端会当没看见（实测三种 content type 都不行）');
+  assert.equal(item.content?.[0]?.type, 'input_text');
+  assert.match(item.content?.[0]?.text ?? '', /塔可夫斯基怎么样/, '必须带原问题，否则长任务会乱序');
+  assert.match(item.content?.[0]?.text ?? '', /他很厉害/, '答案也要在');
+});
+
+test('injectAnswer：超长答案硬截断', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.injectAnswer('问', '啊'.repeat(500));
+  const creates = h.socket.sent.filter((s) => s.type === 'conversation.item.create');
+  assert.equal(creates.length, 1);
+  const text = (creates[0]!['item'] as { content: Array<{ text: string }> }).content[0]!.text;
+  assert.ok(text.length < 300, `200 字上限 + 旁注框架，实际 ${text.length}`);
+  assert.ok(text.endsWith('）'));
+});
+
+test('injectAnswer：车道不在（broken/idle）就丢，不排队', () => {
+  const h = make('full');
+  h.shadow.injectAnswer('问', '答');
+  h.ready();
+  assert.equal(h.socket.count('conversation.item.create'), 0);
 });
 
 test('omni 发 tool_call → delegateReason 非空；正常答 → null', async () => {

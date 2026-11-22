@@ -231,6 +231,9 @@ test('trackActivity 透传**全部**可选能力（漏一个就是静默降级�
     'attachAudioLane',
     'willServeAudio',
     'noteServedTurn',
+    // 委派轮回注：漏了 → omni 永远不知道 dsh 答了什么，下一轮顺着追问就答非所问。
+    // 同样是**静默**的：没有它 omni 照样能答，只是答的内容是错的。
+    'injectAnsweredTurn',
   ] as const;
 
   const inner = { name: 'fake', reply: async () => ({ text: '', speech: '' }) } as Record<string, unknown>;

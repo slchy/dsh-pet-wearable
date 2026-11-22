@@ -121,12 +121,29 @@ export interface FastLaneAudioLane {
   /** 认领本轮音频；`null` = 此刻拿不到（连接没就绪 / 这一份已经被取消） */
   claim(): AgentAudioAnswer | null;
   /**
-   * 这一轮不采纳（走 dsh / 判停并段 / 太长）。
+   * 这一轮不采纳（走 dsh / 判据否决）。
    *
    * 实现方必须**立刻 `response.cancel`** —— 否则它会在后台把整段废音频生成完，
    * 既烧输出 token，又让下一轮开口时它还挂着 busy。
+   *
+   * 与 {@link interrupt} 的差别只有一点但很要害：`discard` 意味着这一轮**一个字都没播**，
+   * 那条回复应当从服务端历史里删掉；`interrupt` 是播到一半被打断，**必须留着**。
    */
   discard(): void;
+  /**
+   * 播到一半被用户打断：取消生成，但保留已说出去的回复。
+   *
+   * 缺失时退回 `discard()` 也能用，只是会把用户听过的那半句也删掉 ——
+   * 和快车道 `pending` 里记的那半句就对不上了。
+   */
+  interrupt?(): void;
+  /**
+   * 把别的车道答出来的内容回注进本车道的上下文（委派轮用）。
+   *
+   * 没有它，omni 不知道自己那一轮被 dsh 接走了；下一轮用户顺着 dsh 的回答追问，
+   * omni 会答非所问。实现方应自行决定「什么时候能发」（如等 `ready`）。
+   */
+  injectAnswer?(userText: string, said: string): void;
 }
 
 /** Agent 回复。只保留编排层真正需要的字段。 */
@@ -220,6 +237,17 @@ export interface AgentProvider {
    * `said` 应当是**实际播出去的那部分**（被打断时按已播比例截断）。
    */
   noteServedTurn?(userText: string, said: string): void;
+  /**
+   * 可选能力：把**委派轮**的答案回注进音频车道（omni）的上下文。
+   *
+   * 为什么需要：委派轮是 omni 先答了个开头、然后被掐掉交给 dsh；omni 的服务端
+   * 历史里只有「用户问了什么」，**不知道 dsh 答了什么**。下一轮用户顺着 dsh 的
+   * 回答追问，omni 接不上。
+   *
+   * 宿主只在**这一轮真的播完了**时叫（被打断的正文不回注 —— 用户没听到的东西
+   * 不该变成 omni 的记忆）。没挂车道时是空操作。
+   */
+  injectAnsweredTurn?(userText: string, said: string): void;
   /**
    * 可选能力：**取消在途的一轮**（宿主侧能力，走 dsh 的 `session/cancel`）。
    *

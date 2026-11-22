@@ -223,8 +223,8 @@ export interface VoiceSessionOptions {
   readonly omniShadow?: {
     readonly apiKey: string;
     readonly model?: string;
-    /** 认领模式：`off`（只量）/ `clip`（只答单段轮）/ `full`。缺省 `off` */
-    readonly serve?: 'off' | 'clip' | 'full';
+    /** 认领模式：`off`（只量）/ `full`（真答）。缺省 `off` */
+    readonly serve?: 'off' | 'full';
   };
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;

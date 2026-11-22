@@ -750,10 +750,10 @@ async function main(): Promise<void> {
       && turnJudgePython !== '' && turnJudgeScript !== '';
 
     /**
-     * omni 影子旁路（**只量，不发声**）。默认关。
+     * omni 一体化车道。默认关。
      *
-     * 硬前提是 `qwen-realtime` STT：影子的起跑线是 `onCommit`（我们主动封段那一刻），
-     * 而 NLS 的 `commitMs` 是 0 —— 没有这个回调，影子会**一条数据都不出**却不报错。
+     * 硬前提是 `qwen-realtime` STT：车道的起跑线是 `onCommit`（我们主动封段那一刻），
+     * 而 NLS 的 `commitMs` 是 0 —— 没有这个回调，车道会**一条数据都不出**却不报错。
      * 这种静默失效比直接报错难查得多，所以在启动时就拦住并说清原因。
      */
     const omniWanted = envString('OMNI_SHADOW') === '1';
@@ -762,19 +762,22 @@ async function main(): Promise<void> {
     /**
      * `OMNI_ANSWER`：让 omni 真的答，而不只是量。
      *
-     * - `off`（默认）/ 未设：纯影子，一个字节都不播
-     * - `clip`：只答**单段**轮 —— 开全量前先验播放/音色/打断
-     * - `full`：与文本快车道同口径（含 omni 自己的 `tool_call` 转交）
+     * - `off`（默认）/ 未设：纯影子，一个字节都不播（只用来量）
+     * - `full`：与文本快车道同口径（含 omni 自己的 `tool_call` 转交、并段轮）
+     *
+     * 有过一个 `clip`（只答单段轮）的中间档，真机两场之后砍掉了 —— 它拒掉的并段轮
+     * 回答质量与全量无差别，真正要担心的「掐半句」22 轮里只出现 3 次、全是用户
+     * 自己插话。留着中间态只会让「线上到底是哪一档」变成一件要记的事。
      */
     const omniAnswer = envString('OMNI_ANSWER') ?? 'off';
-    if (!['off', 'clip', 'full'].includes(omniAnswer)) {
-      console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|clip|full）`);
+    if (!['off', 'full'].includes(omniAnswer)) {
+      console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|full）`);
       process.exit(2);
     }
     const omniShadow = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime'
       ? {
         apiKey: omniKey,
-        serve: omniAnswer as 'off' | 'clip' | 'full',
+        serve: omniAnswer as 'off' | 'full',
         ...(omniModel === undefined ? {} : { model: omniModel }),
       }
       : undefined;
