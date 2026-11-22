@@ -1,4 +1,4 @@
-/**
+﻿/**
  * omni 影子旁路：**只量，不发声**。
  *
  * <h2>它要回答什么</h2>
@@ -248,6 +248,23 @@ export class OmniShadow {
   private turnSeqs: number[] = [];
   /** 等 `ready` 再发的回注文本（见 `injectAnswer()`） */
   private injects: string[] = [];
+  /**
+   * `claim()` 认领了「还没建出来的那一份」时置位。
+   *
+   * 语义是**预留**：`sendSeal()` 一建好就把新那份标成 `claimed`，别的消费者再也拿不走。
+   * 一轮只会 claim 一次，所以单槽够；`discard()` / `restart()` 会把它清掉。
+   */
+  private claimReserved = false;
+  /**
+   * 认领落在哪一份上。
+   *
+   * **不能事后去 `this.resp` 里找**：`response.done` 一到 `finish()` 就把 `this.resp`
+   * 置 null，如果消费者这时还没开始读（异步 generator 的第一个 `next()` 是微任务），
+   * 那一份就再也够不着了 —— 表现是这一轮静默等 5 s、零音频。所以引用要留在这里。
+   */
+  private claimedResp: PendingResponse | null = null;
+  /** 在等「下一份建出来」的读端（`claim()` 的流会挂在这里） */
+  private liveWaiters: Array<() => void> = [];
   /** 还没跑过任何一份 seal —— 第一条标 `warmup`，分析时排除 */
   private sharedSeals = 0;
 
@@ -326,6 +343,9 @@ export class OmniShadow {
     this.ws = null;
     this.opened = false;
     this.state = 'broken';
+    this.claimReserved = false;
+    this.claimedResp = null;
+    this.wakeLive();
     if (ws !== null) {
       try {
         ws.close();
@@ -359,6 +379,10 @@ export class OmniShadow {
     this.ring = [];
     this.ringBytes = 0;
     this.turnSeqs = [];
+    // 新一轮开口：上一轮预留的那份不再属于任何人
+    this.claimReserved = false;
+    this.claimedResp = null;
+    this.wakeLive();
 
     if (this.dirtyBytes > 0) {
       this.lastFlushedMs = Math.round(this.dirtyBytes / BYTES_PER_MILLISECOND);
@@ -451,23 +475,26 @@ export class OmniShadow {
   /**
    * 这一轮能不能由 omni 自己答。纯读、不改账。
    *
-   * 两条限制，每一条都对应一次踩坑：
-   * - `serve === 'off'`：没开的连接一个字节都不该被认领
-   * - `cancelled` / `claimed`：一份只能给一个消费者，取消过的更不能再给（那是死答案）
+   * **硬约束：omni 开着的时候，快车道的每一轮都必须由它答。** 一轮退回级联，
+   * 用户就会在一段对话里听到两副嗓子。所以这里的判据要宽，宁可等也不能放：
+   * 手里那份被顶掉了（`cancelled`）但还有一份在 `pending` 里排队时，**也算能答** ——
+   * 新那一份马上就建出来（实测空窗 92 ms）。
    *
-   * **并段轮不再挡。** 曾经按 `turnSeqs.length > 1` 挡过（`clip` 档），理由是
-   * 「上下文里夹着被砍掉的半句」；实测两场之后砍掉：并段轮的回答质量与单段轮
-   * 5/5 无差别（`tmp/omni-probe/barge-in.cjs`），半句也已经由 `discard()` 标了删。
+   * 踩过的坑：只看 `this.resp` 的版本，会在「seal#2 排队 → done → 新建」这个
+   * 空窗里判 false，然后整轮退回级联，而 omni 那份 1 s 的回答生成完没人要。
+   *
+   * **并段轮不挡。** 曾经按 `turnSeqs.length > 1` 挡过（`clip` 档），实测两场之后
+   * 砍掉：并段轮的回答质量与单段轮 5/5 无差别（`tmp/omni-probe/barge-in.cjs`）。
    */
   willServe(): boolean {
     if ((this.opts.serve ?? 'off') === 'off') {
       return false;
     }
-    const resp = this.resp;
-    if (resp === null || resp.cancelled || resp.claimed) {
-      return false;
+    if (this.liveResp() !== null) {
+      return true;
     }
-    return true;
+    // 手里没有可用的一份：只有「已经有一份在排队」才算能答
+    return this.pending !== null;
   }
 
   /**
@@ -476,21 +503,49 @@ export class OmniShadow {
    * 注意：**首块通常还没到**（认领在定稿 ~220 ms，首块 600–670 ms），而判停延拍时
    * 认领可以晚到 700–870 ms、那时首块已经发过来了 —— 两条路都靠 `resp.audio`
    * 从封段就开始攒（见 `PendingResponse.audio`）。
+   *
+   * 手里那份被顶掉时，认领的是**排队中的下一份**：`claimReserved` 让 `sendSeal()`
+   * 一建好就把它标成 `claimed`，流从这里开始等（可能几十毫秒，也可能永远等不到 ——
+   * 那说明车道挂了，见 `waitLive`）。
    */
   claim(): AgentAudioAnswer | null {
     if (!this.willServe()) {
       return null;
     }
-    const resp = this.resp;
-    if (resp === null) {
-      return null;
+    // 上一轮的认领随这一轮作废（一轮一个消费者）
+    this.claimedResp = null;
+    const live = this.liveResp();
+    if (live !== null) {
+      live.claimed = true;
+      this.claimedResp = live;
+    } else {
+      // 只能预留：真正那一份还没建出来。一轮只会 claim 一次，所以单槽够用。
+      this.claimReserved = true;
     }
-    resp.claimed = true;
+    const self = this;
+    let bound = live;
+    /** 这一轮真正对应的那一份：手里这份，或者预留到的那份 */
+    const current = (): PendingResponse | null => {
+      if (bound === null) {
+        bound = self.claimedResp;
+      }
+      return bound;
+    };
     return {
       sampleRate: DOWNSTREAM_RATE,
-      transcript: () => resp.text,
-      delegateReason: () => resp.delegate,
+      transcript: () => current()?.text ?? '',
+      delegateReason: () => current()?.delegate ?? null,
       chunks: (async function* iterate() {
+        let resp = current();
+        // 等排队那份建出来。车道挂了 / 被停掉就放弃，让这一轮以「零音频」结束
+        // （宿主会按 `audioBytes === 0` 记账，不会假装说过话）。
+        while (resp === null) {
+          if (self.state === 'broken' || self.state === 'idle') {
+            return;
+          }
+          await self.waitLive();
+          resp = current();
+        }
         for (;;) {
           if (resp.audio.length > 0) {
             const next = resp.audio.shift();
@@ -528,6 +583,11 @@ export class OmniShadow {
       this.cancelCurrent();
     }
     this.pending = null;
+    // 预留作废，并且把可能挂在 `waitLive()` 上的读端叫起来（它会看到 broken/idle 退出，
+    // 或者等不到东西直接结束这一轮）
+    this.claimReserved = false;
+    this.claimedResp = null;
+    this.wakeLive();
   }
 
   /**
@@ -601,6 +661,10 @@ export class OmniShadow {
       has_resp: resp !== null,
       cancelled: resp?.cancelled ?? null,
       claimed: resp?.claimed ?? null,
+      // 有一份在排队 —— `willServe()` 在「手里那份被顶掉」时靠它才敢说能答
+      pending: this.pending !== null,
+      // 本次 gate 窗口内封了几段（`restart()` 清零）。**不等于**这一轮并了几段：
+      // 插话时门不关、`restart()` 不跑，计数会跨轮累积。
       turn_seqs: this.turnSeqs.length,
     };
   }
@@ -614,6 +678,42 @@ export class OmniShadow {
     for (const wake of waiters) {
       wake();
     }
+  }
+
+  /** 手里那份可用吗（没被取消、没被认领走） */
+  private liveResp(): PendingResponse | null {
+    const resp = this.resp;
+    if (resp === null || resp.cancelled || resp.claimed) {
+      return null;
+    }
+    return resp;
+  }
+
+  private wakeLive(): void {
+    const waiters = this.liveWaiters.splice(0);
+    for (const wake of waiters) {
+      wake();
+    }
+  }
+
+  /** 等「下一份建出来」；`wakeLive()` 或超时（防挂死）后返回 */
+  private waitLive(ms = 5000): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = (): void => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        const at = this.liveWaiters.indexOf(done);
+        if (at >= 0) {
+          this.liveWaiters.splice(at, 1);
+        }
+        resolve();
+      };
+      timer = setTimeout(done, ms);
+      this.liveWaiters.push(done);
+    });
   }
 
   // ---------------------------------------------------------------- 内部
@@ -641,8 +741,18 @@ export class OmniShadow {
       deleteOnDone: false,
       claimed: false,
     };
+    // `claim()` 可能已经把这一份预留了（它认领时手里那份已经被顶掉）：
+    // 一建出来就标成已认领，别的消费者再也拿不走。
+    if (this.claimReserved) {
+      this.resp.claimed = true;
+      this.claimReserved = false;
+      this.claimedResp = null;
+      this.claimedResp = this.resp;
+    }
     this.state = 'busy';
     this.armResponseTimeout();
+    // 读端可能正挂在 `waitLive()` 上等这一份
+    this.wakeLive();
   }
 
   private cancelCurrent(): void {
@@ -911,6 +1021,9 @@ export class OmniShadow {
       resp.closed = true;
       this.wakeAudio(resp);
     }
+    this.claimReserved = false;
+    this.claimedResp = null;
+    this.wakeLive();
     if (ws !== null) {
       try {
         ws.close();

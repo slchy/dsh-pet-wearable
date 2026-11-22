@@ -1,4 +1,4 @@
-# omni 一体化车道
+﻿# omni 一体化车道
 
 > **状态：现行。** 本文描述的是**已上线并在真机跑过的形态**，不是设计草案。
 > 初版设计稿（S0，只量不发声）与本形态的偏差集中在 §十二，别拿旧稿子对账。
@@ -75,6 +75,11 @@ omni：     封段 ────── 670 ──────▶ 首块
 ---
 
 ## 三、车道层：三个方法的契约
+
+> **硬约束：omni 开着的时候，快车道的每一轮都必须由它答。**
+> 一轮退回级联，用户就会在同一段对话里听到两副嗓子。所以下面对 `willServe()`
+> 的判据是**宽**的（宁可等，也不放），而任何 `lane_ok:false && text_ok:true`
+> 的 `agent.lane` 都是缺陷，要清零。§12.4 列了剩余路径。
 
 ```ts
 interface FastLaneAudioLane {
@@ -180,7 +185,29 @@ feed(voiced)  → muted = false，先补 ring 再追加
    `maybe no invalid audio stream`。
 4. 解除闭嘴、推预卷。
 
-### 4.6 删半句：只能延迟到 `response.done`
+### 4.6 认领必须能跨过「排队窗口」
+
+`seal()` 撞上忙的时候，做的是「cancel 当前那份 + 把新的排进 `pending`」，而**新的那份
+要等旧那份的 `response.done` 才建出来**。实测空窗 **92 ms**。
+
+如果 `willServe()` 只看 `this.resp`，它在这个窗口里会指着一份已经被取消的回复、
+判 false —— 于是这一轮退回级联，而 omni 那份 1 s 的回答生成完没人要。
+（真机 `20261122-194042` 两轮中招，占 5%。）
+
+所以：
+
+```text
+willServe()  手里没有活的，但 pending !== null  ⇒  true（新一份马上来）
+claim()      手里没有活的 ⇒  预留（claimReserved），流先挂起
+sendSeal()   建好时按预留把 claimed 置上，并把引用记进 claimedResp
+```
+
+**`claimedResp` 这个引用是必须的，不是冗余。** `finish()` 一到就把 `this.resp` 置 null，
+而异步 generator 的第一个 `next()` 是微任务 —— 如果 response 在消费者开始读之前就
+`done` 了，事后去 `this.resp` 里找只会得到 null，表现是这一轮静默等 5 s、零音频。
+（这个坑是写测试时撞出来的，第一版就是「事后去找」。）
+
+### 4.7 删半句：只能延迟到 `response.done`
 
 `conversation.item.delete` 要 **item id**，而 id 在 `response.done.response.output`
 里。`discard()` 的时机（委派轮、同一句的第二次封段）通常连 `response.created`
@@ -204,7 +231,7 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 | `cancelCurrent()` 且 `!claimed` | 删 | 同一句第二次封段把上一份顶掉，那份答的是半句话 |
 | `interrupt()`（播到一半被打断） | **不删** | 用户已经听到了一部分；删掉就和快车道 `pending` 里记的半句对不上 |
 
-### 4.7 委派轮回注：`role` 必须是 `user`
+### 4.8 委派轮回注：`role` 必须是 `user`
 
 委派轮是 omni 先答了个开头、被掐掉交给 dsh。omni 的服务端历史里只有
 「用户问了什么」，**不知道 dsh 答了什么**——这是「缺失」，不是「污染」。
@@ -270,7 +297,7 @@ input_audio_transcription: { model: 'qwen3-asr-flash-realtime' },  // 没它就�
 判断一个原语要用**回答内容**，不能用计费。
 
 生产上要回注 dsh 的答案时，把内容包成一条 `user` 角色的文本项即可；
-实测在**音频上下文**里同样生效（§12.4 有验证方式），代价约 30–50 token/轮。
+实测在**音频上下文**里同样生效（§12.5 有验证方式），代价约 30–50 token/轮。
 
 ---
 
@@ -535,7 +562,7 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 | 无 `created_ms` | 无（`created` 只是内部布尔） | 没用到 |
 | `~380 行`，`fronted-agent.ts` 零改动 | 850 + 4 处改动 | 记忆复用 `pending` |
 | 无「删半句」 | `discard()` 标 `deleteOnDone`，`done` 到了才删（见 §4.6） | 那会儿才有 item id |
-| 无「回注」 | `injectAnswer()`：`user` 角色 + 带原问题 + 硬截断 + 等 `ready`（见 §4.7） | 委派轮 omni 会失忆 |
+| 无「回注」 | `injectAnswer()`：`user` 角色 + 带原问题 + 硬截断 + 等 `ready`（见 §4.8） | 委派轮 omni 会失忆 |
 | 写在 `QOS.md` 里 | 独立本文 + `QOS.md` 附录一行 | 篇幅 |
 
 ### 12.1 当前空档
@@ -567,7 +594,23 @@ cd <部署路径> && sed -i 's/^OMNI_ANSWER=.*/OMNI_ANSWER=off/' .env && sudo -n
 
 `off` 仍保留影子测量，只是不发声。
 
-### 12.4 协议原语怎么验（别用 token 数判）
+### 12.4 硬约束之下还剩哪些「退回级联」的路径
+
+判据统一用档案：`agent.lane` 里 **`lane_ok:false && text_ok:true`** —— 这表示
+不是文本闸把这一轮判给了 dsh，而是车道自己没接住。**这个数应当是 0。**
+
+| 路径 | 现在 | 说明 |
+|:---|:---|:---|
+| 排队窗口（92 ms） | **已修**（§4.6） | 曾经 2/38 |
+| `state === 'connecting'` | 未处理 | 握手 1.3 s。此时 `seal()` 直接 `skipped`，音频**从来没发出去**，事后补不回来 —— 真要修得把整句 PCM 缓冲到 `ready`。三场 90 轮里出现 0 次 |
+| `state === 'broken'` | 只能是整场退回 | 车道挂了以后每一轮都没 omni。这是**整场**退回纯级联，不是逐轮抖动；`break()` 落一条 `{skipped:'broken', why}` |
+| 本轮已被 `interrupt()` | 不需要答 | 用户插话已经把这一轮作废了，不存在"该答没答" |
+| `image !== undefined` | 不算 | 带图的轮次本来就要视觉模型，omni 这档接不了 |
+
+想彻底消灭 `connecting` 那一条，只有「缓冲整句 PCM，`ready` 后补发 commit+create」——
+约和 V2 重发同量级的工作。**在三场 90 轮实测 0 次之前不值得做。**
+
+### 12.5 协议原语怎么验（别用 token 数判）
 
 四个原语的判定方法，以及各自**踩过的误判**：
 

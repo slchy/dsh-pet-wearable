@@ -470,6 +470,92 @@ test('injectAnswer：车道不在（broken/idle）就丢，不排队', () => {
   assert.equal(h.socket.count('conversation.item.create'), 0);
 });
 
+test('手里那份被顶掉时认领「排队中的下一份」（空窗 92 ms，一放就整轮退回级联）', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  // 同一句第二次封段：seal#1 被 cancel、#2 排队。此刻 `this.resp` 指着已取消的 #1。
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.shadow.seal(2, 40);
+
+  assert.equal(h.shadow.willServe(), true,
+    '还有一份在排队就算能答 —— 判 false 会让这一轮整轮退回级联（听到两副嗓子）');
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+
+  // #1 的 done 到达 → 排队那份建出来，并且**一建好就是已认领**
+  h.at(30);
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'cancelled', output: [{ id: 'item_a1', role: 'assistant' }] },
+  });
+  assert.equal(h.socket.count('response.create'), 2, '排队那份这时才发');
+  h.at(40);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(960).toString('base64') });
+  h.at(50);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await drain;
+  assert.equal(got.length, 1, '下一份的音频必须能拿到');
+  assert.equal(got[0]!.length, 960);
+});
+
+test('预留的那份被 discard 作废：不会被后面另一份顺手拿走', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.shadow.seal(2, 40);
+  assert.ok(h.shadow.claim() !== null);
+  h.shadow.discard();
+  h.at(30);
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  // 下一轮的封段不该背着上一轮的预留
+  h.at(40);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(3, 40);
+  assert.equal(h.shadow.willServe(), true, '新的一份没被谁认领过');
+});
+
+test('等「下一份」的时候车道断了：流正常结束，不挂死', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.shadow.seal(2, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  h.socket.close();
+  await drain;
+  assert.equal(got.length, 0);
+});
+
 test('omni 发 tool_call → delegateReason 非空；正常答 → null', async () => {
   const h = make('full');
   h.ready();
