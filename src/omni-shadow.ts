@@ -144,6 +144,16 @@ interface PendingResponse {
   text: string;
   /** omni 自己决定转 dsh（`tool_call`）；`null` = 它会自己答 */
   delegate: DelegateReason | null;
+  /**
+   * 服务端回过 `response.created` 了吗。
+   *
+   * **`response.cancel` 在它之前发会被拒**（实测文案
+   * `Cannot cancel response before response.created`），而委派轮恰恰是在
+   * `seal()` 之后几百毫秒就 discard —— 那时 created 通常还没到。
+   */
+  created: boolean;
+  /** 还没 created 就被要求取消：等 created 到了立刻补发 */
+  cancelPending: boolean;
   /** 有没有人认领过（一份只给一个消费者） */
   claimed: boolean;
 }
@@ -524,6 +534,8 @@ export class OmniShadow {
       closed: false,
       text: '',
       delegate: null,
+      created: false,
+      cancelPending: false,
       claimed: false,
     };
     this.state = 'busy';
@@ -535,6 +547,13 @@ export class OmniShadow {
       return;
     }
     this.resp.cancelled = true;
+    if (!this.resp.created) {
+      // `response.cancel` 在 `response.created` 之前发会被服务端拒
+      // （`Cannot cancel response before response.created`），所以先记账，
+      // 等 created 到了立刻补发 —— 见 `onMessage` 的 `response.created` 分支
+      this.resp.cancelPending = true;
+      return;
+    }
     this.send({ type: 'response.cancel' });
   }
 
@@ -617,6 +636,15 @@ export class OmniShadow {
           this.log('[omni] 影子就绪');
         }
         return;
+      case 'response.created':
+        if (this.resp !== null) {
+          this.resp.created = true;
+          if (this.resp.cancelPending) {
+            this.resp.cancelPending = false;
+            this.send({ type: 'response.cancel' });
+          }
+        }
+        return;
       case 'input_audio_buffer.committed':
         if (this.resp !== null && this.resp.ackAt === null) {
           this.resp.ackAt = this.now();
@@ -669,6 +697,11 @@ export class OmniShadow {
   private onError(ev: ServerEvent): void {
     const message = ev.error?.message ?? '';
     this.log(`[omni] 服务端错误：${message.slice(0, 160)}`);
+    // 「在 created 之前 cancel」是我们自己时序问题，已经按 `cancelPending` 修掉；
+    // 万一旧路径漏过来一次，它不该把整条车道判死（不计入协议错误）
+    if (message.includes('before response.created')) {
+      return;
+    }
     this.protocolErrors += 1;
     // 「忙时 create」这类错误说明我们的状态机和服务端已经不同步了。
     // 不猜怎么修，直接停 —— 影子还留着的价值不如它污染数据的代价。

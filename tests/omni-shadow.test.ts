@@ -203,6 +203,10 @@ test('忙时封段：先 cancel，done 之前不许再发 create', () => {
   h.shadow.restart([Buffer.alloc(MS * 100)]);
   h.at(100);
   h.shadow.seal(1, 40);
+  // 真的「忙」意味着服务端已经回过 `response.created` —— 只有 created 之后的
+  // cancel 才合法（之前发会被拒，见 `cancelPending`）
+  h.at(150);
+  h.socket.message({ type: 'response.created' });
 
   // 第一份还在跑，第二段就来了
   h.at(200);
@@ -320,7 +324,7 @@ test('认领之前到的那块音频不能丢（判停延拍时认领会晚到 7
   assert.equal(got[0]!.length, 480);
 });
 
-test('discard 后立刻 cancel，且不再可认领', () => {
+test('discard 后立刻不可认领（cancel 要等 created，见下一条）', () => {
   const h = make('full');
   h.ready();
   h.at(0);
@@ -330,9 +334,8 @@ test('discard 后立刻 cancel，且不再可认领', () => {
   assert.equal(h.shadow.willServe(), true);
 
   h.shadow.discard();
-  assert.equal(h.socket.count('response.cancel'), 1, '不取消就会在后台把整段废音频生成完');
   assert.equal(h.shadow.willServe(), false);
-  assert.equal(h.shadow.claim(), null);
+  assert.equal(h.shadow.claim(), null, '取消过的就是死答案，不能再给出去');
 });
 
 test('clip 档不认多段轮；full 档认', () => {
@@ -392,4 +395,32 @@ test('serve=off 时 claim 恒 null（一个字节都不该被认领）', () => {
   h.shadow.seal(1, 40);
   assert.equal(h.shadow.willServe(), false);
   assert.equal(h.shadow.claim(), null);
+});
+test('created 之前 discard 不立刻 cancel，等 created 到了再补发', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  // 委派轮就是这样：seal 之后几百毫秒就 discard，那时 response.created 还没到
+  h.shadow.discard();
+  assert.equal(h.socket.count('response.cancel'), 0, 'created 之前发会被服务端拒');
+  assert.equal(h.shadow.willServe(), false);
+
+  h.at(120);
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1, 'created 一到就补发');
+});
+
+test('「created 之前 cancel」的服务端错误不判死车道', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  h.socket.message({ type: 'error', error: { message: 'Cannot cancel response before response.created' } });
+  h.socket.message({ type: 'error', error: { message: 'Cannot cancel response before response.created' } });
+  assert.equal(h.shadow.currentState, 'busy', '这个错误是我们自己的时序，不该把整条车道停掉');
 });
