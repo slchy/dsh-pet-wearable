@@ -601,8 +601,13 @@ export class OmniShadow {
     }
     // 上一轮的认领随这一轮作废（一轮一个消费者）
     this.claimedResp = null;
-    // 记下这一轮的 epoch：并段轮被顶掉时，只允许跟到**同一轮**新封出来的那份
-    this.claimEpoch = this.turnEpoch;
+    // 每次认领一个新纪元：并段轮被顶掉时，只允许跟到**这一次认领之后**新封出来的那份。
+    //
+    // 不能只靠 `restart()` 推进：连着说话时能量门不关，`restart()` 根本不跑
+    // （真机 `20261122-2259` 的 `turn_seqs` 一路涨到 15 —— 那就是没 restart 的证据），
+    // 于是「同一个 turnEpoch」会把**下一轮**的段也当成自己的。
+    const me = (this.turnEpoch += 1);
+    this.claimEpoch = me;
     const live = this.liveResp();
     if (live !== null) {
       live.claimed = true;
@@ -652,7 +657,8 @@ export class OmniShadow {
             // 播过就到此为止：两段回答接在一起比「少说一句」更难听。
             // 只认**同一个 turn epoch** 里新封出来的那一份：`restart()` 之后 `this.resp`
             // 属于下一轮，跟过去就把人家的答案抢了（`interrupt` 也就掐错人）。
-            if (yielded === 0 && active.superseded && self.claimEpoch === self.turnEpoch) {
+            if (yielded === 0 && active.superseded
+              && self.claimEpoch === me && self.turnEpoch === me) {
               let next = active.next;
               if (next === null && self.pending !== null) {
                 // 排队那份还没建出来（inish() 先收尾上一份、再补发）：等它
