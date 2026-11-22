@@ -65,6 +65,9 @@ CLOCK: dict[str, str] = {
     "TURN_JUDGE_QUIET_MS": "wall",
     "TURN_JUDGE_MAX_OPEN_SILENCE_MS": "audio",
     "TURN_JUDGE_TRIM_MS": "audio",
+    # 语义判停（END 标签）：一次网络往返，藏在静候窗里
+    "SEMANTIC_END_TAG_TIMEOUT_MS": "wall",
+    "SEMANTIC_END_TAG_BUDGET_MS": "wall",
     # 模型
     "FAST_LANE_TIMEOUT_MS": "wall",
     # TTS
@@ -128,6 +131,8 @@ SHADED_BY: dict[str, str] = {
     "TURN_JUDGE_WAIT_BUDGET_MS": "同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算",
     "TURN_JUDGE_QUIET_MS": "模型段",
     "TURN_JUDGE_MAX_OPEN_SILENCE_MS": "无（它自己是上限）",
+    "SEMANTIC_END_TAG_BUDGET_MS": "静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行",
+    "SEMANTIC_END_TAG_TIMEOUT_MS": "同上（它只决定这一次判定放弃得多早，不单独产生等待）",
     "VOICE_PAUSE_DETECT_MS": "ASR 解出句之前（提前起跑，不额外等）",
     "VOICE_SPECULATE_MS": "同上（投机与 ASR 并行）",
     "PREWARM_TTL_MS": "定稿→开轮之间（正常 0–600 ms，用不完）",

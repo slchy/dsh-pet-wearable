@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 判停组装层：**一句话被 ASR 切成两句**时不要拿后半截当一轮。
  *
  * 真机（2026-11-15）：用户问「…你是怎么答的？」，ASR 断成
@@ -1165,4 +1165,121 @@ test('QoS：不在序列形态时，普通句尾仍按小预算收下', async ()
   assert.equal(utterances.length, 1);
   const unsure = facts.filter((f) => f.why === 'unsure').length;
   assert.ok(unsure <= 1, `普通句尾不该拿到序列豁免，实际 ${unsure} 拍`);
+});
+
+// ── 语义判停（END 标签） ────────────────────────────────────────────────
+//
+// 声学判停回答「这段像不像句尾」，回答不了「这句话说完了没有」：真机
+// 20261122-2259 里 7 次 `p=0.985 静音 ≥ 门槛，放行` 全是半句被当成整句
+// （「实在不甘心的话，可以趁现在停一下想想。」/「如果你发现自己。」）。
+// 文本这一层只补这一个洞 —— 说 `MORE` 就再等一拍。
+
+test('语义判停说 MORE 时再等一拍，不在当口成轮', async () => {
+  const facts: Array<{ why?: string; action: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    semanticEndpoint: async () => 'more',
+    onJudge: (fact) => { facts.push({ why: fact.why, action: fact.action }); },
+  });
+
+  assembler.addSentence('如果你发现自己');
+  await delay(10);
+  assert.equal(utterances.length, 0, 'MORE 不该立刻成轮');
+
+  await delay(80);
+  assert.equal(utterances.length, 1, '延长一拍之后还是要收下，不能吞');
+  assert.equal(utterances[0]?.text, '如果你发现自己');
+  assert.equal(facts.filter((f) => f.why === 'meaning').length, 1, '只延长一次');
+});
+
+test('语义判停说 END 时照常成轮，不多等', async () => {
+  const { assembler, utterances } = makeAssembler({
+    semanticEndpoint: async () => 'end',
+  });
+
+  assembler.addSentence('把灯关掉。');
+  await delay(10);
+  assert.equal(utterances.length, 1);
+});
+
+test('语义判停超时按「说完了」放行，不卡住开轮', async () => {
+  const { assembler, utterances } = makeAssembler({
+    // 永远不回话：模拟服务端慢/挂住
+    semanticEndpoint: () => new Promise<'end' | 'more' | null>(() => {}),
+    semanticBudgetMs: 25,
+  });
+
+  const startedAt = Date.now();
+  assembler.addSentence('把灯关掉。');
+  await delay(80);
+  assert.equal(utterances.length, 1, '超时必须放行');
+  assert.ok(Date.now() - startedAt < 300, '超时按预算走，不该拖到天荒地老');
+});
+
+test('语义判停不许绕过拍数上限', async () => {
+  const { assembler, utterances } = makeAssembler({
+    maxExtensions: 0,
+    semanticEndpoint: async () => 'more',
+  });
+
+  assembler.addSentence('如果你发现自己');
+  await delay(10);
+  assert.equal(utterances.length, 1, '拍数和预算都用完了，MORE 也只能放行');
+});
+
+test('语义判停只能问一次：同一段文字不重复发请求', async () => {
+  let calls = 0;
+  const { assembler, utterances } = makeAssembler({
+    semanticEndpoint: async () => {
+      calls += 1;
+      return 'more';
+    },
+    maxExtensions: 4,
+  });
+
+  assembler.addSentence('如果你发现自己');
+  await delay(80);
+  assembler.addSentence('对。');
+  await delay(120);
+
+  assert.equal(utterances.length >= 1, true);
+  // 两段文字 = 最多两次请求；同一段被 evaluate 多次时不许重复问
+  assert.ok(calls <= 2, `同一段只该问一次（实际 ${calls} 次）`);
+});
+test('说话期间就从中间结果发判定（这样才来得及藏在静候窗里）', async () => {
+  const asked: string[] = [];
+  const { assembler } = makeAssembler({
+    semanticEndpoint: async (text) => { asked.push(text); return 'end'; },
+  });
+
+  assembler.notePartial('如果你');                 // 太短，不问
+  assembler.notePartial('如果你发现自己在想');       // 够长（9 字），问
+  assembler.notePartial('如果你发现自己在想啊');      // 只多一个字，不问
+  await delay(20);
+  assert.deepEqual(asked, ['如果你发现自己在想']);
+
+  assembler.notePartial('如果你发现自己在想啊这件事是不是有点奇怪');  // 变了够多，再问
+  await delay(20);
+  assert.equal(asked.length, 2);
+});
+
+test('中间结果判了 MORE，定稿只是它的延长 → 立刻再等一拍，不重新问', async () => {
+  const asked: string[] = [];
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    semanticEndpoint: async (text) => {
+      asked.push(text);
+      return text.startsWith('你讲一下') ? 'more' : 'end';
+    },
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+
+  assembler.notePartial('你讲一下莱姆写的');   // 说话期间：MORE
+  await delay(30);
+  assembler.addSentence('你讲一下莱姆写的棋谱');  // 定稿只多了两个字
+  await delay(10);
+  assert.equal(utterances.length, 0, '前缀判 MORE 就该再等一拍');
+  await delay(80);
+  assert.equal(utterances.length, 1, '等完照样收下');
+  assert.equal(facts.filter((f) => f.why === 'meaning').length, 1);
+  assert.equal(asked.filter((t) => t === '你讲一下莱姆写的棋谱').length, 0, '不该为延长后的文字重问');
 });

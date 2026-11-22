@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 句子 → 一轮话语（utterance）的合并与判停。
  *
  * <h2>职责</h2>
@@ -42,6 +42,20 @@ export interface UtteranceAssemblerOptions {
   readonly quietMs: number;
   /** 判为「没说完」时再多等这么久 */
   readonly extendMs: number;
+  /**
+   * 语义判停：给**当前这边的整段文字**，回 `'end'`（说完了）/ `'more'`（还有下文）
+   * / `null`（拿不准或失败）。
+   *
+   * 声学判停（`TurnJudge`）看的是音频，它能判断「这像不像句尾」，判断不了「这句话
+   * 说完了没有」—— 真机上 `p=0.985` 判对句尾、判错语义的场景一抓一把。文本这一层
+   * 只补这一个洞：`'more'` 就再等一拍（吃既有的拍数/预算，不开后门），`'end'` 或
+   * 超时都照常开轮。
+   *
+   * 判定在 `addSentence` 时就发出去，与静候窗重叠，所以正常情况下**不额外加延迟**。
+   */
+  readonly semanticEndpoint?: (text: string) => Promise<'end' | 'more' | null>;
+  /** 等语义判停回话的上限（ms）。等不到就按「说完了」走。默认 300 */
+  readonly semanticBudgetMs?: number;
   /** 一轮最多延长几次（**总预算**，四种原因共用） */
   readonly maxExtensions: number;
   /**
@@ -262,7 +276,7 @@ export interface JudgeFact {
   readonly waitMs: number;
   readonly action: 'accept' | 'extend' | 'error';
   /** 为什么还要等（只有 `extend` 有） */
-  readonly why?: 'short' | 'unsure' | 'silence';
+  readonly why?: 'short' | 'unsure' | 'silence' | 'meaning';
   /** 为什么放行（只有 `accept` 可能带）。`cap` = 静音到了统一上限 */
   readonly whyAccept?: 'cap';
   /** 这次决定用的阈值（中文和默认可能不同，落档才分得清） */
@@ -355,6 +369,20 @@ export class UtteranceAssembler {
   /** `predictAtMs` 的定时器 */
   private predictTimer: NodeJS.Timeout | null = null;
   private extensions = 0;
+  /**
+   * 语义判停的请求缓存：文字 → 判定。
+   *
+   * 为什么按**文字**存：判定在说话期间（中间结果）和定稿时就发出去了，而真正要用的
+   * 时刻是「即将开轮」；同一段文字可能被问过一次，就该直接取。只留最近几条 ——
+   * 中间结果会连续改写，不是历史账本。
+   */
+  private readonly semanticAsks = new Map<string, Promise<'end' | 'more' | null>>();
+  /** 已经回来的判定（同步可读，见 hasPrefixMore） */
+  private readonly semanticSettled = new Map<string, 'end' | 'more' | null>();
+  /** 上一次因为中间结果发出去的文字（避免同一个中间结果反复问） */
+  private semanticLastAsked = '';
+  /** 已经因为语义判停延长过的那段文字（同一段只延长一次） */
+  private semanticExtended = '';
   /**
    * 其中「判停说没说完」用掉了几次。
    *
@@ -656,6 +684,10 @@ export class UtteranceAssembler {
   notePartial(text: string): void {
     this.lastPartialAt = this.now();
     this.lastPartialText = text;
+    // 语义判停要藏在静候窗里，就不能等到定稿才发请求：真服务实测 p50 250–310 ms
+    // （qwen-flash，见 docs/EOT-SUPPLEMENT.md §11.5），而「定稿→开轮」只有
+    // 200–300 ms。中间结果在**说话期间**就到了，从这一刻发才来得及。
+    this.askSemanticsDuringSpeech(text);
   }
 
   /** 一句定稿的识别结果。 */
@@ -688,6 +720,12 @@ export class UtteranceAssembler {
     // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
     // 先把它交出去起跑，真并了下一段再换 —— 见 `VoiceSession` 的接线。
     this.options.onSentence?.(this.pendingText);
+    // 语义判停**立刻**发出去：它是一次网络往返（150–300 ms），现在发就跟下面这个
+    // 静候窗重叠；等判定那一刻再发就变成纯加延迟了。
+    // 前缀已经判了「还有下文」就不用再问：延长后的文字问回来时，开轮早该发生了
+    if (!this.hasPrefixMore(this.pendingText)) {
+      void this.askSemantics(this.pendingText);
+    }
     const delay = this.options.predict
       ? this.options.quietMs
       : this.options.fallbackWindowMs;
@@ -821,7 +859,9 @@ export class UtteranceAssembler {
       // 判停器出问题就退回保守策略：宁可多合成一轮，也别把用户的话吞掉
       this.options.log(`  判停    ${shown} → 判停器不可用，直接结束本轮`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'error' });
-      this.flush();
+      if (await this.semanticAllowsFlush(seq, probability)) {
+        this.flush();
+      }
       return;
     }
 
@@ -901,7 +941,9 @@ export class UtteranceAssembler {
     if (probability < threshold && unchanged && this.extensions > 0) {
       this.options.log(`  判停    ${shown} → 音频和文本都没变，不再等（阈值 ${threshold}）`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
-      this.flush();
+      if (await this.semanticAllowsFlush(seq, probability)) {
+        this.flush();
+      }
       return;
     }
 
@@ -943,7 +985,9 @@ export class UtteranceAssembler {
       // 由 `waitBudgetSequenceMs` 给**更大的预算**，不再给更多拍数。
       this.options.log(`  判停    ${shown} → 收下这一轮（阈值 ${threshold}）`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
-      this.flush();
+      if (await this.semanticAllowsFlush(seq, probability)) {
+        this.flush();
+      }
       return;
     }
 
@@ -959,6 +1003,149 @@ export class UtteranceAssembler {
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
   }
 
+  /**
+   * 说话期间就从中间结果发一次判定。
+   *
+   * 这是「零额外延迟」的全部秘密：真服务实测 p50 250–310 ms，而「定稿→开轮」只有
+   * 200–300 ms —— 等定稿再问，答案永远晚一拍。中间结果在用户还说着的时候就到了。
+   *
+   * 只在**够长**且**变了够多**时才问（中间结果会连续改写，逐字问等于打服务）：
+   * 至少 8 个字、比上一次多/少 4 个字以上。
+   */
+  private askSemanticsDuringSpeech(text: string): void {
+    if (this.options.semanticEndpoint === undefined) {
+      return;
+    }
+    const trimmed = text.trim();
+    if (trimmed.length < 8 || trimmed === this.semanticLastAsked) {
+      return;
+    }
+    if (
+      this.semanticLastAsked !== ''
+      && Math.abs(trimmed.length - this.semanticLastAsked.length) < 4
+    ) {
+      return;
+    }
+    this.semanticLastAsked = trimmed;
+    void this.askSemantics(trimmed);
+  }
+
+  /** 把某段文字的判定请求发出去（同一段文字只问一次；失败一律回 `null`）。 */
+  private askSemantics(text: string): Promise<'end' | 'more' | null> {
+    const endpoint = this.options.semanticEndpoint;
+    if (endpoint === undefined || text.trim() === '') {
+      return Promise.resolve(null);
+    }
+    const cached = this.semanticAsks.get(text);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const promise = endpoint(text).catch((): null => null).then((verdict) => {
+      this.semanticSettled.set(text, verdict);
+      return verdict;
+    });
+    this.semanticAsks.set(text, promise);
+    // 只留最近 8 条：中间结果会连续改写，这里不是历史账本
+    if (this.semanticAsks.size > 8) {
+      const oldest = this.semanticAsks.keys().next().value;
+      if (oldest !== undefined) {
+        this.semanticAsks.delete(oldest);
+      }
+    }
+    return promise;
+  }
+
+  /**
+   * 「要不要开轮」的最后一道文本闸：语义判停说还有下文时再等一拍。
+   *
+   * 三条硬边界：
+   * - **只延长一次**（同一段文字）。多次延长等于把判停交给另一层，收益全是延迟。
+   * - 吃的是**既有的**拍数与总预算（`maxExtensionsNow()` / `overBudget()`），不新开账。
+   * - 等判停本身有上限（`semanticBudgetMs`）；等不到按「说完了」放行 —— 判停这层
+   *   出问题绝不能把用户的话吞掉。
+   *
+   * @returns 是否放行（`true` = 可以 `flush()`）
+   */
+  private async semanticAllowsFlush(seq: number, probability: number): Promise<boolean> {
+    if (this.options.semanticEndpoint === undefined) {
+      return true;
+    }
+    const text = this.pendingText;
+    if (text.trim() === '') {
+      return true;
+    }
+    // 说话期间/定稿时已经问过了就直接取。**前缀判定要先看**：定稿常常只是中间结果的
+    // 延长，那份「还有下文」已经够用了 —— 再为延长后的文字问一趟，等回来时开轮早就
+    // 该发生了（实测 p50 250–310 ms）。
+    const settled = this.semanticSettled.get(text);
+    let verdict: 'end' | 'more' | null | 'timeout';
+    if (settled !== undefined) {
+      verdict = settled;
+    } else if (this.hasPrefixMore(text)) {
+      verdict = 'more';
+    } else {
+      verdict = await this.awaitSemantics(text);
+    }
+    if (this.disposed || seq !== this.seq) {
+      // 等待期间又来了新的一句：那一轮已经重新排好，放行交给它（`flush` 自带
+      // 空文本保护，不会把新的一句误封出去）
+      return true;
+    }
+    if (verdict !== 'more') {
+      if (verdict === 'timeout') {
+        const budget = this.options.semanticBudgetMs ?? 300;
+        this.options.log(`  判停    语义判停 ${budget} ms 没回话，按「说完了」放行`);
+      }
+      return true;
+    }
+    if (this.semanticExtended === text) {
+      return true;
+    }
+    if (this.extensions >= this.maxExtensionsNow() || this.overBudget()) {
+      this.options.log('  判停    语义=还有下文，但拍数/预算已经用完，放行');
+      return true;
+    }
+    const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);
+    this.semanticExtended = text;
+    this.extensions += 1;
+    this.waitedMs += wait;
+    this.options.log(
+      `  判停    语义=还有下文（${JSON.stringify(text.slice(0, 24))}），再等 ${wait} ms`,
+    );
+    this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'meaning' });
+    this.cancelTimer();
+    this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
+    return false;
+  }
+
+  /** 取这段文字的判定；没问过就现问，最多等 `semanticBudgetMs`。 */
+  private async awaitSemantics(text: string): Promise<'end' | 'more' | null | 'timeout'> {
+    const ask = this.semanticAsks.get(text) ?? this.askSemantics(text);
+    const budget = this.options.semanticBudgetMs ?? 300;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), budget);
+    });
+    const verdict = await Promise.race([ask, timedOut]).finally(() => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+    });
+    return verdict;
+  }
+
+  /** 有没有哪份**前缀**判定说了「还有下文」（定稿往往只是中间结果的延长）。 */
+  private hasPrefixMore(text: string): boolean {
+    for (const [asked, verdict] of this.semanticSettled) {
+      if (verdict !== 'more' || asked === text || !text.startsWith(asked)) {
+        continue;
+      }
+      if (text.length - asked.length <= 6) {
+        return true;
+      }
+    }
+    return false;
+  }
   /** 判停决定落档（见 {@link UtteranceAssemblerOptions.onJudge}）。没有出口就算了 */
   private reportJudge(fact: JudgeFact): void {
     // 落档时补上「这一轮花掉多少 / 预算是多少」：`②` 的成因只有 p 是看不出来的，

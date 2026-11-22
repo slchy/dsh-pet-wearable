@@ -60,6 +60,7 @@ import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
 import { UplinkPipeline } from './uplink-pipeline.ts';
 import { UtteranceAssembler } from './utterance-assembler.ts';
+import type { SemanticEndpoint } from './semantic-endpoint.ts';
 
 /** 上行采样率：mSBC 解码后固定 16 kHz */
 export const UPSTREAM_SAMPLE_RATE = 16_000;
@@ -210,6 +211,15 @@ export interface VoiceSessionOptions {
    * 配置错误，会退化成 `quietMs: 0`。
    */
   readonly turnJudgeClient?: EndpointDetector;
+  /**
+   * 语义判停（END 标签）：只在「即将开轮」那一刻问「用户这句话说完了没有」。
+   *
+   * 声学判停（`turnJudge`）看音频、判不了语义；不给就是老行为。
+   * 实现见 `semantic-endpoint.ts`，只回 `END`/`MORE`。
+   */
+  readonly semantic?: SemanticEndpoint;
+  /** 等语义判停回话的上限（ms）。等不到按「说完了」走。默认 300 */
+  readonly semanticBudgetMs?: number;
   /**
    * omni 影子旁路：只观测，**不发声**。
    *
@@ -628,6 +638,14 @@ class VoiceConnection {
       ...(turnJudgeOptions?.maxOpenSilenceMs === undefined
         ? {}
         : { maxOpenSilenceMs: turnJudgeOptions.maxOpenSilenceMs }),
+      ...(options.semantic === undefined
+        ? {}
+        : {
+          semanticEndpoint: (text: string) => options.semantic!.judge(text),
+          ...(options.semanticBudgetMs === undefined
+            ? {}
+            : { semanticBudgetMs: options.semanticBudgetMs }),
+        }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
       // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。

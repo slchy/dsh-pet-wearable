@@ -43,6 +43,7 @@ import { MemoryFile } from './memory-file.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 import { TurnJudge } from './turn-judge.ts';
+ import { semanticEndpoint } from './semantic-endpoint.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
@@ -818,6 +819,30 @@ async function main(): Promise<void> {
      *
      * 预热：先用 1 s 静音跑一次推理把模型加载进来，别让第一次真说话的那轮承担。
      */
+    /**
+     * 语义判停（END 标签）：声学判停判不了「这句话说完了没有」，这一层只补这个洞。
+     *
+     * 和快车道共用一套凭据/端点（同一个 `qwen-flash`）—— 判停要的是快，不是聪明。
+     * `SEMANTIC_END_TAG=0` 关掉，退回纯声学判停。
+     */
+    // 快车道的 key 只在它自己那个 if 块里可见，这里按同一优先级再取一次
+    const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
+    const semantic = envString('SEMANTIC_END_TAG') === '0' || semanticKey === ''
+      ? null
+      : semanticEndpoint({
+        apiKey: semanticKey,
+        ...(process.env['FAST_LANE_MODEL'] === undefined
+          ? {}
+          : { model: process.env['FAST_LANE_MODEL'] }),
+        ...(process.env['FAST_LANE_BASE_URL'] === undefined
+          ? {}
+          : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
+        timeoutMs: envNumber('SEMANTIC_END_TAG_TIMEOUT_MS', 400),
+        log: (line) => { console.log(line); },
+      });
+    if (semantic !== null) {
+      console.log('语义判停  开（END 标签，与静候窗重叠，超时按「说完了」）  SEMANTIC_END_TAG=0 关闭');
+    }
     const turnJudgeClient = turnJudgeEnabled
       ? new TurnJudge({
         python: turnJudgePython,
@@ -953,6 +978,9 @@ async function main(): Promise<void> {
         }
         : undefined,
       ...(turnJudgeClient === null ? {} : { turnJudgeClient }),
+      ...(semantic === null
+        ? {}
+        : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 300) }),
       gate: {
         thresholdDbfs: peakDbfs,
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
