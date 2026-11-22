@@ -181,3 +181,32 @@ test('forceDelegate：omni 发了 tool_call 就地切 dsh；出过声就不叠�
   });
   assert.deepEqual(hooks, ['delegate'], 'omni 一个字都没说，回执得我们自己出');
 });
+
+test('插话取消要连 omni 的 response 一起掐：cancelTurn 必须 discard 车道', async () => {
+  const agent = makeAgent(async () => {
+    throw new Error('不该走到文本模型');
+  });
+  const lane = fakeLane({ serve: true, chunks: ['在', '呢。'] });
+  agent.attachAudioLane(lane);
+
+  const ticket = { no: 7, gen: 7 };
+  const pending = agent.reply('你好呀', undefined, undefined, { ticket });
+  assert.equal(lane.claimed, 1, '认领发生在 reply() 的同步段里');
+
+  // 不 discard 的话它会一直生成到 `response.done`：既烧输出 token，
+  // 又让下一轮开口时它还挂着 busy（那时新的 create 会被服务端拒掉且永久丢失）。
+  agent.cancelTurn(ticket);
+  assert.equal(lane.discarded, 1);
+
+  await pending;
+});
+
+test('票据对不上时不动车道：迟到的取消不能掐掉下一轮', async () => {
+  const agent = makeAgent(async () => sse(['在呢哥。']));
+  const lane = fakeLane({ serve: true, chunks: ['在呢。'] });
+  agent.attachAudioLane(lane);
+
+  await agent.reply('你好呀', undefined, undefined, { ticket: { no: 3, gen: 3 } });
+  agent.cancelTurn({ no: 2, gen: 2 });
+  assert.equal(lane.discarded, 0);
+});

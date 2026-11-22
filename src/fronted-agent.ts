@@ -1441,6 +1441,11 @@ export class FrontedAgent implements AgentProvider {
       return;
     }
     this.askAbort?.abort(new Error('插话取消'));
+    // omni 轮的上游不是 HTTP 请求，是一个还在出的 response：不取消的话它会一直生成到
+    // 结束，既烧输出 token，又让下一轮开口时它还挂着 busy。
+    // `discard()` 内部走 `cancelCurrent()`，与 `0caa415` 同一条安全路径
+    // （`response.created` 未到就只挂 `cancelPending`，不裸发 cancel）。
+    this.audioLane?.discard();
     try {
       this.inner.cancelTurn?.(ticket);
     } catch (error) {
