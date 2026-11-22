@@ -52,6 +52,54 @@ export interface AgentImage {
   readonly data: string;
 }
 
+/**
+ * 快车道的「音频直出」答案（omni）。
+ *
+ * **认领时首块通常还没到**（认领在定稿 ~220 ms，首块在 600–760 ms），所以
+ * `chunks` 是一个**活的**流；更关键的是判停延拍时认领会晚到 700–870 ms，
+ * 那时首块已经发过来了 —— 实现方必须在 `seal()` 之后就开始缓冲 PCM，
+ * 否则句首一两个字会被吞掉。
+ */
+export interface AgentAudioAnswer {
+  /** PCM16（s16le / 单声道），采样率见 `sampleRate` */
+  readonly chunks: AsyncIterable<Buffer>;
+  readonly sampleRate: number;
+  /**
+   * 已收到的转写。**活的**：随流增长，流结束才是完整的一句。
+   *
+   * 为什么不是 `Promise<string>`：被打断时 `Promise` 永远不 resolve，而这里
+   * 的当前值正好是「已播出去的部分」，审计与续话要的就是它。
+   */
+  transcript(): string;
+}
+
+/**
+ * 「这一轮由音频直出」的车道（omni）。
+ *
+ * 为什么不另起一条旁路：快车道的**记忆**就是 `FrontedAgent.pending` 与
+ * `remember()`（`keepTurns`、`overcap`、给 dsh 带的上下文全长在那里）。
+ * 旁路一旦绕开它，omni 答过的轮次就不进历史 —— 下一轮委派给 dsh 就失忆。
+ * 所以车道只负责「有没有音频」，**要不要用、记不记账由 Agent 决定**。
+ */
+export interface FastLaneAudioLane {
+  /**
+   * 这一轮**能不能**由本车道作答。纯读、不改任何账。
+   *
+   * 必须与 `claim()` 的判据一致：宿主会先在 TTS 起跑前问一次（决定要不要开
+   * 流式合成），再在 `reply()` 里问一次。
+   */
+  willServe(): boolean;
+  /** 认领本轮音频；`null` = 此刻拿不到（连接没就绪 / 这一份已经被取消） */
+  claim(): AgentAudioAnswer | null;
+  /**
+   * 这一轮不采纳（走 dsh / 判停并段 / 太长）。
+   *
+   * 实现方必须**立刻 `response.cancel`** —— 否则它会在后台把整段废音频生成完，
+   * 既烧输出 token，又让下一轮开口时它还挂着 busy。
+   */
+  discard(): void;
+}
+
 /** Agent 回复。只保留编排层真正需要的字段。 */
 export interface AgentReplyView {
   /** 原始文本（日志/调试用） */
@@ -60,6 +108,14 @@ export interface AgentReplyView {
   readonly firstTokenMs?: number;
   /** 清洗后、准备送 TTS 的文本 */
   readonly speech: string;
+  /**
+   * 答案自带音频（omni 直出）。有它就不走 TTS —— 编排层只负责播。
+   *
+   * **契约**：有 `audio` 时 `text` / `speech` 是活的（随音频流增长），
+   * 轮末使用（`said` 审计、记忆回写、打断续话）必须在音频流 drain 之后读。
+   * 这不是疏忽 —— 被打断时它的当前值正好是「已播出去的部分」。
+   */
+  readonly audio?: AgentAudioAnswer;
   /**
    * 情绪（`happy` / `proud` / `calm` / `worried` / `sulk`）。
    *
@@ -74,7 +130,7 @@ export interface AgentReplyView {
    * 而 qwen 现场回的轮次是 200–660，`dsh` 是 885–1342，**三段有重叠**
    * （真机：`还在吗？` 343 ms 是快车道，`我怎么说？` 662 ms 是 dsh）。
    */
-  readonly path?: 'fast' | 'dsh';
+  readonly path?: 'fast' | 'dsh' | 'omni';
   /**
    * 交给慢车道的原因（只有 `path === 'dsh'` 时有意义）。
    *
@@ -110,6 +166,31 @@ export interface AgentProvider {
    * 那个带 20 token 门槛、只给日志判断用。
    */
   attachLiveSink?(sink: ((text: string) => void) | null): void;
+  /**
+   * 可选能力：挂上/摘掉「音频直出」车道（omni）。传 `null` = 摘掉。
+   *
+   * **按连接挂**：omni 的连接是设备连接的一个子资源，`VoiceConnection` 建连时挂、
+   * 断开时摘。实现方必须容忍「挂着但这一轮用不上」（那就照常走文本路）。
+   */
+  attachAudioLane?(lane: FastLaneAudioLane | null): void;
+  /**
+   * 可选能力：这一轮会不会走音频直出。
+   *
+   * 宿主在**起跑流式 TTS 之前**问一次 —— 那一步会真的开一个合成 task，而 omni
+   * 轮没有任何文本可送，服务端会拒空文本并让整轮退化成兜底。判据必须与
+   * `reply()` 内部一致，否则两边打架。
+   */
+  willServeAudio?(text: string): boolean;
+  /**
+   * 可选能力：记一轮**不是自己答的**（omni 直出），让上下文与 dsh 交接不断链。
+   *
+   * 为什么必须有：omni 那一轮没走 `reply()`，如果宿主播完就完事，
+   * 这一轮的「用户问了什么、答了什么」在快车道历史和 dsh 眼里都不存在 ——
+   * 下一轮一旦委派给 dsh，系统直接失忆。
+   *
+   * `said` 应当是**实际播出去的那部分**（被打断时按已播比例截断）。
+   */
+  noteServedTurn?(userText: string, said: string): void;
   /**
    * 可选能力：**取消在途的一轮**（宿主侧能力，走 dsh 的 `session/cancel`）。
    *

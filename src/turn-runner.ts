@@ -434,7 +434,7 @@ export class TurnRunner {
     let agentLatencyMs = 0;
     let speech = '';
     /** 这一轮是谁答的（`AgentReplyView.path`），档案里要落下来 */
-    let replyPath: 'fast' | 'dsh' | undefined;
+    let replyPath: 'fast' | 'dsh' | 'omni' | undefined;
     /** 交给 dsh 的原因（只有 `path === 'dsh'` 时有） */
     let delegateReason: DelegateReason | undefined;
 

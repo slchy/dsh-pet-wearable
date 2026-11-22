@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 快车道装饰器：**短句纯闲聊**直接答，其余交给内层 agent（dsh）。
  *
  * <h2>三条路径</h2>
@@ -40,7 +40,7 @@
 import { cleanForSpeech } from './agent.ts';
 import { EVENTS } from './events.ts';
 import { parseEmotion } from './emotion.ts';
-import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, TurnContext } from './providers.ts';
+import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, TurnContext } from './providers.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
 /** 快模型说「这个我答不了」的唯一暗号 */
@@ -677,6 +677,12 @@ export class FrontedAgent implements AgentProvider {
     return null;
   }
   private sink: ((text: string) => void) | null = null;
+  /**
+   * 音频直出车道（omni）。**按连接挂**：`VoiceConnection` 建连时挂、断开时摘。
+   *
+   * 默认 `null` = 这条腿不存在，一切照旧走文本快车道。
+   */
+  private audioLane: FastLaneAudioLane | null = null;
   /** 交给慢车道时叫一次：编排层据此给用户一句回执 */
   private delegateHook: ((reason: DelegateReason) => void) | null = null;
   private innerMode: InnerMode = 'pass';
@@ -801,6 +807,45 @@ export class FrontedAgent implements AgentProvider {
 
   setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
     this.inner.setAnnouncer?.(cb);
+  }
+
+  /** 挂/摘音频直出车道（omni）。见 `FastLaneAudioLane` */
+  attachAudioLane(lane: FastLaneAudioLane | null): void {
+    this.audioLane = lane;
+  }
+
+  /**
+   * 这一轮会不会走音频直出。
+   *
+   * 宿主在**起跑流式 TTS 之前**问一次 —— 那一步会真的开一个合成 task，而 omni 轮
+   * 没有任何文本可送（服务端会拒空文本、整轮退化成兜底）。判据必须与 `reply()`
+   * 内部完全一致，所以两处都走 {@link textEligible} + `lane.willServe()`。
+   */
+  willServeAudio(text: string): boolean {
+    if (this.audioLane === null || this.audioLane.willServe() !== true) {
+      return false;
+    }
+    return this.textEligible(text);
+  }
+
+  /**
+   * 记一轮**不是自己答的**（omni 直出）—— 让上下文与 dsh 交接不断链。
+   *
+   * 不记的后果不是「少一条日志」：快车道历史里没有这一轮，下一轮委派给 dsh 时，
+   * dsh 拿到的上下文是断的，而 omni 自己也以为没答过。
+   */
+  noteServedTurn(userText: string, said: string): void {
+    const speech = said.trim();
+    // 一个字都没出声就不记：否则窗口里会出现「用户问了、你答了空」
+    if (speech === '') {
+      return;
+    }
+    this.recordSaid(userText, speech);
+    this.auditSink(EVENTS.agentDone, {
+      path: 'omni',
+      len: [...speech].length,
+      text: speech,
+    });
   }
 
   /**
@@ -939,6 +984,14 @@ export class FrontedAgent implements AgentProvider {
    * 分开写迟早两边不一致（一边预跑一边不认，白花钱）。
    */
   private isPrefetchable(text: string): boolean {
+    // 这一轮由 omni 直出：它**从封段就起跑了**（见 `OmniShadow`），文本模型再问一遍
+    // 就是纯白烧 —— 而且它的答案会被丢掉。所以先看车道再看文本。
+    if (this.audioLane?.willServe() === true) return false;
+    return this.textEligible(text);
+  }
+
+  /** 这一句是不是「快车道能答的那类话」。**不含** omni 车道的判断。 */
+  private textEligible(text: string): boolean {
     if (this.apiKey === '') return false;
     if (this.lastDsh?.asked === true && looksLikeAnswer(text)) return false;
     if (looksMemorable(text)) return false;
@@ -1142,6 +1195,26 @@ export class FrontedAgent implements AgentProvider {
       this.log('  快车道    攒满上限，这一轮强制交给 dsh（顺便刷上下文）');
       return await this.delegate(userText, image, note, ticket, 'overcap');
     }
+    // omni 直出：它**从封段就起跑了**，这里只是认领（首块通常还没到）。
+    // 判据与 `isPrefetchable` 共用 `textEligible` —— 一处放松就会「文本路预跑过、
+    // omni 也答了」，同一个问题付两次钱。
+    if (this.audioLane !== null && image === undefined
+      && this.audioLane.willServe() === true && this.textEligible(userText)) {
+      const audio = this.audioLane.claim();
+      if (audio !== null) {
+        this.log('  快车道    走 omni 直出音频（不经过文本模型）');
+        // `text` / `speech` 是**活的**：随音频流增长，drain 之后才完整。
+        // 被打断时它们的当前值正好是「已播出去的部分」——审计与续话要的就是它。
+        const live = (): string => audio.transcript();
+        return {
+          get text(): string { return live(); },
+          get speech(): string { return live(); },
+          audio,
+          path: 'omni',
+        };
+      }
+      // 认领失败（连接没就绪 / 这一份已被取消）→ 照常走文本路，不额外报错
+    }
 
     const startedAt = this.now();
     let emitted = '';
@@ -1228,21 +1301,7 @@ export class FrontedAgent implements AgentProvider {
     }
     const { emotion, rest } = parseEmotion(raw);
     const speech = cleanForSpeech(rest);
-    this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
-    // **硬上限**：纯聊天模式下 `keepTurns=0`（永不因计数转交），`pending` 会一直长 ——
-    // 快车道的 prompt 本来有 `windowChars` 截断，但数组本身不封顶就会吃内存。
-    // 丢最老的几轮必须落档：这是**静默丢上下文**，dsh 以后永远看不到那几轮。
-    while (this.pending.length / 2 > this.pendingCap) {
-      this.pending.splice(0, 2);
-      this.droppedTurns += 1;
-    }
-    if (this.droppedTurns > 0 && this.droppedTurns !== this.reportedDropped) {
-      this.auditSink(EVENTS.agentTrim, {
-        dropped_turns: this.droppedTurns, cap_turns: this.pendingCap,
-      });
-      this.reportedDropped = this.droppedTurns;
-    }
-    this.remember(userText, speech);
+    this.recordSaid(userText, speech);
     this.log(`  快车道    ${firstTokenMs} ms 首字（流式） ：${JSON.stringify(speech)}`);
     // `path` 必须由这里报：编排层分不出「预跑被认领」和「qwen 现场回」——
     // 两者的 `dsh_ms` 都可能是几十毫秒。
@@ -1260,6 +1319,31 @@ export class FrontedAgent implements AgentProvider {
     this.push('user', userText);
     this.push('you', said);
     this.trim();
+  }
+
+  /**
+   * 把一轮「实际播出去的话」记进上下文：快车道的 `pending`（带 `keepTurns`/`overcap`）
+   * + 送进 prompt 的 `history`。
+   *
+   * 文本快车道与 omni 直出**共用这一处** —— 分开写就会一边记账一边不记，
+   * 于是「omni 答过的轮次 dsh 从没见过」，跨车道失忆。
+   */
+  private recordSaid(userText: string, speech: string): void {
+    this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
+    // **硬上限**：纯聊天模式下 `keepTurns=0`（永不因计数转交），`pending` 会一直长 ——
+    // 快车道的 prompt 本来有 `windowChars` 截断，但数组本身不封顶就会吃内存。
+    // 丢最老的几轮必须落档：这是**静默丢上下文**，dsh 以后永远看不到那几轮。
+    while (this.pending.length / 2 > this.pendingCap) {
+      this.pending.splice(0, 2);
+      this.droppedTurns += 1;
+    }
+    if (this.droppedTurns > 0 && this.droppedTurns !== this.reportedDropped) {
+      this.auditSink(EVENTS.agentTrim, {
+        dropped_turns: this.droppedTurns, cap_turns: this.pendingCap,
+      });
+      this.reportedDropped = this.droppedTurns;
+    }
+    this.remember(userText, speech);
   }
 
   /** 把一轮记进窗口（dsh 答的也记，用户听得到的话 L1 就得知道） */
