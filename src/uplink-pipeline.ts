@@ -63,7 +63,13 @@ export interface UplinkPipelineOptions {
   readonly onRawPcm?: (pcm: Buffer) => void;
   /** 有声开始：先把 preroll 喂进 STT，再继续喂后续 */
   readonly onSpeechOpen: (peakDbfs: number, preroll: readonly Buffer[], prerollMs: number) => void;
-  readonly onSpeech: (pcm: Buffer) => void;
+  /**
+   * 门开着时的每一块音频。
+   *
+   * `voiced` = 这一块**本身**有没有声音（见 `EnergyGateDecision.voiced`）。
+   * 必须传下去：门比封段晚关 2 s 左右，按「门开着」当成「有声」会往旁路里灌两秒静音。
+   */
+  readonly onSpeech: (pcm: Buffer, voiced: boolean) => void;
   /** 持续静音：请 STT 出定稿并挂断这一路。`gapMs` = 距最后一个有声块多久 */
   readonly onSpeechClose: (gapMs?: number) => void;
 }
@@ -204,7 +210,7 @@ export class UplinkPipeline {
       onSpeechOpen(decision.opened.peakDbfs, decision.opened.preroll, decision.opened.prerollMs);
     }
     if (decision.forward) {
-      onSpeech(pcm);
+      onSpeech(pcm, decision.voiced);
     }
     if (decision.closed) {
       // 带上「距上次有声多久」：holdMs 只有 2 s，如果 gap 远大于它，

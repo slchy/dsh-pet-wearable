@@ -34,6 +34,16 @@ export interface EnergyGateOptions {
 export interface EnergyGateDecision {
   /** 这块音频是否应当送进 ASR */
   readonly forward: boolean;
+  /**
+   * 这一块**本身**有没有超过门限的有声帧。
+   *
+   * 与 {@link forward} 是两件事：`forward` 包住 `holdMs` 尾巴（默认 2 s），
+   * 只说明「门还开着、这块该推给 ASR」；`voiced` 才是「这块真有声音」。
+   * 封段发生在静音 20 ms 时，之后还有 ~1980 ms 的块满足 `forward` 却没有声音 ——
+   * 凡是按「有声」而不是按「门开着」做判断的下游（omni 影子旁路就是），
+   * 必须用这个字段，**不要自己按能量重算**：两处门限一漂移就分不出是丢字还是灌静音。
+   */
+  readonly voiced: boolean;
   /** 刚开门时附带的值：触发开门的那块音频的峰值与补推的预卷 */
   readonly opened?: {
     readonly peakDbfs: number;
@@ -46,7 +56,7 @@ export interface EnergyGateDecision {
   readonly closedGapMs?: number;
 }
 
-const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false };
+const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false, voiced: false };
 
 export class EnergyGate {
   private readonly options: EnergyGateOptions;
@@ -82,6 +92,7 @@ export class EnergyGate {
         return {
           forward: true,
           closed: false,
+          voiced: true,
           opened: {
             peakDbfs,
             preroll,
@@ -89,7 +100,7 @@ export class EnergyGate {
           },
         };
       }
-      return { forward: true, closed: false };
+      return { forward: true, closed: false, voiced: true };
     }
 
     if (!this.open) {
@@ -102,8 +113,8 @@ export class EnergyGate {
     const gapMs = this.now() - this.lastVoiceAtMs;
     if (gapMs > this.options.holdMs) {
       this.open = false;
-      return { forward: true, closed: true, closedGapMs: gapMs };
+      return { forward: true, closed: true, voiced: false, closedGapMs: gapMs };
     }
-    return { forward: true, closed: false };
+    return { forward: true, closed: false, voiced: false };
   }
 }

@@ -750,6 +750,29 @@ async function main(): Promise<void> {
       && turnJudgePython !== '' && turnJudgeScript !== '';
 
     /**
+     * omni 影子旁路（**只量，不发声**）。默认关。
+     *
+     * 硬前提是 `qwen-realtime` STT：影子的起跑线是 `onCommit`（我们主动封段那一刻），
+     * 而 NLS 的 `commitMs` 是 0 —— 没有这个回调，影子会**一条数据都不出**却不报错。
+     * 这种静默失效比直接报错难查得多，所以在启动时就拦住并说清原因。
+     */
+    const omniWanted = envString('OMNI_SHADOW') === '1';
+    const omniKey = process.env['DASHSCOPE_API_KEY'] ?? '';
+    const omniModel = envString('OMNI_SHADOW_MODEL');
+    const omniShadow = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime'
+      ? { apiKey: omniKey, ...(omniModel === undefined ? {} : { model: omniModel }) }
+      : undefined;
+    if (omniWanted && omniShadow === undefined) {
+      console.log(
+        '影子    OMNI_SHADOW=1 但没启用：'
+        + (omniKey === '' ? 'DASHSCOPE_API_KEY 为空' : `STT=${resolvedStt}（需要 qwen-realtime）`)
+        + '\n',
+      );
+    } else if (omniShadow !== undefined) {
+      console.log(`影子    omni 旁路开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`);
+    }
+
+    /**
      * 判停器侧车：**进程级一份，跨连接常驻**。
      *
      * 以前每条连接建一个、断开就 `stop()`。侧车是 python + 8.7 MB ONNX，冷启动
@@ -821,6 +844,8 @@ async function main(): Promise<void> {
       agent,
       stt,
       tts,
+      // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
+      ...(omniShadow === undefined ? {} : { omniShadow }),
       turnJudge: turnJudgeEnabled
         ? {
           pythonPath: turnJudgePython,

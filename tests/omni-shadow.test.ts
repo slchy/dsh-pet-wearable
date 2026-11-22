@@ -1,0 +1,290 @@
+/**
+ * omni 影子旁路：**只量不发声**。
+ *
+ * 这里只验客户端这一侧的行为 —— 计时口径、闭嘴（mute）、忙时排队、跳过。
+ * 真实延迟与成本在 `tmp/omni-probe/` 里量（40 轮单连接：p50 670 / p90 734 / 0 长尾）。
+ *
+ * 两条最要紧的回归：
+ * - **封段之后一块静音都不许发**（能量门 `holdMs` 2 s 比 `commitMs` 20 ms 长得多）
+ * - **忙时不许发 `response.create`**（服务端会拒且那一次 create 永久丢失）
+ */
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import { OmniShadow } from '../src/omni-shadow.ts';
+import type { RealtimeSocket } from '../src/qwen-realtime-asr.ts';
+
+interface Sent {
+  type: string;
+  audio?: string;
+}
+
+class FakeSocket {
+  readyState = 0;
+  readonly sent: Sent[] = [];
+  private readonly handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+
+  send(data: string): void {
+    this.sent.push(JSON.parse(data) as Sent);
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.emit('close');
+  }
+
+  on(event: string, cb: (...args: never[]) => void): void {
+    const list = this.handlers.get(event) ?? [];
+    list.push(cb as (...args: unknown[]) => void);
+    this.handlers.set(event, list);
+  }
+
+  emit(event: string, ...args: unknown[]): void {
+    for (const cb of this.handlers.get(event) ?? []) {
+      cb(...args);
+    }
+  }
+
+  open(): void {
+    this.readyState = 1;
+    this.emit('open');
+  }
+
+  message(obj: unknown): void {
+    this.emit('message', Buffer.from(JSON.stringify(obj)));
+  }
+
+  types(): string[] {
+    return this.sent.map((s) => s.type);
+  }
+
+  count(type: string): number {
+    return this.types().filter((t) => t === type).length;
+  }
+}
+
+/** 32 字节 = 1 ms（16 kHz × 2 B） */
+const MS = 32;
+const SILENCE = Buffer.alloc(MS * 100);
+
+function make() {
+  const socket = new FakeSocket();
+  const events: Array<Record<string, unknown>> = [];
+  let clock = 0;
+  const shadow = new OmniShadow({
+    apiKey: 'k',
+    now: () => clock,
+    emit: (data) => { events.push(data); },
+    socketFactory: () => socket as unknown as RealtimeSocket,
+  });
+  return {
+    socket,
+    events,
+    shadow,
+    at: (t: number) => { clock = t; },
+    advance: (by: number) => { clock += by; },
+    ready() {
+      shadow.start();
+      socket.open();
+      socket.message({ type: 'session.updated' });
+    },
+  };
+}
+
+test('一轮正常：字段齐、audio_ms 从封段算起', () => {
+  const h = make();
+  h.ready();
+  // 握手之后第一条必须是 session.update，且关掉服务端 VAD
+  assert.equal(h.socket.types()[0], 'session.update');
+
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]); // 预卷 100 ms
+  h.shadow.feed(Buffer.alloc(MS * 100), true); // 有声 100 ms
+  assert.equal(h.socket.count('input_audio_buffer.append'), 2);
+
+  h.at(100);
+  h.shadow.seal(1, 40); // 封段
+  assert.deepEqual(h.socket.types().slice(-2), ['input_audio_buffer.commit', 'response.create']);
+
+  h.at(110);
+  h.socket.message({ type: 'input_audio_buffer.committed' });
+  h.at(300);
+  h.socket.message({ type: 'conversation.item.input_audio_transcription.completed' });
+  h.at(350);
+  h.socket.message({ type: 'response.text.delta', delta: '嗯' });
+  h.at(700);
+  // 15360 字节 = 320 ms（24 kHz × 2 B）；用 base64 传，不解码也能算对
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(15_360).toString('base64') });
+  h.at(900);
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'completed',
+      usage: {
+        input_tokens: 722,
+        input_tokens_details: { audio_tokens: 14, text_tokens: 708 },
+        output_tokens_details: { audio_tokens: 82 },
+      },
+    },
+  });
+
+  assert.equal(h.events.length, 1);
+  const e = h.events[0]!;
+  assert.equal(e['seq'], 1);
+  assert.equal(e['warmup'], true);
+  assert.equal(e['seal_s'], 0.2, '预卷 100 ms + 有声 100 ms');
+  assert.equal(e['silence_ms'], 40);
+  assert.equal(e['ack_ms'], 10);
+  assert.equal(e['final_ms'], 200);
+  assert.equal(e['text_ms'], 250);
+  assert.equal(e['audio_ms'], 600, '700（首块）−100（封段）');
+  assert.equal(e['cancel_wait_ms'], 0);
+  assert.equal(e['out_s'], 0.32);
+  assert.equal(e['status'], 'completed');
+  assert.equal(e['cancelled'], false);
+  assert.equal(e['in_audio_tok'], 14);
+  assert.equal(e['out_audio_tok'], 82);
+});
+
+test('封段之后的静音一块都不发（能量门比封段晚关约 2 s）', () => {
+  const h = make();
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.at(100);
+  h.shadow.seal(1, 40);
+  const before = h.socket.count('input_audio_buffer.append');
+
+  // 门还开着，这些块会进 `onSpeech`，但都没声音
+  for (let i = 0; i < 20; i += 1) {
+    h.shadow.feed(SILENCE, false);
+  }
+  assert.equal(
+    h.socket.count('input_audio_buffer.append'),
+    before,
+    '封段后灌静音 = 白付 token + 下一轮 commit 出空白用户消息',
+  );
+
+  // 真又开口了：软起音不该被切掉，ring 里那 100 ms 要补回去
+  h.shadow.feed(Buffer.alloc(MS * 50), true);
+  assert.equal(h.socket.count('input_audio_buffer.append'), before + 2, 'ring + 这一块');
+});
+
+test('并段：第二次封段能正常再起一份', () => {
+  const h = make();
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  h.at(60);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+
+  // 用户接着说：解除闭嘴、继续推
+  h.at(200);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.at(300);
+  h.shadow.seal(2, 60);
+  assert.equal(h.socket.count('response.create'), 2);
+  assert.equal(h.events.length, 1);
+
+  h.at(400);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.events.length, 2);
+  assert.equal(h.events[1]!['seq'], 2);
+});
+
+test('忙时封段：先 cancel，done 之前不许再发 create', () => {
+  const h = make();
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(100);
+  h.shadow.seal(1, 40);
+
+  // 第一份还在跑，第二段就来了
+  h.at(200);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.at(300);
+  h.shadow.seal(2, 50);
+  assert.equal(h.socket.count('response.cancel'), 1, '必须取消，否则 create 会被拒且永久丢失');
+  assert.equal(h.socket.count('response.create'), 1, 'done 之前不能发第二份');
+
+  h.at(400);
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  // done 之后才补发第二份
+  assert.equal(h.socket.count('response.create'), 2);
+  assert.equal(h.events[0]!['cancelled'], true);
+  assert.equal(h.events[0]!['audio_ms'], null, '一块音频都没出就不能拿 0 冒充');
+
+  h.at(1100);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(4800).toString('base64') });
+  h.at(1200);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const second = h.events[1]!;
+  assert.equal(second['seq'], 2);
+  assert.equal(second['audio_ms'], 800, '从 seal(2) 的 300 算起，不是从发送时刻的 400 算');
+  assert.equal(second['cancel_wait_ms'], 100, '等 cancel 的那 100 ms 单独一列');
+});
+
+test('还没就绪就封段：记 skipped，不猜数据', () => {
+  const h = make();
+  h.shadow.start();
+  h.socket.open();
+  // 故意不喂 session.updated
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.shadow.seal(7, 40);
+  assert.equal(h.events.length, 1);
+  assert.equal(h.events[0]!['skipped'], 'connecting');
+  assert.equal(h.socket.count('response.create'), 0);
+});
+
+test('空缓冲封段：不发 commit', () => {
+  const h = make();
+  h.ready();
+  h.shadow.seal(3, 40);
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 0);
+  assert.equal(h.events[0]!['skipped'], 'empty');
+});
+
+test('未启用（从未 start）时所有入口都是空操作', () => {
+  const socket = new FakeSocket();
+  const events: Array<Record<string, unknown>> = [];
+  const shadow = new OmniShadow({
+    apiKey: 'k',
+    emit: (data) => { events.push(data); },
+    socketFactory: () => socket as unknown as RealtimeSocket,
+  });
+  shadow.restart([Buffer.alloc(MS * 100)]);
+  shadow.feed(Buffer.alloc(MS * 100), true);
+  shadow.seal(1, 40);
+  assert.equal(socket.sent.length, 0, '关掉时连一个字节都不许发');
+  assert.equal(events[0]!['skipped'], 'idle');
+});
+
+test('restart 时把残留 flush 掉（commit 但不 create），并记在新一份上', () => {
+  const h = make();
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(100);
+  h.shadow.seal(1, 40);
+  h.at(110);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+
+  // 有人说了 50 ms 又停了，但没走到封段就又开口 —— 这段残留要清掉
+  h.at(200);
+  h.shadow.feed(Buffer.alloc(MS * 50), true);
+  h.at(300);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  const commits = h.socket.count('input_audio_buffer.commit');
+  assert.equal(commits, 2, '残留那次是不带 create 的 commit');
+  assert.equal(h.socket.count('response.create'), 1, 'flush 不能产生回复');
+
+  h.at(400);
+  h.shadow.seal(2, 40);
+  h.at(500);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.events[1]!['flushed_ms'], 50);
+});

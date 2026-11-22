@@ -54,6 +54,7 @@ import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './prov
 import type { SessionCore } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { TurnJudge } from './turn-judge.ts';
+import { OmniShadow } from './omni-shadow.ts';
 import { startToolControl, type ToolControl } from './tool-control.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
@@ -209,6 +210,17 @@ export interface VoiceSessionOptions {
    * 配置错误，会退化成 `quietMs: 0`。
    */
   readonly turnJudgeClient?: EndpointDetector;
+  /**
+   * omni 影子旁路：只观测，**不发声**。
+   *
+   * 给 `apiKey` 就开，不给就完全不建连。它量的是「把封段→首块交给 omni
+   * 一体模型能快多少」，用来判要不要让它接管快车道 —— 判据见 `EVENTS.omniShadow`。
+   *
+   * **硬前提：STT 必须是 `qwen-realtime`。** 只有「端点由我们控」的 provider 才有
+   * `onCommit`（NLS 的 `commitMs` 是 0），而封段正是影子的起跑线；没有它，
+   * 影子一条数据都出不来（会静默地什么都不发生，所以 `main.ts` 启动时就拦）。
+   */
+  readonly omniShadow?: { readonly apiKey: string; readonly model?: string };
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
@@ -448,6 +460,20 @@ class VoiceConnection {
   private readonly ownsTurnJudge: boolean;
   private readonly assembler: UtteranceAssembler;
   private readonly stt: SttSession;
+  /**
+   * omni 影子旁路（`OMNI_SHADOW=1` 才有，默认 null = 零成本）。
+   *
+   * 跟着**这条连接**活：服务空跑时 DashScope realtime 会空闲断链，进程启动就建连
+   * 等于白建一条注定 `broken` 的连接。
+   */
+  private readonly omni: OmniShadow | null;
+  /**
+   * 封段序号。**同一个值写进两处**：`asr.commit` 与 `omni.shadow`。
+   *
+   * 没有它两份事件对不上：真机有二次封段（并段）、咳嗽误触发（没有 `turn.end`）、
+   * 打断轮（也没有 `turn.end`），光靠自增 seq 几轮就会错位。
+   */
+  private commitSeq = 0;
 
   private control: ToolControl | null = null;
 
@@ -554,6 +580,14 @@ class VoiceConnection {
     // 快车道的输入/输出、TTS 的两段耗时都接进**这一条**连接的档案（见 `setAudit`）
     options.setAudit?.((name, data) => this.archive?.event(name, data));
 
+    this.omni = options.omniShadow === undefined ? null : new OmniShadow({
+      apiKey: options.omniShadow.apiKey,
+      ...(options.omniShadow.model === undefined ? {} : { model: options.omniShadow.model }),
+      // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
+      emit: (data) => { this.archive?.event(EVENTS.omniShadow, data); },
+      log: (line) => { console.log(line); },
+    });
+
     const turnJudgeOptions = options.turnJudge;
     const detector = resolveEndpointDetector(
       options,
@@ -617,11 +651,16 @@ class VoiceConnection {
         : {
           commitAfterMs: options.gate.commitMs,
           onCommit: (silenceMs) => {
+            const seq = (this.commitSeq += 1);
             this.archive?.event(EVENTS.asrCommit, {
+              seq,
               silence_ms: Math.round(silenceMs),
               want_ms: options.gate.commitMs,
             });
             this.stt.commit?.();
+            // 与 ASR **同一行**起跑：这是「封段 → 首块」两边同口径的前提，
+            // 差几行就会把 ② 那段等待算成 omni 的耗时。
+            this.omni?.seal(seq, silenceMs);
           },
         }),
       // 开轮门槛：提交早 → 定稿也早，可能人还在说。定稿到达时看「截至此刻的
@@ -695,8 +734,15 @@ class VoiceConnection {
         for (const part of preroll) {
           this.stt.feed(part);
         }
+        // 影子按「这一句」重新起一段。封段后到下一次开口之间的静音**一个字节都不推**
+        // （见 `OmniShadow` 的 mute），所以这里只要把预卷补上就行。
+        this.omni?.restart(preroll);
       },
-      onSpeech: (pcm) => { this.stt.feed(pcm); },
+      onSpeech: (pcm, voiced) => {
+        this.stt.feed(pcm);
+        // `voiced` 必须透传：门比封段晚关约 2 s，不带它就会往旁路里灌静音
+        this.omni?.feed(pcm, voiced);
+      },
       onSpeechClose: (gapMs) => {
         // 带上 gapMs：能量门要 holdMs（默认 2 s）才关门，所以 `t` 本身**不是**
         // 「用户停嘴」的时刻，`t - gapMs` 才是。延迟报告靠这个还原真实起点。
@@ -732,6 +778,9 @@ class VoiceConnection {
       `  设备    ${this.link.label}（v${this.link.proto}）：${describeCapabilities(this.caps)}`,
     );
     this.archive?.event(EVENTS.deviceLink, { proto: this.link.proto, label: this.link.label });
+
+    // 影子握手（实测 ~1.3 s）与设备握手并行，不占关键路径
+    this.omni?.start();
 
     // 后台任务完成后的播报落在这条连接上
     this.options.agent.setAnnouncer?.((speech, emotion) => { this.onAnnounce(speech, emotion); });
@@ -1129,6 +1178,8 @@ class VoiceConnection {
       this.turnJudge?.stop();
     }
     this.control?.close();
+    // 影子最后关：正常断开**不落事件**（`stop()` 不 emit），只有异常才留 `broken`
+    this.omni?.stop();
     // 先摘审计出口再关档案：否则最后一批 `agent.done` 会写进已关闭的档案
     this.options.setAudit?.(null);
     this.archive?.close();
