@@ -32,6 +32,8 @@ const OPEN = 1;
 const CLOSED = 3;
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
 const DEFAULT_MODEL = 'qwen3-asr-flash-realtime';
+/** 解码窗口内最多暂存多少音频（正常解码 ~261 ms；2 s 是防挂死的上限） */
+const MAX_HELD_BYTES = 32 * 2000;
 
 /** 只用到这么点成员，抽出来是为了单测能塞假 socket。 */
 export interface RealtimeSocket {
@@ -114,6 +116,18 @@ export class QwenRealtimeAsr {
    * - `.error` → 这一发废了，得重新武装，否则后面再也 commit 不出去
    */
   private awaitingDecode = false;
+  /**
+   * **解码窗口内的 PCM 先存本地**，定稿之后再推上去。
+   *
+   * 为什么必须存：实测（`tmp/omni-probe/asr-3cell.cjs`）在解码窗口里 append 的音频
+   * **服务端直接丢掉** —— 既不进正在解的那一条（第一段定稿不含它），也不进下一条
+   * （第二段定稿是空的）。两组都是 500 ms 真人语音，凭空消失。
+   * 反过来（`asr-hold-fix.cjs`）只把同一段音频攒到定稿之后再推，两段定稿都齐。
+   *
+   * 上限按 2 s 兜：正常解码 ~261 ms，真卡住时宁可丢尾巴也不能无限涨内存。
+   */
+  private heldDuringDecode: Buffer[] = [];
+  private heldBytes = 0;
   private seq = 0;
   /** 还有几条 `commit` 的结果要扔掉（打断用，`clear` 不存在） */
   private discardLeft = 0;
@@ -186,6 +200,8 @@ export class QwenRealtimeAsr {
     this.backlog = [];
     this.dirty = false;
     this.awaitingDecode = false;
+    this.heldDuringDecode = [];
+    this.heldBytes = 0;
     return true;
   }
 
@@ -229,10 +245,33 @@ export class QwenRealtimeAsr {
   }
 
   private sendAudio(pcm: Buffer): void {
+    if (this.awaitingDecode) {
+      // 现在发上去会被服务端丢掉 —— 先存着，定稿之后再推（见 `heldDuringDecode`）
+      this.heldDuringDecode.push(pcm);
+      this.heldBytes += pcm.length;
+      while (this.heldBytes > MAX_HELD_BYTES && this.heldDuringDecode.length > 0) {
+        const dropped = this.heldDuringDecode.shift();
+        this.heldBytes -= dropped?.length ?? 0;
+        this.log('[asr] 暂存溢出，丢掉最早一帧');
+      }
+      return;
+    }
     this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
-    // 解码窗口内推上去的音频会被服务端算进**正在解的那一条**，不能当新一段
-    // （见 `awaitingDecode`）。真记成 dirty 就是那一发空 commit 的来源。
-    if (!this.awaitingDecode) this.dirty = true;
+    this.dirty = true;
+  }
+
+  /** 把解码窗口里攒下的音频推上去 —— 它们到这一刻才真正属于下一段 */
+  private flushHeld(): void {
+    if (this.heldDuringDecode.length === 0) {
+      return;
+    }
+    const held = this.heldDuringDecode.splice(0);
+    this.heldBytes = 0;
+    for (const pcm of held) {
+      this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+    }
+    this.dirty = true;
+    this.log(`[asr] 补推解码期暂存的 ${held.length} 帧`);
   }
 
   /**
@@ -327,6 +366,8 @@ export class QwenRealtimeAsr {
     }
     if (ev.type === 'conversation.item.input_audio_transcription.completed') {
       this.awaitingDecode = false;
+      // 解码结束 —— 窗口期攒下的音频现在推上去，才算下一段的开始
+      this.flushHeld();
       const t = (ev.transcript ?? '').trim();
       const index = this.seq;
       this.seq += 1;
@@ -341,6 +382,7 @@ export class QwenRealtimeAsr {
     if (ev.type === 'error') {
       // 这一发废了：重新武装，否则 `awaitingDecode` 永远挂着，后面再也 commit 不出去
       this.awaitingDecode = false;
+      this.flushHeld();
       const msg = ev.error?.message ?? text.slice(0, 200);
       this.opts.onError?.(new QwenRealtimeAsrError(`服务端错误: ${msg}`));
     }

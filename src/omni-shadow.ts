@@ -61,7 +61,6 @@ const MAX_INJECT_CHARS = 200;
 const MAX_PENDING_INJECTS = 4;
 /** 「没人认领的回复」最多记几份再一次性清。多了说明上游一直没出整句 */
 const MAX_ORPHANS = 8;
-
 /** 按**字符**截断（中文一个字一个 token 量级，`String.length` 对代理对也不至于切坏） */
 function clipText(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;

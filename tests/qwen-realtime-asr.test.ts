@@ -276,3 +276,41 @@ test('服务端错误转成 onError，不吞', async () => {
   socket.message({ type: 'error', error: { code: 'invalid_value', message: 'boom' } });
   assert.deepEqual(errors, ['服务端错误: boom']);
 });
+
+test('解码窗口内喂的音频先存本地，定稿之后补推（服务端会把它丢掉）', async () => {
+  // 实测：commit 在飞时 append 的 500 ms 语音，既不进第一段定稿也不进第二段 —— 凭空消失。
+  // 所以这一段必须在客户端攒住，等 `.completed` 之后再推。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  const appendsAfterCommit = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+
+  asr.feed(Buffer.alloc(640));
+  asr.feed(Buffer.alloc(640));
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length,
+    appendsAfterCommit,
+    '解码窗口内不该直接 append',
+  );
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length,
+    appendsAfterCommit + 2,
+    '定稿之后要把攒下的两帧补推上去',
+  );
+
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2,
+    '补推之后才算新的一段，这时才允许再封段');
+});
+
+test('补推出来的音频也要能封段（dirty 由 flush 置位）', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  asr.feed(Buffer.alloc(640)); // 攒着
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
