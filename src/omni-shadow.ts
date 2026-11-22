@@ -596,14 +596,24 @@ export class OmniShadow {
    * 与 `discard()` 的差别只有一点，但是要害：这一轮用户**已经听到了一部分**。
    * 删掉它会让 omni 以为自己没说过，而快车道那边的 `pending` 记的正是这半句
    * （`noteServedTurn` 用的是活 getter 的当前值）—— 两条上下文轨就分叉了。
+   *
+   * **只掐 `claimedResp`（这一轮真正吃掉的那一份），不是 `this.resp`。**
+   * 插话的时刻常常晚于下一段的封段：那时 `this.resp` 已经是**新那句话**的回复了，
+   * 盲掐 `this.resp` 会把还没开口的新答案一起杀掉 —— 下一轮只能退回级联，
+   * 用户听到换嗓子。真机实测每次插话都中招。
    */
   interrupt(): void {
-    const resp = this.resp;
-    if (resp !== null) {
+    const resp = this.claimedResp;
+    this.claimedResp = null;
+    if (resp === null) {
+      // 这一轮本来就没用 omni（走的是文本快车道/ dsh）——没有该掐的东西
+      return;
+    }
+    if (!resp.cancelled && !resp.closed) {
       resp.audio.length = 0;
       this.wakeAudio(resp);
+      this.cancelCurrent(resp);
     }
-    this.cancelCurrent();
   }
 
   /**
@@ -755,23 +765,29 @@ export class OmniShadow {
     this.wakeLive();
   }
 
-  private cancelCurrent(): void {
-    if (this.resp === null || this.resp.cancelled) {
+  /**
+   * 取消一份 response。
+   *
+   * @param resp 默认 `this.resp`。**`interrupt()` 必须传 `claimedResp`** ——
+   *   插话时 `this.resp` 可能已经是下一句的回复了（见 `interrupt()`）。
+   */
+  private cancelCurrent(resp: PendingResponse | null = this.resp): void {
+    if (resp === null || resp.cancelled) {
       return;
     }
-    this.resp.cancelled = true;
+    resp.cancelled = true;
     // 没人认领过 = 没人听过 = 这条回复不该留在历史里。
     // 它覆盖的是「同一句里第二次封段」把上一份顶掉的情形（`seal()` 撞 busy、
     // `restart()` 换段）—— 那份答的是半句话，留着只会污染下一轮。
     // 认领过的**不动**：用户已经听到了一部分，见 `interrupt()`。
-    if (!this.resp.claimed) {
-      this.resp.deleteOnDone = true;
+    if (!resp.claimed) {
+      resp.deleteOnDone = true;
     }
-    if (!this.resp.created) {
+    if (!resp.created) {
       // `response.cancel` 在 `response.created` 之前发会被服务端拒
       // （`Cannot cancel response before response.created`），所以先记账，
       // 等 created 到了立刻补发 —— 见 `onMessage` 的 `response.created` 分支
-      this.resp.cancelPending = true;
+      resp.cancelPending = true;
       return;
     }
     this.send({ type: 'response.cancel' });

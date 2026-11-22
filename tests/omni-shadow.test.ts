@@ -612,3 +612,44 @@ test('「created 之前 cancel」的服务端错误不判死车道', () => {
   h.socket.message({ type: 'error', error: { message: 'Cannot cancel response before response.created' } });
   assert.equal(h.shadow.currentState, 'busy', '这个错误是我们自己的时序，不该把整条车道停掉');
 });
+
+test('插话时不许掐掉下一句的回复（interrupt 只动 claimedResp）', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  assert.ok(h.shadow.claim() !== null, '第 1 轮认领 #1 并开始播');
+
+  // 用户开口说下一句 → 封段：把正在播的 #1 取消并排队
+  h.at(30);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.shadow.seal(2, 40);
+  // #1 的 done 到了 → 排队那份建出来（这时 `this.resp` 已经是 #2）
+  h.at(40);
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'cancelled', output: [{ id: 'item_a1', role: 'assistant' }] },
+  });
+  assert.equal(h.socket.count('response.create'), 2);
+
+  // 插话处理才姗姗来迟：它该掐的是第 1 轮吃掉的 #1，不是 #2
+  h.at(50);
+  h.shadow.interrupt();
+  assert.equal(h.shadow.willServe(), true,
+    '#2 是下一句的回复，掐了它下一轮只能退回级联（用户听到换嗓子）');
+});
+
+test('这一轮没用 omni 时 interrupt 是空操作，不碰别人的回复', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  // 没人 claim，直接插话：不该把这一份取消掉（那一轮走的是别处）
+  h.shadow.interrupt();
+  assert.equal(h.shadow.willServe(), true);
+});
