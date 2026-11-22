@@ -696,6 +696,19 @@ export class FrontedAgent implements AgentProvider {
    */
   private askAbort: { abort(why: Error): void } | null = null;
 
+  /**
+   * 此刻**在途**的快车道 HTTP 请求数（对冲的每一份单独算）。
+   *
+   * 为什么要有它：`ask()` 的 1200 ms 首字超时是从**进门**开始计时的，而请求真正
+   * 发出去之前可能要在一张共享的连接池里排队（`installHttpAgent` 的 `connections: 16`，
+   * 快车道/对冲/投机/dsh 全走同一条全局 dispatcher）。排队时间和厂商务时间算在同一段里，
+   * 于是一条 200 ms 就该回来的请求也能被判成「首字超时」。
+   *
+   * 只有失败时把当时的在途数记进错误文本，才能区分「我们把自己堵住了」和「厂商慢」。
+   * 这个数在失败那一刻正好是**别人**在途的数 —— 本组的已经全部落地了。
+   */
+  private inFlight = 0;
+
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
     this.apiKey = options.apiKey ?? '';
@@ -1462,18 +1475,40 @@ export class FrontedAgent implements AgentProvider {
       kind, model: this.model, hedge: controllers.length, text: userText, msgs,
     });
     try {
-      const racers = controllers.map((c) => doFetch(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${this.apiKey}`,
-        },
-        body: payload,
-        signal: c.signal,
-      }).then((r) => {
-        if (!r.ok || r.body === null) throw new Error(`HTTP ${r.status}`);
-        return { r, c };
-      }));
+      // 每一份的结局都要留痕：失败时 `Promise.any` 只给一个笼统的 reject，
+      // 「两份都打满 1200 ms」和「一份 429 + 一份被掐」在日志里长得一样，
+      // 但前者是厂商/网络、后者是我们自己的问题。结局最后拼进错误文本，
+      // 由调用方的 `agent.done { ok:false, err }` 落进档案（不截断）。
+      const outcomes: string[] = [];
+      // 进门那一刻已经有多少份在跑 —— 这是「池子被我们自己堵住」的直接读数
+      const inFlightBefore = this.inFlight;
+      const racers = controllers.map((c, index) => {
+        this.inFlight += 1;
+        return doFetch(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${this.apiKey}`,
+          },
+          body: payload,
+          signal: c.signal,
+        }).then(
+          (r) => {
+            this.inFlight -= 1;
+            outcomes[index] = `#${index} 头@${(this.now() - startedAt).toFixed(0)}ms`
+              + (r.ok ? '' : ` HTTP ${r.status}`);
+            if (!r.ok || r.body === null) throw new Error(`HTTP ${r.status}`);
+            return { r, c };
+          },
+          (e) => {
+            this.inFlight -= 1;
+            outcomes[index] = `#${index} ✗${(e as Error).name === 'AbortError'
+              ? `aborted@${(this.now() - startedAt).toFixed(0)}ms`
+              : String((e as Error).message).slice(0, 60)}`;
+            throw e;
+          },
+        );
+      });
       // 落败/被打断的那些也要有人接：否则 abort 会变成进程级 rejection（线上挂过）
       for (const p of racers) p.catch(() => undefined);
       let winner: { r: Response; c: AbortController };
@@ -1481,7 +1516,10 @@ export class FrontedAgent implements AgentProvider {
         // `any` 取的是第一个**成功**的（HTTP 错的那份算失败，会自动等另一份）
         winner = await Promise.any(racers);
       } catch {
-        throw new Error(`HTTP 全部失败（${racers.length} 份）`);
+        throw new Error(
+          `HTTP 全部失败（${racers.length} 份）: ${outcomes.join(' | ') || '无结局'}`
+          + `（进队前在途 ${inFlightBefore} 份，此刻 ${this.inFlight} 份）`,
+        );
       }
       for (const c of controllers) {
         if (c !== winner.c) c.abort(new Error('对冲落败'));
@@ -1492,7 +1530,8 @@ export class FrontedAgent implements AgentProvider {
       if (process.env['FAST_LANE_TRACE'] === '1') {
         const chars = msgs.reduce((n, m) => n + m.content.length, 0);
         this.log(`  快车道    提示词 ${msgs.length} 条 / ${chars} 字`);
-        this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms（对冲 ${racers.length} 份）`);
+        this.log(`  快车道    响应头 ${(this.now() - startedAt).toFixed(0)} ms`
+          + `（对冲 ${racers.length} 份，进队前在途 ${inFlightBefore}）`);
       }
       const answer = await readStream(
         winner.r.body!, startedAt, this.now, { onFirstToken: rearm, emit }, this.delegateEnabled,

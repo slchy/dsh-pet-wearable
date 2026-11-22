@@ -501,3 +501,34 @@ test('对冲：两份都失败才算失败', async () => {
   assert.equal(calls, 2, '两份都发了');
   assert.equal(reply.speech, '慢车道答复。', '全失败就退回 dsh，不能哑');
 });
+
+test('快车道全灭：错误文本要写清每一份的结局和进门时的在途数', { timeout: 5000 }, async () => {
+  // 「两份都打满 1200 ms」和「一份 429 + 一份被掐」在旧日志里长得一模一样，
+  // 但前者是厂商/网络、后者是我们自己。只留一句「HTTP 全部失败」就永远分不开。
+  const logs: string[] = [];
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    hedge: 2,
+    speculate: false,
+    timeoutMs: 60,
+    totalMs: 400,
+    log: (line) => { logs.push(line); },
+    fetchImpl: ((_url: string, init?: { signal?: AbortSignal }) => new Promise<Response>((_ok, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const err = new Error(String(init.signal?.reason ?? 'aborted'));
+        err.name = 'AbortError';
+        reject(err);
+      });
+    })) as unknown as typeof fetch,
+  });
+
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.speech, '慢车道答复。', '快车道挂了仍然要退回 dsh');
+
+  const fail = logs.find((line) => line.includes('✗'));
+  assert.ok(fail !== undefined, `失败原因必须落进日志，实际：${JSON.stringify(logs)}`);
+  assert.match(fail, /#0 ✗aborted@\d+ms/, '第 0 份的结局要写清楚');
+  assert.match(fail, /#1 ✗aborted@\d+ms/, '第 1 份的结局也要写');
+  assert.match(fail, /进队前在途 \d+ 份/, '要带上进门那一刻的在途数（判「是不是我们自己堵住了」）');
+});
