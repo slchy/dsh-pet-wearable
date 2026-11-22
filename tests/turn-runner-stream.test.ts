@@ -10,7 +10,7 @@ import { test } from 'node:test';
 
 import type { Cancel, Clock } from '../src/app/clock.ts';
 import { DialogFsm } from '../src/dialog-fsm.ts';
-import type { AgentProvider, AgentReplyView, TtsProvider } from '../src/providers.ts';
+import type { AgentProvider, AgentReplyView, DelegateReason, TtsProvider } from '../src/providers.ts';
 import { TurnRunner, type TurnResult } from '../src/turn-runner.ts';
 
 /** 10 ms 的有声 PCM：够触发「首块」，又不会让播放等待拖慢测试 */
@@ -51,18 +51,49 @@ function rig(options: {
   reply: AgentReplyView | Error;
   /** 流式合成收完文本后抛这个错 */
   streamError?: Error;
-}): Rig {
+  /** omni 直出：给了音频就让第一次 `reply()` 返回 audio 视图 */
+  audio?: readonly string[];
+  /** omni 决定转交 dsh（`tool_call`） */
+  omniDelegate?: DelegateReason;
+  /** 这一轮会不会走 omni（宿主据此不启流式 TTS） */
+  willServe?: boolean;
+}): Rig & { served: Array<[string, string]> } {
   const streamed: string[] = [];
   const whole: string[] = [];
   const events: string[] = [];
   /** 事件的载荷（`turn.end` 的 `path` / `delegate` 只能从这里看） */
   const payloads: Array<{ name: string; data: Record<string, unknown> }> = [];
   const logs: string[] = [];
+  const served: Array<[string, string]> = [];
   let sink: ((text: string) => void) | null = null;
 
+  let calls = 0;
   const agent: AgentProvider = {
     name: 'fake',
+    willServeAudio: () => options.willServe === true,
+    noteServedTurn: (userText, said) => { served.push([userText, said]); },
     reply: async () => {
+      calls += 1;
+      if (calls === 1 && options.audio !== undefined) {
+        let said = '';
+        const chunks = options.audio;
+        return {
+          get text(): string { return said; },
+          get speech(): string { return said; },
+          path: 'omni',
+          audio: {
+            sampleRate: 24_000,
+            transcript: () => said,
+            delegateReason: () => options.omniDelegate ?? null,
+            chunks: (async function* generate() {
+              for (const text of chunks) {
+                said += text;
+                yield LOUD;
+              }
+            })(),
+          },
+        };
+      }
       for (const delta of options.deltas) {
         sink?.(delta);
         await tick();
@@ -101,7 +132,7 @@ function rig(options: {
     onLiveAvailable: (next) => { sink = next; },
     log: (line) => { logs.push(line); },
   });
-  return { streamed, whole, events, payloads, logs, run: () => runner.run('你好') };
+  return { streamed, whole, events, payloads, logs, served, run: () => runner.run('你好') };
 }
 
 test('流式：增量一路送到 TTS，出声，不走整段合成', async () => {
@@ -210,4 +241,37 @@ test('turn.end 记下交给 dsh 的原因：本地闸(task) 与模型让位(dele
     'task',
     '本地判据挡住的轮次记 task；快模型自己让位记 delegate —— 两者在日志里长得一样，只能靠这个分',
   );
+});
+
+test('omni 直出：不启流式 TTS、音频原样下行、path=omni、播完回写记忆', async () => {
+  const r = rig({
+    deltas: [],
+    reply: { text: '不该走到这里', speech: '不该走到这里' },
+    willServe: true,
+    audio: ['我在', '呢。'],
+  });
+  const result = await r.run();
+
+  assert.ok(result);
+  assert.equal(r.payloads.find((p) => p.name === 'turn.end')?.data['path'], 'omni');
+  assert.deepEqual(r.streamed, [], 'omni 轮没有文本可送，流式 TTS 一个 chunk 都不该收');
+  assert.deepEqual(r.whole, [], '也不该退回整段合成');
+  assert.ok(result.audioBytes > 0, '音频必须真的下发');
+  assert.equal(result.speech, '我在呢。', 'drain 之后才是完整的一句');
+  assert.deepEqual(r.served, [['你好', '我在呢。']], '播完必须回写，否则跨车道失忆');
+});
+
+test('omni 发 tool_call：就地切 dsh，dsh 的文本走整段合成', async () => {
+  const r = rig({
+    deltas: [],
+    reply: { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' },
+    willServe: true,
+    audio: [], // 零音频：纯函数调用
+    omniDelegate: 'delegate',
+  });
+  const result = await r.run();
+
+  assert.ok(result);
+  assert.equal(r.payloads.find((p) => p.name === 'turn.end')?.data['path'], 'dsh', '第二轮应当由 dsh 作答');
+  assert.deepEqual(r.whole, ['慢车道答复。'], 'omni 没出声，dsh 的答案得走 TTS 念出来');
 });
