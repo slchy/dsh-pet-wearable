@@ -645,6 +645,16 @@ export class FrontedAgent implements AgentProvider {
     readonly startedAt: number;
     readonly answer: Promise<FastAnswer>;
     readonly buffered: string[];
+    /**
+     * 这一趟的结局。`fail` 在认领时是**能读到的**：
+     *
+     * 预跑可能在轮次真正开跑之前就已经失败（先例：2026-11-22 17:30 那轮，
+     * 「Hmm.」的预跑 1200 ms 首字超时死在 12.6 s，轮次 13.9 s 才开）。
+     * 以前这时 `takePrefetch` 照样报 `ok: true` —— 仪表上说「命中」，实际认到的是
+     * 一份死结果。**行为保持不变**（那条路径顺带救回了半截答案，见 `reply()` 的
+     * `emitted !== ''` 分支），只把真相记下来。
+     */
+    state: 'pending' | 'ok' | 'fail';
     abort: { abort(why: Error): void } | null;
     listener: ((text: string) => void) | null;
   } | null = null;
@@ -942,6 +952,7 @@ export class FrontedAgent implements AgentProvider {
       startedAt: this.now(),
       answer: null as unknown as Promise<FastAnswer>,
       buffered: [] as string[],
+      state: 'pending' as 'pending' | 'ok' | 'fail',
       abort: null as { abort(why: Error): void } | null,
       listener: null as ((chunk: string) => void) | null,
     };
@@ -954,6 +965,11 @@ export class FrontedAgent implements AgentProvider {
     }, speculative ? 'spec' : 'prefetch');
     // 预跑出来的 promise 可能永远没人认领（插话/并段）：接住，别让它变成进程级 rejection
     slot.answer.catch(() => undefined);
+    // 同一份 promise 上再挂一个：只为记下结局，供认领时判断这是不是一份死结果
+    slot.answer.then(
+      () => { slot.state = 'ok'; },
+      () => { slot.state = 'fail'; },
+    );
     // `ask()` 在第一个 await 之前同步设好了控制器，这里取到的就是这一趟的
     const controller = this.askAbort;
     // **同一个对象**，不能 `{ ...slot }`：`ask()` 的闭包捕获的是 `slot`，
@@ -995,8 +1011,39 @@ export class FrontedAgent implements AgentProvider {
       return null;
     }
     const ranFor = this.now() - slot.startedAt;
-    this.log(`  快车道    认领预跑（已经跑了 ${ranFor.toFixed(0)} ms）`);
-    this.auditSink(EVENTS.agentClaim, { ok: true, text: slot.text, ran_for_ms: Math.round(ranFor) });
+    const produced = slot.buffered.length;
+    if (slot.state === 'fail') {
+      if (produced === 0) {
+        // 开轮时这份预跑早就死了，而且**一个字都没产出** —— 没东西可救。
+        //
+        // **别把它当命中交出去**：`await` 一个已经 reject 的 promise 会立刻抛，
+        // 于是这一轮**跳过「现场重跑」**直接掉 dsh。2026-11-22 17:30 那轮就是这么来的：
+        // 预跑 1201 ms 首字超时死在 12.6 s，轮次 13.9 s 才开，认领后一路交给 dsh，
+        // 1.2 s 的偶发波动被放大成 18.5 s。
+        this.log(
+          `  快车道    预跑已失败且无产出（跑了 ${ranFor.toFixed(0)} ms）→ 现场重新问一次`,
+        );
+        this.auditSink(EVENTS.agentClaim, {
+          ok: false, why: 'failed', taken: false, produced, text: slot.text,
+          ran_for_ms: Math.round(ranFor),
+        });
+        return null;
+      }
+      // 已经产出过字：**保持原行为**。`attach` 会把那几段先补推出去，随后的 reject
+      // 让 `reply()` 走「已播出一部分，按现有文本收下」—— 这半截答案是白捡的，
+      // 重问一次反而把它丢掉。
+      this.log(
+        `  快车道    认领到一份**已经失败**的预跑（跑了 ${ranFor.toFixed(0)} ms，`
+        + `已产出 ${produced} 段）→ 按现有文本收下`,
+      );
+      this.auditSink(EVENTS.agentClaim, {
+        ok: false, why: 'failed-partial', taken: true, produced, text: slot.text,
+        ran_for_ms: Math.round(ranFor),
+      });
+    } else {
+      this.log(`  快车道    认领预跑（已经跑了 ${ranFor.toFixed(0)} ms）`);
+      this.auditSink(EVENTS.agentClaim, { ok: true, text: slot.text, ran_for_ms: Math.round(ranFor) });
+    }
     return {
       answer: slot.answer,
       attach: (sink) => {
@@ -1018,8 +1065,15 @@ export class FrontedAgent implements AgentProvider {
   }
 
   private abortPrefetch(handle: { abort(why: Error): void } | null): void {
-    // 已经被别的 `ask()` 顶替过就别动它 —— 那会掐掉正在服务的那一轮
-    if (handle !== null && this.askAbort === handle) {
+    // **无条件掐**：`handle` 是那一趟 `ask()` 自己的 `abortAll`（`startPrefetch` 在
+    // `ask()` 之后同步取的），它只会 abort 那一组 controller，碰不到别的轮次。
+    //
+    // 原来这里有一道 `this.askAbort === handle` 的守卫，注释说「已经被别的 ask()
+    // 顶替过就别动它，会掐掉正在服务的那一轮」—— **反了**：被顶替之后 `handle`
+    // 恰恰是那份没人要的旧请求，正是该掐的对象；而正在服务的那一轮有自己的 handle，
+    // 动不了。那道守卫的实际后果是：**任何被顶掉的预跑都再也取消不掉**，
+    // 只能自己跑满（最长 `totalMs` 2.8 s），白占一条连接、白花 token。
+    if (handle !== null) {
       handle.abort(new Error('预跑作废'));
     }
   }
@@ -1124,7 +1178,10 @@ export class FrontedAgent implements AgentProvider {
       }
       // 超时和真报错分开：回执话术不一样（「嗯，我想想」vs「我看看」）
       const reason: DelegateReason = why.includes('超时') ? 'timeout' : 'error';
-      return await this.abandon(dsh, userText, image, note, `✗ ${why}`, ticket, reason);
+      // 带上「在快车道上已经耗了多久」：和后面 `dsh 12.05 s` 那行一比，
+      // 「交给 dsh」→「dsh 真的起跑」之间有没有空洞就现形了（2026-11-22 那轮有 ~6.5 s）。
+      const spent = (this.now() - startedAt).toFixed(0);
+      return await this.abandon(dsh, userText, image, note, `✗ ${why}（快车道已耗 ${spent} ms）`, ticket, reason);
     }
 
     if (answer.delegated) {

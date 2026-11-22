@@ -532,3 +532,72 @@ test('快车道全灭：错误文本要写清每一份的结局和进门时的�
   assert.match(fail, /#1 ✗aborted@\d+ms/, '第 1 份的结局也要写');
   assert.match(fail, /进队前在途 \d+ 份/, '要带上进门那一刻的在途数（判「是不是我们自己堵住了」）');
 });
+
+test('预跑已失败且零产出：开轮时**现场重跑**，不再一路掉 dsh', { timeout: 5000 }, async () => {
+  // 先例：2026-11-22 17:30 那轮，「Hmm.」的预跑 1201 ms 首字超时死在 12.6 s，
+  // 轮次 13.9 s 才开。旧代码认领那份死 promise → await 立刻抛 → 直接交给 dsh（12 s）。
+  // 1.2 s 的偶发波动就这样被放大成 18.5 s。
+  const events: Array<{ name: string; data: Record<string, unknown> }> = [];
+  let calls = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    hedge: 1,
+    speculate: false,
+    log: () => {},
+    audit: (name, data) => { events.push({ name, data }); },
+    fetchImpl: (async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('HTTP 全部失败（1 份）: #0 ✗HTTP 500');
+      return sse(['[平静]', '在呢哥。']);
+    }) as unknown as typeof fetch,
+  });
+
+  agent.prefetch('你好呀');
+  await new Promise((resolve) => { setImmediate(resolve); });   // 等预跑那一趟死透
+
+  const reply = await agent.reply('你好呀');
+  assert.equal(calls, 2, '应当现场重跑一次，而不是拿死结果去交给 dsh');
+  assert.equal(reply.speech, '在呢哥。', '重跑成功就该走快车道');
+
+  const claims = events.filter((e) => e.name === 'agent.claim');
+  const dead = claims.find((e) => e.data['why'] === 'failed');
+  assert.ok(dead !== undefined, `应当记一条「预跑已失败」，实际：${JSON.stringify(claims)}`);
+  assert.equal(dead.data['ok'], false);
+  assert.equal(dead.data['taken'], false, '零产出时不该把它交给调用方');
+  assert.equal(dead.data['produced'], 0);
+  assert.equal(claims.some((e) => e.data['ok'] === true), false, '不能再谎报一条 ok:true');
+});
+
+test('预跑已失败但**吐过字**：按现有文本收下，不重跑（那半截是白捡的）', { timeout: 5000 }, async () => {
+  const enc = new TextEncoder();
+  let calls = 0;
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    hedge: 1,
+    speculate: false,
+    log: () => {},
+    fetchImpl: (async () => {
+      calls += 1;
+      if (calls > 1) return sse(['不该走到这里。']);
+      // 先吐一段，再把流打断 —— 模拟「说出半句就断了」
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(enc.encode(
+            `data: ${JSON.stringify({ choices: [{ delta: { content: '[平静]在' } }] })}\n\n`,
+          ));
+          setTimeout(() => { controller.error(new Error('stream boom')); }, 0);
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }) as unknown as typeof fetch,
+  });
+
+  agent.prefetch('你好呀');
+  await new Promise((resolve) => { setTimeout(resolve, 30); });   // 等那段字落地 + 流报错
+
+  const reply = await agent.reply('你好呀');
+  assert.equal(calls, 1, '已经产出过字就不要再问一遍');
+  assert.match(reply.speech, /在/, `应当把那半句收下，实际：${JSON.stringify(reply.speech)}`);
+});
