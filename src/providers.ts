@@ -303,6 +303,15 @@ export interface AgentProvider {
    */
   interruptTurn?(): void;
   /**
+   * 可选能力：**放手**——不取消 dsh 那一轮，只把「有人在等它」这件事摘掉。
+   *
+   * 委派轮撞上插话时用这个替掉 `cancelTurn`：工具已经跑过的活儿不会因为
+   * `session/cancel` 消失（bash 照样跑完），取消只省下最后那一步总结，却把
+   * **用户唯一能听到的答案**一起丢了。放手之后它答完时没有等待者，
+   * 走「没有任何一轮」的播报链路（`setAnnouncer`）说出来 —— 与后台任务结算同一口。
+   */
+  detachTurn?(ticket?: TurnTicket): void;
+  /**
    * 可选能力：**后台任务状态**的一句话事实（「在跑什么 / 刚跑完什么 / 什么都没有」）。
    *
    * 数据来自 dsh 自己发的事件（`job/registered`、`job/settled`、`subagent/catalog`），

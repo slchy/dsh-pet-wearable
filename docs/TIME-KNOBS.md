@@ -76,7 +76,7 @@
 | `DEFAULT_TIMEOUT_MS` | 60000 | wall | `src/session.ts:49` | 无关首声（不在停嘴→出声路径上） | — |
 | `CANCEL_GRACE_MS` | 2000 | wall | `src/session.ts:57` | 无关首声（不在停嘴→出声路径上） | — |
 | `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:66` | 无关首声（不在停嘴→出声路径上） | — |
-| `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:176` | 无关首声（不在停嘴→出声路径上） | — |
+| `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:182` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
 | `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:38` | 设备播报期间（轮询，不加延迟） | — |
 | `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:46` | 无关首声（不在停嘴→出声路径上） | — |

@@ -337,6 +337,63 @@ test('不投机时绝不动手取消：dsh 里在跑的可能是后台任务的�
   assert.equal(cancelled, 0);
 });
 
+test('委派轮撞插话：放手让 dsh 说完，不取消（取消只作废下游，活儿白干）', async () => {
+  // 真机（第 9、10 轮）：omni 说完垫话转 dsh，用户接着说了一句 → `session/cancel`
+  // → dsh 那一轮判成 aborted。可 bash 还在跑（实测取消后 2 s 才结束），
+  // 所以丢掉的不是那 10 秒，而是唯一那一步总结 —— 用户一个字都没听到。
+  const inner = slowInner(150);
+  let cancelled = 0;
+  let detached = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    detachTurn: () => { detached += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']));
+  agent.attachLiveSink(() => {});
+
+    // 第一轮照常走（生产里也是先有一次 reply 才会拿到 forceDelegate 那一轮）
+    const ticket = { no: 1, gen: 1 };
+    await agent.reply('你好呀', undefined, undefined, { ticket });
+    cancelled = 0; // 第一轮快车道胜出时本来就会取消一条投机，不算这一条
+
+    // `receiptSpoken: true` = omni 已经说过垫话（生产里就是这个形态）
+    const pending = agent.reply('帮我查一下订单', undefined, undefined, {
+      ticket,
+      forceDelegate: 'delegate',
+      receiptSpoken: true,
+    });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  agent.cancelTurn(ticket);
+  await pending;
+
+  assert.equal(detached, 1, 'dsh 那一轮要放手，让它把答案说完');
+  assert.equal(cancelled, 0, '取消只会把答案扔掉 —— 上游的活儿已经干过了');
+});
+
+test('普通轮撞插话照旧取消（这条边界不能一起放松）', async () => {
+  const inner = slowInner(150);
+  let cancelled = 0;
+  let detached = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    detachTurn: () => { detached += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']));
+  agent.attachLiveSink(() => {});
+
+  const ticket = { no: 1, gen: 1 };
+  const pending = agent.reply('帮我查一下订单', undefined, undefined, { ticket });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const before = cancelled;
+  agent.cancelTurn(ticket);
+  await pending;
+
+  assert.equal(cancelled, before + 1, '没在委派（dsh 没起）就是普通取消');
+  assert.equal(detached, 0);
+});
+
 test('取消模式 interrupt 走硬中断而不是 rpc', async () => {
   const inner = slowInner(200);
   let rpc = 0;

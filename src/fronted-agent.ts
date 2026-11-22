@@ -688,6 +688,14 @@ export class FrontedAgent implements AgentProvider {
   private innerMode: InnerMode = 'pass';
   private readonly buffered: string[] = [];
   /**
+   * 这一轮是不是「已经对用户说过话、正在等 dsh」。
+   *
+   * 插话时据此改走「放手」而不是「取消」：omni 的垫话等于**承诺了答案**，
+   * 而 `session/cancel` 只作废下游、上游的活儿照跑完（真机实测取消之后 2 s，
+   * `bash` 才刚结束）—— 取消只省下最后那一步总结，丢掉的正是要兑现的那句话。
+   */
+  private delegating = false;
+  /**
    * 投机起的 dsh 那一轮属于哪个代次。
    *
    * 取消**按代次**判定：只有「现在这一轮的票据」才允许取消上游。以前用一个
@@ -1471,7 +1479,14 @@ export class FrontedAgent implements AgentProvider {
       this.audioLane?.discard();
     }
     try {
-      this.inner.cancelTurn?.(ticket);
+      // 委派轮：dsh 的活儿（工具调用、bash）取消不了，`session/cancel` 只作废下游，
+      // 结果就是「活儿干完了、答案没了」—— 真机两轮委派都是这么死的（第 9、10 轮）。
+      // 放手让它说完，用户之后还能听到答案（`session.detachTurn` → `setAnnouncer`）。
+      if (this.delegating) {
+        this.inner.detachTurn?.(ticket);
+      } else {
+        this.inner.cancelTurn?.(ticket);
+      }
     } catch (error) {
       this.log(`  快车道    ✗ 取消失败：${(error as Error).message}`);
     }
@@ -1520,9 +1535,20 @@ export class FrontedAgent implements AgentProvider {
     if (opts?.silent !== true) {
       this.reportDelegate(reason);
     }
-    const answer = await this.startInner(userText, image, note, ticket);
-    this.rememberDsh(answer.speech, userText);
-    return { ...answer, path: 'dsh', delegate: reason };
+    // 只有「委派之前已经对用户说过话」的轮次才放手（见 `cancelTurn`）：
+    // omni 那句垫话等于**承诺了答案**，插话之后答案还得兑现；
+    // 没出过声的轮次，用户插话就是不要了，照旧取消（`delegating` 保持 false）。
+    this.delegating = opts?.silent === true;
+    try {
+      const answer = await this.startInner(userText, image, note, ticket);
+      // 放手那一轮拿回来的是空答复 —— 别把它写进窗口，真正的答案从播报口出
+      if (answer.speech !== '') {
+        this.rememberDsh(answer.speech, userText);
+      }
+      return { ...answer, path: 'dsh', delegate: reason };
+    } finally {
+      this.delegating = false;
+    }
   }
 
   /** 记下 dsh 最后说的话（快模型下一轮要看：它在问什么、答案是什么） */

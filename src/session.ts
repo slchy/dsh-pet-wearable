@@ -118,6 +118,12 @@ export interface AskResult {
   firstTokenMs?: number;
   /** 是否沿用了已有会话 */
   resumed: boolean;
+  /**
+   * 这一轮被**放手**了（见 `detachTurn`）：dsh 还在跑，答案之后从播报口出来。
+   *
+   * 上层看到它就别把空 `text` 当失败 —— 那只是「这一轮不再等它」。
+   */
+  detached?: boolean;
 }
 
 /**
@@ -391,6 +397,23 @@ export class DshSession {
   /** 当前在途那一轮是不是**被我们主动取消**的（是的话收成空答复，不抛错） */
   private cancelRequested = false;
   /**
+   * 当前在途那一轮被**放手**了（见 `detachTurn`）：`ask` 立刻收尾，但 dsh 那一轮
+   * 还在跑，答完之后没有等待者 —— 由 `onAnnounce` 播出去。
+   */
+  private detached = false;
+  /** 放手那一轮的答复文本（独立一份：新一轮开起来会清 `assistantText`） */
+  private detachedText = '';
+  /**
+   * 发出去了几条 `session/prompt`、收到过几条 `idle`。
+   *
+   * dsh 是**串行**的，`idle` 按顺序来 —— 所以「这条 idle 属于哪一轮」可以用
+   * 两个计数器算出来：`idlesSeen < promptsSent` 说明后面还有更新的轮次在等，
+   * 那这条 idle 就是更早那一轮（也就是被放手的那一轮）的。
+   * 不用这个就只能靠「有没有等待者」猜，猜错就把上一轮的答案交给新一轮。
+   */
+  private promptsSent = 0;
+  private idlesSeen = 0;
+  /**
    * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
    * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
    */
@@ -591,6 +614,37 @@ export class DshSession {
   }
 
   /**
+   * 放手：**不取消** dsh 那一轮，只把「有人在等它」摘掉。
+   *
+   * 为什么不是取消：`session/cancel` 只作废下游输出，**上游的活儿照跑**（真机实测
+   * 05:08:50 取消之后 2 s，`bash「nproc; free -h」` 才刚结束）—— 所以取消省下的是
+   * 最后那一步总结，丢掉的却是用户唯一能听到的答案。之后用户还得把问题重问一遍。
+   *
+   * 放手之后：`ask` 立刻收成空答复（这一轮已经作废了，没人要），dsh 继续跑完；
+   * 回来的那条 `assistant/message` 记在 {@link detachedText}，`idle` 时交给
+   * `onAnnounce` —— 与「后台任务结算」同一口播报，用户照样能听到答案。
+   *
+   * 票据按代次校验，规则与 `cancelTurn` 一致：迟到的放手不能摘掉下一轮的等待者。
+   */
+  detachTurn(ticket?: TurnTicket): void {
+    if (this.proc === null) {
+      return;
+    }
+    const active = this.activeTicket;
+    if (ticket !== undefined && active !== null
+      && (ticket.no !== active.no || ticket.gen !== active.gen)) {
+      this.log(`  放手    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
+      return;
+    }
+    this.detached = true;
+    this.detachedText = this.assistantText.trim();
+    // `ask` 的等待者立刻收尾：这一轮已经作废，别让它挂到超时
+    const fire = this.onIdle;
+    this.onIdle = null;
+    fire?.();
+  }
+
+  /**
    * 启动时探测：宿主运行时认不认 `session/cancel`。
    *
    * 顺手把 SDK 握手拉起来（第一次探测本来就要 initialize），之后首轮会快一点。
@@ -708,6 +762,7 @@ export class DshSession {
           ]
         : [{ type: 'text', text }],
     });
+    this.promptsSent += 1;
 
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
@@ -726,6 +781,7 @@ export class DshSession {
 
     const answer = this.assistantText.trim();
     const cancelled = this.cancelRequested;
+    const detached = this.detached;
     this.cancelRequested = false;
     if (this.exitError !== null) {
       const reason = this.exitError;
@@ -733,8 +789,9 @@ export class DshSession {
       throw new DshError(reason);
     }
     // 被我们主动取消的那一轮：正常收尾成空答复，**不能抛** —— 上层没人在等一个
-    // 「用户不要了」的异常，抛出去就是未捕获的 rejection（实测把 bench harness 打死）
-    if (!answer && !cancelled) throw new DshError('sdk 没有返回任何文本');
+    // 「用户不要了」的异常，抛出去就是未捕获的 rejection（实测把 bench harness 打死）。
+    // 放手的那一轮同理：它还在跑，只是这一轮不再等它（答案之后从播报口出来）。
+    if (!answer && !cancelled && !detached) throw new DshError('sdk 没有返回任何文本');
 
     return {
       text: answer,
@@ -743,6 +800,7 @@ export class DshSession {
       durationMs: Date.now() - started,
       resumed,
       ...(this.firstTokenMs === null ? {} : { firstTokenMs: this.firstTokenMs }),
+      ...(detached ? { detached: true } : {}),
     };
   }
 
@@ -964,6 +1022,11 @@ export class DshSession {
       this.sdkReady = false;
       // 进程没了，里面的会话也就不在了；下次必须重新 resume
       this.openSessionId = null;
+      // 计数与「放手」状态一起归零：进程都没了，那些 idle 再也不会来
+      this.promptsSent = 0;
+      this.idlesSeen = 0;
+      this.detached = false;
+      this.detachedText = '';
       if (this.proc === proc) this.proc = null;
       // 没收到 shutdown 就退出，说明崩了；挂起的请求全部失败
       for (const [, p] of this.pending) p.reject(new DshError(`sdk 进程退出（code=${code}）`));
@@ -1196,6 +1259,11 @@ export class DshSession {
       }
       if (parts.length > 0) {
         this.assistantText = parts.join('');
+        // 被放手那一轮的答复可能在这之后才到，而新一轮的开头会清 `assistantText`
+        // —— 单独留一份，否则「放手」的答案会被下一轮冲掉
+        if (this.detached) {
+          this.detachedText = this.assistantText;
+        }
         // 没挂流式桥时（bench 就是这样）拿不到 token 级时刻，退一步记「首条 assistant
         // 消息到达」。它晚于真正的首 token，但仍是"模型开始产出"的可比口径。
         if (this.firstTokenMs === null && this.turnStartedAt > 0) {
@@ -1214,6 +1282,30 @@ export class DshSession {
 
     if (method === 'session.status') {
       const status = typeof p['status'] === 'string' ? p['status'] : '';
+      if (status === 'idle') {
+        this.idlesSeen += 1;
+      }
+      // 放手的那一轮跑完了（它比最新的 prompt 老）。答案交给播报链路 ——
+      // 同后台任务结算同一口；用户已经问了新问题就算了，别再补播旧的。
+      // **这条 idle 不能拿去唤醒新一轮的等待者**，否则新一轮会拿到上一轮的答案。
+      if (status === 'idle' && this.detached && this.idlesSeen < this.promptsSent) {
+        this.detached = false;
+        const text = (this.detachedText || this.assistantText).trim();
+        this.detachedText = '';
+        this.assistantText = '';
+        if (text === '') {
+          return;
+        }
+        if (this.onIdle !== null) {
+          this.log('  放手    答案回来时用户已经问了新问题 → 丢掉这一条');
+          return;
+        }
+        if (this.onAnnounce) {
+          this.log('  放手    委派轮跑完了，用户早走了 → 答案转成播报');
+          this.onAnnounce(text);
+        }
+        return;
+      }
       const waiting = this.onIdle !== null;
       const verdict = this.spontaneous.onStatus(status, waiting);
       if (verdict === 'begin') {

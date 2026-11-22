@@ -212,6 +212,11 @@ export class VoiceAgent {
     const { emotion, rest } = parseEmotion(r.text);
     const speech = cleanForSpeech(rest);
     if (!speech) {
+      // 放手的那一轮：这一轮已经作废，空答复不是失败 —— 真正的答案之后从播报口出来
+      if (r.detached === true) {
+        this.log('  dsh     已放手（用户走了），答案之后从播报口出');
+        return { ...r, speech: '', emotion, path: 'dsh' };
+      }
       throw new Error('清洗后没有可朗读的内容');
     }
     const usage = r.usage;
