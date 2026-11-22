@@ -719,6 +719,16 @@ export class FrontedAgent implements AgentProvider {
    */
   private inFlight = 0;
 
+  /**
+   * 这一轮的开轮时刻（`reply()` 进门就记）。
+   *
+   * 只服务一件事：`startInner` 里报「dsh 距开轮多久才真的起跑」。
+   * 2026-11-22 17:30 那轮 `agent 18.51 s` 减掉 `dsh 12.05 s` 还剩 ~6.5 秒，
+   * 而日志里**没有任何一行能对上**——不知道那 6.5 秒是在等锁、等回执，还是
+   * dsh 建连/鉴权重试。这一行就是为了把那个空洞切开。
+   */
+  private turnStartedAt = 0;
+
   constructor(options: FastLaneOptions) {
     this.inner = options.inner;
     this.apiKey = options.apiKey ?? '';
@@ -1090,6 +1100,7 @@ export class FrontedAgent implements AgentProvider {
     const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
     // 新一轮：投机的次数配额按轮算（上一轮用完不能让下一轮一直没法投机）
     this.speculateStarts = 0;
+    this.turnStartedAt = this.now();
     this.currentGen = ticket.gen;
     this.currentTicket = ticket;
     this.innerMode = 'pass';
@@ -1342,6 +1353,10 @@ export class FrontedAgent implements AgentProvider {
   ): Promise<AgentReplyView> {
     this.log(`  快车道    ${why} → 交给 dsh`);
     this.reportDelegate(reason);
+    if (dsh !== null) {
+      // 开轮时（投机）就已经起跑了：那 dsh 的那段耗时是从开轮算的，中间没有空洞
+      this.log('  dsh 沿用开轮时就起跑的那一趟（不另起）');
+    }
     const promise = dsh ?? this.startInner(userText, image, note, ticket);
     this.innerMode = 'pass';
     const held = this.buffered.splice(0);
@@ -1392,6 +1407,10 @@ export class FrontedAgent implements AgentProvider {
     note: string | undefined,
     ticket: TurnTicket,
   ): Promise<AgentReplyView> {
+    // 「交给 dsh」之后**到这里**之间可能夹着好几秒（2026-11-22 测到 ~6.5 s）。
+    // 这一行把它切开：距开轮 0 ms = 开轮就起跑（投机那条路）；
+    // 几百毫秒到几秒 = 中间有等待，得顺着 `abandon`/`delegate` 往上查。
+    this.log(`  dsh 起跑（距开轮 ${Math.max(0, Math.round(this.now() - this.turnStartedAt))} ms）`);
     const blocks: string[] = [];
     if (note !== undefined) {
       blocks.push(note);

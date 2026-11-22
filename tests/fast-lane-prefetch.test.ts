@@ -601,3 +601,22 @@ test('预跑已失败但**吐过字**：按现有文本收下，不重跑（那�
   assert.equal(calls, 1, '已经产出过字就不要再问一遍');
   assert.match(reply.speech, /在/, `应当把那半句收下，实际：${JSON.stringify(reply.speech)}`);
 });
+
+test('dsh 起跑要报「距开轮多久」—— 那 6.5 秒的空洞靠它切', { timeout: 5000 }, async () => {
+  // 2026-11-22 17:30 那轮 agent 18.51 s − dsh 12.05 s 还剩 ~6.5 s，日志里对不上。
+  const logs: string[] = [];
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    speculate: false,
+    log: (line) => { logs.push(line); },
+    fetchImpl: (async () => { throw new Error('不该走快车道'); }) as unknown as typeof fetch,
+  });
+
+  // 任务类句子直接交给 dsh（不走快车道），开轮即起跑 → 距开轮应当 ~0
+  await agent.reply('帮我看看今天天气怎么样');
+  const line = logs.find((l) => l.includes('dsh 起跑'));
+  assert.ok(line !== undefined, `必须报 dsh 起跑时刻，实际：${JSON.stringify(logs)}`);
+  assert.match(line, /距开轮 \d+ ms/, '要带距开轮的毫秒数');
+  assert.match(line, /距开轮 [0-9] ms|距开轮 [1-9]?0 ms/, `开轮即起跑时应当接近 0，实际：${line}`);
+});
