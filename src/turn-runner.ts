@@ -569,11 +569,17 @@ export class TurnRunner {
           // omni 自己发了 tool_call：就地切给 dsh。
           // 已经出过声就不再叠回执（两份不同的声音接在一起很难听，而且收不回来）。
           this.log('  omni    决定转交 dsh');
-          reply = await agent.reply(text, image, note, {
-            ticket,
-            forceDelegate: why,
-            receiptSpoken: speech.trim() !== '',
-          });
+          // 正文用 omni 的转述（它直接听音频，专名比 ASR 准），ASR 原话只作附注 ——
+          // 数字、路径、设备名这些"照抄"的东西靠原话兜底。
+          const omniText = reply.audio.delegateText?.() ?? null;
+          reply = await agent.reply(
+            omniText === null ? text : `${omniText}\n用户原话：「${text}」`,
+            image, note, {
+              ticket,
+              forceDelegate: why,
+              receiptSpoken: speech.trim() !== '',
+            },
+          );
           replyPath = reply.path;
           delegateReason = reply.delegate;
           speech = reply.speech;

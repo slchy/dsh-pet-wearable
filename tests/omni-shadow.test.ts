@@ -686,6 +686,47 @@ test('omni 发 tool_call → delegateReason 非空；正常答 → null', async 
   assert.equal(answer!.delegateReason!(), 'delegate', '本地判据分不出任务，只能靠它');
 });
 
+test('tool_call 里的 request 会被取出来交给 dsh（ASR 听错时靠它）', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+  assert.equal(answer!.delegateText!(), null, '还没调用时是空的');
+
+  // 完整参数走 `.done`（delta 是分段，拼起来容易漏引号）
+  h.at(700);
+  h.socket.message({
+    type: 'response.function_call_arguments.done',
+    arguments: '{"request":"把客厅的灯关掉","reason":"要操作设备"}',
+  });
+  h.at(710);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(answer!.delegateReason!(), 'delegate');
+  assert.equal(answer!.delegateText!(), '把客厅的灯关掉');
+});
+
+test('tool_call 参数坏掉时 delegateText 回 null，不连累委派', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(50);
+  h.shadow.seal(1, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  h.at(700);
+  h.socket.message({ type: 'response.function_call_arguments.done', arguments: '{"request":' });
+  h.at(710);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(answer!.delegateReason!(), 'delegate', '委派照旧');
+  assert.equal(answer!.delegateText!(), null, '取不到就退回 ASR 原话');
+});
+
 test('工具调用**之后**才到的音频也要播（真服务顺序是 call→audio）', async () => {
   const h = make('full');
   h.ready();

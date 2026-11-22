@@ -92,6 +92,12 @@ export interface AgentAudioAnswer {
    * 判不出「这事得问助手」。
    */
   delegateReason?(): DelegateReason | null;
+  /**
+   * omni 在 `tool_call` 里写下的那句「用户要什么」。没有就是 `null`（退回 ASR 原话）。
+   *
+   * 和 {@link delegateReason} 分开：那个只回答「要不要转」，这个带上**内容**。
+   */
+  delegateText?(): string | null;
 }
 
 /**

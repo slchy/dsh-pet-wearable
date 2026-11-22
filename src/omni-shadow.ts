@@ -88,6 +88,32 @@ function clipText(text: string, max: number): string {
 const LEAD_IN_CLAUSE = '调用之前先用一句话应一声（八个字以内）。';
 
 /**
+ * 从 `function_call_arguments.done` 里取 `request`。
+ *
+ * 容错到底：参数可能是 JSON 字符串、对象，也可能是半截；取不到就返回 `null`，
+ * 调用方退回 ASR 原话。**绝不让一个解析错误把整轮委派搞砸**。
+ */
+function parseDelegateRequest(args: unknown): string | null {
+  let parsed: unknown = args;
+  if (typeof args === 'string') {
+    try {
+      parsed = JSON.parse(args);
+    } catch {
+      return null;
+    }
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    return null;
+  }
+  const request = (parsed as { request?: unknown }).request;
+  if (typeof request !== 'string') {
+    return null;
+  }
+  const trimmed = request.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/**
  * 唯一的工具：把这一轮转给 dsh。
  *
  * 描述必须收窄到「**真的要去操作**」—— 只写「操作设备 / 读设备数据 / 长期记忆」，
@@ -107,8 +133,16 @@ const DELEGATE_TOOL = {
     + LEAD_IN_CLAUSE,
   parameters: {
     type: 'object',
-    properties: { reason: { type: 'string', description: '为什么转交（一句话）' } },
-    required: ['reason'],
+    properties: {
+      request: {
+        type: 'string',
+        description:
+          '把用户要你做的事**写清楚**（一句话，用他的口吻）：做什么、对象是谁。'
+          + '数字、名字、书名、路径、设备名**原样照抄**，不要概括、不要改写、不要补全。',
+      },
+      reason: { type: 'string', description: '为什么转交（一句话）' },
+    },
+    required: ['request', 'reason'],
   },
 } as const;
 
@@ -182,6 +216,8 @@ interface PendingResponse {
   text: string;
   /** omni 自己决定转 dsh（`tool_call`）；`null` = 它会自己答 */
   delegate: DelegateReason | null;
+  /** tool_call 里那句「用户要什么」（omni 自己听出来的）；没解析到就是 `null` */
+  delegateRequest: string | null;
   /**
    * 服务端回过 `response.created` 了吗。
    *
@@ -629,6 +665,7 @@ export class OmniShadow {
       sampleRate: DOWNSTREAM_RATE,
       transcript: () => current()?.text ?? '',
       delegateReason: () => current()?.delegate ?? null,
+      delegateText: () => current()?.delegateRequest ?? null,
       chunks: (async function* iterate() {
         let resp = current();
         // 等排队那份建出来。车道挂了 / 被停掉就放弃，让这一轮以「零音频」结束
@@ -892,6 +929,7 @@ export class OmniShadow {
       closed: false,
       text: '',
       delegate: null,
+      delegateRequest: null,
       created: false,
       cancelPending: false,
       superseded: false,
@@ -1104,6 +1142,15 @@ export class OmniShadow {
         // omni 自己决定转 dsh。音频可能还没出（纯调用），也可能已经说了句垫音。
         if (this.resp !== null) {
           this.resp.delegate ??= 'delegate';
+        }
+        return;
+      case 'response.function_call_arguments.done':
+        // 完整参数在这一条里（delta 是分段，拼起来容易漏引号）。解析失败不算错：
+        // 委派照旧进行，只是那一轮退回 ASR 原话。
+        if (this.resp !== null) {
+          this.resp.delegate ??= 'delegate';
+          const args = (ev as { arguments?: unknown }).arguments;
+          this.resp.delegateRequest = parseDelegateRequest(args) ?? this.resp.delegateRequest;
         }
         return;
       case 'response.audio.delta':

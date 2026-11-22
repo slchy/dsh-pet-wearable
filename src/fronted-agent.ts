@@ -1195,6 +1195,8 @@ export class FrontedAgent implements AgentProvider {
     // **必须在任何路由判断之前** —— 再判一次会把它送回同一条车道，死循环。
     if (turn?.forceDelegate !== undefined) {
       this.log(`  快车道    omni 决定转交（${turn.forceDelegate}）`);
+      // 正文可能已经是 omni 的转述 + 原话附注（`TurnRunner` 拼好的），原样交给 dsh：
+      // 它听到的是「用户要什么」，而不是被 ASR 听错的那句。
       return await this.delegate(
         userText, image, note, ticket, turn.forceDelegate,
         { silent: turn.receiptSpoken === true },
