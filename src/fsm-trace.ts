@@ -280,6 +280,21 @@ export function checkTrace(input: readonly TraceEvent[], options: AuditOptions =
     if (first !== undefined && stopBefore !== undefined && first.t - stopBefore > maxStopToFirst) {
       bad(stopBefore, 'timing.stopToFirst', `第 ${span.no} 轮停嘴到首块 ${Math.round(first.t - stopBefore)} ms`);
     }
+
+    // omni 车道：开着就不许有「该它答却退回级联」的轮次。
+    //
+    // 判据是 `agent.lane` 的两个布尔，**不是** `path`：`text_ok:false` 表示这一句
+    // 本来就不属于快车道（超字数 / 含数字 / 像长期事实），那一直是交给 dsh 的，
+    // 不算违约。只有 `lane_ok:false && text_ok:true` 才是「车道自己没接住」——
+    // 用户会在同一段对话里听到两副嗓子（见 `docs/state-machines.md` §5.6）。
+    const lane = inTurn('agent.lane')[0];
+    if (lane !== undefined && lane['lane_ok'] === false && lane['text_ok'] === true) {
+      bad(lane.t, 'lane.fallback',
+        `第 ${span.no} 轮该由 omni 答却退回级联（state=${String(lane['state'] ?? '?')}，`
+        + `has_resp=${String(lane['has_resp'] ?? '?')}，`
+        + `cancelled=${String(lane['cancelled'] ?? '?')}，`
+        + `pending=${String(lane['pending'] ?? '?')}）`);
+    }
   }
 
   return { turns, violations, skipped: [...skipped], states: states.length };

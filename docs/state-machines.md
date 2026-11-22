@@ -21,6 +21,9 @@
 | 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 只在还没出声时能说；答案的第一块一到就置 `cancelled` 并 `audio.stop`，不再有人读它。**出声期间它占着 `DialogFsm` 的 `speaking`**（`receiptStarted` / `receiptEnded`），所以那会儿用户开口算插话 |
 | 宠物状态 | `PetSession.state`（`PetState`） | 纯函数 `brain.step` 产出；执行器无判断 |
 | 后台汇报什么时候开口 | `DialogRuntime.announceQueue` + 四道闸 | `queue.length > 0` → 宠物闸门 `floorFree` 不通过（`announcePending`），宠物自己不说话；`announce` 抢不动 `reply` |
+| omni 车道状态 | `VoiceConnection.omni`（`OmniShadow.state`：`idle`/`connecting`/`ready`/`busy`/`broken`） | `FrontedAgent.audioLane.willServe()` / `explain()`；宿主只经这两个入口读，不复制状态 |
+| 这一轮由谁答 | `FrontedAgent`（`willServeAudio()` 与 `reply()` 内部**同一套判据**：`lane.willServe()` + `textEligible()`） | `TurnRunner` 只按 `reply.audio !== undefined` 分支，不自己判 |
+| omni 那一份音频归谁 | `OmniShadow.claimedResp`（认领时绑定） | `AgentAudioAnswer.chunks` / `transcript()` 的闭包；**不许事后去 `resp` 里找**（见 §5.6） |
 
 > 播放口径：**估算时长是下限，设备回执只能延后**。真机上见过设备在「最后一批字节收到」
 > 就报 `played`（4.58 s 音频 1 s 回执），按它收尾会把尾音那段插话窗口关掉。
@@ -249,7 +252,7 @@ stateDiagram-v2
 
 | 门 | 何时 | 做什么 |
 |---|---|---|
-| `commitAfterMs`（`VOICE_COMMIT_MS`，代码默认 40 / **线上 20**） | 上行静音到点、且这段有音频 | 让 ASR 封段开始解码（`SttSession.commit()`），一段只封一次 |
+| `commitAfterMs`（`VOICE_COMMIT_MS`，代码默认 40 / **线上 20**） | 上行静音到点、且这段有音频 | 让 ASR 封段开始解码（`SttSession.commit()`），一段只封一次。**omni 也在这里起跑**（同一行 `omni.seal()`，见 §5.6） |
 | `openQuietMs` / `openQuietShortMs`（`VOICE_OPEN_QUIET_MS`，300 / 200；p ≥ 0.8 走短档） | 定稿到达时 | 要求「**截至此刻**」的连续静音 ≥ 门槛才允许 `accept`；不够就 `extend` 差额（`why=silence`）。防的是「换气被当成句尾」 |
 
 > **短档不是死代码**（2026-11-19 核对四份真机档案，69 次判停）：静音门整体只触发 5 次（7%），
@@ -483,6 +486,112 @@ stateDiagram-v2
     空闲 --> [*]
 ```
 
+## 5.6 OmniShadow —— 音频直出车道
+
+**持有**：`VoiceConnection.omni`（`src/omni-shadow.ts`，**按设备连接建、按连接销毁**）。
+**驱动**：`UtteranceAssembler` 的三个回调（`onSpeechOpen` / `onSpeech` / `onCommit`）
+推音频，`TurnRunner` → `FrontedAgent` 认领或丢弃。
+
+> **硬约束：`OMNI_ANSWER=full` 时，快车道每一轮都必须由 omni 答。**
+> 一轮退回级联，用户就在同一段对话里听到两副嗓子。验收口径见本节末。
+
+### 状态
+
+| 状态 | 含义 |
+|---|---|
+| `idle` | 还没建连（`assert` 之前的一切入口都是空操作） |
+| `connecting` | socket 已发握手，等 `session.updated`（实测 ~1.3 s） |
+| `ready` | 可发 `commit`+`create` |
+| `busy` | 有一份 response 在生成（`resp !== null`） |
+| `broken` | **吸收态，不自动重连** |
+
+| 事件 | 从 | 到 | 条件 / 副作用 |
+|---|---|---|---|
+| `start()` | `idle` | `connecting` | 与设备握手**并行**，不占关键路径。握手超时 15 s → `broken` |
+| `session.updated` | `connecting` | `ready` | 握手完成即就绪，**没有「预热 seal」**（发假音频会白花钱 + 往第 0 轮塞脏历史） |
+| `seal()` | `ready` | `busy` | `commit` + `create` **连发**（pipe）。create 每推迟 1 ms 首块就晚 1 ms，决策预算只有 ~171 ms |
+| `seal()` | `busy` | `busy` | 先 `response.cancel()`，把这一份排进 `pending`（只留一份），`done` 之后补发 |
+| `response.done` | `busy` | `ready` | 同时 flush `pending`（→ `busy`）和排队中的回注 |
+| `response.done` / `error` / `close` | 任意 | `broken` | 落 `{skipped:'broken', why}`；`stop()` 也走这里 |
+| 一份 response 30 s 没 `done` | `busy` | `broken` | 看门狗，防挂死（**不是性能判据**） |
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> connecting : start()
+    connecting --> ready : session.updated
+    connecting --> broken : 握手超时 / error / close
+    ready --> busy : seal()（commit + create 连发）
+    busy --> busy : seal()（先 cancel，排队）
+    busy --> ready : response.done（并 flush pending）
+    ready --> broken : error / close / stop()
+    busy --> broken : 超时 / 连续协议错误
+    broken --> [*]
+```
+
+### 子状态一：闭嘴（`muted` + `ring`）
+
+能量门 `holdMs`（2 s）比 `commitMs`（20 ms）长得多，所以**封段之后还会收到 ~2 s 静音**。
+
+| 事件 | `muted` | 动作 |
+|---|---|---|
+| `seal()` | `true` | 之后一段都不往服务端推 |
+| `feed(pcm, voiced=false)` | `true` | 只进 `ring`（上限 150 ms），**一个字节都不发** |
+| `feed(pcm, voiced)` | `true` | `muted=false`，先补 `ring` 再追加（软起音不被切掉） |
+| `feed(…)` | `false` | 直接追加 |
+| `restart(preroll)` | `false` | 新一轮开口：cancel 上一份 → 清 `pending` → 有残留就 `commit`（**不发 create**）→ 补预卷 |
+
+`voiced` 必须由能量门给（`EnergyGateDecision.voiced`），不能自己按能量重算 ——
+两处门限一漂移就开始丢字或灌静音，而且从数据上分不出来。
+
+### 子状态二：认领（谁拿走这一份）
+
+| 字段 | 含义 |
+|---|---|
+| `resp` | 当前这一份（`response.done` 一到就置 `null`） |
+| `pending` | 撞 busy 时排队的那一份（只留一份，`SealMeta` 钉住字节数） |
+| `claimReserved` | 已经答应给某个消费者，但那一份还没建出来 |
+| `claimedResp` | **认领落在哪一份上**（引用，不是事后去 `resp` 里找） |
+
+两处容易写错：
+
+1. **`willServe()` 必须看得见 `pending`。** 撞 busy 之后「cancel 掉旧的 + 新的排队」，
+   而新的要等旧的 `done` 才建 —— 实测空窗 **92 ms**。只看 `resp` 会在这窗口里判 false，
+   整轮退回级联，而 omni 那份 1 s 的回答生成完没人要（真机 2/38 中招）。
+2. **`claimedResp` 不能省。** `finish()` 一到就把 `resp` 置 null，而异步 generator 的
+   第一个 `next()` 是微任务 —— response 若在消费者开始读之前就 `done`，事后去 `resp` 里
+   找只会得到 null，表现是静默等 5 s、零音频。
+
+### 与主链路的接缝（三处，各管一件事）
+
+| 位置 | 做什么 |
+|---|---|
+| `voice-session` 三个回调 | `onSpeechOpen` → `restart(preroll)`；`onSpeech` → `feed(pcm, voiced)`；`onCommit` → `seal(seq, silenceMs)`，**与 `stt.commit()` 同一行** |
+| `FrontedAgent` | `isPrefetchable()` 里压住投机（不压就是每轮双花 LLM 钱）；`reply()` 认领；`delegate()` 先 `discard()`；`noteServedTurn()` 写回 `pending`；`injectAnsweredTurn()` 回注委派轮 |
+| `TurnRunner` | 起跑流式 TTS **之前**问 `willServeAudio()`；`reply.audio !== undefined` 走直出分支；drain 之后才读 `speech` |
+
+三种「不采纳」的语义**不能混**：
+
+| 入口 | 取消 | 删半句 | 为什么 |
+|---|:--:|:--:|---|
+| `discard()`（走 dsh / 判据否决） | ✅ | ✅ | 一个字都没播 |
+| `cancelCurrent()` 且 `!claimed`（同句第二次封段顶掉） | ✅ | ✅ | 那份答的是半句话，没人听过 |
+| `interrupt()`（播到一半被插话） | ✅ | ❌ | 用户已经听到了一部分，删了就和 `pending` 里记的半句对不上 |
+
+`item.delete` 只能**延迟**到 `response.done`：要 item id，而 id 在
+`response.done.response.output` 里，discard 当场通常连 `created` 都没到。
+
+### 验收：怎么知道硬约束还成立
+
+`agent.lane` 每次 `willServeAudio()` 落一条，其中：
+
+```text
+lane_ok:false && text_ok:true   ⇒  该 omni 答却没答，整轮退回级联
+```
+
+**这个数必须是 0。** 文本闸（`text_ok:false`）不是违约 —— 那种轮次本来就不属于快车道，
+一直是交给 dsh 的。`omni.shadow` 的 `cancelled`/`skipped` 另有口径（影子数据，不是接管）。
+
 ## 5.8 怎么验证状态轮转真的对
 
 上面每节写的「转移条件」，代码里对不对不能靠读 —— 跑一场，看档案：
@@ -503,6 +612,7 @@ node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录 | event
 | `state.settledAfterTurn` | 一轮结束后没落回 `listening`/`ending` |
 | `barge.noAudioStop` | 被判插话却没发 `audio.stop`（喇叭停不下来） |
 | `turn.tooLong` / `timing.stopToFirst` | 挂住，或者用户等太久 |
+| `lane.fallback` | `agent.lane` 里 `lane_ok:false && text_ok:true` —— 该 omni 答却退回级联，**用户会听到两副嗓子**（§5.6） |
 
 状态事件来自 `dialog.state`（`DialogRuntime.notifyState` 落档）。**老档案没有这个事件**时，
 状态那几条记「缺仪表」跳过 —— 与 `latency-report` 的 `null` 口径一致，不拿「没记录」冒充「没问题」。
@@ -605,3 +715,58 @@ sequenceDiagram
     D-->>FA: rejection（被掐后没文本）／或已作废
     Note over FA: 起跑时就挂了 catch<br/>迟到的结局不会带走进程
 ```
+
+### 分支 C：omni 直出（`OMNI_ANSWER=full`）
+
+omni **不等定稿**：它的起跑线是 `onCommit`（封段），与 `stt.commit()` 同一行。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户（设备）
+    participant G as 能量门
+    participant A as UtteranceAssembler
+    participant VS as VoiceConnection
+    participant OS as OmniShadow
+    participant SC as SessionCore
+    participant TR as TurnRunner
+    participant FA as FrontedAgent
+
+    U->>G: 上行音频
+    G->>VS: onSpeechOpen(preroll)
+    VS->>A: resetAudio(preroll)
+    VS->>OS: restart(preroll)（cancel 上一份 + 解除闭嘴）
+    G->>VS: onSpeech(pcm, voiced)
+    VS->>OS: feed(pcm, voiced)（静音只进 ring，不发）
+    Note over A: 静音 20 ms
+    A->>VS: onCommit(silenceMs)
+    VS->>OS: seal(seq, silenceMs) —— 与 stt.commit() 同一行
+    OS->>OS: commit + create 连发 → busy
+    rect rgb(235,245,255)
+    Note over A,VS: 判停 / 定稿（①b，~210 ms）与 omni 生成并行
+    end
+    A->>SC: accept（整句）
+    SC->>TR: run(text, ticket)
+    TR->>FA: willServeAudio(text)  ← 起流式 TTS **之前**
+    FA->>FA: lane.willServe() + textEligible()
+    FA-->>TR: true → 不开 TTS task
+    TR->>FA: reply(text, …, {ticket})
+    FA->>OS: claim()
+    Note over OS: 首块通常还没到（认领 ~220 ms，首块 ~640 ms）<br/>手里那份被顶掉时认领「排队中的下一份」
+    FA-->>TR: AgentAudioAnswer（text/speech 是**活 getter**）
+    loop 每个音频块
+        TR->>OS: chunks.next()
+        OS-->>TR: PCM 24 kHz
+        TR->>U: 下发（首块前 fsm.audioStarted → speaking）
+    end
+    TR->>FA: noteServedTurn(text, speech)（drain 之后读 getter）
+    TR->>FA: interrupt() / discard() / (委派轮) injectAnsweredTurn()
+```
+
+三条与 §6 主图不同的地方，都是有意的：
+
+| 差异 | 为什么 |
+|---|---|
+| omni 在 `onCommit` 起跑，早于 `beginTurn()` | 推迟 241 ms 到定稿才 `create`，首块从 664 掉到 887，输给级联的 835 |
+| `willServeAudio()` 在流式 TTS 之前问 | 那一步会真开一个合成 task，而 omni 轮没文本可送，服务端拒空文本 → 整轮退化 |
+| `speech` 在 drain 之后才读 | 它是活 getter；被打断时当前值正好是「已播出去的部分」，审计与续话要的就是它 |

@@ -195,3 +195,30 @@ test('parseTrace：坏行要抛，不能当成"没有违规"', () => {
     /档案行不像事件|JSON/);
   assert.equal(parseTrace('\n\n{"t":1,"ev":"close"}\n').length, 1);
 });
+
+test('omni 该答却退回级联：lane.fallback 报红（用户会听到两副嗓子）', () => {
+  const rows = healthyTurn(0);
+  // 插在开轮之后、首块之前 —— 和真实档案里 `agent.lane` 的位置一致
+  rows.splice(4, 0, [at(0, 505), 'agent.lane', { lane_ok: false, text_ok: true, state: 'busy', has_resp: true }]);
+  const r = checkTrace(trace(rows));
+  assert.ok(r.violations.some((v) => v.rule === 'lane.fallback'), JSON.stringify(r.violations));
+});
+
+test('文本闸拒掉的轮次不算违约：它本来就不属于快车道', () => {
+  const rows = healthyTurn(0);
+  rows.splice(4, 0, [at(0, 505), 'agent.lane', { lane_ok: true, text_ok: false }]);
+  const r = checkTrace(trace(rows));
+  assert.deepEqual(r.violations.filter((v) => v.rule === 'lane.fallback'), []);
+});
+
+test('接管成功的轮次不报 lane.fallback', () => {
+  const rows = healthyTurn(0);
+  rows.splice(4, 0, [at(0, 505), 'agent.lane', { lane_ok: true, text_ok: true }]);
+  const r = checkTrace(trace(rows));
+  assert.deepEqual(r.violations.filter((v) => v.rule === 'lane.fallback'), []);
+});
+
+/** 健康轮里的相对时刻 */
+function at(base: number, offset: number): number {
+  return base + offset;
+}
