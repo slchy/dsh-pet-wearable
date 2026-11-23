@@ -55,12 +55,13 @@
 
 ## 三、硬编码常量（改要动代码）
 
-共 30 项。
+共 31 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
 | `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:41` | 无关首声（不在停嘴→出声路径上） | — |
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:50` | 无关首声（不在停嘴→出声路径上） | — |
+| `CLOCK_MISMATCH_MS` | 1e9 | —（判据） | `src/barge-voicing.ts:52` | 无（纯判据：只用来发现两把时钟接错，不放慢任何东西） | — |
 | `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:235` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
 | `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:364` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:69` | 无关首声（不在停嘴→出声路径上） | — |

@@ -16,7 +16,7 @@
  */
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
-import { voicedSinceLastSentence } from './barge-voicing.ts';
+import { voicingVerdict } from './barge-voicing.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
 import { performance } from 'node:perf_hooks';
@@ -468,6 +468,15 @@ class VoiceConnection {
   private readonly clock: Clock = new SystemClock();
   /** 最近一次 ASR 定稿的时刻（插话闸用，见 `barge-voicing.ts`） */
   private lastSentenceAtMs = Number.NEGATIVE_INFINITY;
+  /**
+   * 装配器与插话闸**共用**的时刻源。
+   *
+   * 写成同一个函数引用，就是为了让「两边各取一个时钟」这件事再也做不出来 ——
+   * 真机踩过：装配器 `Date.now()`、闸 `SystemClock.now()`，闸恒放行且无日志。
+   */
+  private readonly assemblerNow = (): number => this.clock.now();
+  /** 时钟接错只报一次，免得每句话刷一行 */
+  private clockMismatchLogged = false;
   /** 上行编码由能力集决定；档案与解码都要它 */
   private readonly uplinkCodec: 'msbc' | 'pcm16';
 
@@ -664,6 +673,10 @@ class VoiceConnection {
       // 静音一到就把判停跑掉，和 ASR 那 200 ms 静音窗并行 —— 出句时概率已经算好。
       // 门槛用能量门那个（同一路放大后的波形、同一套设备标定）。
       silenceDb: options.gate.thresholdDbfs,
+      // **必须与本类的 `clock` 同一把尺**：`lastVoicedAt` 要拿 `lastSentenceAtMs` 去比
+      // （见 `barge-voicing.ts`）。默认是 `Date.now()`（≈1.76e12），而 `SystemClock`
+      // 是进程启动后的单调毫秒（≈2e4）—— 接错的那一版闸恒放行且毫无日志。
+      now: this.assemblerNow,
       ...(options.gate.pauseDetectMs === undefined || options.gate.pauseDetectMs <= 0
         ? {}
         : { silencePauseMs: options.gate.pauseDetectMs }),
@@ -1234,10 +1247,7 @@ class VoiceConnection {
     // 判据不是语种、不是音量、也不是「距上次有声多久」，而是
     // **这一段定稿之后还有没有新的声音** —— 见 `barge-voicing.ts`（8 份档案 17 次
     // 插话逐条压过：3/3 幻觉拦下、13/13 真话放行）。
-    if (
-      this.dialog.core.fsm.state === 'speaking'
-      && !voicedSinceLastSentence(this.assembler.lastVoicedAtMs, this.lastSentenceAtMs)
-    ) {
+    if (this.dialog.core.fsm.state === 'speaking' && this.gatedByVoicing()) {
       console.log(`  … ${text}（这段已出过定稿、之后没有新声音 → 重复解码，不算插话）`);
       return;
     }
@@ -1253,6 +1263,25 @@ class VoiceConnection {
     }
   }
 
+  /**
+   * 这段转写是不是「同一截缓冲的重复解码」。
+   *
+   * 判据见 `barge-voicing.ts`。时钟接错时**报一次** —— 那一版闸会静默失效
+   * （`20261123-051448` 第 4 轮被 `Okay` 打断就是这么漏的），不报等于没有仪表。
+   */
+  private gatedByVoicing(): boolean {
+    const verdict = voicingVerdict(this.assembler.lastVoicedAtMs, this.lastSentenceAtMs);
+    if (verdict === 'clock-mismatch' && !this.clockMismatchLogged) {
+      this.clockMismatchLogged = true;
+      console.error(
+        '  ✗ 插话闸   两把时钟不同源'
+        + `（有声 ${this.assembler.lastVoicedAtMs} / 定稿 ${this.lastSentenceAtMs}）`
+        + ' → 闸失效，检查 UtteranceAssembler 的 now',
+      );
+    }
+    return verdict === 'silent';
+  }
+
   private onSentence(text: string, index: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
     this.archive?.event(EVENTS.asrSentence, { text, index });
@@ -1261,13 +1290,13 @@ class VoiceConnection {
     // 底下一条有声帧都没有；回放里它们每个都会开出一轮「答无可答」的轮次，
     // 直接把 omni 车道撞成 `lane.fallback`）。
     // 真人说「对。」必然带新的有声帧，所以这条不会误杀确认。
-    if (!voicedSinceLastSentence(this.assembler.lastVoicedAtMs, this.lastSentenceAtMs)) {
+    if (this.gatedByVoicing()) {
       console.log(`  句 ${index}  ↳ 定稿之后没有新声音 → 重复解码，丢弃`);
       return;
     }
     // 后面的 partial 拿它当「上一句」：这之后还有没有新的有声帧，决定那些 partial
     // 是真插话还是重复解码（见 `barge-voicing.ts`）
-    this.lastSentenceAtMs = this.clock.now();
+    this.lastSentenceAtMs = this.assemblerNow();
     const effects = this.dialog.dispatch({ type: 'sentence', text });
     // 打断有两处入口（中间结果 / 定稿），日志必须都打 —— 否则统计打断率会漏掉
     // 「短促插话只出定稿」那一半，真机上就是 4 次里少记 1 次。
