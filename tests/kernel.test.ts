@@ -175,3 +175,26 @@ test('step 是纯的：同一份输入调两次，结果相同且不改原状态
   assert.deepEqual(a, b);
   assert.equal(JSON.stringify(state), before, '不许原地改');
 });
+
+test('打断当场结算过的轮次，协程跑到尾巴再报时不能重算一遍', () => {
+  // `TurnRunner` 在打断那一刻就喂了 `ticketInvalidated`+`turnEnded` 拿到结算；
+  // 它自己那条 `async` 跑到尾巴还会再喂一次 `turnEnded`。此时播放区已经清空，
+  // 若拿空播放区重算，就会把"少听了一半"变成"听了 0 秒、也没少听"→ 该吞的答案被回注。
+  const events: KernelEvent[] = [
+    { type: 'turnStarted', ticket: ticket(1, 0, 0), atMs: 1000 },
+    { type: 'fsmPhase', phase: 'speaking' },
+    { type: 'audioSent', mediaMs: 4000, atMs: 1100 },
+    { type: 'userSpeech', commitSeq: 5, final: false, atMs: 2100 },
+    { type: 'ticketInvalidated', ticket: ticket(1, 0, 0) },
+    { type: 'turnEnded', ticket: ticket(1, 0, 0), atMs: 2600 },
+  ];
+  const { effects } = reduceKernel(initialKernelState(), events);
+  const settles = effects.filter((e) => e.type === 'settleTurn');
+  assert.equal(settles.length, 2, '一次来自打断当场，一次来自协程收尾（幂等重述）');
+  const first = settles[0];
+  const second = settles[1];
+  if (first?.type !== 'settleTurn' || second?.type !== 'settleTurn') return;
+  assert.deepEqual(second.outcome, first.outcome, '两次必须是同一份结算');
+  assert.equal(first.outcome.truncated, true, '4 s 的东西听了 1 s');
+  assert.equal(second.reflect, false, '少听了就不该回注');
+});

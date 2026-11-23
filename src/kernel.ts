@@ -38,6 +38,18 @@
  *    `truncated`（少听了，后验）归 `playback`。两者分属不同区域就不会再打架。
  * 3. **跨区只读快照**：判打断只比 `event.commitSeq > dialog.ticket.baseCommitSeq`，
  *    不回头去问 ASR「你是不是还在解」。
+ *
+ * ## 运行时边界（现状，别搞混）
+ *
+ * | 判定 | 现在归谁 |
+ * |:--|:--|
+ * | 能不能打断（旧段 vs 新话） | `causal.ts` 的纯函数 —— `voice-session` 与内核**调同一个** |
+ * | 这一轮听到多少、少听没少听、要不要回注 | **本文件**（`turn-runner` 只喂事实、只执行结算意图） |
+ * | 话筒主权相位（listening/thinking/speaking） | `DialogFsm`（它本身就是同步纯状态机） |
+ *
+ * 也就是说：泵（`turn-runner`）仍然 `await` TTS/模型，但**它不再自己算账**。
+ * 把 `DialogFsm` 的相位也搬进这里（让 `dialog` 区域成为唯一相位真相源）是下一步，
+ * 动的是 460 行 FSM 与全部调用点，得单独一次改动。
  */
 import { isPreTurnSegment, isStaleTicket } from './causal.ts';
 import { outcomeOf, type TurnOutcome } from './engine-contract.ts';
@@ -79,6 +91,18 @@ export interface LedgerRegion {
   readonly lastAnsweredAtMs: number | null;
   /** 最近一轮的结算（少听没少听在这里落定，回注记忆看它） */
   readonly lastOutcome: TurnOutcome | null;
+  /**
+   * 最近一次结算对应的轮次。
+   *
+   * 打断**当场**就结算了那一轮（用户听到多少是后验事实，清了播放区就没了），
+   * 所以那条协程跑到尾巴再发 `turnEnded` 时不能拿空播放区重算一遍 ——
+   * 那会把"少听了一半"重算成"听了 0 秒、也没少听"，于是该吞的答案被回注。
+   */
+  readonly lastSettled: {
+    readonly ticket: TurnTicket;
+    readonly outcome: TurnOutcome;
+    readonly reflect: boolean;
+  } | null;
 }
 
 /** 内核状态：四个正交区域的快照。**不含 socket / promise / timer** */
@@ -110,6 +134,13 @@ export type KernelEvent =
   | { readonly type: 'audioSent'; readonly mediaMs: number; readonly atMs: number }
   | { readonly type: 'devicePlayed'; readonly atMs: number }
   | { readonly type: 'turnEnded'; readonly ticket: TurnTicket; readonly atMs: number }
+  /**
+   * 这一轮**已经作废**（插话 / 断连 / 被新轮顶掉）。
+   *
+   * 由发现这件事的人发（目前是 `TurnRunner`：它拿票据跟 FSM 比）。内核自己不猜 ——
+   * 它只认事实事件，这也是"事件按发生顺序瞬时到达"这个假设被真正打破的地方。
+   */
+  | { readonly type: 'ticketInvalidated'; readonly ticket: TurnTicket }
   /** 一轮由谁答的（快/慢/omni），记账用 */
   | { readonly type: 'turnAnswered'; readonly lane: Lane }
   | { readonly type: 'closed' };
@@ -142,7 +173,7 @@ export function initialKernelState(gateSeq = 0): KernelState {
     input: { gateSeq, commitSeq: 0, awaitingDecode: false },
     dialog: { phase: 'listening', ticket: null },
     playback: { ticket: null, firstAudioAtMs: null, sentMediaMs: 0, playedAtMs: null },
-    ledger: { lastLane: null, lastAnsweredAtMs: null, lastOutcome: null },
+    ledger: { lastLane: null, lastAnsweredAtMs: null, lastOutcome: null, lastSettled: null },
   };
 }
 
@@ -250,16 +281,28 @@ export function step(state: KernelState, event: KernelEvent): [KernelState, Effe
         { type: 'invalidateTurn', ticket },
         { type: 'abortEngine', reason: 'barge_in' },
       ];
+      let ledger = state.ledger;
       // 被打断的这一刻就是这一轮该结算的时刻：**先结算再清区**，
       // 否则"用户听到多少"这条后验事实会随着播放区清零一起消失。
       if (state.playback.ticket !== null) {
-        effects.push(settle(state.playback, state.playback.ticket, event.atMs, true));
+        const effect = settle(state.playback, state.playback.ticket, event.atMs, true);
+        effects.push(effect);
+        ledger = {
+          ...ledger,
+          lastOutcome: effect.outcome,
+          lastSettled: {
+            ticket: effect.ticket,
+            outcome: effect.outcome,
+            reflect: effect.reflect,
+          },
+        };
       }
       return [
         {
           ...state,
           dialog: { ...state.dialog, phase: 'listening', ticket: null },
           playback: { ticket: null, firstAudioAtMs: null, sentMediaMs: 0, playedAtMs: null },
+          ledger,
         },
         effects,
       ];
@@ -267,18 +310,30 @@ export function step(state: KernelState, event: KernelEvent): [KernelState, Effe
 
     case 'turnStarted': {
       const effects: Effect[] = [];
+      let ledger = state.ledger;
       // 上一轮还挂着（被新轮顶掉）：用**它自己那份**播放记录结算，再开新的一轮。
       // 真机 `20261123-002440` 第 3 轮就是这样：19.44 s 音频正好播完、用户 26 ms 后开口，
       // 老轮 stale 但没少听 —— 该回注记忆。播放区若不按轮次归档，这条事实就丢了。
       const prev = state.playback;
       if (prev.ticket !== null && isStaleTicket(event.ticket, prev.ticket)) {
-        effects.push(settle(prev, prev.ticket, event.atMs, true));
+        const effect = settle(prev, prev.ticket, event.atMs, true);
+        effects.push(effect);
+        ledger = {
+          ...ledger,
+          lastOutcome: effect.outcome,
+          lastSettled: {
+            ticket: effect.ticket,
+            outcome: effect.outcome,
+            reflect: effect.reflect,
+          },
+        };
       }
       return [
         {
           ...state,
           dialog: { phase: 'thinking', ticket: event.ticket },
           playback: { ticket: event.ticket, firstAudioAtMs: null, sentMediaMs: 0, playedAtMs: null },
+          ledger,
         },
         effects,
       ];
@@ -316,7 +371,29 @@ export function step(state: KernelState, event: KernelEvent): [KernelState, Effe
         [],
       ];
 
+    case 'ticketInvalidated': {
+      // 只作废"就是这一轮"的票据；迟到的作废不能摘掉下一轮的（与 `cancelTurn` 同一条规矩）
+      const current = state.dialog.ticket;
+      if (current === null || isStaleTicket(current, event.ticket)) {
+        return [state, []];
+      }
+      return [{ ...state, dialog: { ...state.dialog, ticket: null } }, []];
+    }
+
     case 'turnEnded': {
+      // 已经结算过（打断那一刻就结了）：原样再声明一次，别拿空播放区重算
+      const settled = state.ledger.lastSettled;
+      if (settled !== null && !isStaleTicket(settled.ticket, event.ticket)) {
+        return [
+          state,
+          [{
+            type: 'settleTurn',
+            ticket: settled.ticket,
+            outcome: settled.outcome,
+            reflect: settled.reflect,
+          }],
+        ];
+      }
       const stale = isStaleTicket(state.dialog.ticket, event.ticket);
       // 播放记录属于哪一轮就结算哪一轮：迟到的 `turnEnded` 不能把新一轮的媒体算进来
       const playback = state.playback.ticket !== null
@@ -333,6 +410,11 @@ export function step(state: KernelState, event: KernelEvent): [KernelState, Effe
             ...state.ledger,
             lastAnsweredAtMs: event.atMs,
             lastOutcome: effect.outcome,
+            lastSettled: {
+              ticket: effect.ticket,
+              outcome: effect.outcome,
+              reflect: effect.reflect,
+            },
           },
         },
         [effect],

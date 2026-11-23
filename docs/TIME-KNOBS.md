@@ -84,8 +84,8 @@
 | `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:66` | 无关首声（不在停嘴→出声路径上） | — |
 | `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:182` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
-| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:39` | 设备播报期间（轮询，不加延迟） | — |
-| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:47` | 无关首声（不在停嘴→出声路径上） | — |
+| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:40` | 设备播报期间（轮询，不加延迟） | — |
+| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
 | `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:110` | ASR 出句之后（兜底，正常不触发） | — |
 | `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:123` | ASR 出句之前 | — |
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:132` | 无关首声（不在停嘴→出声路径上） | — |

@@ -15,6 +15,7 @@ import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
 import { outcomeOf } from './engine-contract.ts';
+import { initialKernelState, step, type Effect, type KernelEvent, type KernelState } from './kernel.ts';
 import { loopLagSnapshot } from './loop-lag.ts';
 import { diffNetCounters, netFields, readNetCounters } from './net-counters.ts';
 import { sampleSockets } from './socket-stats.ts';
@@ -138,6 +139,11 @@ export interface TurnResult {
 export class TurnRunner {
   private readonly options: TurnRunnerOptions;
   private readonly log: (line: string) => void;
+  /**
+   * 内核快照（四正交区域）。**它不带 I/O**，`await` 之间不会被别的协程改坏 ——
+   * 判定不再依赖"这条 `async` 函数跑到哪一行了"。
+   */
+  private kernel: KernelState = initialKernelState();
   /** 旁白与本轮回答共用一条下行音频，必须串行，否则两段 PCM 会交织在一起 */
   private speechChain: Promise<void> = Promise.resolve();
   /**
@@ -185,6 +191,20 @@ export class TurnRunner {
       return;
     }
     this.playedSeen = true;
+    // 内核也要知道（它记的是"设备回执到的时刻"，与媒体游标拼起来才是完整的播放事实）
+    this.feed({ type: 'devicePlayed', atMs: this.options.clock.now() });
+  }
+
+  /**
+   * 把一条事实喂给内核，拿回它声明的意图。
+   *
+   * **只允许在 `run()` 里喂与当前轮相关的事件**：`speakCanned` / `say` 那些旁白
+   * 不属于任何一轮（它们不推进话筒主权，也不进 `turn.end` 的账）。
+   */
+  private feed(event: KernelEvent): readonly Effect[] {
+    const [next, effects] = step(this.kernel, event);
+    this.kernel = next;
+    return effects;
   }
 
   /** 本轮是否已经收到设备的 `played` */
@@ -398,6 +418,9 @@ export class TurnRunner {
     if (!ticket) {
       return null;
     }
+    // 内核开轮：从这一刻起，"这一轮听到多少 / 该不该回注"由 `kernel.ts` 的纯函数裁决，
+    // 这里只负责把事实（发了多少媒体、什么时候发声、设备报没报播完）喂进去。
+    this.feed({ type: 'turnStarted', ticket, atMs: this.options.clock.now() });
     // 回执标志按**轮次**清零：挪到这里而不是等待环入口，是因为合成期间
     // （最后一批字节发出之前）到达的回执也得算数 —— 在入口清会把已经到的那次擦掉，
     // 之后设备不再发第二次，就只能等满上限。
@@ -488,6 +511,12 @@ export class TurnRunner {
           this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
         }
         audioBytes += chunk.length;
+        // 媒体游标：内核判"用户听到多少"只认它（不是墙钟）——`outcomeOf` 那张三把尺子的表
+        this.feed({
+          type: 'audioSent',
+          mediaMs: pcm16DurationMs(audioBytes, audioRate),
+          atMs: this.options.clock.now(),
+        });
         this.options.onDownlinkChunk?.(chunk);
         downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       };
@@ -722,22 +751,32 @@ export class TurnRunner {
         interrupted = fsm.isStale(ticket);
       }
 
-      // 用户听到的时长按**媒体时间**算 —— 见 `outcomeOf()` 上方那张「三把尺子」的表。
-      // **用户到底少听了没有**，和上面的 `interrupted` 是两件事，别合成一个变量：
+      // 用户听到多少、这一轮该不该记账 —— **判定交给内核**（`kernel.ts` 的纯函数）。
+      // 这里只做两件事：把"这一轮被顶掉了"这条事实告诉它，然后取它声明的结算意图。
       //
-      // - `interrupted` = 票据被作废（控制面）。它决定老轮还能不能动 FSM，
-      //   不能改判 —— 真机 2026-11-23 第 3 轮，19.44 s 音频**正好播完**、
-      //   用户 26 ms 后才开口，`heard_s` 因为 `Math.min` 封顶在 19.44，
-      //   按 `heard == audio` 判「没打断」的话，那一轮就会以为还能去收尾。
-      // - `truncated` = 内容面。只有它才该管记账与「要不要当成没听完」。
-      //
-      // 算法本身在 `engine-contract.ts`（纯函数，回放可对账）：四层契约④。
-      const outcome = outcomeOf({
+      // 为什么不再自己 `outcomeOf(...)`：`stale`（控制面，票据比对）与 `truncated`
+      // （内容面，媒体游标）以前在 `run()` 里各算一遍，一旦某处改了尺子就静默漂移。
+      // 现在两者都在内核里，且**分属不同正交区域**，播完瞬间被新轮顶掉也不会互相打架。
+      if (fsm.isStale(ticket)) {
+        this.feed({ type: 'ticketInvalidated', ticket });
+      }
+      const settleEffects = this.feed({
+        type: 'turnEnded',
+        ticket,
+        atMs: this.options.clock.now(),
+      });
+      const settlement = settleEffects.find(
+        (effect): effect is Extract<Effect, { type: 'settleTurn' }> =>
+          effect.type === 'settleTurn' && effect.ticket.no === ticket.no,
+      );
+      if (settlement === undefined) {
+        this.log('  内核    ✗ 没拿到这一轮的结算意图（状态对不上），按旧口径兜底');
+      }
+      const outcome = settlement?.outcome ?? outcomeOf({
         stale: interrupted,
         firstAudioAtMs,
         nowMs: this.options.clock.now(),
         totalAudioMs: audioBytes === 0 ? 0 : audioSeconds * 1000,
-        // 媒体游标：字节数 / 采样率。生成慢的轮次里它比墙钟小得多（见 `outcomeOf`）
         sentMediaMs: pcm16DurationMs(audioBytes, audioRate),
       });
       const heardSeconds = outcome.heardMs / 1000;
