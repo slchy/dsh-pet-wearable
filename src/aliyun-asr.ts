@@ -423,6 +423,9 @@ export class AliyunAsr {
     if (name === 'SentenceEnd') {
       const t = msg.payload?.result;
       const idx = msg.payload?.index ?? 0;
+      // **不传 `commitSeq`**：NLS 由服务端 VAD 判句，客户端根本没有「第几发 commit」
+      // 这个概念。留 `undefined` 是有意义的（见 `causal.ts`）：宿主一律判「不是旧段」，
+      // 宁可让一次插话通过，也不能凭空吞掉一轮回答。别在这里硬编一个序号。
       if (typeof t === 'string' && t.trim()) this.opts.onSentence(t.trim(), idx);
       return;
     }

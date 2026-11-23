@@ -13,6 +13,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 
 import { UtteranceAssembler, looksUnfinished, type UtteranceAssemblerOptions } from '../src/utterance-assembler.ts';
+import type { AudioFrame } from '../src/engine-contract.ts';
+import { UplinkPipeline } from '../src/uplink-pipeline.ts';
 
 interface Harness {
   assembler: UtteranceAssembler;
@@ -1307,4 +1309,164 @@ test('定稿判了 MORE → 再等一拍，仍不重问', async () => {
   assert.equal(utterances.length, 1, '等完照样收下，不能吞掉');
   assert.equal(facts.filter((f) => f.why === 'meaning').length, 1);
   assert.equal(asked.length, 1, '同一段文字只问一趟');
+});
+
+// ------------------------------------------------ 声学前端统一入口（AudioFrame）
+//
+// 能量门已经算过 `voiced`，组装器不该再按能量算一遍：同一段音频在门与判停两处
+// 得到两个「有没有人说话」，正是「有时候丢字、有时候灌静音」的来源。
+
+function frameAt(tsMs: number, voiced: boolean, pcm: Buffer = Buffer.alloc(640)): AudioFrame {
+  return { pcm, voiced, silenceMs: 0, gateSeq: 1, tsMs };
+}
+
+test('addFrame：`voiced` 与时刻都听前端的，全零 PCM 也算有声', () => {
+  const commits: number[] = [];
+  let clock = 1;                       // 故意和 frame.tsMs 差得很远：用错时钟一眼就露
+  const assembler = new UtteranceAssembler({
+    quietMs: 0,
+    extendMs: 30,
+    maxExtensions: 1,
+    fallbackWindowMs: 0,
+    threshold: 0.5,
+    recentMaxBytes: 16_000,
+    silenceDb: -40,                    // 全零 PCM = −120 dBFS，按能量算必然是静音
+    commitAfterMs: 40,
+    now: () => clock,
+    onCommit: (silenceMs) => { commits.push(silenceMs); },
+    onUtterance: () => {},
+    log: () => {},
+  });
+  try {
+    assembler.addFrame(frameAt(5_000, true));
+    assert.equal(assembler.lastVoicedAtMs, Number.NEGATIVE_INFINITY, '第一帧只计数（2 帧去抖）');
+    assembler.addFrame(frameAt(5_020, true));
+    assert.equal(assembler.lastVoicedAtMs, 5_020, '第二帧起推进，且用的是 frame.tsMs');
+
+    assembler.addFrame(frameAt(5_040, false));
+    assembler.addFrame(frameAt(5_060, false));
+    // 若在组装器里重算能量峰值，这两帧全零 PCM 会被判成「静音」，`lastVoicedAt`
+    // 一直是 −∞，一封都不会有。
+    assert.deepEqual(commits, [40], '静音时长按 frame.tsMs 累计（5060 − 5020）');
+    assert.equal(assembler.lastVoicedAtMs, 5_020, '静音帧不推进「最近有声」');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('addFrame 的四路触发与 addAudio 完全一致', async () => {
+  const run = async (kind: 'audio' | 'frame'): Promise<string[]> => {
+    const events: string[] = [];
+    let clock = 1_000;
+    const { assembler } = makeAssembler({
+      silenceDb: -40,
+      commitAfterMs: 40,
+      sttCommitAfterMs: 60,
+      speculateMs: 40,
+      silencePauseMs: 60,
+      now: () => clock,
+      predict: async () => { events.push('predict'); return 0.99; },
+      onCommit: (ms) => { events.push(`commit:${Math.round(ms)}`); },
+      onSttCommit: (ms) => { events.push(`stt:${Math.round(ms)}`); },
+      onPartial: (text) => { events.push(`partial:${text}`); return true; },
+      log: () => {},
+    });
+    try {
+      for (let i = 0; i < 6; i += 1) {
+        clock += 20;
+        const chunk = voiced();
+        if (kind === 'audio') assembler.addAudio(chunk);
+        else assembler.addFrame(frameAt(clock, true, chunk));
+      }
+      assembler.notePartial('你好');
+      for (let i = 0; i < 4; i += 1) {
+        clock += 20;
+        const chunk = silent(20);
+        if (kind === 'audio') assembler.addAudio(chunk);
+        else assembler.addFrame(frameAt(clock, false, chunk));
+      }
+      await delay(30);
+    } finally {
+      assembler.dispose();
+    }
+    return events;
+  };
+
+  const fromAudio = await run('audio');
+  const fromFrame = await run('frame');
+  assert.deepEqual(fromFrame, fromAudio, '两条入口必须给出同一串四路事件');
+  for (const expected of ['partial:你好', 'commit:40', 'stt:60', 'predict']) {
+    assert.ok(fromFrame.includes(expected), `缺了 ${expected}：${JSON.stringify(fromFrame)}`);
+  }
+});
+
+test('UplinkPipeline 把注入的时钟同时交给能量门与 AudioFrame.tsMs', () => {
+  let clock = 500_000;
+  const frames: AudioFrame[] = [];
+  const closes: Array<number | undefined> = [];
+  const pipeline = new UplinkPipeline({
+    ffmpegPath: 'ffmpeg',              // codec=pcm16 时不会真的 spawn
+    codec: 'pcm16',
+    sampleRate: 16_000,
+    gate: { thresholdDbfs: -40, holdMs: 2_000, prerollMs: 800 },
+    now: () => clock,
+    log: () => {},
+    onError: () => {},
+    onPcm: () => {},
+    onSpeechOpen: () => {},
+    onFrame: (frame) => { frames.push(frame); },
+    onSpeechClose: (gapMs) => { closes.push(gapMs); },
+  });
+  try {
+    pipeline.push(Buffer.alloc(640));          // 纯静音：门不开、不吐帧
+    assert.equal(frames.length, 0);
+
+    clock += 1_000;
+    pipeline.push(voiced());                   // 有声（约 −12 dBFS）：开门
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0]!.voiced, true);
+    assert.equal(frames[0]!.tsMs, clock, '帧时戳要来自注入的时钟，不是 Date.now()');
+
+    // 门开着再喂一块静音：保持窗口也得按同一把尺算。漏传 `now` 时门里是
+    // `Date.now()`、这里是假时钟，gap 会是天文数字 —— 第一块静音就把门关了。
+    clock += 20;
+    pipeline.push(Buffer.alloc(640));
+    assert.equal(closes.length, 0, '20 ms 静音不该关门');
+    assert.equal(frames.length, 2);
+    assert.equal(frames[1]!.silenceMs, 20, '静音时长按注入的时钟算');
+  } finally {
+    pipeline.end();
+  }
+});
+
+// ------------------------------------------------ 语义判停缓存的上限
+//
+// 两个 Map 都是「最近几句」的窗口，不是历史账本。`semanticSettled` 曾经只进不出：
+// 随会话无限长，`hasPrefixEnd` / `hasPrefixMore` 会把几小时前的前缀判定借给新句。
+
+test('语义判停缓存只留最近 8 条：陈旧的前缀判定不许复用到新句', async () => {
+  const asked: string[] = [];
+  const { assembler } = makeAssembler({
+    semanticEndpoint: async (text) => { asked.push(text); return 'end'; },
+  });
+
+  try {
+    assembler.addSentence('莱姆写的书');
+    await delay(10);
+    assert.equal(asked.length, 1);
+
+    for (const filler of ['第二句啊', '第三句啊', '第四句啊', '第五句啊', '第六句啊', '第七句啊', '第八句啊', '第九句啊']) {
+      assembler.addSentence(filler);
+      await delay(10);
+    }
+    assert.equal(asked.length, 9, '九段文字各问一趟');
+
+    // 只多一个字：没被淘汰的话 `hasPrefixEnd` 会直接复用第一句的 END，一趟都不问 ——
+    // 那正是把几分钟前的判定借给新句。
+    assembler.addSentence('莱姆写的书吗');
+    await delay(10);
+    assert.equal(asked.length, 10, '最老那条必须被淘汰，这里要重新问');
+  } finally {
+    assembler.dispose();
+  }
 });

@@ -7,7 +7,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { QwenRealtimeAsr, type RealtimeSocket } from '../src/qwen-realtime-asr.ts';
+import {
+  QwenRealtimeAsr,
+  qwenRealtimeStt,
+  type RealtimeSocket,
+} from '../src/qwen-realtime-asr.ts';
 
 interface Sent {
   type: string;
@@ -58,19 +62,26 @@ const asSocket = (s: FakeSocket): RealtimeSocket => s as unknown as RealtimeSock
 function make(options: { onSentence?: (t: string, i: number) => void } = {}) {
   const socket = new FakeSocket();
   const sentences: Array<{ text: string; index: number }> = [];
+  /** 每条定稿带出来的因果出生证（`undefined` = provider 不提供） */
+  const sentenceStamps: Array<number | undefined> = [];
   const partials: string[] = [];
+  const partialStamps: Array<number | undefined> = [];
   const errors: string[] = [];
   const asr = new QwenRealtimeAsr({
     apiKey: 'k',
-    onSentence: (text, index) => {
+    onSentence: (text, index, commitSeq) => {
       sentences.push({ text, index });
+      sentenceStamps.push(commitSeq);
       options.onSentence?.(text, index);
     },
-    onPartial: (t) => { partials.push(t); },
+    onPartial: (t, commitSeq) => {
+      partials.push(t);
+      partialStamps.push(commitSeq);
+    },
     onError: (e) => { errors.push(e.message); },
     socketFactory: () => asSocket(socket),
   });
-  return { asr, socket, sentences, partials, errors };
+  return { asr, socket, sentences, sentenceStamps, partials, partialStamps, errors };
 }
 
 /** 连上并等到就绪（服务端回 `session.updated`）。 */
@@ -423,4 +434,122 @@ test('断连时把窗口暂存一起清掉，别漏进下一句', async () => {
   asr.commit();
   assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before + 1,
     '只有新喂的这一帧');
+});
+
+// ------------------------------------------------------- commitSeq：因果出生证
+//
+// 这份账以前由宿主自己维护（`commit()` 一被调就 +1），三处会静默失步：
+// 跳过/延后时虚增、`hangup()` 时漏增、`flushHeld()` 之后先于定稿交付改了号。
+// 现在号源**只有一处**：真正写进 WebSocket 的那一刻。
+
+test('commitSeq 只在真发出 commit 时 +1 —— 跳过和延后都不占号', async () => {
+  const { asr, socket } = await ready();
+  assert.equal(asr.commitSeq(), 0, '从 0 起');
+
+  asr.commit(); // 空缓冲 → 闸掉
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    0,
+  );
+  assert.equal(asr.commitSeq(), 0, '跳过的那一发不许虚增');
+
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(asr.commitSeq(), 1);
+
+  asr.feed(Buffer.alloc(640), true); // 解码窗口里又开口 → 攒住
+  asr.commit(); // 撞在解码期 → 延后
+  assert.equal(asr.commitSeq(), 1, '延后的要等 flushHeld 真发出去才占号');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(asr.commitSeq(), 2, '定稿之后补发的延后 commit 才 +1');
+});
+
+test('hangup 真发出 commit 时要占号 —— 定稿带回来的就是这个号', async () => {
+  // 以前 `hangup()` 走的是同一条 `commit()`，但号记在宿主那边、只在组装器封段时 +1，
+  // 所以 gate.close 封出来的这一段拿不到出生证。
+  const { asr, socket, sentences, sentenceStamps } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.hangup(); // == gate.close
+  assert.equal(asr.commitSeq(), 1, 'hangup 走的也是 commit()，不能漏号');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '你好。' });
+  assert.deepEqual(sentences, [{ text: '你好。', index: 0 }]);
+  assert.deepEqual(sentenceStamps, [1], '这条定稿的出生证就是 hangup 那一发');
+});
+
+test('延后的 commit：定稿交付旧段序号，下一发在交付之后才占号', async () => {
+  // 关键顺序缺陷：`.completed` 里若先 `flushHeld()`，它会立刻补发延后的下一发、
+  // 把 `awaitingDecode` 置回 true、把号改写 —— 那条定稿于是戴着下一段的出生证。
+  const socket = new FakeSocket();
+  let asr: QwenRealtimeAsr;
+  /** 交付定稿那一刻的三个事实：出生证 / 已发出的号 / 已发出的 commit 条数 */
+  const atSentence: Array<{ stamp: number | undefined; seq: number; commits: number }> = [];
+  asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    onSentence: (_text, _index, commitSeq) => {
+      atSentence.push({
+        stamp: commitSeq,
+        seq: asr.commitSeq(),
+        commits: socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+      });
+    },
+    socketFactory: () => asSocket(socket),
+  });
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  socket.message({ type: 'session.updated', session: {} });
+
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit(); // 1 号，开始解码
+  asr.feed(Buffer.alloc(640), true); // 窗口里真说了话
+  asr.commit(); // 只能延后
+  assert.equal(asr.commitSeq(), 1);
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1);
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '第一段。' });
+  assert.deepEqual(
+    atSentence,
+    [{ stamp: 1, seq: 1, commits: 1 }],
+    '交付旧段时还是 1 号，延后的下一发还没发出',
+  );
+  assert.equal(asr.commitSeq(), 2, '下一发在交付之后才占号');
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('onPartial 的出生证：解码期属于当前那一发，空闲新开口属于下一发', async () => {
+  const { asr, socket, partialStamps } = await ready();
+  assert.equal(asr.commitSeq(), 0);
+
+  // 还没封过段：用户新开口的增量属于**下一发**（1 号）
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', text: '', stash: '嗯' });
+  assert.deepEqual(partialStamps, [1]);
+
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', text: '', stash: '嗯，见' });
+  assert.deepEqual(partialStamps, [1, 1], '解码期间属于正在解的那一发');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯，见面了。' });
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', text: '', stash: '下' });
+  assert.deepEqual(partialStamps, [1, 1, 2], '解码结束后属于下一发 commit');
+});
+
+test('qwenRealtimeStt 把 commitSeq 透传给宿主（这是唯一的号源）', async () => {
+  // 漏透传不会报错，只会让宿主退回自己数 —— 表现就是旧段判错、自己打断自己。
+  const socket = new FakeSocket();
+  const stt = qwenRealtimeStt({ apiKey: 'k', socketFactory: () => asSocket(socket) });
+  const session = stt.open({ onSentence: () => {} });
+  assert.equal(typeof session.commitSeq, 'function', '可选能力必须真的接上');
+
+  session.feed(Buffer.alloc(640), true); // 懒连接：有音频才建
+  socket.open();
+  await new Promise((r) => { setImmediate(r); });
+  socket.message({ type: 'session.updated', session: {} });
+
+  assert.equal(session.commitSeq?.(), 0);
+  session.commit?.();
+  assert.equal(session.commitSeq?.(), 1);
+  assert.equal(session.commit?.(), undefined, 'commit 仍然不返回值（老调用点不受影响）');
 });

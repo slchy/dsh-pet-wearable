@@ -67,10 +67,21 @@ export interface QwenRealtimeAsrOptions {
   readonly turnDetection?: 'manual' | 'vad';
   /** `vad` 模式下的静音窗（服务端下限 200，填更小不生效 —— 见探针） */
   readonly vadSilenceMs?: number;
-  /** 一句封段后的定稿 */
-  onSentence: (text: string, index: number) => void;
-  /** 段内增量（`.text` 的 `stash`），会反复改写，不能拼 */
-  onPartial?: (text: string) => void;
+  /**
+   * 一句封段后的定稿。
+   *
+   * @param commitSeq 产出这句的那一发 commit 的**因果出生证**（见 `causal.ts`）。
+   *   宿主判「这段是不是开轮之前录的」只认它 —— 比到达时刻干净。
+   */
+  onSentence: (text: string, index: number, commitSeq?: number) => void;
+  /**
+   * 段内增量（`.text` 的 `stash`），会反复改写，不能拼。
+   *
+   * @param commitSeq 这段增量属于哪一发：解码窗口内是**正在解的那一发**
+   *   （`decodingCommitSeq`，可能是旧段）；空闲时是用户新开口、尚未封段，
+   *   其出生证是下一发（`commitSeq() + 1`）。
+   */
+  onPartial?: (text: string, commitSeq?: number) => void;
   onError?: (e: Error) => void;
   log?: (line: string) => void;
   /** 测试注入 */
@@ -166,6 +177,25 @@ export class QwenRealtimeAsr {
    */
   private decodeWaiters: Array<() => void> = [];
   private seq = 0;
+  /**
+   * 已**真正发出去**的 commit 序号（从 0 起，单调）。
+   *
+   * 只在一处 `+1`：{@link commit} 里 `input_audio_buffer.commit` 真的写进
+   * WebSocket 那一刻。跳过（`!dirty`）、延后（`commitDeferred`）、以及
+   * 「还没就绪先记着」都不占号 —— 宿主以前自己数，跳过时虚增、`hangup()`
+   * 时漏增，转写戴的出生证就指错了段（`causal.ts` 里那条水位线全靠它）。
+   *
+   * 断线重连**不清零**：清零会让新会话的 1 号与旧水印撞车，旧段被判成
+   * 「不是旧段」，反而更容易自己打断自己。
+   */
+  private _commitSeq = 0;
+  /**
+   * 当前正在解码的那一发 commit 的序号。
+   *
+   * 只在真发出 commit 的那一刻改写。定稿（`.completed`）必须**先**把它取走
+   * 再去 `flushHeld()` —— 那个调用可能立刻补发延后的下一发，把这里改成新号。
+   */
+  private decodingCommitSeq = 0;
   /** 还有几条 `commit` 的结果要扔掉（打断用，`clear` 不存在） */
   private discardLeft = 0;
   /** 还没就绪就到了 commit：等 `session.updated` 补发一次 */
@@ -416,6 +446,10 @@ export class QwenRealtimeAsr {
       return;
     }
     this.sendRaw({ type: 'input_audio_buffer.commit' });
+    // **真正发出去了**才占号。这是全文件唯一的 +1 点：跳过、延后、
+    // 「未就绪先记着」都走不到这里，`hangup()` 也复用本方法，所以不会漏。
+    this._commitSeq += 1;
+    this.decodingCommitSeq = this._commitSeq;
     this.dirty = false;
     // 这段人声已经交出去了：之后灌进来的尾静音不再算「新的一段」
     this.pendingVoice = false;
@@ -432,6 +466,15 @@ export class QwenRealtimeAsr {
   /** 手上还有一段没解完吗（见 `SttSession.decoding`）。 */
   decoding(): boolean {
     return this.awaitingDecode;
+  }
+
+  /**
+   * 已经**真正发出去**的 commit 序号（见 `SttSession.commitSeq`）。
+   *
+   * 与转写事件里带出来的 `commitSeq` 同源 —— 宿主判「旧段」不该再自己数一份。
+   */
+  commitSeq(): number {
+    return this._commitSeq;
   }
 
   /**
@@ -510,25 +553,39 @@ export class QwenRealtimeAsr {
     if (ev.type === 'conversation.item.input_audio_transcription.text') {
       // 增量在 stash（`text` 恒为空串），见文件头
       const t = ev.stash ?? ev.text;
-      if (typeof t === 'string' && t) this.opts.onPartial?.(t);
+      if (typeof t === 'string' && t) {
+        // 出生证：正在解码 → 属于**正在解的那一发**（可能是旧段）；
+        // 空闲 → 用户新开口还没封段，属于**下一发**。
+        // 取 `+1` 是安全的：开轮时锁存的水位线 `baseCommitSeq <= _commitSeq`，
+        // 而这里严格大于它，所以不会把真插话误判成旧段。
+        const stamp = this.awaitingDecode ? this.decodingCommitSeq : this._commitSeq + 1;
+        this.opts.onPartial?.(t, stamp);
+      }
       return;
     }
     if (ev.type === 'conversation.item.input_audio_transcription.completed') {
+      // **顺序全部是有意的**，三处挨着改会静默出错：
+      //
+      // 1. 出生证先取走。`flushHeld()` 若补发延后的 commit，会立刻把
+      //    `decodingCommitSeq` 改写成**下一段**的号 —— 那之后再取就指错了。
+      const completedSeq = this.decodingCommitSeq;
       this.awaitingDecode = false;
-      // 解码结束 —— 窗口期攒下的音频现在推上去，才算下一段的开始
-      this.flushHeld();
       const t = (ev.transcript ?? '').trim();
       const index = this.seq;
       this.seq += 1;
-      // **在 `onSentence` 之后**才真正唤醒（微任务），顺序不能挪到前面：
-      // 等的人要以「新定稿已经进过组装器」为前提决定要不要抢跑。
-      this.resolveDecode();
+      // 2. 交付定稿时 `awaitingDecode` 已经是 false、序号也还没被下一发改写。
       if (this.discardLeft > 0) {
         this.discardLeft -= 1;
         this.log(`[asr] 丢弃第 ${index} 段（迟到 ${t.length} 字）`);
-        return;
+      } else if (t !== '') {
+        this.opts.onSentence(t, index, completedSeq);
       }
-      if (t !== '') this.opts.onSentence(t, index);
+      // 3. 解码结束 —— 窗口期攒下的音频现在推上去，才算下一段的开始。
+      //    它可能立刻补发延后的 commit（`_commitSeq + 1`、`awaitingDecode = true`）。
+      this.flushHeld();
+      // 4. **在定稿之后**才真正唤醒（微任务），顺序不能挪到前面：
+      //    等的人要以「新定稿已经进过组装器」为前提决定要不要抢跑。
+      this.resolveDecode();
       return;
     }
     if (ev.type === 'error') {
@@ -562,6 +619,7 @@ export function qwenRealtimeStt(
         hangup: () => { asr.hangup(); },
         close: () => { asr.close(); },
         commit: () => { asr.commit(); },
+        commitSeq: () => asr.commitSeq(),
         discard: () => { asr.discard(); },
         decoding: () => asr.decoding(),
         whenDecoded: () => asr.whenDecoded(),

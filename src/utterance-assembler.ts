@@ -35,7 +35,9 @@
  *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
+import type { AudioFrame } from './engine-contract.ts';
 import { pcm16DurationMs, pcm16PeakDbfs, pcm16TrimTrailingSilence } from './pcm.ts';
+import { SilenceTriggers } from './silence-triggers.ts';
 
 export interface UtteranceAssemblerOptions {
   /** 句子结束后先静候这么久再判定 */
@@ -135,7 +137,11 @@ export interface UtteranceAssemblerOptions {
    */
   readonly shortFragmentWaitMs?: number;
   /**
-   * 本地静音判据：上行峰值低于这个 dBFS 就算「没在说话」。不设就不启用预判停。
+   * 本地静音判据：上行峰值低于这个 dBFS 就算「没在说话」。
+   *
+   * 只有旧入口 {@link addAudio} 用它自算 `voiced`（不设 = 那条路不启用静音跟踪）；
+   * 走 {@link addFrame} 时 `voiced` 由能量门给，不读这个值。裁快照尾巴的门限也由它
+   * 推出（见 {@link silenceFloorOffsetDb}）。
    *
    * 传**能量门那个门槛**（同一路放大后的波形、同一套设备标定），别另设一个。
    */
@@ -145,7 +151,7 @@ export interface UtteranceAssemblerOptions {
    *
    * 动机：ASR 要靠 200 ms 静音才发 `SentenceEnd`，而那 200 ms 里音频已经全在手里了 ——
    * 判停器完全可以这时候就跑。等 `SentenceEnd` 到了，概率早算好了，`出句→开轮`
-   * 那 118 ms 直接归零。见 {@link UtteranceAssembler.addAudio}。
+   * 那 118 ms 直接归零。见 `silence-triggers.ts` 的 `maybePrefirePrediction`。
    */
   readonly silencePauseMs?: number;
   /**
@@ -192,8 +198,8 @@ export interface UtteranceAssemblerOptions {
    *
    * `silenceMs` = **距最后一个有声帧多久**。它一定 ≥ `commitAfterMs`，多出来的那截
    * 是「静音开始到真有音频帧到达」的等待 —— 所有按静音计时的动作（封段 / 投机 /
-   * 判停预跑）都跑在 `trackSilence` 里，而它只在 `addAudio` 时调，所以这段等待
-   * 直接变成每一轮的固定开销。落档才知道它有多大（`asr.commit`）。
+   * 判停预跑）都跑在 `silence-triggers.ts` 的 `noteFrame` 里，而它只在喂音频时调，
+   * 所以这段等待直接变成每一轮的固定开销。落档才知道它有多大（`asr.commit`）。
    */
   readonly onCommit?: (silenceMs: number) => void;
   /** 静音到 {@link sttCommitAfterMs} 时调一次，宿主拿去 `stt.commit()`（见该字段） */
@@ -365,6 +371,15 @@ const SEMANTIC_SKIP_P = 0.80;
  */
 
 /**
+ * 语义判停两个缓存各留多少条。
+ *
+ * 它们是「最近几句」的窗口，不是历史账本：中间结果会连续改写，几小时前的判定
+ * 既不会被同一个前缀命中，还会把旧结论借给新句（`semanticSettled` 曾经只进不出，
+ * 随会话无限长，前缀匹配甚至可能跨到上一次连接）。
+ */
+const SEMANTIC_CACHE_LIMIT = 8;
+
+/**
  * 「定稿只是中间结果的收尾」允许差几个字。
  *
  * 中间结果的最后一版和定稿通常差一两个标点/收尾字（`…《基础之森` → `…《基础之森》吗？`）。
@@ -408,9 +423,10 @@ export class UtteranceAssembler {
     readonly seq: number;
     readonly startedAt: number;
     /**
-     * 这一份是「静音一到就提前跑」的（见 `trackSilence`），不是给已经定稿的句子算的。
+     * 这一份是「静音一到就提前跑」的（见 `silence-triggers.ts` 的
+     * `maybePrefirePrediction`），不是给已经定稿的句子算的。
      *
-     * 预跑的**新鲜度**由音频保证：之后只要又来声音，`trackSilence` 就把这份清掉。
+     * 预跑的**新鲜度**由音频保证：之后只要又来声音，`noteFrame` 就把这份清掉。
      * 所以它不受 `startedAt >= lastPartialAt` 那条约束 —— ASR 的中间结果本来就比
      * 真实停嘴晚（实测晚 98–140 ms），拿它当「用户还在说」的证据会把预跑全废掉。
      */
@@ -436,7 +452,13 @@ export class UtteranceAssembler {
    * 中间结果会连续改写，不是历史账本。
    */
   private readonly semanticAsks = new Map<string, Promise<'end' | 'more' | null>>();
-  /** 已经回来的判定（同步可读，见 hasPrefixMore） */
+  /**
+   * 已经回来的判定（同步可读，见 hasPrefixMore）。
+   *
+   * 与 {@link semanticAsks} **同生共死**、同样只留最近 {@link SEMANTIC_CACHE_LIMIT} 条
+   * （见 `evictSemanticCache`）：它曾经只进不出，随会话无限长，于是几分钟前那句的
+   * 前缀判定会被借给新句。`dispose()` 会清空。
+   */
   private readonly semanticSettled = new Map<string, 'end' | 'more' | null>();
   /** 已经因为语义判停延长过的那段文字（同一段只延长一次） */
   private semanticExtended = '';
@@ -458,15 +480,13 @@ export class UtteranceAssembler {
   private lastPartialAt = Number.NEGATIVE_INFINITY;
   /** 最近一次 ASR 中间结果的文本（原始，不含已定稿部分）—— 静音那一刻拿它投机 */
   private lastPartialText = '';
-  /** 最近一次「上行有声音」的时刻（本地静音检测，见 `silenceDb`） */
-  private lastVoicedAt = Number.NEGATIVE_INFINITY;
   /**
-   * 连续有声帧计数（去抖，见 `trackSilence`）。
+   * 静音驱动的四路提前触发（封段 / ASR 封段 / 投机 / 判停预跑）。
    *
-   * 单帧不算数：这段录音里 20 ms 的「有声」有 14 处，多是塞音闭塞段或门限抖动。
-   * 从第二帧起才更新 `lastVoicedAt`，之后每帧都推进 —— 它仍然等于真实停嘴时刻。
+   * 连同「有没有人说话、静音多久」一起搬去了 `silence-triggers.ts`：那四路各有
+   * 各的期限与前提，留在这里只会和文本判停糊成一团。本类通过它读 `lastVoicedAt`。
    */
-  private voicedRun = 0;
+  private readonly silence: SilenceTriggers;
   /**
    * 最近一次「上行有声音」的时刻（毫秒，和 `clock` 同一把尺）。
    *
@@ -475,25 +495,9 @@ export class UtteranceAssembler {
    * 见 `barge-voicing.ts`。
    */
   get lastVoicedAtMs(): number {
-    return this.lastVoicedAt;
+    return this.silence.lastVoicedAtMs;
   }
 
-  /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
-  private preFiredAt = Number.NEGATIVE_INFINITY;
-  /**
-   * 这一段语音是否已经请求过**车道起跑**（omni 的 `seal`，每段只一次）。
-   *
-   * 「一段」的边界是 `lastVoicedAt`：又来声音就自然重新武装（比较的是时刻，
-   * 不是布尔），静音期内反复进 `trackSilence` 只封一次。
-   */
-  private sealFiredAt = Number.NEGATIVE_INFINITY;
-  /** 这一段语音是否已经请 ASR 封段解码（和 `sealFiredAt` 分开，见 `sttCommitAfterMs`） */
-  private sttCommitFiredAt = Number.NEGATIVE_INFINITY;
-  /** 上一次问过、但接收方没发出去的那一版（同一版不重复问，免得每个静音帧刷一次） */
-  private specTriedText = '';
-  /** 上一次投机的时刻 / 这一句已经投机几次（`addSentence` 归零） */
-  private specFiredAt = Number.NEGATIVE_INFINITY;
-  private specCount = 0;
   /** 上一次判停用的快照字节数（判「再等一拍有没有意义」，见 `prediction.bytes`） */
   private lastSnapshotBytes = -1;
   /** 上一次判停决定的时刻 */
@@ -503,18 +507,57 @@ export class UtteranceAssembler {
   constructor(options: UtteranceAssemblerOptions) {
     this.options = options;
     this.now = options.now ?? Date.now;
+    // 触发器只读事实、只喊「到点了」：文本与判停状态机仍在这一层 ——
+    // 拆出去的那一半不认识 `pendingText` 是怎么攒起来的，也不认识 `seq`。
+    this.silence = new SilenceTriggers(options, {
+      pendingText: () => this.pendingText,
+      lastUtteranceAt: () => this.lastUtteranceAt,
+      lastPartialAt: () => this.lastPartialAt,
+      lastPartialText: () => this.lastPartialText,
+      hasPredictor: () => this.options.predict !== undefined,
+      predictionPending: () => this.prediction !== null,
+      startUpcomingPrediction: () => { this.startPrediction(this.seq + 1, true); },
+      dropPrediction: () => { this.prediction = null; },
+    });
   }
 
   get pending(): string {
     return this.pendingText;
   }
 
-  /** 每块上行 PCM 都要喂进来，判停器需要「最近的音频」而不只是文本。 */
+  /**
+   * 每块上行 PCM 都要喂进来，判停器需要「最近的音频」而不只是文本。
+   *
+   * 旧入口：`voiced` 由这里按 `silenceDb` 自算。生产链路已经能拿到声学前端的
+   * `AudioFrame` 时应当用 {@link addFrame} —— 那里 `voiced` 是**能量门**算的，
+   * 两处各算一遍正是「有时候丢字、有时候灌静音」的来源。
+   */
   addAudio(chunk: Buffer): void {
     this.recentChunks.push(Buffer.from(chunk));
     this.recentBytes += chunk.length;
     this.trimRecent();
-    this.trackSilence(chunk);
+    const floor = this.options.silenceDb;
+    if (floor === undefined) {
+      return;
+    }
+    this.silence.noteFrame(pcm16PeakDbfs(chunk) > floor, this.now());
+  }
+
+  /**
+   * 喂一帧声学前端的输出（见 `engine-contract.ts` 契约①）。
+   *
+   * 与 {@link addAudio} 的区别只有一处：`voiced` 与 `tsMs` 都是**前端给的**，
+   * 所以这里**绝不调用 `pcm16PeakDbfs`**，也不读 `this.now()` —— 门与判停
+   * 用同一份 `voiced`、同一个时钟，四个静音阈值才对得上同一段音频。
+   *
+   * ⚠️ 宿主的 `now` 必须和产出 `frame.tsMs` 的时钟是**同一把尺**：本类会在
+   * `evaluate` 里拿 `this.now()` 减 `lastVoicedAt` 算静音（见 `barge-voicing.ts`）。
+   */
+  addFrame(frame: AudioFrame): void {
+    this.recentChunks.push(Buffer.from(frame.pcm));
+    this.recentBytes += frame.pcm.length;
+    this.trimRecent();
+    this.silence.noteFrame(frame.voiced, frame.tsMs);
   }
 
   /**
@@ -564,20 +607,6 @@ export class UtteranceAssembler {
   }
 
   /**
-   * 现在的快照会有多少字节**（不真的拼出来）。
-   *
-   * 只用来判「和上次判定相比输入变了没有」—— 静音期间裁掉尾巴之后长度不变，
-   * 说明这一段音频一个字都没多，重算必然得到同一个 p。
-   */
-  private snapshotBytes(): number {
-    const pcm = Buffer.concat(this.recentChunks);
-    const floor = this.options.silenceDb === undefined
-      ? undefined
-      : this.options.silenceDb - (this.options.silenceFloorOffsetDb ?? 20);
-    return pcm16TrimTrailingSilence(pcm, floor, this.options.trailingTrimMs ?? 0).length;
-  }
-
-  /**
    * 这次决定用哪个阈值。
    *
    * 中文单独一档：官方 benchmark 上中文是最差的一档（85.8%，漏报 9.26% / 误报
@@ -591,197 +620,11 @@ export class UtteranceAssembler {
   }
 
   /**
-   * 本地静音检测 → 把判停**提前**跑掉。
-   *
-   * ASR 要等 200 ms 静音才发 `SentenceEnd`，但判停器看的是音频 —— 那 200 ms 里
-   * 音频早就够了。所以「有声之后静下来 `silencePauseMs`」就先跑一次，
-   * `SentenceEnd` 到达时直接取用（`takeProbability` 的缓存）。
-   *
-   * 两条防呆：
-   * - 又来声音就把这份预跑作废（音频变了，那份快照里没有后半句）；
-   * - 一段语音只预跑一次，长时间静音不会反复烧判停器。
-   */
-  private trackSilence(chunk: Buffer): void {
-    const floor = this.options.silenceDb;
-    if (floor === undefined) {
-      return;
-    }
-    const t = this.now();
-    if (pcm16PeakDbfs(chunk) > floor) {
-      // **去抖**：这段录音里 20 ms 的「有声」帧有 14 处，很多是塞音的闭塞段
-      // 或门限抖动，不是真的重新开口。单帧就把 `lastVoicedAt` 推平会让
-      // 「截至此刻的静音」被反复归零（开轮条件永远不成立），预跑也被无谓作废。
-      // 所以第一帧只计数，从**第二帧**起才更新 —— 之后每帧都推进，`lastVoicedAt`
-      // 仍然等于「真实停嘴」那一刻（不能停在首帧，否则一句话说两秒就被算成两秒静音）。
-      this.voicedRun += 1;
-      if (this.voicedRun < 2) {
-        return;
-      }
-      this.lastVoicedAt = t;
-      // 音频比快照长了：预跑的那份判停不再代表「用户说完没有」
-      this.prediction = null;
-      return;
-    }
-    this.voicedRun = 0;
-    // 两条线拆开跑，阈值不同：
-    //   投机 100 ms —— 拿中间结果先问出去，等久了纯属白等
-    //   判停 200 ms —— 判停器看的是音频，跟 ASR 的静音窗对齐
-    this.maybeSpeculate(t);
-    this.maybePrefirePrediction(t);
-    this.maybeCommit(t);
-    this.maybeSttCommit(t);
-  }
-
-  /** 两条封段闸共用的前提：这一段说过话、且还没为它动过手 */
-  private canCommit(t: number, after: number | undefined, firedAt: number): boolean {
-    if (after === undefined || after <= 0) {
-      return false;
-    }
-    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
-      return false;
-    }
-    if (this.lastVoicedAt <= firedAt) {
-      return false;
-    }
-    return t - this.lastVoicedAt >= after;
-  }
-
-  /**
-   * 静音满 `commitAfterMs` 就让**车道起跑**（omni 的 `seal`）。
-   *
-   * 为什么不等判停：判停要 200 ms 静音才有把握，而封段只要「这句停下来了」——
-   * 封早了顶多多一段碎片（并段逻辑照拼），封晚了整段延迟都是白等。
-   *
-   * 一段语音只封一次（`sealFiredAt`），长时间静音不会反复 commit。
-   */
-  private maybeCommit(t: number): void {
-    if (this.options.onCommit === undefined) {
-      return;
-    }
-    if (!this.canCommit(t, this.options.commitAfterMs, this.sealFiredAt)) {
-      return;
-    }
-    this.sealFiredAt = t;
-    // `after` 是**配置值**，实际静音是 `t - lastVoicedAt` —— 两者之差就是「静音开始
-    // 到真有音频帧到达」的等待。日志和档案都要记实际值，否则永远看不见那截开销。
-    const silenceMs = t - this.lastVoicedAt;
-    this.options.log(
-      `  封段    静音 ${this.options.commitAfterMs} ms（实际 ${silenceMs.toFixed(0)} ms）→ 车道起跑`,
-    );
-    this.options.onCommit(silenceMs);
-  }
-
-  /**
-   * 静音满 `sttCommitAfterMs` 才请 ASR 封段解码（见 {@link UtteranceAssemblerOptions.sttCommitAfterMs}）。
-   *
-   * 为什么要晚于车道起跑：ASR 一收到 `commit` 就把这一段切走，切在 20 ms 静音上
-   * 等于把「换气」当句尾。真机 `20261123-053719` 两轮都断在书名中间，第二个碎片
-   * 被解成德语。判停本来要等 200–300 ms，所以晚到 150 ms **不花延迟**。
-   */
-  private maybeSttCommit(t: number): void {
-    if (this.options.onSttCommit === undefined) {
-      return;
-    }
-    if (!this.canCommit(t, this.options.sttCommitAfterMs, this.sttCommitFiredAt)) {
-      return;
-    }
-    this.sttCommitFiredAt = t;
-    const silenceMs = t - this.lastVoicedAt;
-    this.options.log(
-      `  封段    ASR 静音 ${this.options.sttCommitAfterMs} ms`
-        + `（实际 ${silenceMs.toFixed(0)} ms）→ 开始解码`,
-    );
-    this.options.onSttCommit(silenceMs);
-  }
-
-  /**
-   * 静音满 `speculateMs` 就把手上这版中间结果先问出去（投机）。
-   *
-   * 和判停预跑分开是因为**两者的等待理由完全不同**：判停要等够音频才敢判「说完了」，
-   * 投机只是猜，猜早了作废就是，猜晚了一无所得。
-   *
-   * 防呆（每一条都对应一次真机踩坑）：
-   * - **这一版 partial 必须属于本段语音**（`lastPartialAt > lastUtteranceAt`）。
-   *   `lastPartialText` 不会跟着语音结束自动清空，上一段最后那版「嗯」能一直留到
-   *   下一段开口 —— 拿它去投机就是拿别人那句话猜这一句。
-   * - **接收方说发出去了才算一次**（`onPartial` 的返回值）。门槛（`specMinChars`、
-   *   候选判据）都在接收方，这边记账早一步就会把机会记成「已用」。
-   * - 发出去了就不再问（`lastVoicedAt <= specFiredAt`）：静音之后 ASR 还会补一两版
-   *   partial，让它们重投机等于把已经跑掉的时间作废重来（实测认领时只跑了 6 ms）。
-   * - 一句最多 2 次（`specCount`，`addSentence` 归零）—— 覆盖「说-停-说」的多段。
-   */
-  private maybeSpeculate(t: number): void {
-    if (this.options.onPartial === undefined) {
-      return;
-    }
-    const pause = this.options.speculateMs ?? 100;
-    if (pause <= 0) {
-      return;
-    }
-    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
-      return;
-    }
-    if (t - this.lastVoicedAt < pause) {
-      return;
-    }
-    // 这段语音已经投机过了：后来补的 partial 不再顶掉在跑的那一趟
-    if (this.lastVoicedAt <= this.specFiredAt) {
-      return;
-    }
-    if (this.specCount >= 2) {
-      return;
-    }
-    // 本段语音还没吐过字：`lastPartialText` 是上一段的残留，不能用
-    if (this.lastPartialAt <= this.lastUtteranceAt) {
-      return;
-    }
-    const latest = this.lastPartialText;
-    if (latest === '') {
-      return;
-    }
-    const text = this.pendingText + latest;
-    // 同一版 partial 问过一次就够了：静音帧是每 20 ms 一个，不去重会刷成一片
-    if (text === this.specTriedText) {
-      return;
-    }
-    if (!this.options.onPartial(text)) {
-      this.specTriedText = text;
-      return;
-    }
-    this.specTriedText = '';
-    this.specFiredAt = t;
-    this.specCount += 1;
-    this.options.log(
-      `  投机    静音 ${pause} ms → 交出中间结果（第 ${this.specCount}/2 次，判停还等 `
-        + `${this.options.silencePauseMs ?? 200} ms）`,
-    );
-  }
-
-  /** 静音满 `silencePauseMs` 就先把判停算掉，定稿时直接取用。 */
-  private maybePrefirePrediction(t: number): void {
-    if (this.options.predict === undefined || this.prediction !== null) {
-      return;
-    }
-    const pause = this.options.silencePauseMs ?? 200;
-    // 只在「这一轮说过话、且还没为这段语音预跑过」时动手
-    if (this.lastVoicedAt <= this.preFiredAt || this.lastVoicedAt <= this.lastUtteranceAt) {
-      return;
-    }
-    if (t - this.lastVoicedAt < pause) {
-      return;
-    }
-    this.preFiredAt = t;
-    this.options.log(`  判停    静音 ${pause} ms → 先跑一遍（不等 ASR 定稿）`);
-    // 下一句定稿时会拿到 `seq + 1`，见 `addSentence`
-    this.startPrediction(this.seq + 1, true);
-  }
-
-  /**
    * ASR 中间结果到了 —— 用户还在说话。
    *
    * 这**不是**用来拼文本的（中间结果会反复改写，拼起来是乱的）。它有两个用途：
    * 「还在出字」的信号（打断播放），以及给快车道**投机**攒素材
-   * （真正起跑在静音那一刻，见 `trackSilence`）。
+   * （真正起跑在静音那一刻，见 `silence-triggers.ts` 的 `maybeSpeculate`）。
    */
   notePartial(text: string): void {
     this.lastPartialAt = this.now();
@@ -814,16 +657,15 @@ export class UtteranceAssembler {
     this.pendingText = tail ? tail + text : text;
     this.cancelTimer();
     // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿。
-    // **例外**是预跑（`trackSilence`）：那份快照本来就是给这一句的（seq 已经对上），
-    // 留着才能把「出句→开轮」那一段省掉。
+    // **例外**是预跑（`silence-triggers.ts` 的 `maybePrefirePrediction`）：那份快照
+    // 本来就是给这一句的（seq 已经对上），留着才能把「出句→开轮」那一段省掉。
     this.seq += 1;
     if (this.prediction !== null && this.prediction.seq !== this.seq) {
       this.prediction = null;
     }
     const seq = this.seq;
-    // 新的一句：投机的次数配额按句重置（下一段语音可以再投机两次）
-    this.specCount = 0;
-    this.specTriedText = '';
+    // 新的一句：投机的次数配额与去重按句重置（下一段语音可以再投机两次）
+    this.silence.resetForSentence();
     // 中间结果属于上一段语音，不能留给下一段当素材（见 `maybeSpeculate` 的 `lastPartialAt` 判据）
     this.lastPartialText = '';
     // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
@@ -900,7 +742,7 @@ export class UtteranceAssembler {
     const hit = ready !== null && ready.seq === seq
       && (ready.pre || ready.startedAt >= this.lastPartialAt);
     if (hit) {
-      // 记下这份判停用的是哪一段音频 —— 下一拍拿它比「输入有没有变」（见 `snapshotBytes`）
+      // 记下这份判停用的是哪一段音频 —— 下一拍拿它比「输入有没有变」
       this.lastSnapshotBytes = ready.bytes;
       return await ready.probability;
     }
@@ -931,6 +773,8 @@ export class UtteranceAssembler {
       return;
     }
     this.lastUtteranceAt = this.now();
+    // 一轮收下：四路静音闸重新武装（不重置 `lastVoicedAt` —— 插话判据还在读它）
+    this.silence.onUtterance();
     this.options.onUtterance(text);
   }
 
@@ -943,6 +787,10 @@ export class UtteranceAssembler {
     this.pendingText = '';
     this.recentChunks.length = 0;
     this.recentBytes = 0;
+    // 语义判停的两个缓存不准跟到连接之后：它们是「最近几句」的窗口，
+    // 留着的判定既没有下一个消费者，也不会再被淘汰。
+    this.semanticAsks.clear();
+    this.semanticSettled.clear();
   }
 
   /** 判定当前这一轮是否定稿。 */
@@ -996,7 +844,7 @@ export class UtteranceAssembler {
     // 放在所有分支之前 —— 它就是那条"谁都不能绕过"的闸。
     const openSilenceCap = this.options.maxOpenSilenceMs ?? 0;
     if (openSilenceCap > 0) {
-      const quietNow = this.now() - this.lastVoicedAt;
+      const quietNow = this.now() - this.silence.lastVoicedAtMs;
       if (quietNow >= openSilenceCap) {
         this.options.log(
           `  判停    ${shown} → 静音 ${Math.round(quietNow)} ms ≥ 上限 ${openSilenceCap}，放行`,
@@ -1018,7 +866,7 @@ export class UtteranceAssembler {
       // 判停那趟往返（70–200 ms）里 `lastVoicedAt` 可能已经前移 —— 用旧值会算出
       // 负的静音（实测日志里出现过「静音才 −55 ms」），门槛等于失效。
       const quietAt = this.now();
-      const quietNow = quietAt - this.lastVoicedAt;
+      const quietNow = quietAt - this.silence.lastVoicedAtMs;
       if (quietNow < openQuiet) {
         const wait = Math.max(1, Math.min(openQuiet - quietNow, this.options.extendMs));
         this.extensions += 1;
@@ -1049,7 +897,7 @@ export class UtteranceAssembler {
     // 没有音频（`lastSnapshotBytes <= 0`）时这个判据不成立：那时判停器本来就在
     // 报「不可用」，没有「输入没变」可言。
     const unchanged = this.lastSnapshotBytes > 0
-      && this.snapshotBytes() === this.lastSnapshotBytes
+      && this.snapshot().length === this.lastSnapshotBytes
       && this.lastPartialAt <= this.lastDecisionAt;
     this.lastDecisionAt = evaluatedAt;
     if (probability < threshold && unchanged && this.extensions > 0) {
@@ -1130,17 +978,39 @@ export class UtteranceAssembler {
     }
     const promise = endpoint(text).catch((): null => null).then((verdict) => {
       this.semanticSettled.set(text, verdict);
+      this.evictSemanticCache();
       return verdict;
     });
     this.semanticAsks.set(text, promise);
-    // 只留最近 8 条：中间结果会连续改写，这里不是历史账本
-    if (this.semanticAsks.size > 8) {
-      const oldest = this.semanticAsks.keys().next().value;
-      if (oldest !== undefined) {
-        this.semanticAsks.delete(oldest);
-      }
-    }
+    this.evictSemanticCache();
     return promise;
+  }
+
+  /**
+   * 淘汰语义判停缓存里最老的条目。
+   *
+   * 两个 Map **必须一起收**：`semanticAsks` 是请求侧、`semanticSettled` 是结果侧。
+   * 只收一边的话请求被淘汰了、判定却永远留着 —— `hasPrefixMore` / `hasPrefixEnd`
+   * 靠 `semanticSettled` 做前缀复用，于是几小时前那句的前缀判定会被借给新句
+   * （`semanticSettled` 曾经真的只进不出）。结果侧自己也压一遍上限：它的键
+   * 不一定还在请求侧（请求先被淘汰、之后才落地）。
+   */
+  private evictSemanticCache(): void {
+    while (this.semanticAsks.size > SEMANTIC_CACHE_LIMIT) {
+      const oldest = this.semanticAsks.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.semanticAsks.delete(oldest);
+      this.semanticSettled.delete(oldest);
+    }
+    while (this.semanticSettled.size > SEMANTIC_CACHE_LIMIT) {
+      const oldest = this.semanticSettled.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.semanticSettled.delete(oldest);
+    }
   }
 
   /**
@@ -1343,14 +1213,15 @@ export class UtteranceAssembler {
     const t = text.trim();
     const cjk = [...t].filter((c) => /[\u4e00-\u9fff]/.test(c)).length;
     const junk = cjk <= 2 || /^[A-Za-z][A-Za-z './-]*\.?$/.test(t);
+    const lastVoicedAt = this.silence.lastVoicedAtMs;
     return junk
       && this.pendingText.trim() !== ''
       && this.lastSentenceChars >= 6
       && this.now() - this.lastSentenceAt < 800
       // lastVoicedAt > 0 = 这一轮真的见过有声帧。纯合成输入（没有音频证据）时不去抖：
       // 宁可多并一次，也不要把用户真的说出来的短句丢掉。
-      && this.lastVoicedAt > 0
-      && this.lastVoicedAt <= this.lastSentenceAt;
+      && lastVoicedAt > 0
+      && lastVoicedAt <= this.lastSentenceAt;
   }
   private reportJudge(fact: JudgeFact): void {
     // 落档时补上「这一轮花掉多少 / 预算是多少」：`②` 的成因只有 p 是看不出来的，

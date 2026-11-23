@@ -46,6 +46,15 @@ export interface UplinkPipelineOptions {
   readonly log: (line: string) => void;
   readonly onError: (line: string) => void;
   /**
+   * 可注入时钟，默认 `Date.now`。
+   *
+   * **必须和宿主（`voice-session` 的 `SystemClock`）是同一把尺**：`AudioFrame.tsMs`
+   * 与能量门的保持窗口都从这里取。不传时门用 `Date.now()`、宿主用单调毫秒，
+   * 两边比出来的「静音多久」是个天文数字（真机踩过一次：帧时戳和判停的时间戳
+   * 差 1.7e12，插话判据整场静默失效且没有一行日志）。
+   */
+  readonly now?: () => number;
+  /**
    * 电平表周期（毫秒）。> 0 时每这么久打一行「上行电平 峰值 -XX dBFS」。
    *
    * 调增益时唯一可靠的依据：只看"开门那一瞬"的峰值会误判 —— 门一开就记录，
@@ -81,6 +90,8 @@ export class UplinkPipeline {
   private readonly options: UplinkPipelineOptions;
   private readonly gate: EnergyGate;
   private readonly ffmpeg: ChildProcessWithoutNullStreams | null;
+  /** 统一时钟：能量门、电平表、`AudioFrame.tsMs` 共用（见 `UplinkPipelineOptions.now`） */
+  private readonly now: () => number;
   private received = false;
   private closed = false;
 
@@ -100,7 +111,7 @@ export class UplinkPipeline {
     if (period <= 0) {
       return;
     }
-    const now = Date.now();
+    const now = this.now();
     if (this.meterAt === 0) {
       this.meterAt = now;
       this.meterPeak = -Infinity;
@@ -120,6 +131,7 @@ export class UplinkPipeline {
 
   constructor(options: UplinkPipelineOptions) {
     this.options = options;
+    this.now = options.now ?? Date.now;
 
     // 门限作用在**放大后**的波形上：增益越大，小声越容易被判为有声。
     // 早先这里按 +20log10(gain) 同步抬高门限（"保持选择性不变"），结果是
@@ -129,6 +141,9 @@ export class UplinkPipeline {
       holdMs: options.gate.holdMs,
       prerollBytes: Math.round((options.gate.prerollMs / 1000) * options.sampleRate * 2),
       sampleRate: options.sampleRate,
+      // **必须透传**：门自己默认 `Date.now()`，跟宿主的 `SystemClock` 差 1.7e12。
+      // 漏传的症状是「第一块静音就把门关了」（gap 看似无穷大），或反过来永不关门。
+      now: this.now,
     });
 
     this.ffmpeg = options.codec === 'pcm16'
@@ -216,7 +231,8 @@ export class UplinkPipeline {
       onSpeechOpen(decision.opened.peakDbfs, decision.opened.preroll, decision.opened.prerollMs);
     }
     if (decision.forward) {
-      const tsMs = Date.now();
+      // 与能量门同一把尺：下游拿 `tsMs` 和宿主的 `lastSentenceAt` 比「这之后有没有人说话」
+      const tsMs = this.now();
       onFrame({
         pcm,
         voiced: decision.voiced,

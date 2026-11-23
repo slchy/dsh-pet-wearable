@@ -262,8 +262,40 @@ export interface AgentProvider {
    * 下一轮一旦委派给 dsh，系统直接失忆。
    *
    * `said` 应当是**实际播出去的那部分**（被打断时按已播比例截断）。
+   *
+   * @param truncated 那一轮是不是**没播完**（被打断）。与 `said` 本身无关：
+   *   文本可以一个字不少，但用户只听到了一半。实现方用它决定回写上下文时
+   *   要不要标注「这句没说完」。
    */
-  noteServedTurn?(userText: string, said: string): void;
+  noteServedTurn?(userText: string, said: string, truncated?: boolean): void;
+  /**
+   * 可选能力：把**结算后才知道的事实**按票据对回账本。
+   *
+   * 由内核的 `settleTurn` 端口调用（见 `kernel-runtime.ts`）：`truncated` 与
+   * `endedAtMs` 在**播完之后**才算得出来，而这一轮的账早在 `reply()` 返回时就记下了。
+   * 不回来改这一笔，`KernelState.ledger` 与 `ConversationLedger` 就会各说一套
+   * （内核说少听了、账本说听全了），路由与回注按哪一份走都是错的。
+   *
+   * **按 `{ no, gen }` 精确认领**：只有票据一字不差的那一笔允许改。票据对不上
+   * 必须**什么都不做** —— 那是迟到的结算，落到别的轮次上就是把「听全了」改成
+   * 「被打断」，下一轮会凭空多注一次不该注的记忆。
+   */
+  reconcileTurnOutcome?(info: {
+    readonly ticket: { readonly no: number; readonly gen: number };
+    readonly truncated: boolean;
+    readonly endedAtMs: number;
+  }): void;
+  /**
+   * 可选能力：**上一轮是谁答的**（账本口径，`null` = 还没有答过的轮次）。
+   *
+   * 由 `DialogRuntime` 在建连时读一次，用来给 `initialKernelState` 的
+   * `ledger.lastLane` 播种：重连之后内核以为「没有上文」，而 agent 的账本明明
+   * 记得上一轮是 dsh —— 于是用户顺着 dsh 的追问说一句，被当成闲聊抢答。
+   *
+   * `pet`（宠物主动开口）**不在此列**：那不是「回答用户这一轮」，按没有上文处理，
+   * 实现方应把它归并成 `null`。
+   */
+  lastLedgerLane?(): 'live' | 'cascade' | 'dsh' | null;
   /**
    * 可选能力：把**委派轮**的答案回注进音频车道（omni）的上下文。
    *
@@ -322,6 +354,16 @@ export interface AgentProvider {
    * 一句被门槛挡掉的「嗯」会把整段语音的机会用光（真机 `20261119-071340` 三轮）。
    */
   speculatePartial?(text: string): boolean;
+  /**
+   * 可选能力：**掐掉在途的预跑 / 投机**（`why` 只进日志，不参与决策）。
+   *
+   * 由内核的 `abortEngine` 端口调用（见 `kernel-runtime.ts`）：交给 dsh、被新轮顶掉、
+   * 被插话 —— 这三种情况下那一趟的答案**已经确定不会被采用**，不掐就会一直跑到
+   * 首字 1200 ms / 整句 2800 ms 的超时，白占一条连接，还会让下一轮的投机配额白白用光。
+   *
+   * 实现方应当把配额一起归零：一次中止不该吃掉后面几轮的机会。
+   */
+  dropPrefetch?(why: string): void;
   /**
    * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
    *
@@ -427,6 +469,17 @@ export interface SttSession {
    */
   commit?(): void;
   /**
+   * 可选能力：**已经真正发出去**的 commit 序号（单调递增，从 0 起）。
+   *
+   * 「真正发出去」是字面意思：空缓冲被 `dirty` 闸挡掉的那一发、解码窗口内被
+   * 延后（`commitDeferred`）的那一发，**都不占号**。宿主曾经自己维护这份账
+   * （`commit()` 一被调就 +1），于是和 ASR 实际封段对不上 —— 跳过时虚增、
+   * `hangup()` 漏增，转写戴着的出生证就指错了段（见 `causal.ts`）。
+   *
+   * 这是**唯一**的号源：转写事件的 `commitSeq` 与它同源，宿主不要再自己数。
+   */
+  commitSeq?(): number;
+  /**
    * 可选能力：**下一次识别结果作废**。
    *
    * 打断时用。DashScope realtime 协议没有 `input_audio_buffer.clear`
@@ -453,10 +506,22 @@ export interface SttSession {
 }
 
 export interface SttHandlers {
-  /** 中间结果（边说边出字），可选。 */
-  onPartial?: (text: string) => void;
-  /** 一句说完。`index` 是本次连接内的句序。 */
-  onSentence: (text: string, index: number) => void;
+  /**
+   * 中间结果（边说边出字），可选。
+   *
+   * @param commitSeq 这段增量所属那一发 commit 的**因果出生证**（见 `causal.ts`）。
+   *   解码窗口里的增量是**正在解的那一发**（可能是旧段）；空闲时用户新开口的
+   *   增量属于**下一发**。不传 = 这个 provider 不提供因果坐标，宿主一律
+   *   判「不是旧段」——宁可让一次插话通过，也不能凭空吞掉一轮回答。
+   */
+  onPartial?: (text: string, commitSeq?: number) => void;
+  /**
+   * 一句说完。`index` 是本次连接内的句序。
+   *
+   * @param commitSeq 产出这句定稿的**那一发** commit 的序号。`undefined` =
+   *   这个 provider 不提供因果坐标（服务端 VAD 判句，如 `aliyun-asr`）。
+   */
+  onSentence: (text: string, index: number, commitSeq?: number) => void;
   onError?: (error: Error) => void;
 }
 
