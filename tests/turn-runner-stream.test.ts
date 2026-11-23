@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import type { Cancel, Clock } from '../src/app/clock.ts';
 import { DialogFsm } from '../src/dialog-fsm.ts';
 import type { AgentProvider, AgentReplyView, DelegateReason, TtsProvider } from '../src/providers.ts';
+import type { ImageAttachment } from '../src/session.ts';
 import { TurnRunner, type TurnResult } from '../src/turn-runner.ts';
 
 /** 10 ms 的有声 PCM：够触发「首块」，又不会让播放等待拖慢测试 */
@@ -43,11 +44,17 @@ interface Rig {
   readonly logs: string[];
   /** 下发给设备的指令（udio.stop 这类） */
   readonly deviceCalls: Array<{ op?: string }>;
+  /** 回注给音频车道的答案（`injectAnsweredTurn` 的三参） */
+  readonly injected: Array<[string, string, string | undefined]>;
+  /** 写进账本的 `truncated`（`noteServedTurn` 的第三参，`undefined` = 没传） */
+  readonly servedTruncated: Array<boolean | undefined>;
+  /** `willServeAudio` 被问过几次（带图轮次不该问） */
+  readonly willServeCalls: number;
   /** 测试里要能主动插话（`interrupted` / `truncated` 的差别只有它能造出来） */
   readonly fsm: DialogFsm;
   /** 最后一块音频吐出的时刻（`chunkDelayMs` 造流式耗时后用它算「多锁了多久」） */
   readonly lastChunkAt: number;
-  run(): Promise<TurnResult | null>;
+  run(image?: ImageAttachment): Promise<TurnResult | null>;
 }
 
 function rig(options: {
@@ -76,6 +83,9 @@ function rig(options: {
   const logs: string[] = [];
   const deviceCalls: Array<{ op?: string }> = [];
   const served: Array<[string, string]> = [];
+  const injected: Array<[string, string, string | undefined]> = [];
+  const servedTruncated: Array<boolean | undefined> = [];
+  let willServeCalls = 0;
   let sink: ((text: string) => void) | null = null;
   /** 最后一块音频吐出的时刻（验「播完之后还要多锁多久」用） */
   let lastChunkAt = 0;
@@ -83,8 +93,15 @@ function rig(options: {
   let calls = 0;
   const agent: AgentProvider = {
     name: 'fake',
-    willServeAudio: () => options.willServe === true,
-    noteServedTurn: (userText, said) => { served.push([userText, said]); },
+    willServeAudio: () => {
+      willServeCalls += 1;
+      return options.willServe === true;
+    },
+    noteServedTurn: (userText, said, truncated) => {
+      served.push([userText, said]);
+      servedTruncated.push(truncated);
+    },
+    injectAnsweredTurn: (userText, said, kind) => { injected.push([userText, said, kind]); },
     reply: async () => {
       calls += 1;
       if (calls === 1 && options.audio !== undefined) {
@@ -140,7 +157,9 @@ function rig(options: {
       if (options.streamError !== undefined) throw options.streamError;
     },
   };
-  const fsm = new DialogFsm(() => {});
+  // `now` 必须给：插话当场由内核结算（`bargeIn` 里的 `atMs` 来自宿主上下文），
+  // 缺了它 `atMs` 是 0，`heardMs` 会被算成 0 —— 那与真机装配的行为不同。
+  const fsm = new DialogFsm(() => {}, { now: () => clock.now() });
   const runner = new TurnRunner({
     clock,
     agent,
@@ -158,9 +177,10 @@ function rig(options: {
     log: (line) => { logs.push(line); },
   });
   return {
-    streamed, whole, events, payloads, logs, served, fsm, deviceCalls,
+    streamed, whole, events, payloads, logs, served, fsm, deviceCalls, injected, servedTruncated,
     get lastChunkAt(): number { return lastChunkAt; },
-    run: () => runner.run('你好'),
+    get willServeCalls(): number { return willServeCalls; },
+    run: (image?: ImageAttachment) => runner.run('你好', image),
   };
 }
 
@@ -320,6 +340,30 @@ test('omni 直出：不启流式 TTS、音频原样下行、path=omni、播完�
   assert.ok(result.audioBytes > 0, '音频必须真的下发');
   assert.equal(result.speech, '我在呢。', 'drain 之后才是完整的一句');
   assert.deepEqual(r.served, [['你好', '我在呢。']], '播完必须回写，否则跨车道失忆');
+  assert.deepEqual(r.servedTruncated, [false], '听全了，账本要收真实的那一个值（不是缺省的 undefined）');
+});
+
+test('omni 自己答完但被打断：账本收到的是真实 truncated', async () => {
+  // 这个值只有结算时才知道（内核的媒体游标），以前在两参调用里直接缺省成 false ——
+  // 账本于是永远以为用户听全了，路由和回注都按它判。
+  const r = rig({
+    deltas: [],
+    reply: { text: '不该走到这里', speech: '不该走到这里' },
+    willServe: true,
+    audio: Array.from({ length: 200 }, () => '念'), // 2 s 垫话，先全部下发再插话
+  });
+  const running = r.run();
+  for (
+    let i = 0;
+    i < 400 && r.fsm.runtime.state.playback.sentMediaMs < 2_000;
+    i += 1
+  ) {
+    await sleep(5);
+  }
+  r.fsm.bargeIn('插话');
+  await running;
+
+  assert.deepEqual(r.servedTruncated, [true], `实际：${JSON.stringify(r.servedTruncated)}`);
 });
 
 test('播放等待以首块为基准：吐完最后一块之后不该再补等一整段音频', async () => {
@@ -420,4 +464,119 @@ test('omni 发 tool_call 且一个字都没出声：dsh 的答案走 TTS 念出�
   assert.ok(result);
   assert.equal(r.payloads.find((p) => p.name === 'turn.end')?.data['path'], 'dsh', '第二轮应当由 dsh 作答');
   assert.deepEqual(r.whole, ['慢车道答复。'], 'omni 没出声，dsh 的答案得走 TTS 念出来');
+});
+
+// ---------------------------------------------------------------- Wave 3-A 收口
+//
+// 这一组钉的是「只有一份内核、只有一份结算」：
+// 以前 `TurnRunner` 私存一份 `KernelState`，相位在 FSM、账本在私货；插话当场结算
+// 过的那一轮它看不见，协程跑到尾巴拿空播放区重算，于是"少听了一段"被算成"听全了"，
+// 该吞的答案被回注。下面每一条都只在"共用同一个 runtime"时才成立。
+
+test('与 DialogFsm 共用同一个内核：一轮跑完后账本里有**真实**结算', async () => {
+  const r = rig({
+    deltas: ['[平静]在呢。'],
+    reply: { text: '[平静]在呢。', speech: '在呢。', path: 'fast' },
+  });
+  const result = await r.run();
+
+  assert.ok(result);
+  // 私有副本的账本永远是 `null` —— 这一轮喂过什么，只有共享的那个实例知道
+  const ledger = r.fsm.runtime.state.ledger;
+  assert.equal(ledger.lastSettled?.ticket.no, 1, `实际：${JSON.stringify(ledger)}`);
+  assert.equal(ledger.lastSettled?.ticket.gen, 0);
+  assert.equal(ledger.lastOutcome?.totalAudioMs, 10, '媒体游标要落在共享内核里（1 块 10 ms）');
+  assert.equal(ledger.lastSettled?.inject, 'spoken', '听全了 → 按「他听到了」记');
+  assert.equal(ledger.lastLane, 'cascade', '快车道在核心里叫 cascade');
+});
+
+test('dsh 轮次严格按内核 settlement.inject 回注：spoken / unspoken / none', async () => {
+  // (a) 听全了 → spoken
+  const full = rig({
+    deltas: ['慢车道答复。'],
+    reply: { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' },
+  });
+  await full.run();
+  assert.deepEqual(
+    full.injected,
+    [['你好', '慢车道答复。', 'spoken']],
+    `听全了就该按「用户听到了」注；实际：${JSON.stringify(full.injected)}`,
+  );
+
+  // (b) 有结论但一个字都没播出去 → unspoken（真机 `20261123-053719` 第 2 轮：
+  //     dsh 答出了书名，`audio_s=0.00`，不注的话下一轮它会把同一件事再编一遍）
+  const silent = rig({
+    deltas: [], // 流式口一个增量都没来 → 一个字节也没合成
+    reply: { text: '其主之声。', speech: '其主之声。', path: 'dsh' },
+  });
+  await silent.run();
+  assert.deepEqual(
+    silent.injected,
+    [['你好', '其主之声。', 'unspoken']],
+    `没播出去也要注（口气是 unspoken）；实际：${JSON.stringify(silent.injected)}`,
+  );
+
+  // (c) 播了一半被打断 → none（用户少听了一段，不注）。
+  //     音频要**先全部下发**再插话：抢在合成期插话只能说明「后面那段还没送出去」，
+  //     媒体游标（唯一可信的尺子）会说"没少听"。所以先等内核的游标到 2 s，再开口。
+  const cut = rig({
+    deltas: Array.from({ length: 200 }, () => '念'),
+    reply: { text: '念'.repeat(400), speech: '念'.repeat(400), path: 'dsh' },
+  });
+  const running = cut.run();
+  for (
+    let i = 0;
+    i < 400 && cut.fsm.runtime.state.playback.sentMediaMs < 2_000;
+    i += 1
+  ) {
+    await sleep(5);
+  }
+  cut.fsm.bargeIn('插话');
+  const result = await running;
+  assert.ok(result);
+  assert.equal(result.interrupted, true);
+  assert.deepEqual(
+    cut.injected,
+    [],
+    `少听了一段就不注 —— 用户没听到的东西不该变成 omni 的记忆；实际：${JSON.stringify(cut.injected)}`,
+  );
+});
+
+test('omni 转交 dsh：dsh 的增量走流式合成，不退化成整段', async () => {
+  const r = rig({
+    deltas: ['慢车道', '答复。'],
+    reply: { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' },
+    audio: ['行，我这就查。'], // omni 的垫话：第一段
+    omniDelegate: 'delegate',
+    willServe: true,
+  });
+  const result = await r.run();
+
+  assert.ok(result);
+  assert.deepEqual(
+    r.streamed,
+    ['慢车道', '答复。'],
+    'dsh 的增量必须接到 TTS 的流式口 —— 不接就只能等整段回来再合成（静音 5–20 s）',
+  );
+  assert.deepEqual(r.whole, [], '流式成功就不该再整段合成一遍');
+  assert.equal(result.speech, '慢车道答复。');
+  assert.equal(r.payloads.find((p) => p.name === 'turn.end')?.data['path'], 'dsh');
+});
+
+test('带图的轮次不走 omni：流式 TTS 照常开', async () => {
+  // 带图那一轮一定走 dsh（omni 吃的是音频流，没有图片通道）。若还去问
+  // `willServeAudio`，路由只看健康度会答「能」，于是流式 TTS 被关掉、
+  // dsh 的答案只能整段合成 —— 带图那一轮白白慢好几秒。
+  const r = rig({
+    deltas: ['[平静]我看了，', '是只猫。'],
+    reply: { text: '[平静]我看了，是只猫。', speech: '我看了，是只猫。', path: 'dsh' },
+    willServe: true,
+  });
+  const result = await r.run({ mimeType: 'image/jpeg', data: 'AAAA' });
+
+  assert.ok(result);
+  assert.equal(r.willServeCalls, 0, '带图轮次连问都不该问');
+  assert.deepEqual(r.streamed, ['[平静]我看了，', '是只猫。'], '流式 TTS 要照常收增量');
+  assert.deepEqual(r.whole, [], '没走 omni 就不该退化成整段合成');
+  assert.equal(r.payloads.find((p) => p.name === 'turn.end')?.data['path'], 'dsh');
 });

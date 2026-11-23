@@ -10,12 +10,34 @@
  *
  * 依赖全部注入，自身不 import 任何具体供应商实现
  * （`synthesize` 是函数，不是 TTS 客户端）。
+ * 判定不在这个文件里：相位、播放游标、结算全由共享内核（`fsm.runtime`）裁决。
+ *
+ * <h2>副作用也只有一条路：内核意图 → 装配层的端口</h2>
+ *
+ * 事实（`audioSent` / `devicePlayed` / `turnEnded` …）一律走
+ * `KernelRuntime.dispatchAndApply`，声明的意图由装配层绑好的端口执行 ——
+ * 停音频、作废轮次、结算回注都只执行**一次**。本类自己只实现端口那一侧：
+ * {@link TurnRunner.invalidateTurn}（作废在途轮次）与
+ * {@link TurnRunner.acceptSettlement}（收下这一轮的结算）。
+ *
+ * 没挂端口的裸跑（单测 / 离线推演）仍要能跑完一轮：那种情况下 `turnEnded` 的
+ * 结算意图由本类用一个一次性本地端口解释，**不另算一套口径**。
+ *
+ * <h2>Item C 边界：三分支泵仍在，换引擎是刻意的下一阶段</h2>
+ *
+ * 本类目前仍维护 `omni` / `stream` / `pump` 三条 `AgentProvider` 分支。这不是
+ * 漏接线，是**刻意分期**：那三条上挂着 `FrontedAgent` 的双轨投机、流式 TTS 的
+ * 异常回落，以及逐轮延迟埋点（`tts.first` / `turn.end` 的 `dsh_ms` / `audio_s`）。
+ * `FastVoiceEngine` 的两份实现（`src/engines/*`）与工厂
+ * （`FrontedAgent.toLiveEngine` / `toCascadeEngine`）**都已落地并通过契约测试**
+ * （`tests/fast-voice-engine.test.ts`）—— 换泵的条件齐了，但把泵切过去要同时搬走
+ * 上面那三件事，所以留到下一阶段；现在动它会静默丢掉这些能力。
  */
 import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
-import { outcomeOf } from './engine-contract.ts';
-import { initialKernelState, step, type Effect, type KernelEvent, type KernelState } from './kernel.ts';
+import type { Effect, KernelEvent } from './kernel.ts';
+import { applyEffects, type KernelSettlement } from './kernel-runtime.ts';
 import { loopLagSnapshot } from './loop-lag.ts';
 import { diffNetCounters, netFields, readNetCounters } from './net-counters.ts';
 import { sampleSockets } from './socket-stats.ts';
@@ -28,7 +50,7 @@ import { SentencePump } from './sentence-pump.ts';
 import { TokenQueue } from './token-queue.ts';
 import { cleanForSpeech } from './agent.ts';
 import { parseEmotion } from './emotion.ts';
-import type { AgentProvider, DelegateReason, TtsProvider } from './providers.ts';
+import type { AgentProvider, AgentReplyView, DelegateReason, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
 /**
@@ -46,6 +68,16 @@ const PLAYBACK_POLL_MS = 100;
  * 的上限；3 s 足够覆盖设备缓冲，也不会把一轮挂太久。
  */
 const PLAYED_GRACE_MS = 3_000;
+
+/**
+ * 流式那条路**实际念出去的全文**：增量按到达顺序拼起来，再剥情绪标签、按 TTS 口径清洗。
+ *
+ * 单独提出来是因为它有两条调用点（正常回答 / omni 转交 dsh 之后），而它决定了
+ * 打断续话从哪个字接着念 —— 两处各写一遍迟早漂。
+ */
+function spokenFromStream(raw: string): string {
+  return cleanForSpeech(parseEmotion(raw).rest);
+}
 
 export interface TurnRunnerOptions {
   /** 时钟端口：一轮里的所有等待与计时都走它（模拟器要用虚拟时间） */
@@ -139,11 +171,6 @@ export interface TurnResult {
 export class TurnRunner {
   private readonly options: TurnRunnerOptions;
   private readonly log: (line: string) => void;
-  /**
-   * 内核快照（四正交区域）。**它不带 I/O**，`await` 之间不会被别的协程改坏 ——
-   * 判定不再依赖"这条 `async` 函数跑到哪一行了"。
-   */
-  private kernel: KernelState = initialKernelState();
   /** 旁白与本轮回答共用一条下行音频，必须串行，否则两段 PCM 会交织在一起 */
   private speechChain: Promise<void> = Promise.resolve();
   /**
@@ -192,19 +219,57 @@ export class TurnRunner {
     }
     this.playedSeen = true;
     // 内核也要知道（它记的是"设备回执到的时刻"，与媒体游标拼起来才是完整的播放事实）
-    this.feed({ type: 'devicePlayed', atMs: this.options.clock.now() });
+    if (this.ownsPlayback(this.playingTicket)) {
+      this.feed({ type: 'devicePlayed', atMs: this.options.clock.now() });
+    }
   }
 
   /**
-   * 把一条事实喂给内核，拿回它声明的意图。
+   * 把一条事实喂给**共享内核**（`fsm.runtime`，与 `DialogFsm` 是同一个实例）。
    *
-   * **只允许在 `run()` 里喂与当前轮相关的事件**：`speakCanned` / `say` 那些旁白
-   * 不属于任何一轮（它们不推进话筒主权，也不进 `turn.end` 的账）。
+   * 以前这里有一份 `private kernel`：相位由 FSM 算、账本与结算由私货算，两套
+   * `turn` / `playback`。插话当场结算过的那一轮它看不见，协程跑到尾巴再拿空播放区
+   * 重算一遍，就把「少听了一段」重算成「听全了」（该吞的答案被回注）。
+   * 现在只有一个 `KernelState`，`settleTurn` 也只有一份算法。
+   *
+   * **只允许在 `run()` / `devicePlayed()` 里喂与当前轮相关的事件**：`speakCanned`
+   * 那些旁白不属于任何一轮（它们不推进话筒主权，也不进 `turn.end` 的账）。
+   *
+   * 走 `dispatchAndApply`：装配层（`DialogRuntime`）绑了端口时，事件声明的意图
+   * **在这里就执行**（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` /
+   * `settleTurn`），且只执行这一次。裸跑（没绑端口）时它只推状态 —— 与
+   * `dispatch` 等价，`run()` 的尾巴再拿返回的意图自己解释一遍。
    */
   private feed(event: KernelEvent): readonly Effect[] {
-    const [next, effects] = step(this.kernel, event);
-    this.kernel = next;
-    return effects;
+    return this.options.fsm.runtime.dispatchAndApply(event);
+  }
+
+  /**
+   * 这一轮还占着内核的**播放区**吗。
+   *
+   * 共享之后只有一个 `playback` 区：被插话（`bargeIn` 当场清区）或已结算之后再喂
+   * `audioSent`，媒体游标就记到**下一轮**头上 —— 结算拿它算「少听多少」，会静默算错。
+   * 所以喂之前先确认这一轮还是区主；迟到的分片照常下发，只是不记账。
+   */
+  private ownsPlayback(ticket: TurnTicket): boolean {
+    const owner = this.options.fsm.runtime.state.playback.ticket;
+    return owner !== null && owner.no === ticket.no && owner.gen === ticket.gen;
+  }
+
+  /**
+   * 这一轮由谁答的，记进内核账本（`ledger.lastLane`）。
+   *
+   * 只报事实 —— 路由判定在 `turn-router.ts`。`omni` / `fast` 翻译成**车道**名
+   * （`live` / `cascade`）：内核不认识"谁调的"，只认识"哪条车道"。
+   */
+  private noteLane(replyPath: 'fast' | 'dsh' | 'omni' | undefined): void {
+    if (replyPath === undefined) {
+      return;
+    }
+    this.feed({
+      type: 'turnAnswered',
+      lane: replyPath === 'omni' ? 'live' : replyPath === 'fast' ? 'cascade' : 'dsh',
+    });
   }
 
   /** 本轮是否已经收到设备的 `played` */
@@ -225,6 +290,26 @@ export class TurnRunner {
   private readonly receiptCache = new Map<string, { readonly rate: number; readonly chunks: readonly Buffer[] }>();
   /** 本轮是否已经下发过真正的回答音频（回执只在这是 false 时有意义） */
   private firstAudioSeen = false;
+  /**
+   * 在途的那一轮（端口 `invalidateTurn` 的对象）。
+   *
+   * `invalidateTurn` 从内核的 `invalidateTurn` 意图进来（插话 / 连接结束），也可能从
+   * 裸跑时的 `fsm.onInvalidate` 进来 —— 两条路都必须按**整张票据**比对：迟到的
+   * 取消不能杀掉下一轮（`no` 不同），同一轮也不能被取消两次（`invalidated`）。
+   * `markStale` 是「这一轮已经没必要再等」的信号（放掉还在 `await` 的 dsh 答复）。
+   */
+  private activeTurn: {
+    readonly ticket: TurnTicket;
+    invalidated: boolean;
+    readonly markStale: () => void;
+  } | null = null;
+  /**
+   * 最近一次由 `KernelPorts.settleTurn` 送来的结算。
+   *
+   * 不在这里算任何东西 —— 内核给出什么就是什么（`kernel.ts` 的 `settle()` 是唯一
+   * 算法）。`run()` 的尾巴按票据取走它，**取不到才是装配坏了**。
+   */
+  private lastSettlement: KernelSettlement | null = null;
 
   /**
    * 播一句**系统旁白**（不是模型的回答）。
@@ -404,6 +489,71 @@ export class TurnRunner {
     return residue;
   }
 
+  // ---------------------------------------------------------------- 端口侧（内核意图的执行者）
+
+  /**
+   * 作废在途的那一轮：`KernelPorts.invalidateTurn`（以及裸跑时的 `onInvalidate`）。
+   *
+   * **严格按票据比对 + 幂等**：
+   * - `no` / `gen` 任一不同 → 直接返回。迟到的取消（上一轮的）不能杀掉这一轮。
+   * - 已经作废过 → 直接返回。同一条 `invalidateTurn` 意图不能被解释两遍
+   *   （`audio.stop` 多发一遍只是噪音，`cancelTurn` 联动 `detachTurn` 会让 dsh 丢答案）。
+   */
+  invalidateTurn(
+    ticket: { readonly no: number; readonly gen: number },
+    reason: 'bargeIn' | 'closed' = 'bargeIn',
+  ): void {
+    const active = this.activeTurn;
+    if (
+      active === null
+      || active.invalidated
+      || active.ticket.no !== ticket.no
+      || active.ticket.gen !== ticket.gen
+    ) {
+      return;
+    }
+    active.invalidated = true;
+    this.log(`  取消    ${reason === 'bargeIn' ? '插话' : '连接结束'} → 取消在途请求（第 ${ticket.no} 轮）`);
+    // 先放掉还在等的 await（委派轮的软取消要几秒才回，串行链不能跟着卡）
+    active.markStale();
+    // 回执也要停：`audio.stop` 只清掉设备已经收到的缓冲，合成循环还在往下发，
+    // 不掐掉就会在用户说话时接着播（试过：用户一开口「我看看」又从头上响一遍）。
+    if (this.receipt !== null && !this.receipt.cancelled) {
+      this.receipt.cancelled = true;
+      this.receiptPlaying = false;
+      this.log('  回执    插话中止，停止下发');
+    }
+    try {
+      this.options.agent.cancelTurn?.(active.ticket);
+    } catch (error) {
+      this.log(`  取消    ✗ ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 收下内核给的这一轮结算（`KernelPorts.settleTurn`）。
+   *
+   * 只存不算：`truncated` / `inject` / `heardMs` 的算法唯一归口在 `kernel.ts`，
+   * 执行层照单执行（以前这里按 `audioBytes` 自己判口气，两边静默漂移）。
+   */
+  acceptSettlement(turn: KernelSettlement): void {
+    this.lastSettlement = turn;
+  }
+
+  /** 按整张票据取走结算；对不上就返回 `null`（迟到的结算不能算到别的轮次头上）。 */
+  private takeSettlement(ticket: TurnTicket): KernelSettlement | null {
+    const settlement = this.lastSettlement;
+    if (
+      settlement === null
+      || settlement.ticket.no !== ticket.no
+      || settlement.ticket.gen !== ticket.gen
+    ) {
+      return null;
+    }
+    this.lastSettlement = null;
+    return settlement;
+  }
+
   /**
    * 跑一轮。
    *
@@ -418,9 +568,11 @@ export class TurnRunner {
     if (!ticket) {
       return null;
     }
-    // 内核开轮：从这一刻起，"这一轮听到多少 / 该不该回注"由 `kernel.ts` 的纯函数裁决，
-    // 这里只负责把事实（发了多少媒体、什么时候发声、设备报没报播完）喂进去。
-    this.feed({ type: 'turnStarted', ticket, atMs: this.options.clock.now() });
+    // **不再自己发 `turnStarted`**：`DialogFsm.beginTurn()` 已经把同一条 `beginTurn`
+    // 派给了共享内核（铸票 + 结算被顶掉的上一轮 + 把播放区绑到这张票上）。再发一次
+    // 就是第二套开轮口径，还会把刚初始化的播放区重算一遍。
+    // 从这里起，「这一轮听到多少 / 该不该回注」只由内核裁决，我们只喂事实：
+    // 发了多少媒体（`audioSent`）、什么时候出声（`audioStarted`）、设备报没报播完。
     // 回执标志按**轮次**清零：挪到这里而不是等待环入口，是因为合成期间
     // （最后一批字节发出之前）到达的回执也得算数 —— 在入口清会把已经到的那次擦掉，
     // 之后设备不再发第二次，就只能等满上限。
@@ -443,25 +595,23 @@ export class TurnRunner {
     const staleSignal = new Promise<typeof STALE>((resolve) => {
       markStale = () => { resolve(STALE); };
     });
+    // 端口侧的作废对象：`invalidateTurn` 只认这一张票，`finally` 里清掉。
+    this.activeTurn = {
+      ticket,
+      invalidated: false,
+      markStale: () => { markStale?.(); },
+    };
 
-    // **上游取消的唯一入口**：插话与连接结束都从 `DialogFsm.onInvalidate` 发出来。
-    // 带着票据说清楚要取消哪一轮 —— 迟到的取消由 session 层按代次丢弃。
-    const offInvalidate = fsm.onInvalidate((reason) => {
-      this.log(`  取消    ${reason === 'bargeIn' ? '插话' : '连接结束'} → 取消在途请求（第 ${ticket.no} 轮）`);
-      markStale?.();
-      // 回执也要停：`audio.stop` 只是清掉设备已经收到的缓冲，合成循环还在往下发，
-      // 不掐掉就会在用户说话时接着播（试过：用户一开口「我看看」又从头上响一遍）。
-      if (this.receipt !== null && !this.receipt.cancelled) {
-        this.receipt.cancelled = true;
-        this.receiptPlaying = false;
-        this.log('  回执    插话中止，停止下发');
-      }
-      try {
-        agent.cancelTurn?.(ticket);
-      } catch (error) {
-        this.log(`  取消    ✗ ${(error as Error).message}`);
-      }
-    });
+    // **上游取消的入口**。生产（`DialogRuntime` 绑了端口）走内核那条：
+    // `dispatchAndApply` → `applyEffects` → `KernelPorts.invalidateTurn`
+    // → `this.invalidateTurn(ticket, reason)`。这里**不再订阅** `onInvalidate`，
+    // 否则同一条意图会被解释两遍（`cancelTurn` 联动 `detachTurn` 会让 dsh 丢答案）。
+    //
+    // 裸跑（TurnRunner 单测 / 离线推演，没有装配层）没有端口执行意图，
+    // 才退回订阅 —— 两条路都只落在 `invalidateTurn` 上，口径同一份。
+    const offInvalidate = fsm.runtime.ports === null
+      ? fsm.onInvalidate((reason) => { this.invalidateTurn(ticket, reason); })
+      : (): void => {};
     // 这三次转移（beginTurn / audioStarted / audioDone）都在本方法里发生，
     // 走不到 `DialogRuntime.dispatch`。不在这里通知，话筒就永远只看到 `listening`
     // 一个状态 —— 结束时 `release('reply')` 不会执行，宠物的 `floorFree` 一直不成立。
@@ -476,6 +626,13 @@ export class TurnRunner {
     let replyPath: 'fast' | 'dsh' | 'omni' | undefined;
     /** 交给 dsh 的原因（只有 `path === 'dsh'` 时有） */
     let delegateReason: DelegateReason | undefined;
+    /**
+     * 这一轮中途把它转交给了 dsh（omni 发了 `tool_call`）。
+     *
+     * omni 在转交前说的那句只是**垫话**，不是一轮独立的 `live` 完结 —— 记账时不能
+     * 当成"omni 答过这一轮"，否则账本里会出现一条它其实没答完的记录。
+     */
+    let delegated = false;
 
     try {
       const agentStartedAt = this.options.clock.now();
@@ -511,12 +668,16 @@ export class TurnRunner {
           this.options.onEvent?.(EVENTS.ttsFirst, { ms: firstChunkAtMs });
         }
         audioBytes += chunk.length;
-        // 媒体游标：内核判"用户听到多少"只认它（不是墙钟）——`outcomeOf` 那张三把尺子的表
-        this.feed({
-          type: 'audioSent',
-          mediaMs: pcm16DurationMs(audioBytes, audioRate),
-          atMs: this.options.clock.now(),
-        });
+        // 媒体游标：内核判"用户听到多少"只认它（不是墙钟）——`outcomeOf` 那张三把尺子的表。
+        // 只在**这一轮还占着播放区**时喂：被插话当场结算之后迟到的那一块若还记进去，
+        // 会写进下一轮的播放区（共享内核只有一个），结算就按错的数据算少听没少听。
+        if (this.ownsPlayback(ticket)) {
+          this.feed({
+            type: 'audioSent',
+            mediaMs: pcm16DurationMs(audioBytes, audioRate),
+            atMs: this.options.clock.now(),
+          });
+        }
         this.options.onDownlinkChunk?.(chunk);
         downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       };
@@ -529,8 +690,12 @@ export class TurnRunner {
        *
        * 必须在**起跑流式 TTS 之前**问：那一步会真的开一个合成 task，而 omni 轮
        * 没有任何文本可送 —— 服务端会拒空文本，整轮退化成兜底（比不走 omni 还慢）。
+       *
+       * **带图轮次一定走 dsh**，连问都不问：omni 吃的是音频流，没有图片通道。
+       * 问一次会得到 `true`（路由只看健康度），于是流式 TTS 被关掉、dsh 的答案
+       * 只能整段合成 —— 带图那一轮白白慢好几秒。
        */
-      const omniTurn = agent.willServeAudio?.(text) === true;
+      const omniTurn = image === undefined && agent.willServeAudio?.(text) === true;
       // 这条只在装配坏了时出声：`trackActivity()` 之类的包装层漏转发可选能力时，
       // 表现是「omni 一次都不接管」而不报错（2026-11-23 线上踩过一整晚）
       if (typeof agent.willServeAudio !== 'function') {
@@ -594,6 +759,7 @@ export class TurnRunner {
       agentLatencyMs = this.options.clock.now() - agentStartedAt;
       replyPath = reply.path;
       delegateReason = reply.delegate;
+      this.noteLane(replyPath);
       if (reply.firstTokenMs !== undefined) {
         // 模型开口的时刻。和 TTS 首块分开记，才看得出"等生成"占了多少
         this.options.onEvent?.(EVENTS.llmFirst, { ms: reply.firstTokenMs });
@@ -617,7 +783,6 @@ export class TurnRunner {
         }
         // drain 之后 `speech` 才是完整的（它是活的 getter）
         speech = reply.speech;
-        agent.noteServedTurn?.(text, speech);
         const why = reply.audio.delegateReason?.() ?? null;
         if (why !== null && fsm.isStale(ticket)) {
           // 已经作废了就别再叫 dsh：真机 2026-11-23 第 5 轮，插话与 omni 的
@@ -647,6 +812,34 @@ export class TurnRunner {
           const omniText = reply.audio.delegateText?.() ?? null;
           const leadIn = speech;
           const bytesBeforeDelegate = audioBytes;
+          delegated = true;
+          // 转交之后 dsh 的增量要**接着**往 TTS 送。第一次 `reply` 的 sink 已经在
+          // 它的 finally 里摘掉了，不重挂的话这条流没人接 —— 只能等 `reply` 整段回来
+          // 再 `pump.drain()`，而慢车道的答案是 5–20 s，用户先听一段静音。
+          let delegateQueue: TokenQueue | null = null;
+          /** dsh 那条流收到的全部增量（未清洗），转写口径与主路径一致 */
+          let delegateStreamedRaw = '';
+          let delegateStreaming: Promise<void> | null = null;
+          if (streamTts !== undefined && this.options.onLiveAvailable !== undefined) {
+            const delegateTokenQueue = new TokenQueue();
+            delegateQueue = delegateTokenQueue;
+            this.options.onLiveAvailable((delta) => {
+              delegateStreamedRaw += delta;
+              // 口径同主路径：起点是「有文本可送」，不是合成任务开跑
+              if (firstSynthAt === 0) firstSynthAt = this.options.clock.now();
+              delegateTokenQueue.push(delta);
+            });
+            delegateStreaming = (async () => {
+              await this.speechChain;
+              for await (const chunk of streamTts(delegateTokenQueue, undefined)) {
+                if (fsm.isStale(ticket)) return;
+                emit(chunk);
+              }
+            })();
+            // 先挂一个空的 catch：作废时我们会提前返回，这条流跟着失败也没人接，
+            // 而没人接的 rejection 是进程级错误。
+            delegateStreaming.catch(() => undefined);
+          }
           const pending = agent.reply(
             omniText === null ? text : `${omniText}\n用户原话：「${text}」`,
             image, note, {
@@ -660,7 +853,14 @@ export class TurnRunner {
           );
           // 可能不等它了：留一个 catch，别让迟到的那次失败变成进程级错误
           pending.catch(() => undefined);
-          const raced = await Promise.race([pending, staleSignal]);
+          let raced: AgentReplyView | typeof STALE;
+          try {
+            raced = await Promise.race([pending, staleSignal]);
+          } finally {
+            // dsh 的增量到此为止（作废时也一样）：不摘的话下一轮的增量还会进这条队列
+            this.options.onLiveAvailable?.(null);
+            delegateQueue?.close();
+          }
           if (raced === STALE) {
             // 已经作废：不再等 dsh 的取消往返（真机 2.5–3.2 s），否则串行链卡着，
             // 用户下一句要排队。作废那一刻走的是**放手**（不取消），dsh 跑完之后
@@ -671,7 +871,41 @@ export class TurnRunner {
             replyPath = reply.path;
             delegateReason = reply.delegate;
             speech = reply.speech;
-            await pump?.drain(reply.speech);
+            this.noteLane(replyPath);
+            if (delegateStreaming !== null) {
+              try {
+                await delegateStreaming;
+                const spoken = spokenFromStream(delegateStreamedRaw);
+                if (spoken !== '' && spoken !== speech) {
+                  this.log(
+                    `  流式    转交后实际念了 ${[...spoken].length} 字`
+                    + `（最后一步只有 ${[...speech].length} 字）`,
+                  );
+                  speech = spoken;
+                }
+                // 流式一条音频都没吐出来（dsh 没挂流式通道 / 增量全是空串）：
+                // 不能就这么哑着走完一轮，退回整段合成。
+                if (audioBytes === bytesBeforeDelegate && !fsm.isStale(ticket)) {
+                  this.log('  流式    ✗ 转交后没有增量到达，退回整段合成');
+                  firstSynthAt = this.options.clock.now();
+                  for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
+                    if (fsm.isStale(ticket)) break;
+                    emit(chunk);
+                  }
+                }
+              } catch (error) {
+                // 这条路挂了（最常见：一个字都没收到，服务端会拒空文本）。
+                // 退回整段合成，宁可慢也不能哑。
+                this.log(`  流式    ✗ ${(error as Error).message}，退回整段合成`);
+                firstSynthAt = this.options.clock.now();
+                for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
+                  if (fsm.isStale(ticket)) break;
+                  emit(chunk);
+                }
+              }
+            } else {
+              await pump?.drain(reply.speech);
+            }
             if (fsm.isStale(ticket) && audioBytes === bytesBeforeDelegate) {
               // dsh 答了，但一个字都没合成出去（这条在到达前就被作废了）。
               // `said` 记的必须是**念出去的**文本，不能是这段没念的答案 ——
@@ -687,7 +921,7 @@ export class TurnRunner {
           // 流式成功：念出去的是**全部增量**，不只是最后一步。用它做 `speech`，
           // 打断续话才对得上已播时长。按全部增量算而不是按「已送批」算：被打断时
           // 没来得及送的那截也是"没说完"的一部分，漏了它续话会少一段。
-          const spoken = cleanForSpeech(parseEmotion(streamedRaw).rest);
+          const spoken = spokenFromStream(streamedRaw);
           if (spoken !== '' && spoken !== speech) {
             this.log(
               `  流式    实际念了 ${[...spoken].length} 字`
@@ -752,11 +986,13 @@ export class TurnRunner {
       }
 
       // 用户听到多少、这一轮该不该记账 —— **判定交给内核**（`kernel.ts` 的纯函数）。
-      // 这里只做两件事：把"这一轮被顶掉了"这条事实告诉它，然后取它声明的结算意图。
+      // 这里只做三件事：把"这一轮被顶掉了"这条事实告诉它，取回它声明的结算意图，
+      // 然后**照单执行**。
       //
       // 为什么不再自己 `outcomeOf(...)`：`stale`（控制面，票据比对）与 `truncated`
       // （内容面，媒体游标）以前在 `run()` 里各算一遍，一旦某处改了尺子就静默漂移。
-      // 现在两者都在内核里，且**分属不同正交区域**，播完瞬间被新轮顶掉也不会互相打架。
+      // 现在两者都在内核里，且**分属不同正交区域**；插话当场结算过的那一轮，
+      // 这里拿到的也是同一份结算（内核按 `lastSettled` 幂等重述），不会重算成"听全了"。
       if (fsm.isStale(ticket)) {
         this.feed({ type: 'ticketInvalidated', ticket });
       }
@@ -765,22 +1001,40 @@ export class TurnRunner {
         ticket,
         atMs: this.options.clock.now(),
       });
-      const settlement = settleEffects.find(
-        (effect): effect is Extract<Effect, { type: 'settleTurn' }> =>
-          effect.type === 'settleTurn' && effect.ticket.no === ticket.no,
-      );
-      if (settlement === undefined) {
-        this.log('  内核    ✗ 没拿到这一轮的结算意图（状态对不上），按旧口径兜底');
+      // 结算由 `KernelPorts.settleTurn` 送进来（上面那次 `feed` 就执行了它）——
+      // 这里只按票据取走，**不再自己从意图里挑一条本地解释**。
+      let settlement = this.takeSettlement(ticket);
+      if (settlement === null && this.options.fsm.runtime.ports === null) {
+        // 裸跑 TurnRunner 单测（未挂 DialogRuntime 端口）时，用一次性本地端口解释
+        // 同一批内核意图 —— 没有第二套口径，只是把「谁来执行」换成本地空实现。
+        const local: { turn: KernelSettlement | null } = { turn: null };
+        applyEffects(settleEffects, {
+          stopDeviceAudio: () => {},
+          invalidateTurn: () => {},
+          abortEngine: () => {},
+          settleTurn: (turn) => { local.turn = turn; },
+          log: this.log,
+        });
+        settlement = local.turn;
       }
-      const outcome = settlement?.outcome ?? outcomeOf({
-        stale: interrupted,
-        firstAudioAtMs,
-        nowMs: this.options.clock.now(),
-        totalAudioMs: audioBytes === 0 ? 0 : audioSeconds * 1000,
-        sentMediaMs: pcm16DurationMs(audioBytes, audioRate),
-      });
-      const heardSeconds = outcome.heardMs / 1000;
-      const truncated = outcome.truncated;
+      // 内核保证 `turnEnded` 必出一条结算（要么现算，要么重述当场那次）。真缺了就是
+      // 装配坏了 —— 只留痕，**不拿第二套口径兜底**（那正是这次要删掉的东西）。
+      if (settlement === null) {
+        this.log('  内核    ✗ 没拿到这一轮的结算意图（内核保证必然有，检查装配）');
+        settlement = {
+          ticket,
+          truncated: false,
+          reflect: false,
+          inject: 'none',
+          heardMs: 0,
+          totalAudioMs: 0,
+          lane: null,
+          endedAtMs: this.options.clock.now(),
+        };
+      }
+      const inject = settlement.inject;
+      const heardSeconds = settlement.heardMs / 1000;
+      const truncated = settlement.truncated;
 
       // 委派轮：把 dsh 的答案回注给 omni 的上下文，否则它不知道自己那一轮被接走了。
       // 按 `truncated` 而不是 `interrupted`：插话落在最后一个字之后（上面第 3 轮那种）
@@ -793,11 +1047,25 @@ export class TurnRunner {
       // 内容照注，口气（`spoken`/`unspoken`）按实际下发情况标 —— 见 `InjectKind`。
       //
       // 快车道答的轮次不注：它们走 `reply()`，omni 那边由 `noteServedTurn` 覆盖。
-      if (replyPath === 'dsh' && !truncated && speech.trim() !== '') {
-        if (audioBytes === 0) {
+      //
+      // **口气只认内核的 `settlement.inject`**（`spoken` / `unspoken` / `none`）：
+      // 以前这里按 `audioBytes === 0` 自己判 `unspoken`，与内核的 `reflect` 是两套算法，
+      // 一处改了尺子另一处静默漂移。`none` 就是「用户少听了一段」，不注。
+      if (replyPath === 'dsh' && inject !== 'none' && speech.trim() !== '') {
+        if (inject === 'unspoken') {
           this.log('  omni    答案一个字都没念出去，但仍回注（下一轮会接着问）');
         }
-        agent.injectAnsweredTurn?.(text, speech, audioBytes === 0 ? 'unspoken' : 'spoken');
+        agent.injectAnsweredTurn?.(text, speech, inject);
+      }
+
+      // 账本：只有 **omni 自己答完**的轮次才记（它没走 `reply()`，不记就跨车道失忆）。
+      // 转交 dsh 的那种不算 —— omni 说的那句只是垫话，dsh 那一轮由 `injectAnsweredTurn`
+      // / `onDetachedAnswer` 记，重复记账会让路由以为"上一轮是 live 答的"。
+      //
+      // `truncated` 用结算出来的那个值，**不能省**：账本里它决定回注与粘性判断，
+      // 缺了就永远以为用户听全了（P1-4 的接线点）。
+      if (replyPath === 'omni' && !delegated) {
+        agent.noteServedTurn?.(text, speech, truncated);
       }
 
       this.options.onEvent?.(EVENTS.turnEnd, {
@@ -867,6 +1135,9 @@ export class TurnRunner {
       return null;
     } finally {
       offInvalidate();
+      // 端口侧的作废对象只活这一轮：清掉之后迟到的 `invalidateTurn` 一定是给别人
+      // （或者已经没有在途轮次），严格票据比对会把它丢掉。
+      this.activeTurn = null;
       this.playingTicket = null;
       fsm.audioDone(ticket);
       this.options.onState?.();

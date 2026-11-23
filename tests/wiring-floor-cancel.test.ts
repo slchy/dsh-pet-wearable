@@ -112,6 +112,14 @@ test('生产装配：一轮走完话筒要放空，中途要通知到 thinking /
     log: () => {},
   });
 
+  // 内核意图的**唯一执行者**就是这份生产端口（`stopDeviceAudio` / `invalidateTurn` /
+  // `abortEngine` / `settleTurn`）。没绑上 = 插话不断音、dsh 白跑，而且一条日志都没有。
+  assert.notEqual(
+    runtime.core.runtime.ports,
+    null,
+    '生产装配必须给内核绑好端口',
+  );
+
   app.userPartial();
   app.userFinal('你好');
   runtime.dispatch({ type: 'utterance', text: '你好' });

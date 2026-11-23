@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { SessionCore, type CoreEffect } from '../src/session-core.ts';
+import { KernelRuntime } from '../src/kernel-runtime.ts';
 import {
   V1_BASELINE,
   XIAOMI_GLASSES_CAPABILITIES,
@@ -41,6 +42,52 @@ function newCore(
 function callOps(effects: readonly CoreEffect[]): string[] {
   return effects.map((effect) => (effect.type === 'call' ? `call:${effect.call.op}` : effect.type));
 }
+
+/**
+ * 带**记账端口**的 core。
+ *
+ * 插话的副作用（停音频 / 作废 / 放弃投机 / 结算）现在全部由内核声明，`DialogFsm`
+ * 走 `dispatchAndApply` 执行 —— 单测要能看见它们真的落到了端口上，而不是只看
+ * `CoreEffect`。
+ *
+ * @param baseCommitSeq 开轮时锁存的因果水位线；不传 = 票据没有因果坐标
+ */
+function newWiredCore(baseCommitSeq?: number): {
+  core: SessionCore;
+  lines: string[];
+  ports: string[];
+} {
+  const lines: string[] = [];
+  const ports: string[] = [];
+  // 装配层（`DialogRuntime`）就是这么做：先建唯一的运行时交给 core，再绑端口
+  const runtime = new KernelRuntime();
+  const core = new SessionCore({
+    capabilities: XIAOMI_GLASSES_CAPABILITIES,
+    imageQuestion: '这张图里有什么？',
+    log: (line) => { lines.push(line); },
+    runtime,
+    ...(baseCommitSeq === undefined
+      ? {}
+      : { ticketContext: { baseCommitSeq: () => baseCommitSeq } }),
+  });
+  core.runtime.attachPorts({
+    stopDeviceAudio: () => { ports.push('stopDeviceAudio'); },
+    invalidateTurn: (ticket, reason) => {
+      ports.push(`invalidateTurn:${reason}:${ticket.no}/${ticket.gen}`);
+    },
+    abortEngine: (reason) => { ports.push(`abortEngine:${reason}`); },
+    settleTurn: (turn) => { ports.push(`settleTurn:${turn.ticket.no}/${turn.ticket.gen}`); },
+  });
+  return { core, lines, ports };
+}
+
+/** 打断时内核必须落地的四件事，顺序就是 `bargeInTransition` 的声明顺序 */
+const BARGE_IN_PORTS = [
+  'stopDeviceAudio',
+  'invalidateTurn:bargeIn:1/0',
+  'abortEngine:barge_in',
+  'settleTurn:1/0',
+];
 
 /** 把会话推到 speaking：开一轮 + 首块音频。 */
 function toSpeaking(core: SessionCore): void {
@@ -81,14 +128,18 @@ test('定稿一句话：开一轮并带上票据', () => {
 });
 
 test('插话只在 speaking 成立', () => {
-  const { core } = newCore();
+  const { core, ports } = newWiredCore();
   // listening：不算插话
   assert.deepEqual(core.dispatch({ type: 'partial', text: '等一下' }), []);
+  assert.deepEqual(ports, [], '不在 speaking 时内核一条意图都不发');
 
   toSpeaking(core);
-  assert.deepEqual(callOps(core.dispatch({ type: 'partial', text: '等一下' })), [
-    'call:audio.stop',
-  ]);
+  assert.deepEqual(
+    callOps(core.dispatch({ type: 'partial', text: '等一下' })),
+    [],
+    '停播由内核意图执行，CoreEffect 里不再有一份 audio.stop',
+  );
+  assert.deepEqual(ports, BARGE_IN_PORTS, '打断的四件事真的落到了 KernelPorts');
   assert.equal(core.phase, 'listening');
 });
 
@@ -100,12 +151,13 @@ test('太短的中间结果不触发插话', () => {
 });
 
 test('播报中的定稿也要打断 —— 短促插话常常只有定稿、没有中间结果', () => {
-  const { core } = newCore();
+  const { core, ports } = newWiredCore();
   toSpeaking(core);
   // 真机日志：「句 3 "退休。"」在 speaking 里到达，只派发 assemble 不打断，
   // 于是要等到下一句的部分结果才停 —— 表现为"有时候打断要等好几秒"。
   const effects = core.dispatch({ type: 'sentence', text: '退下' });
-  assert.deepEqual(callOps(effects), ['call:audio.stop', 'assemble']);
+  assert.deepEqual(callOps(effects), ['assemble'], '定稿只进合并器；停播是内核意图的事');
+  assert.deepEqual(ports, BARGE_IN_PORTS, '定稿打断的副作用同样只由内核执行一次');
   assert.equal(core.phase, 'listening');
 });
 
@@ -122,6 +174,82 @@ test('旁听反馈的定稿不打断播放 —— 和中间结果同一套判据
 test('不在播报时，定稿照常只是攒进一轮（不要多打一枪停止）', () => {  const { core } = newCore();
   // listening 状态：没有音频在放，"停播"是空动作
   assert.deepEqual(callOps(core.dispatch({ type: 'sentence', text: '帮我看看这个' })), ['assemble']);
+});
+
+// ------------------------------------------------- 单一因果屏障（commitSeq 一路到底）
+
+test('因果屏障：开轮前录的中间结果不打断（speaking）', () => {
+  const { core, ports } = newWiredCore(2);
+  toSpeaking(core);
+  // commitSeq=2 就是开轮时锁存的水位线：这段音频全部录在开轮之前，
+  // 它只可能是判停抢跑后补回来的后半句，不是用户在插话。
+  assert.deepEqual(core.dispatch({ type: 'partial', text: '等一下', commitSeq: 2 }), [
+    { type: 'drop', why: 'pre-turn' },
+  ]);
+  assert.equal(core.phase, 'speaking', '旧段不构成插话');
+  assert.deepEqual(ports, [], '一条内核意图都不该发（更不许停音频）');
+});
+
+test('因果屏障：开轮前录的中间结果也不开轮（thinking）', () => {
+  const { core, ports } = newWiredCore(2);
+  assert.ok(core.fsm.beginTurn());
+  assert.equal(core.phase, 'thinking');
+  assert.deepEqual(core.dispatch({ type: 'partial', text: '等一下', commitSeq: 1 }), [
+    { type: 'drop', why: 'pre-turn' },
+  ]);
+  assert.equal(core.phase, 'thinking', '相位不动');
+  assert.deepEqual(ports, []);
+});
+
+test('因果屏障：开轮前录的定稿不打断、也不交给合并器（speaking）', () => {
+  const { core, ports } = newWiredCore(2);
+  toSpeaking(core);
+  const effects = core.dispatch({ type: 'sentence', text: '后半句', commitSeq: 2 });
+  assert.deepEqual(effects, [{ type: 'drop', why: 'pre-turn' }], '不返回 assemble');
+  assert.equal(core.phase, 'speaking', '相位不动');
+  assert.deepEqual(ports, [], '一条内核意图都不该发');
+});
+
+test('因果屏障：开轮前录的定稿也不开轮（thinking）', () => {
+  const { core, ports } = newWiredCore(2);
+  assert.ok(core.fsm.beginTurn());
+  assert.deepEqual(core.dispatch({ type: 'sentence', text: '后半句', commitSeq: 2 }), [
+    { type: 'drop', why: 'pre-turn' },
+  ]);
+  assert.equal(core.phase, 'thinking');
+  assert.deepEqual(ports, []);
+});
+
+test('因果屏障：开轮后的新中间结果构成插话（speaking）', () => {
+  const { core, ports } = newWiredCore(2);
+  toSpeaking(core);
+  assert.deepEqual(core.dispatch({ type: 'partial', text: '等一下', commitSeq: 3 }), []);
+  assert.deepEqual(ports, BARGE_IN_PORTS, '四件事都真的执行了');
+  assert.equal(core.phase, 'listening');
+  assert.equal(core.fsm.gen, 1, '代次 +1：排队中的轮次从此作废');
+});
+
+test('因果屏障：开轮后的新定稿既打断又进合并器（speaking）', () => {
+  const { core, ports } = newWiredCore(2);
+  toSpeaking(core);
+  const effects = core.dispatch({ type: 'sentence', text: '退下', commitSeq: 3 });
+  assert.deepEqual(callOps(effects), ['assemble']);
+  assert.deepEqual(ports, BARGE_IN_PORTS);
+  assert.equal(core.phase, 'listening');
+});
+
+test('因果屏障：服务端 VAD 不给 commitSeq 时放行（宁可放过一次插话）', () => {
+  const partial = newWiredCore(2);
+  toSpeaking(partial.core);
+  assert.deepEqual(partial.core.dispatch({ type: 'partial', text: '等一下' }), []);
+  assert.deepEqual(partial.ports, BARGE_IN_PORTS, '没有出生证就不猜，照常打断');
+  assert.equal(partial.core.phase, 'listening');
+
+  const sentence = newWiredCore(2);
+  toSpeaking(sentence.core);
+  assert.deepEqual(callOps(sentence.core.dispatch({ type: 'sentence', text: '退下' })), ['assemble']);
+  assert.deepEqual(sentence.ports, BARGE_IN_PORTS);
+  assert.equal(sentence.core.phase, 'listening');
 });
 
 test('没人等的图：起一轮识图', () => {

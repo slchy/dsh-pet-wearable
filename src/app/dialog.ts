@@ -26,6 +26,8 @@ import { isBackchannelOnly } from '../backchannel.ts';
 import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { DialogFsmContext, TurnTicket, DialogState } from '../dialog-fsm.ts';
+import { initialKernelState } from '../kernel.ts';
+import { KernelRuntime } from '../kernel-runtime.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
 import {
   announceInterruptionNote, interruptionNote, remainingSpeech, TTS_CHARS_PER_SEC,
@@ -150,10 +152,19 @@ export interface DialogOptions {
   readonly clock: Clock;
   readonly caps: DeviceCapabilities;
   /**
-   * 票据上的 aseCommitSeq / startedAtMs 从哪来（见 dialog-fsm.ts 的
+   * 票据上的 `baseCommitSeq` / `startedAtMs` 从哪来（见 dialog-fsm.ts 的
    * DialogFsmContext）。由 VoiceSession 注入 —— 只有它认识 ASR。
    */
   readonly ticketContext?: DialogFsmContext;
+  /**
+   * 这条会话还是不是**当前活跃的那条连接**（缺省恒 `true`）。
+   *
+   * 唯一用途是 `dispose()` 时决定要不要摘 agent 上的回执钩子：`setDelegateHook`
+   * 是**进程级共用**的一个槽，而旧连接（被新连接顶掉的那条）的收尾常常晚于
+   * 新连接的挂载 —— 不判所有权就摘，等于把新连接的回执掐掉（表现是「重连之后
+   * 它再也不说『我看看』」）。
+   */
+  readonly isActiveOwner?: () => boolean;
   readonly agent: AgentProvider;
   readonly tts: TtsProvider;
   readonly downlink: DownlinkSink;
@@ -191,6 +202,20 @@ export class DialogRuntime {
   private readonly options: DialogOptions;
   /** 上一次通知过的状态机状态（只在真的变了时回调 `onDialogState`） */
   private lastDialogState: DialogState;
+  /**
+   * 挂在 agent 上的回执钩子。
+   *
+   * 存成字段而不是匿名闭包：`dispose()` 要按**值**判断「现在挂的是不是我那份」，
+   * 现造一个新闭包摘不掉别人的（`setDelegateHook` 没有令牌参数）。
+   */
+  private readonly delegateHook = (reason: DelegateReason): void => {
+    if (this.disposed) {
+      return;
+    }
+    this.runner.speakReceipt(pickReceipt(reason));
+  };
+  /** `fsm.onState` 的退订函数（`dispose()` 时摘掉，别让死连接继续收通知） */
+  private readonly unsubscribeState: () => void;
   /** 一轮、一次拍照都排在这条链上，不并发 */
   private serialChain: Promise<void> = Promise.resolve();
   /** 串行队列里还没跑完的任务数 */
@@ -229,11 +254,25 @@ export class DialogRuntime {
   constructor(options: DialogOptions) {
     this.options = options;
 
+    // **一个会话只有一份 `KernelState`**：这里种好它（含「上一轮谁答的」），
+    // `SessionCore` / `DialogFsm` / `TurnRunner` 拿到的是同一个实例。
+    // `lastLedgerLane` 是重连时唯一的记性：内核是新建的，不播种就不知道上一轮是 dsh，
+    // 用户顺着它的追问回一句会被当成闲聊抢答。
+    const kernelRuntime = new KernelRuntime(
+      initialKernelState(0, options.agent.lastLedgerLane?.() ?? null),
+    );
     this.core = new SessionCore({
       imageQuestion: options.imageQuestion,
       log: options.log,
       capabilities: options.caps,
-      ...(options.ticketContext === undefined ? {} : { ticketContext: options.ticketContext }),
+      runtime: kernelRuntime,
+      ticketContext: {
+        ...(options.ticketContext ?? {}),
+        // `now` 必须有：`bargeIn` 的结算时刻（`endedAtMs` / `heardMs`）从它来。
+        // 缺了就是 `atMs = 0`，插话当场结算会算出「一秒都没听到」，与真机行为不同。
+        // 模拟器（`DialogSim`）不注入 `ticketContext`，也要走这一条虚拟时钟。
+        now: options.ticketContext?.now ?? (() => options.clock.now()),
+      },
     });
     this.lastDialogState = this.core.fsm.state;
 
@@ -270,15 +309,51 @@ export class DialogRuntime {
       log: options.log,
     });
 
+    // **生产端口**：内核声明的意图从这里落到真实世界 —— 停设备音频、作废在途轮次、
+    // 放弃引擎投机、把这一轮的结算交回 `TurnRunner` 并写进账本。
+    //
+    // 绑一次，此后每一条事件都走 `dispatchAndApply`，意图**只执行一次**：
+    // 门面（`DialogFsm`）不再另发一份 `audio.stop`，`TurnRunner` 也不再订阅
+    // `onInvalidate` 自己取消一遍。
+    //
+    // **`dispose()` 不许 `attachPorts(null)`**：`VoiceConnection.onClose` 里
+    // `app.dispose()`（含本类 `dispose()`）跑在 `dialog.dispatch({type:'closed'})`
+    // **之前**，而 `closed` 必须还能通过 `invalidateTurn` 取消在途的上游请求。
+    this.core.runtime.attachPorts({
+      stopDeviceAudio: () => {
+        options.env.call({ op: 'audio.stop' });
+      },
+      invalidateTurn: (ticket, reason) => {
+        this.runner.invalidateTurn(ticket, reason ?? 'bargeIn');
+      },
+      abortEngine: (reason) => {
+        options.agent.dropPrefetch?.(`内核中止(${reason})`);
+      },
+      settleTurn: (turn) => {
+        // `TurnRunner` 拿它结算这一轮；账本（`ConversationLedger`）按同一张票据
+        // 补上「用户到底听全没有」—— 两份账必须同源，否则路由按哪份都错。
+        this.runner.acceptSettlement(turn);
+        options.agent.reconcileTurnOutcome?.({
+          ticket: turn.ticket,
+          truncated: turn.truncated,
+          endedAtMs: turn.endedAtMs,
+        });
+      },
+      log: options.log,
+    });
+
     // 委派轮的回执：快车道判出「这轮答不了」时补一句，填掉 1.8–2.9 s 的安静。
     // 挂在 `DialogRuntime` 而不是 `voice-session`：轮次在这里，判断「这一轮还要不要说话」
     // 只有它做得了（票据在 `TurnRunner` 里）。
-    options.agent.setDelegateHook?.((reason) => {
-      if (this.disposed) {
-        return;
-      }
-      this.runner.speakReceipt(pickReceipt(reason));
-    });
+    options.agent.setDelegateHook?.(this.delegateHook);
+
+    // 状态机的**每一次**转移都要走一遍通知（`notifyState` 自己去重）。
+    //
+    // 只在 `dispatch()` 结尾调一次是不够的：一个事件里可能**同步连续**跳好几格
+    // （`awaiting_shot` 里改主意会先 `abortAwaitShot` 回 `listening`、再为同一句话
+    // 重新 `beginAwaitShot`），末尾读到的状态和起点相同，去重之后就一条都不通知 ——
+    // `AppSession` 的话筒归属和档案里的 `dialog.state` 都会漏掉中间那一格。
+    this.unsubscribeState = this.core.fsm.onState(() => { this.notifyState(); });
   }
 
   // ---------------------------------------------------------------- 输入面
@@ -289,6 +364,12 @@ export class DialogRuntime {
    * @returns 这一批效果（调用方偶尔要先看一眼，比如"是不是要求停播"）
    */
   dispatch(event: CoreEvent): readonly CoreEffect[] {
+    // 先让判定核跑：它才知道这段转写是不是**开轮前录的旧段**（因果屏障）。
+    const effects = this.core.dispatch(event);
+    // 旧段既不能打断，也不能当「用户刚开口」去掐旁白、去刷新「他还在说话」的时间戳 ——
+    // 判停抢跑补回来的那半句会让一条后台汇报莫名其妙停下，或让播报一直让路。
+    const droppedPreTurn = effects.some((effect) => effect.type === 'drop' && effect.why === 'pre-turn');
+
     // 用户只要开口（中间结果 / 定稿 / 成句），任何正在念的「回执」和「播报」都要停。
     // 只在 `onPartial` 上收回执是不够的：短促的插话常常只出定稿（真机 05:17:24）。
     //
@@ -296,7 +377,10 @@ export class DialogRuntime {
     // 只剩下一个空壳 `if` —— 表现是「用户插话，旁白照念」。别再把这段改成空的：
     // 旁白（后台汇报 / 回执）不占轮次票据，状态机也停在 `listening`，
     // 所以 `bargeIn` 那条路对它不成立，**它是唯一能掐断播报的地方**。
-    if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
+    if (
+      !droppedPreTurn
+      && (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance')
+    ) {
       this.lastUserSpeechAt = this.options.clock.now();
       if (event.type !== 'partial') {
         this.lastUserSentenceAt = this.options.clock.now();
@@ -307,7 +391,6 @@ export class DialogRuntime {
         this.interruptCanned();
       }
     }
-    const effects = this.core.dispatch(event);
     this.execute(effects);
     this.notifyState();
     return effects;
@@ -626,9 +709,20 @@ export class DialogRuntime {
       return;
     }
     this.disposed = true;
+    // **不要在这里 `attachPorts(null)`**：`VoiceConnection.onClose` 的顺序是
+    // `app.dispose()`（含本方法）→ `dialog.dispatch({type:'closed'})`。摘了端口，
+    // `closed` 就发不出 `invalidateTurn`，在途的上游轮次会一直跑到超时才收。
+    // 端口属于「这条会话的内核」，随实例一起被丢弃，不需要显式解绑。
+    this.unsubscribeState();
     this.announceQueue.length = 0;
     this.announceRetry?.();
     this.announceRetry = null;
     this.photos.dispose();
+    // 回执钩子是**进程级 agent 上的一个槽**：只有「我还是当前那条连接」时才摘。
+    // 旧连接的 `dispose()` 晚于新连接挂载是弱网重连的常态，无条件摘会把新连接
+    // 那份回执一起掐掉（`setDelegateHook` 没有令牌参数，只能靠这条守卫）。
+    if (this.options.isActiveOwner?.() ?? true) {
+      this.options.agent.setDelegateHook?.(null);
+    }
   }
 }
