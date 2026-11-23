@@ -49,3 +49,40 @@ test('heard 不会被推到超过音频总长', () => {
   assert.equal(out.heardMs, 1000);
   assert.equal(out.truncated, false);
 });
+
+test('媒体游标比墙钟更小：慢生成轮次不把"送得慢"算成"听得多"', () => {
+  // dsh 边生成边念：14 s 音频吐了 8 s 才吐完，用户第 5 秒插话。
+  // 旧口径（纯墙钟）说听了 5 s；实际送到设备的媒体时长只有 2 s。
+  // 高估的后果是判成"听全了"→ 该回注的答案被吞（`053719` 第 2 轮丢《其主之声》）。
+  const out = outcomeOf({
+    stale: true,
+    firstAudioAtMs: 1000,
+    nowMs: 6000,
+    totalAudioMs: 14_000,
+    sentMediaMs: 2000,
+  });
+  assert.equal(out.heardMs, 2000, '取媒体游标，不是墙钟差');
+  assert.equal(out.truncated, true);
+
+  // 反过来：媒体早就送完了，墙钟还没走完 —— 仍以墙钟为上界（声音播不了比实时快）
+  const cached = outcomeOf({
+    stale: true,
+    firstAudioAtMs: 1000,
+    nowMs: 3000,
+    totalAudioMs: 14_000,
+    sentMediaMs: 14_000,
+  });
+  assert.equal(cached.heardMs, 2000, 'elapsed 是物理上限');
+});
+
+test('没给媒体游标时退化成旧口径（回放对账不漂）', () => {
+  const withOut = outcomeOf({ stale: false, firstAudioAtMs: 1000, nowMs: 3400, totalAudioMs: 2400 });
+  const withMedia = outcomeOf({
+    stale: false,
+    firstAudioAtMs: 1000,
+    nowMs: 3400,
+    totalAudioMs: 2400,
+    sentMediaMs: 2400,
+  });
+  assert.deepEqual(withMedia, withOut);
+});

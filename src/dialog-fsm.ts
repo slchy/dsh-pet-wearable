@@ -255,6 +255,12 @@ export class DialogFsm {
   }
 
   /** 该票据的轮次是否已被插话作废（代次变了） */
+  /**
+   * 该票据是不是**已经被顶掉**（只比代次）。
+   *
+   * 与 {@link isCurrent} 合起来才等于 `causal.ts` 的 `isStaleTicket`：本类刻意把
+   * 两件事拆开，"哪一轮"和"被插话几次"是不同的因果量，别在一处比完。
+   */
   isStale(t: TurnTicket): boolean {
     return t.gen !== this._gen;
   }

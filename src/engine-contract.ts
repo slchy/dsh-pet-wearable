@@ -111,6 +111,23 @@ export const TRUNCATED_EPSILON_MS = 300;
  * 由「票据作废 + 首块时刻 + 音频总长」算出 {@link TurnOutcome}。
  *
  * 纯函数：同一份输入永远同一个结果，回放可以对账。
+ *
+ * ## 尺子：这里必须用**媒体时间**，不是墙钟
+ *
+ * 三把尺子各有各的活（见 `docs/QOS.md` 的"三种时间"）：
+ *
+ * | 尺子 | 回答什么 | 用在哪 |
+ * |:--|:--|:--|
+ * | 逻辑因果（`commitSeq`/`ticket`） | 谁发生在谁之前 | 能不能打断、这份回答该谁认领 |
+ * | **媒体时间**（采样点数/字节数） | 声音在声学轴上落到哪 | `heardMs`、`truncated`、续话 |
+ * | 墙钟（`clock.now`） | 等了多久 | 超时、轮询 |
+ *
+ * `heardMs` 曾经是「首块下发之后过了多久」（纯墙钟）。dsh 那种**边生成边念**的轮次上
+ * 它会高估：音频 14 s、TTS 吐了 8 s 才吐完，用户 5 s 时插话 —— 墙钟说听了 5 s，
+ * 可真正送到设备的媒体时长只有 2 s。高估 → 判成"听全了" → 该回注的答案被吞。
+ *
+ * 所以取两者的小值：声音播不了比实时更快（`elapsed` 是物理上限），也播不了还没送到的
+ * 东西（`sentMediaMs`）。没给 `sentMediaMs` 时退化成旧口径，回放对账不会漂。
  */
 export function outcomeOf(input: {
   readonly stale: boolean;
@@ -119,13 +136,20 @@ export function outcomeOf(input: {
   /** 算 `heardMs` 用的「现在」 */
   readonly nowMs: number;
   readonly totalAudioMs: number;
+  /**
+   * 已经**下发到设备**的媒体时长（ms）：字节数 / 采样率。
+   *
+   * 不是墙钟——生成慢的轮次里它比 `nowMs - firstAudioAtMs` 小得多。
+   */
+  readonly sentMediaMs?: number;
 }): TurnOutcome {
   const total = Math.max(0, input.totalAudioMs);
-  // 用户听到的时长按「首块发出之后过了多久」算，不按字节算：
-  // 回答是整段先合成完再等的，插话那会儿音频早就全发出去了。
+  const elapsed = input.firstAudioAtMs < 0
+    ? 0
+    : Math.max(0, input.nowMs - input.firstAudioAtMs);
   const heard = input.firstAudioAtMs < 0
     ? 0
-    : Math.min(total, Math.max(0, input.nowMs - input.firstAudioAtMs));
+    : Math.min(total, elapsed, input.sentMediaMs ?? Number.POSITIVE_INFINITY);
   return {
     stale: input.stale,
     truncated: total > 0 && heard + TRUNCATED_EPSILON_MS < total,

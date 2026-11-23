@@ -18,6 +18,7 @@ import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
 import { pcm16PeakDbfs } from './pcm.ts';
 import { voicingVerdict } from './barge-voicing.ts';
+import { isPreTurnSegment } from './causal.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
 import { performance } from 'node:perf_hooks';
@@ -1370,7 +1371,10 @@ class VoiceConnection {
     if (base === undefined) {
       return false;
     }
-    return this.commitSeq <= base;
+    // 判据只有一条，且**唯一的家**在 `causal.ts`：以前这条比较散在五个文件八处，
+    // 改一处漏一处就是静默失效（`baseCommitSeq` 缺失时会被判成"不是旧段"，
+    // 表现就是自己打断自己）。
+    return isPreTurnSegment({ commitSeq: this.commitSeq }, { baseCommitSeq: base });
   }
 
   /**

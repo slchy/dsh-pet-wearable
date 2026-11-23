@@ -722,7 +722,7 @@ export class TurnRunner {
         interrupted = fsm.isStale(ticket);
       }
 
-      // 用户听到的时长按「首块发出之后过了多久」算 —— 见 `outcomeOf()`。
+      // 用户听到的时长按**媒体时间**算 —— 见 `outcomeOf()` 上方那张「三把尺子」的表。
       // **用户到底少听了没有**，和上面的 `interrupted` 是两件事，别合成一个变量：
       //
       // - `interrupted` = 票据被作废（控制面）。它决定老轮还能不能动 FSM，
@@ -737,6 +737,8 @@ export class TurnRunner {
         firstAudioAtMs,
         nowMs: this.options.clock.now(),
         totalAudioMs: audioBytes === 0 ? 0 : audioSeconds * 1000,
+        // 媒体游标：字节数 / 采样率。生成慢的轮次里它比墙钟小得多（见 `outcomeOf`）
+        sentMediaMs: pcm16DurationMs(audioBytes, audioRate),
       });
       const heardSeconds = outcome.heardMs / 1000;
       const truncated = outcome.truncated;
