@@ -54,9 +54,17 @@ export interface EnergyGateDecision {
   readonly closed: boolean;
   /** 关门时距上次「有声」过去了多久 —— 用来区分「真的安静」和「上行断流」 */
   readonly closedGapMs?: number;
+  /**
+   * 距最近一块**有声**音频过去了多久（ms）。
+   *
+   * 这是全链路**唯一**的静音累计：封段（20/150）、投机（100）、判停（200）
+   * 三个阈值都该读它，而不是各自按能量重算一遍（那正是"配置写 20 ms、实际门槛
+   * 92 ms 还查不出来"的来源）。`voiced` 那一块本身返回 0。
+   */
+  readonly silenceMs: number;
 }
 
-const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false, voiced: false };
+const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false, voiced: false, silenceMs: 0 };
 
 export class EnergyGate {
   private readonly options: EnergyGateOptions;
@@ -93,6 +101,7 @@ export class EnergyGate {
           forward: true,
           closed: false,
           voiced: true,
+          silenceMs: 0,
           opened: {
             peakDbfs,
             preroll,
@@ -100,7 +109,7 @@ export class EnergyGate {
           },
         };
       }
-      return { forward: true, closed: false, voiced: true };
+      return { forward: true, closed: false, voiced: true, silenceMs: 0 };
     }
 
     if (!this.open) {
@@ -113,8 +122,8 @@ export class EnergyGate {
     const gapMs = this.now() - this.lastVoiceAtMs;
     if (gapMs > this.options.holdMs) {
       this.open = false;
-      return { forward: true, closed: true, voiced: false, closedGapMs: gapMs };
+      return { forward: true, closed: true, voiced: false, closedGapMs: gapMs, silenceMs: gapMs };
     }
-    return { forward: true, closed: false, voiced: false };
+    return { forward: true, closed: false, voiced: false, silenceMs: gapMs };
   }
 }

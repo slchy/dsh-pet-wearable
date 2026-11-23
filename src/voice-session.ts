@@ -531,6 +531,14 @@ class VoiceConnection {
    * 补回来的后半句。比时钟干净：不用猜「这一段是什么时候录的」。
    */
   private turnBaseCommitSeq = -1;
+  /**
+   * 最近一帧的**前端**静音时长（`AudioFrame.silenceMs`，能量门算的）。
+   *
+   * 落进 `asr.commit.front_silence_ms`：组装器那条「静音 20 ms（实际 92 ms）」
+   * 里的 92 是**它自己的 tick 延迟**（下一块音频什么时候到），而真机那句话问的
+   * 「到底静了多久」要的是这个数。两个数并排落档，①a 才拆得开。
+   */
+  private lastFrameSilenceMs = 0;
 
   private control: ToolControl | null = null;
 
@@ -745,6 +753,9 @@ class VoiceConnection {
                 this.archive?.event(EVENTS.asrCommit, {
                   seq,
                   silence_ms: Math.round(silenceMs),
+                  // 前端（能量门）算的真静音时长。与 `silence_ms` 的差就是
+                  // 「静音开始到真有音频帧到达」的 tick 延迟 —— ①a 拆开看这两个数
+                  front_silence_ms: Math.round(this.lastFrameSilenceMs),
                   want_ms: options.gate.sttCommitMs,
                   // 与 `omni.shadow` 的 join key：同一段语音的车道序号。
                   // 两个号从 2026-11-23 起**不再相等**（车道 20 ms 先跑、ASR 150 ms 后切），
@@ -836,12 +847,13 @@ class VoiceConnection {
         // （见 `OmniShadow` 的 mute），所以这里只要把预卷补上就行。
         this.omni?.restart(preroll);
       },
-      onSpeech: (pcm, voiced) => {
+      onFrame: (frame) => {
         // `voiced` 必须透传：门比封段晚关约 2 s，不带它 ASR 的「解码期暂存」
         // 就会把尾静音攒下来补推，换来一句幻觉定稿（实测 150 ms 静音 → 「嗯。」）
-        this.stt.feed(pcm, voiced);
+        this.lastFrameSilenceMs = frame.silenceMs;
+        this.stt.feed(frame.pcm, frame.voiced);
         // 同一个理由：不带它就会往旁路里灌静音
-        this.omni?.feed(pcm, voiced);
+        this.omni?.feed(frame.pcm, frame.voiced);
       },
       onSpeechClose: (gapMs) => {
         // 带上 gapMs：能量门要 holdMs（默认 2 s）才关门，所以 `t` 本身**不是**

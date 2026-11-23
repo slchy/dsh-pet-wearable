@@ -7,6 +7,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import { EnergyGate } from './energy-gate.ts';
+import type { AudioFrame } from './engine-contract.ts';
 import { pcm16Gain, pcm16PeakDbfs } from './pcm.ts';
 
 export interface UplinkGateConfig {
@@ -64,12 +65,14 @@ export interface UplinkPipelineOptions {
   /** 有声开始：先把 preroll 喂进 STT，再继续喂后续 */
   readonly onSpeechOpen: (peakDbfs: number, preroll: readonly Buffer[], prerollMs: number) => void;
   /**
-   * 门开着时的每一块音频。
+   * 门开着时的每一块音频 —— **声学前端的唯一出口**（见 `engine-contract.ts` 契约①）。
    *
-   * `voiced` = 这一块**本身**有没有声音（见 `EnergyGateDecision.voiced`）。
-   * 必须传下去：门比封段晚关 2 s 左右，按「门开着」当成「有声」会往旁路里灌两秒静音。
+   * 为什么给一整个 `AudioFrame` 而不是 `(pcm, voiced)`：下游各自需要的量不一样
+   * （ASR 要 `voiced` 决定暂存、omni 旁路要它决定 mute、封段/投机/判停要
+   * `silenceMs`），而「各取一个」的后果是各算一遍 —— 真机上就是四个阈值
+   * （20/100/150/200 ms）对不上同一段音频。
    */
-  readonly onSpeech: (pcm: Buffer, voiced: boolean) => void;
+  readonly onFrame: (frame: AudioFrame) => void;
   /** 持续静音：请 STT 出定稿并挂断这一路。`gapMs` = 距最后一个有声块多久 */
   readonly onSpeechClose: (gapMs?: number) => void;
 }
@@ -84,6 +87,8 @@ export class UplinkPipeline {
   /** 电平表：窗口内峰值与窗口起点 */
   private meterPeak = -Infinity;
   private meterAt = 0;
+  /** 能量门周期号：每次开门 +1（`AudioFrame.gateSeq`）。闭门期间不变 */
+  private gateSeq = 0;
 
   /**
    * 每 `levelLogMs` 打一行窗口峰值。
@@ -192,7 +197,7 @@ export class UplinkPipeline {
   }
 
   private onPcm(raw: Buffer): void {
-    const { onPcm, onSpeechOpen, onSpeech, onSpeechClose, onRawPcm, log } = this.options;
+    const { onPcm, onSpeechOpen, onFrame, onSpeechClose, onRawPcm, log } = this.options;
 
     onRawPcm?.(raw);
 
@@ -207,10 +212,18 @@ export class UplinkPipeline {
         `  上行    有声 ${decision.opened.peakDbfs.toFixed(1)} dBFS → 开始推送`
         + `（补 ${decision.opened.preroll.length} 块 / ${decision.opened.prerollMs} ms）`,
       );
+      this.gateSeq += 1;
       onSpeechOpen(decision.opened.peakDbfs, decision.opened.preroll, decision.opened.prerollMs);
     }
     if (decision.forward) {
-      onSpeech(pcm, decision.voiced);
+      const tsMs = Date.now();
+      onFrame({
+        pcm,
+        voiced: decision.voiced,
+        silenceMs: decision.silenceMs,
+        gateSeq: this.gateSeq,
+        tsMs,
+      });
     }
     if (decision.closed) {
       // 带上「距上次有声多久」：holdMs 只有 2 s，如果 gap 远大于它，
