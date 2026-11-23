@@ -444,8 +444,17 @@ export class TurnRunner {
       let firstAudioAtMs = -1;
       /** 下行采样率：omni 24 kHz 与 CosyVoice 同值，但**不能假设**，按回答走 */
       let audioRate = this.options.tts.sampleRate;
+      /**
+       * 首块是不是已经处理过。
+       *
+       * **不能拿 `firstChunkAtMs === 0` 当哨兵**：omni 直出那条 `firstSynthAt` 一直是 0，
+       * 于是 `firstChunkAtMs` 永远留在 0，下面整段（`tts.first` 事件、`audioStarted`、
+       * 掐回执）会**每块重跑一次** —— 真机档案里一场 14 轮冒出 338 条 `tts.first`。
+       */
+      let firstChunkSeen = false;
       const emit = (chunk: Buffer): void => {
-        if (firstChunkAtMs === 0) {
+        if (!firstChunkSeen) {
+          firstChunkSeen = true;
           firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
           firstAudioAtMs = this.options.clock.now();
           this.firstAudioSeen = true;
@@ -565,13 +574,20 @@ export class TurnRunner {
         speech = reply.speech;
         agent.noteServedTurn?.(text, speech);
         const why = reply.audio.delegateReason?.() ?? null;
-        if (why !== null) {
+        if (why !== null && fsm.isStale(ticket)) {
+          // 已经作废了就别再叫 dsh：真机 2026-11-23 第 5 轮，插话与 omni 的
+          // `response.done` 落在同一毫秒，这一轮还是去问了 dsh，白等 2.5 s 之后
+          // 一个字都没合成 —— 期间状态机一直挂在 `thinking`，下一轮已经开跑了。
+          this.log('  omni    想转交 dsh，但本轮已作废 → 不问了');
+        } else if (why !== null) {
           // omni 自己发了 tool_call：就地切给 dsh。
           // 已经出过声就不再叠回执（两份不同的声音接在一起很难听，而且收不回来）。
           this.log('  omni    决定转交 dsh');
           // 正文用 omni 的转述（它直接听音频，专名比 ASR 准），ASR 原话只作附注 ——
           // 数字、路径、设备名这些"照抄"的东西靠原话兜底。
           const omniText = reply.audio.delegateText?.() ?? null;
+          const leadIn = speech;
+          const bytesBeforeDelegate = audioBytes;
           reply = await agent.reply(
             omniText === null ? text : `${omniText}\n用户原话：「${text}」`,
             image, note, {
@@ -584,6 +600,13 @@ export class TurnRunner {
           delegateReason = reply.delegate;
           speech = reply.speech;
           await pump?.drain(reply.speech);
+          if (fsm.isStale(ticket) && audioBytes === bytesBeforeDelegate) {
+            // dsh 答了，但一个字都没合成出去（这条在到达前就被作废了）。
+            // `said` 记的必须是**念出去的**文本，不能是这段没念的答案 ——
+            // 否则档案里看着"它答了罗马史"，实际播出去的只有 omni 那半句垫话。
+            this.log(`  omni    dsh 的答案没来得及合成 → said 仍是垫话`);
+            speech = leadIn;
+          }
         }
       } else if (streaming !== null) {
         try {
@@ -656,15 +679,27 @@ export class TurnRunner {
         ? 0
         : Math.min(audioSeconds, (this.options.clock.now() - firstAudioAtMs) / 1000);
 
+      // **用户到底少听了没有**，和上面的 `interrupted` 是两件事，别合成一个变量：
+      //
+      // - `interrupted` = 票据被作废（控制面）。它决定老轮还能不能动 FSM，
+      //   不能改判 —— 真机 2026-11-23 第 3 轮，19.44 s 音频**正好播完**、
+      //   用户 26 ms 后才开口，`heard_s` 因为 `Math.min` 封顶在 19.44，
+      //   按 `heard == audio` 判「没打断」的话，那一轮就会以为还能去收尾。
+      // - `truncated` = 内容面。只有它才该管记账与「要不要当成没听完」。
+      const HEARD_EPSILON_S = 0.3;
+      const truncated = audioSeconds > 0 && heardSeconds + HEARD_EPSILON_S < audioSeconds;
+
       // 委派轮：把 dsh 的答案回注给 omni 的上下文，否则它不知道自己那一轮被接走了。
-      // 只在**真播完了**时注 —— 被打断的正文用户没听到，不该变成 omni 的记忆。
+      // 按 `truncated` 而不是 `interrupted`：插话落在最后一个字之后（上面第 3 轮那种）
+      // 用户其实听全了，该注；少听了一段才不注。
       // 快车道答的轮次不注：它们走 `reply()`，omni 那边由 `noteServedTurn` 覆盖。
-      if (replyPath === 'dsh' && !interrupted && audioBytes > 0 && speech.trim() !== '') {
+      if (replyPath === 'dsh' && !truncated && audioBytes > 0 && speech.trim() !== '') {
         agent.injectAnsweredTurn?.(text, speech);
       }
 
       this.options.onEvent?.(EVENTS.turnEnd, {
         interrupted,
+        truncated,
         audio_s: Number(audioSeconds.toFixed(2)),
         heard_s: Number(heardSeconds.toFixed(2)),
         // 这一轮**念出去的**文本，审计模型行为用（尤其「抢话之后它有没有接上」）。

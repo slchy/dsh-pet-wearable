@@ -182,6 +182,59 @@ test('服务端报错后弃连接（同一条连接上后续合成会静默挂�
   assert.equal(socket.readyState, 3, '连接要关掉');
 });
 
+test('放弃一条流之后，下一条拿不到它的残留音频', async () => {
+  // 真机 2026-11-23 08:24：一条被放弃的长流之后，4 个字的回执合成了
+  // 506880 B / 10.56 s，且首块 0 ms（队列里现成的）。`bench/tts/reader-probe.mjs`
+  // 能稳定复现同一现象：放弃一条长流，下一条请求首块 1 ms、拿到 3.52 s 残留。
+  const { socket, tts } = make();
+  // 注意：`synthesize()` 是 async generator，**第一次 `next()` 才会去建连**
+  const first = tts.synthesize('第一句。')[Symbol.asyncIterator]();
+  const head = first.next();
+  await new Promise((r) => { setImmediate(r); });
+  socket.open();
+  await new Promise((r) => { setImmediate(r); });
+  socket.message({ type: 'session.updated' });
+  await new Promise((r) => { setImmediate(r); });
+  socket.message({ type: 'response.created', response: { id: 'r1' } });
+  socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  const firstChunk = await head;
+  assert.equal(firstChunk.done, false);
+
+  // 调用方不要这条了（插话 / 回执被顶掉）
+  const closing = first.return!(undefined);
+  await new Promise((r) => { setImmediate(r); });
+  assert.ok(socket.sent.some((s) => s.type === 'response.cancel'), '放弃时要让服务端停下');
+
+  // 它还在往下推：这些字节一个都不许进队列
+  socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480, 9).toString('base64') });
+
+  // 下一条不能抢在收尾之前发：服务端忙的时候会拒 `response.create`，而且不排队、直接丢
+  const second = tts.synthesize('第二句。')[Symbol.asyncIterator]();
+  const nextPending = second.next();
+  await new Promise((r) => { setImmediate(r); });
+  assert.equal(
+    socket.sent.filter((s) => s.type === 'conversation.item.create').length,
+    1,
+    '上一条还没 done 就发新请求，会被服务端当忙丢掉',
+  );
+
+  socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  await closing;
+
+  await new Promise((r) => { setImmediate(r); });
+  socket.message({ type: 'response.created', response: { id: 'r2' } });
+  socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(240, 7).toString('base64') });
+  const next = await nextPending;
+  assert.equal(next.done, false);
+  const chunk = next.value as Buffer;
+  assert.equal(chunk.length, 240, '必须是第二条自己的那块');
+  assert.equal(chunk[0], 7, '残留那块（填 9）不许漏过来');
+
+  socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const end = await second.next();
+  assert.equal(end.done, true, '正常收尾：不该再去等一个已经到过的 done');
+});
+
 test('空文本不发任何请求', async () => {
   const { socket, tts } = make();
   const got: Buffer[] = [];

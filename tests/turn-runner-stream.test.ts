@@ -41,6 +41,8 @@ interface Rig {
   /** 事件的载荷，`turn.end.path` / `delegate` 只能从这里看 */
   readonly payloads: Array<{ name: string; data: Record<string, unknown> }>;
   readonly logs: string[];
+  /** 测试里要能主动插话（`interrupted` / `truncated` 的差别只有它能造出来） */
+  readonly fsm: DialogFsm;
   run(): Promise<TurnResult | null>;
 }
 
@@ -117,12 +119,13 @@ function rig(options: {
       if (options.streamError !== undefined) throw options.streamError;
     },
   };
+  const fsm = new DialogFsm(() => {});
   const runner = new TurnRunner({
     clock,
     agent,
     tts,
     downlink: { sendAudio: () => {}, sendControl: () => {} },
-    fsm: new DialogFsm(() => {}),
+    fsm,
     playbackTailMs: 0,
     onEvent: (name, data) => {
       events.push(name);
@@ -132,8 +135,40 @@ function rig(options: {
     onLiveAvailable: (next) => { sink = next; },
     log: (line) => { logs.push(line); },
   });
-  return { streamed, whole, events, payloads, logs, served, run: () => runner.run('你好') };
+  return { streamed, whole, events, payloads, logs, served, fsm, run: () => runner.run('你好') };
 }
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/** 起一轮，`atMs` 之后插话 —— 用来造「音频发完了、用户才开口」的边界 */
+async function runWithBargeIn(atMs: number) {
+  const r = rig({
+    deltas: Array.from({ length: 60 }, () => '念'),   // 60 块 × 10 ms = 0.6 s 音频
+    reply: { text: '念'.repeat(120), speech: '念'.repeat(120) },
+  });
+  const running = r.run();
+  await sleep(atMs);
+  r.fsm.bargeIn('插话');
+  const result = await running;
+  const end = r.payloads.find((p) => p.name === 'turn.end');
+  return { result, end };
+}
+
+test('turn.end：插话落在音频中段 → interrupted 与 truncated 都为真', async () => {
+  const { result, end } = await runWithBargeIn(120);
+  assert.ok(result);
+  assert.equal(result.interrupted, true);
+  assert.equal(end?.data.truncated, true, '0.12 s 就停了，0.6 s 的答案少听了');
+});
+
+test('turn.end：插话落在尾音之后 → interrupted 仍为真，但 truncated 为假', async () => {
+  // `interrupted` 是控制面（票据作废），不能因为"其实听全了"改判 ——
+  // 老轮一旦以为自己没作废，就会去动新一轮的 FSM。
+  const { result, end } = await runWithBargeIn(500);
+  assert.ok(result);
+  assert.equal(result.interrupted, true, '票据确实被作废了');
+  assert.equal(end?.data.truncated, false, '只剩 0.1 s 没听到，不算少听');
+});
 
 test('流式：增量一路送到 TTS，出声，不走整段合成', async () => {
   const r = rig({

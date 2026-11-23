@@ -88,6 +88,29 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
   let wake: (() => void) | null = null;
   /** 上一次合成留下的 item id，下次合成前删掉 */
   let garbage: string[] = [];
+  /**
+   * 有一条合成还没等到 `response.done`（调用方可能已经不要它了）。
+   *
+   * 为什么要有：`readOne` 是 async generator，调用方在被打断时直接 `return`，
+   * generator 停在半路 —— 但服务端还在往下推 `response.audio.delta`。那些字节
+   * 躺在本模块的单队列里，**会被下一句当成自己的音频念出去**。
+   * 真机证据（2026-11-23 08:24 那场）：一条被放弃的长流之后，
+   * 4 个字的回执合成了 **506880 B / 10.56 s**，且首块 0 ms（队列里现成的）。
+   * 同一现象用 `bench/tts/reader-probe.mjs` 能稳定复现：放弃一条长流，
+   * 下一条请求首块 1 ms、拿到 3.52 s 残留。
+   */
+  let inflight = false;
+  /**
+   * 第几次 `response.create`。放弃那条要等的是**自己这一代**的 `response.done`：
+   * 只看 `inflight` 会等错——放行之后下一条会立刻把它置回 true，于是老的那条
+   * 一路等到超时，把新连接也一起弃掉（真机/单测都踩过）。
+   */
+  let responseGen = 0;
+  /** 被放弃的那条正在收尾：它的事件全部丢弃，等 `response.done` 再放行下一条 */
+  let abandoned = false;
+  let idleWaiters: Array<() => void> = [];
+  /** 等被放弃那条 `response.done` 的上限；超时说明服务端没理 `response.cancel` */
+  const ABANDON_TIMEOUT_MS = 3_000;
 
   const take = (ms: number): Promise<ServerEvent | null> => {
     const head = queue.shift();
@@ -118,6 +141,27 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
       return;
     }
     queue.push(ev);
+  };
+
+  const releaseIdle = (): void => {
+    const waiters = idleWaiters;
+    idleWaiters = [];
+    for (const w of waiters) {
+      w();
+    }
+  };
+
+  /**
+   * 上一条还没收尾就等它收尾。
+   *
+   * **不能直接发下一条**：服务端忙的时候会拒 `response.create`，而那条请求
+   * 不是排队而是**永久丢失**（omni 聊天线同款坑，见 `omni-shadow.ts` 顶部）。
+   */
+  const waitIdle = (): Promise<void> => {
+    if (!inflight) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => { idleWaiters.push(resolve); });
   };
 
   const send = (payload: unknown): void => {
@@ -164,6 +208,22 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
         if (ev.type === 'session.updated') {
           ready = true;
         }
+        if (abandoned) {
+          // 被放弃那条的尾巴：一个字节都不许进队列（否则下一句会把它念出来）。
+          // `response.cancel` 在 `response.created` 之前发会被拒（实测文案
+          // `Cannot cancel response before response.created`），而放弃往往就发生在
+          // 首块之前 —— 所以在这里补发。
+          if (ev.type === 'response.created') {
+            send({ type: 'response.cancel' });
+          }
+          if (ev.type === 'response.done' || ev.type === 'error') {
+            abandoned = false;
+            inflight = false;
+            queue = [];
+            releaseIdle();
+          }
+          return;
+        }
         push(ev);
       });
       socket.on('close', () => {
@@ -171,6 +231,10 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
         log('[omni-tts] 连接关闭');
         ws = null;
         ready = false;
+        // 连接没了就没有「还在流」这回事：不放开，下一条合成会一直等下去
+        inflight = false;
+        abandoned = false;
+        releaseIdle();
       });
       send({
         type: 'session.update',
@@ -229,54 +293,99 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
       return;
     }
     await ensure();
+    // 上一条还没收尾就先等它：被放弃的那条正在被 `response.cancel` 收尾，
+    // 这时候发 `response.create` 会被服务端拒掉，而且**不排队、直接丢**。
+    await waitIdle();
+    // 等待期间连接可能被上面那条超时分支弃掉：再确认一次，别把请求发进空连接
+    // （`send` 在 `ws === null` 时是静默 no-op，表现是这一句永远不出声）
+    await ensure();
     cleanGarbage();
+    // 防御性清空：正常路径下队列此刻是空的，但重连/错误恢复之后不一定
+    queue = [];
 
     send({
       type: 'conversation.item.create',
       item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: readPrompt(text) }] },
     });
     send({ type: 'response.create' });
+    inflight = true;
+    const mine = (responseGen += 1);
 
     const deadline = Date.now() + (options.responseTimeoutMs ?? 30_000);
     let userItemId: string | null = null;
     let assistantId: string | null = null;
-    for (;;) {
-      if (Date.now() > deadline) {
-        log('[omni-tts] 合成超时，弃连接');
-        close();
-        return;
-      }
-      const ev = await take(1_000);
-      if (ev === null) {
-        continue;
-      }
-      if (ev.type === 'conversation.item.created' && ev.item?.role === 'user' && typeof ev.item.id === 'string') {
-        userItemId = ev.item.id;
-        continue;
-      }
-      if (ev.type === 'response.output_item.added' && ev.item?.role === 'assistant' && typeof ev.item.id === 'string') {
-        assistantId = ev.item.id;
-        continue;
-      }
-      if (ev.type === 'response.audio.delta') {
-        if ((ev.delta ?? '') !== '') {
-          yield Buffer.from(ev.delta as string, 'base64');
+    let finished = false;
+    try {
+      for (;;) {
+        if (Date.now() > deadline) {
+          log('[omni-tts] 合成超时，弃连接');
+          close();
+          return;
         }
-        continue;
+        const ev = await take(1_000);
+        if (ev === null) {
+          continue;
+        }
+        if (ev.type === 'conversation.item.created' && ev.item?.role === 'user' && typeof ev.item.id === 'string') {
+          userItemId = ev.item.id;
+          continue;
+        }
+        if (ev.type === 'response.output_item.added' && ev.item?.role === 'assistant' && typeof ev.item.id === 'string') {
+          assistantId = ev.item.id;
+          continue;
+        }
+        if (ev.type === 'response.audio.delta') {
+          if ((ev.delta ?? '') !== '') {
+            yield Buffer.from(ev.delta as string, 'base64');
+          }
+          continue;
+        }
+        if (ev.type === 'response.done') {
+          for (const it of ev.response?.output ?? []) {
+            if (it.role === 'assistant' && typeof it.id === 'string') {
+              assistantId = it.id;
+            }
+          }
+          finished = true;
+          break;
+        }
+        if (ev.type === 'error') {
+          log(`[omni-tts] 服务端错误: ${String(ev.error?.message ?? '').slice(0, 120)}`);
+          // 一次报错之后这条连接上后续合成会静默挂死（与 CosyVoice 同款毛病），弃掉重建
+          close();
+          return;
+        }
       }
-      if (ev.type === 'response.done') {
-        for (const it of ev.response?.output ?? []) {
-          if (it.role === 'assistant' && typeof it.id === 'string') {
-            assistantId = it.id;
+    } finally {
+      if (finished) {
+        inflight = false;
+        releaseIdle();
+      } else if (inflight && responseGen === mine) {
+        // 调用方 `return` 掉了（本轮被打断 / 回执被顶掉）—— 服务端还在往下推，
+        // 那些字节必须在这里拦掉，不能留给下一句。等它 `done` 再放行：
+        // 只是 `cancel` 而不同步，下一条的 `response.create` 照样撞「忙」被丢。
+        //
+        // 先看队列：`done` 可能早就到了（服务端先发完、调用方后放弃），这时候
+        // 再等一个已经躺在队列里的事件只会白等满超时，还会把连接一起弃掉。
+        if (queue.some((e) => e.type === 'response.done' || e.type === 'error')) {
+          queue = [];
+          inflight = false;
+          releaseIdle();
+        } else {
+          abandoned = true;
+          send({ type: 'response.cancel' });
+          const until = Date.now() + ABANDON_TIMEOUT_MS;
+          // 条件里要带 `responseGen === mine`：放行之后下一条会立刻把 `inflight`
+          // 置回 true —— 只看 `inflight` 就会把它当成自己还没收尾，等满超时再弃连接。
+          while (inflight && responseGen === mine && Date.now() < until) {
+            await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
+          }
+          if (inflight && responseGen === mine) {
+            // 取消都没人理：弃连接。重连之后队列天然干净，比留着一条流水线更安全
+            log('[omni-tts] 放弃后没等到 response.done，弃连接');
+            close();
           }
         }
-        break;
-      }
-      if (ev.type === 'error') {
-        log(`[omni-tts] 服务端错误: ${String(ev.error?.message ?? '').slice(0, 120)}`);
-        // 一次报错之后这条连接上后续合成会静默挂死（与 CosyVoice 同款毛病），弃掉重建
-        close();
-        return;
       }
     }
     // 这一句用过的两条 item 下次合成前删
@@ -290,6 +399,9 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
     queue = [];
     wake = null;
     garbage = [];
+    inflight = false;
+    abandoned = false;
+    releaseIdle();
     try {
       socket?.close();
     } catch {

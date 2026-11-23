@@ -16,6 +16,7 @@
  */
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
+import { isAsrNoise } from './asr-noise.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
 import { performance } from 'node:perf_hooks';
@@ -1226,6 +1227,13 @@ class VoiceConnection {
   private onPartial(text: string): void {
     console.log(`  … ${text}`);
     this.archive?.event(EVENTS.asrPartial, { text });
+    // 幽灵文本（无汉字，见 `asr-noise.ts`）：到这里为止（上面两行）留档就够了。
+    // 它不能算「用户还在说」——静音上凭空冒出来的一句会把该收的那一段又按住；
+    // 也不该让宠物以为用户开口了（话筒会被白占一段）。`DialogRuntime` 那边
+    // 另有一道闸，管的是打断与开轮。
+    if (isAsrNoise(text)) {
+      return;
+    }
     // 判停的**文本判据**：中间结果在出 = 用户还在说。只传信号不拼文本，
     // 中间结果会反复改写，拼起来是乱的。
     this.assembler.notePartial(text);

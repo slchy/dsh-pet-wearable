@@ -143,3 +143,24 @@ qwen-realtime 在定稿前 6–9 ms 会再发一条**和定稿一字不差**的 
 > 验收见 [EOT-SUPPLEMENT.md](./EOT-SUPPLEMENT.md) §9–§10。
 
 
+
+## 7. 幽灵文本：静音上幻觉出的英文短句（2026-11-23）
+
+`qwen3-asr-flash-realtime` 在**静音 / 尾音 / 底噪**上会稳定吐英文短句。八份真机档案里
+出现的全部是：`Thank` / `Thank you.` / `Yeah.` / `Okay.` / `Oh.` / `These.` / 日文 `エピ。` /
+西里尔 `ж.` / `die.` —— **没有一条是用户真的说了外语**，其中三条还作为**定稿**开了轮。
+
+它不只是脏数据，会**打断播放**：`partial` 一旦解出 ≥2 个字且状态是 `speaking`，
+`DialogFsm.bargeIn()` 就成立，紧接着 `audio.stop` 清掉设备缓冲。
+
+```
+91351  asr.partial "Thank" → 插话「Thank」→ 代次 2
+        omni 的垫话只有 1.28 s，播到 0.64 s 被掐；随后 dsh 的答案一个字都没合成
+260134  asr.partial "Thank" → 插话「Thank」→ 代次 5
+        答案首块刚发出 30 ms，6.72 s 音频被 audio.stop 全清掉 —— 听感「说一半就没了」
+```
+
+判据换成**语种**而不是词表（幻觉词是随机的）：一个汉字都没有就当噪声，纯数字串
+（≥4 位，电话/年份）除外。实现见 `src/asr-noise.ts`，闸在 `DialogRuntime.dispatch`
+（打断/开轮）与 `VoiceConnection.onPartial`（装配器/宠物）两处。
+归档事件 `asr.partial` 照旧落 —— 幽灵文本要能事后统计，只是不再进决策。

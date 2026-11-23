@@ -55,12 +55,12 @@
 
 ## 三、硬编码常量（改要动代码）
 
-共 29 项。
+共 30 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
-| `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:39` | 无关首声（不在停嘴→出声路径上） | — |
-| `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
+| `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:42` | 无关首声（不在停嘴→出声路径上） | — |
+| `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:51` | 无关首声（不在停嘴→出声路径上） | — |
 | `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:235` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
 | `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:364` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
@@ -72,6 +72,7 @@
 | `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:601` | 无（报告里的「慢轮」门槛） | — |
 | `RESOLUTION_MS` | 25 | wall | `src/loop-lag.ts:29` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio | `src/main.ts:400` | 无关首声（不在停嘴→出声路径上） | — |
+| `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:113` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
 | `DEFAULT_POLL_MS` | 60000 | wall | `src/pet/battery-cache.ts:20` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_CAPTURE_TIMEOUT_MS` | 20000 | wall | `src/photo-inbox.ts:38` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_CONFIRM_TIMEOUT_MS` | 40000 | wall | `src/photo-inbox.ts:45` | 无关首声（不在停嘴→出声路径上） | — |
@@ -82,12 +83,12 @@
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
 | `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:38` | 设备播报期间（轮询，不加延迟） | — |
 | `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:46` | 无关首声（不在停嘴→出声路径上） | — |
-| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:107` | ASR 出句之后（兜底，正常不触发） | — |
-| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:120` | ASR 出句之前 | — |
-| `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:129` | 无关首声（不在停嘴→出声路径上） | — |
-| `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:140` | 无关首声（不在停嘴→出声路径上） | — |
-| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:158` | 判停侧车输入预处理（不额外等） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:393` | 无关首声（不在停嘴→出声路径上） | — |
+| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:108` | ASR 出句之后（兜底，正常不触发） | — |
+| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:121` | ASR 出句之前 | — |
+| `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:130` | 无关首声（不在停嘴→出声路径上） | — |
+| `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:141` | 无关首声（不在停嘴→出声路径上） | — |
+| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:159` | 判停侧车输入预处理（不额外等） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:394` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 四、还没标注的
 

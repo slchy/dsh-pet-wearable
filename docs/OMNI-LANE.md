@@ -274,6 +274,7 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 | 握手 | `session.created → session.update → session.updated` ≈ **1.3 s** | 与设备握手并行，不占关键路径 |
 | `cancel` 往返 | → `response.done` **79–96 ms** | 尽量挪到用户说话期间 |
 | 忙时 `create` | 报 `already has an active response`，**永久丢失** | 必须先 cancel 再排队 |
+| 放弃一条流（调用方 `return` 掉生成器） | 服务端**继续推**它的 `response.audio.delta`；单队列读法会把这些字节当成下一句的音频（真机 2026-11-23：4 个字的回执合成出 **506880 B / 10.56 s**、首块 0 ms） | 必须 `response.cancel` + 丢弃到 `response.done` 才放行下一条 —— `omni-tts.ts` 这样修；`bench/tts/reader-probe.mjs` 可复现 |
 | `created` 前 `cancel` | 报 `Cannot cancel response before response.created` | `cancelPending` |
 | 50 ms 短音频 `commit` | **不报错**（空转写、`completed`） | 但会造空白用户消息，所以看 `dirtyBytes` |
 | `conversation.item.delete` | **有效**（三次复现，省 13–39 token） | 洗脏历史可用，**尚未接入** |

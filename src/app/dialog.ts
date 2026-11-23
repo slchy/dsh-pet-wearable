@@ -22,12 +22,15 @@
  * 事件，所以虚拟时间里跑它不需要设备、不需要网络、不需要 ffmpeg。
  */
 import { closeAnnounceMic, speakAnnouncement } from './announce.ts';
+import { isAsrNoise } from '../asr-noise.ts';
 import { isBackchannelOnly } from '../backchannel.ts';
 import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
 import type { TurnTicket, DialogState } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
-import { announceInterruptionNote, interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
+import {
+  announceInterruptionNote, interruptionNote, remainingSpeech, TTS_CHARS_PER_SEC,
+} from '../interrupted-tail.ts';
 import { EVENTS } from '../events.ts';
 import type { AgentProvider, DelegateReason, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
@@ -289,6 +292,15 @@ export class DialogRuntime {
     // 旁白（后台汇报 / 回执）不占轮次票据，状态机也停在 `listening`，
     // 所以 `bargeIn` 那条路对它不成立，**它是唯一能掐断播报的地方**。
     if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
+      // ASR 在静音上幻觉出的英文短句（`Thank you` / `Yeah`）**一个汉字都没有**，
+      // 却会走完整条链路：打断播放（真机两次各丢一整条答案）、开轮、白烧一次 agent。
+      // 闸放在这个入口：`partial` / `sentence` / `utterance` 三条进来都要过一遍，
+      // 而且「掐回执 / 掐旁白」也在下面，噪声连它们都不该碰。
+      // 判据与实况见 `asr-noise.ts`。
+      if (isAsrNoise(event.text)) {
+        this.options.log(`  （ASR 噪声，丢弃：${JSON.stringify(event.text)}）`);
+        return [];
+      }
       this.lastUserSpeechAt = this.options.clock.now();
       if (event.type !== 'partial') {
         this.lastUserSentenceAt = this.options.clock.now();
@@ -416,7 +428,11 @@ export class DialogRuntime {
       const note = composeTurnNote(this.options.env.deviceNote?.(), this.takeTailNote());
       try {
         const result = await this.runner.run(text, image, note);
-        if (result !== null && result.interrupted) {
+        if (result !== null) {
+          // 不只看 `interrupted`：真机 2026-11-23 第 11/13 轮，41–45 字的答案只合成出
+          // 1.1–1.4 s 音频（TTS 那边把上一条被放弃的流的残留当成了自己的），
+          // `interrupted=false` 却少念了大半段 —— 那一半也得交给下一轮。
+          // 判定在 `rememberTail` 里，两者共用同一把尺。
           this.rememberTail(result);
         }
       } finally {
@@ -452,8 +468,22 @@ export class DialogRuntime {
     return notes.length === 0 ? undefined : notes.join('\n');
   }
 
-  /** 记下这一轮被打断后**没念出口**的部分。 */
+  /**
+   * 记下这一轮**没念出口**的部分。
+   *
+   * 两种来路都要记：被插话打断（`interrupted`），以及音频根本没覆盖全文
+   * （TTS 只吐了一部分，`interrupted=false`）。第二种用「这段字该有多长」兜：
+   * 真机那两轮是 41–45 字只出 1.1–1.4 s（应 ~8.5–9.4 s，占比 0.13–0.15），
+   * 正常轮是 100 字 19.44 s（占比 0.93）—— 取 0.6 两边都够不着。
+   */
   private rememberTail(result: TurnResult): void {
+    const chars = [...result.speech].length;
+    const expectedSeconds = chars / TTS_CHARS_PER_SEC;
+    const shortAudio = result.audioSeconds > 0 && result.audioSeconds < expectedSeconds * 0.6;
+    if (!result.interrupted && !shortAudio) {
+      this.tail = null;
+      return;
+    }
     const rest = remainingSpeech(result.speech, result.playedSeconds);
     if (rest === '') {
       this.tail = null;
