@@ -31,6 +31,7 @@
  */
 import WebSocket from 'ws';
 
+import { OMNI_SHORT_INSTRUCTIONS } from './persona.ts';
 import type { RealtimeSocket, RealtimeSocketFactory } from './qwen-realtime-asr.ts';
 import type { AgentAudioAnswer, DelegateReason, FastLaneAudioLane, InjectKind } from './providers.ts';
 
@@ -62,8 +63,9 @@ const DEFAULT_INSTRUCTIONS =
   // 「回执要短、别先讲答案」**不写在这里**：§10.1 的探针结论是"写哪儿比写什么重要" ——
   // 同一句话写进 `instructions` 照样 0 ms 应声，写进工具描述才 4/4 生效。
   // 那条纪律在 `DELEGATE_TOOL.description` 里。
-  '你是米馍，一个中文语音助手。像跟人聊天那样说话，简短些。拿不准的事别硬猜，直接交给能查的人'
-  + ' —— 尤其别先编一句书名或人名再转交。';
+  // 正文**只有一份**：`persona.ts` 的 `OMNI_SHORT_INSTRUCTIONS`（快车道用同一个身份）。
+  // 这里的注释是它为什么长成这样，改正文去 `persona.ts`。
+  OMNI_SHORT_INSTRUCTIONS;
 
 /** `seal()` 之后、下一次有声之前，最多留多少音频（防软起音被吞） */
 const DEFAULT_RING_MILLISECONDS = 150;
@@ -267,7 +269,7 @@ interface PendingResponse {
    */
   superseded: boolean;
   /** 顶掉它的那一份（同一轮的下一段）；
-ull = 还没有（在 pending 里排队） */
+   * null = 还没有（在 pending 里排队） */
   next: PendingResponse | null;
   /**
    * 这一份的助手回复不要留在服务端历史里（`discard()` 时标上）。
@@ -383,7 +385,7 @@ export class OmniShadow {
    */
   private claimReserved = false;
   /**
-   * 轮次纪元：estart() 每次 +1。claim() 记下当时的纪元，并段轮被顶掉时
+   * 轮次纪元：restart() 每次 +1。claim() 记下当时的纪元，并段轮被顶掉时
    * 只肯跟到**同一个纪元**里新封出来的那份 —— 否则就会把下一轮的答案当成自己的。
    */
   private turnEpoch = 0;
@@ -705,16 +707,23 @@ export class OmniShadow {
       delegateText: () => current()?.delegateRequest ?? null,
       chunks: (async function* iterate() {
         let resp = current();
-        // 等排队那份建出来。车道挂了 / 被停掉就放弃，让这一轮以「零音频」结束
-        // （宿主会按 `audioBytes === 0` 记账，不会假装说过话）。
-        while (resp === null) {
-          if (self.state === 'broken' || self.state === 'idle') {
+        // 等排队那份建出来。三条路都放弃，让这一轮以「零音频」结束
+        // （宿主按 `audioBytes === 0` 记账，不会假装说过话）：
+        // 1. 车道挂了 / 被停掉；
+        // 2. 预留已经作废 —— `discard()` / `restart()` 清了 `claimReserved`，
+        //    但 `state` 仍是 `ready` / `busy`。原来只看 state 的写法会在这里
+        //    一圈圈空等（每圈 5 s）；
+        // 3. 等了 5 s 那份还没建出来（`waitLive` 的超时）。
+        if (resp === null) {
+          if (self.state !== 'broken' && self.state !== 'idle' && self.claimReserved) {
+            await self.waitLive();
+            resp = current();
+          }
+          if (resp === null) {
             return;
           }
-          await self.waitLive();
-          resp = current();
         }
-        // 上面那一圈保证非空；单独一个非空变量是为了在「换到下一段」时不丢类型
+        // 上面那一段保证非空；单独一个非空变量是为了在「换到下一段」时不丢类型
         let active: PendingResponse = resp;
         let yielded = 0;
         for (;;) {
@@ -735,7 +744,7 @@ export class OmniShadow {
               && self.claimEpoch === me && self.turnEpoch === me) {
               let next = active.next;
               if (next === null && self.pending !== null) {
-                // 排队那份还没建出来（inish() 先收尾上一份、再补发）：等它
+                // 排队那份还没建出来（finish() 先收尾上一份、再补发）：等它
                 await self.waitLive();
                 next = active.next;
               }
@@ -1302,7 +1311,7 @@ export class OmniShadow {
         text_ms: resp.firstTextAt === null ? null : Math.round(resp.firstTextAt - meta.anchor),
         // ★ 主指标：封段 → 首块音频。与我们 `①b+②+③` 同起点，直接可比
         audio_ms: audioMs === null ? null : Math.round(audioMs),
-      injects_sent: this.injectsSent,
+        injects_sent: this.injectsSent,
         cancel_wait_ms: Math.round(resp.sentAt - meta.anchor),
         out_s: Number((resp.outBytes / (DOWNSTREAM_RATE * 2)).toFixed(2)),
         status: ev.response?.status ?? null,

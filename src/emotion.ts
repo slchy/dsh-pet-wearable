@@ -71,15 +71,13 @@ export function stripEmotionTags(text: string): string {
 export const DEFAULT_EMOTION: Emotion = 'calm';
 
 /**
- * 兼容再导出。
+ * 「某个情绪该用什么语气」是 **provider 的表达方式**，值定义在各家 TTS 模块里
+ * （`mimo.ts` / `cosyvoice.ts`），本模块**严格不认识任何厂商**。
  *
- * 「某个情绪该用什么语气」现在是 **provider 的表达方式**，值定义在 `mimo.ts`
- * （换个 TTS 就得另写一套，不该留在这里）。但 `styleFor` / `BASE_STYLE` 早先是
- * 从这里导出的，为了不把引用点全改一遍，这里继续透出。
- *
- * 新代码请直接从 provider 模块取。
+ * 早先这里有一行兼容再导出，把风格表从 provider 透出来 —— 而 provider 反过来又要用
+ * 本模块的 `asEmotion()`，那正是**全仓最后一个模块环**。现在要用风格表就直接从
+ * provider 模块取，这里不再透出任何厂商符号。
  */
-export { BASE_STYLE, EMOTION_STYLES, styleFor } from './mimo.ts';
 /**
  * 把外部传来的情绪字符串规范成 key。
  *

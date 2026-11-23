@@ -24,7 +24,8 @@
  *    文档里「角色/场景/身份」那几种写法在这两个音色上都是 428，别混用。
  * 5. **`instruction` 和 `rate`/`pitch` 能叠加，且不增加首包**
  *    （happy 基准 351 ms；+rate 1.15 → 377 ms；+pitch 1.1 → 352 ms）。
- *    所以情绪用 instruction 表达语义，rate/pitch 只做细微区分。
+ *    所以情绪用 instruction 表达语义，rate/pitch 只做细微区分 —— 但**默认部署
+ *    不开 instruction**（系统音色会 428），详见 {@link DEFAULT_COSYVOICE_EMOTION_MODE}。
  * 6. **一个 task 报错后这条连接上后续 task 全部静默挂死**，必须弃连接重连
  *    （见 `Connection` 的失败处理）。探针里不重连会把「连接废了」误判成「模型慢」。
  * 7. **句尾自带几百毫秒数字静音**（「嗯。」1040 ms 里有约 600 ms 是 −113…−93 dBFS
@@ -51,6 +52,20 @@ const DEFAULT_MODEL = 'cosyvoice-v3-flash';
  * 传情感指令会 428（见文件头第 4 条）。
  */
 const DEFAULT_VOICE = 'longanhuan';
+
+/**
+ * `COSYVOICE_EMOTION_MODE` 没设置时的默认情绪表达方式。
+ *
+ * **默认 `prosody`**，不是 `instruction`：默认部署用的是系统音色，而系统音色配
+ * `instruction` 会被服务端回 428（`Engine return error code: 428`），整句合成失败；
+ * `prosody`（只调 rate/pitch）对任何音色都成立。`instruction` 只在复刻/设计音色上
+ * 有效，而且首包多 ~90 ms —— 想用就显式打开（`COSYVOICE_EMOTION_MODE=instruction`
+ * 或 `useInstruction: true`）。
+ *
+ * 与生产 `main.ts` 的口径一致（那里是 `=== 'instruction'`，未设置即走 prosody）。
+ * 两边别再各写一个字面量：默认值只在这里定义一次。
+ */
+export const DEFAULT_COSYVOICE_EMOTION_MODE: 'prosody' | 'instruction' = 'prosody';
 
 /** CosyVoice 输出的 PCM16 单声道采样率（与 MiMo 相同，宿主不用改） */
 export const COSYVOICE_SAMPLE_RATE = 24_000;
@@ -107,11 +122,11 @@ export interface CosyVoiceOptions {
   readonly voice?: string;
   readonly sampleRate?: number;
   /**
-   * 情绪是否用 `instruction` 表达。默认 `true` —— 默认音色 `longanhuan` 支持它，
-   * 且实测不增加首包。
+   * 情绪是否用 `instruction` 表达。不传时看 `COSYVOICE_EMOTION_MODE`，
+   * 再缺省就是 {@link DEFAULT_COSYVOICE_EMOTION_MODE}（`prosody`）。
    *
    * 换成不支持 `instruction` 的音色（比如 `longanhuan_v3`，只认方言指令）时必须
-   * 关掉，否则每句话都会 `Engine return error code: 428`。
+   * 保持关闭，否则每句话都会 `Engine return error code: 428`。
    */
   readonly useInstruction?: boolean;
   /** 空闲多久后主动关连接（默认 5 分钟，避免长连接被服务端静默掐掉后下一句话付握手钱） */
@@ -1103,13 +1118,13 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
   const voice = options.voice ?? process.env['COSYVOICE_VOICE'] ?? DEFAULT_VOICE;
   const sampleRate = options.sampleRate ?? COSYVOICE_SAMPLE_RATE;
   /**
-   * 情绪表达方式：`instruction`（默认，语义级）或 `prosody`（只调 rate/pitch，
-   * 给不支持 instruction 的音色用）。
+   * 情绪表达方式：`prosody`（默认，只调 rate/pitch，系统音色也能用）或
+   * `instruction`（语义级，只有复刻/设计音色吃，首包多 ~90 ms）。
    *
    * 为什么不复用 `COSYVOICE_INSTRUCTION`：探针里那个变量是**指令文本**，
    * 同一个名字两种语义迟早出错，所以运行时单独一个变量。
    */
-  const envMode = process.env['COSYVOICE_EMOTION_MODE'] ?? 'instruction';
+  const envMode = process.env['COSYVOICE_EMOTION_MODE'] ?? DEFAULT_COSYVOICE_EMOTION_MODE;
   const useInstruction = options.useInstruction ?? envMode === 'instruction';
   /** `COSYVOICE_PREWARM=0` 关掉预开（A/B 与出事时的退路，默认开） */
   const PREWARM_ENABLED = process.env['COSYVOICE_PREWARM'] !== '0';

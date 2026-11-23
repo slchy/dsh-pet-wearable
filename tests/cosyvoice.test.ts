@@ -10,7 +10,7 @@ import { test } from 'node:test';
 
 import { WebSocketServer } from 'ws';
 
-import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch, trimLeadingSilence, streamBatchReady } from '../src/cosyvoice.ts';
+import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, DEFAULT_COSYVOICE_EMOTION_MODE, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch, trimLeadingSilence, streamBatchReady } from '../src/cosyvoice.ts';
 import { EMOTIONS, type Emotion } from '../src/emotion.ts';
 import { TokenQueue } from '../src/token-queue.ts';
 
@@ -74,6 +74,48 @@ test('provider 声明自己的采样率（24 kHz，和 MiMo 一致，宿主不�
   assert.match(tts.name, /^cosyvoice:/);
 });
 
+/**
+ * 默认情绪模式必须是 `prosody`。
+ *
+ * 系统音色（默认部署的音色）配 `instruction` 会被服务端回 428，整句合成失败；
+ * 而 `prosody` 只调 rate/pitch，对任何音色都成立。想用 `instruction` 必须显式打开。
+ * 这条以前是靠 `cosyVoiceTts` 里写死一个字面量和 `main.ts` 各写一份「碰巧一致」，
+ * 默认值一改就两边打架 —— 现在两边共用 {@link DEFAULT_COSYVOICE_EMOTION_MODE}。
+ */
+test('情绪模式：默认 prosody，显式 useInstruction / 环境变量才发指令', { timeout: 5000 }, async () => {
+  assert.equal(DEFAULT_COSYVOICE_EMOTION_MODE, 'prosody', '默认值变了要先问：系统音色会被 428 拒');
+  const server = await fakeCosyVoice();
+  const prev = process.env['COSYVOICE_EMOTION_MODE'];
+  delete process.env['COSYVOICE_EMOTION_MODE'];
+  try {
+    // 1) 什么都不传 = prosody：只有 rate/pitch，没有 instruction
+    const plain = cosyVoiceTts({ apiKey: 'sk-test', url: server.url });
+    for await (const chunk of plain.synthesize('在，哥。', 'calm')) void chunk;
+    assert.equal(server.params[0]?.['instruction'], undefined, '默认不该带 instruction（系统音色会 428）');
+    assert.equal(server.params[0]?.['rate'], EMOTION_PROSODY.calm.rate);
+    assert.equal(server.params[0]?.['pitch'], EMOTION_PROSODY.calm.pitch);
+
+    // 2) 显式 useInstruction: true —— 复刻/设计音色要语义级情绪
+    const instructed = cosyVoiceTts({ apiKey: 'sk-test', url: server.url, useInstruction: true });
+    for await (const chunk of instructed.synthesize('在，哥。', 'calm')) void chunk;
+    assert.equal(
+      server.params[1]?.['instruction'],
+      EMOTION_INSTRUCTIONS.calm,
+      '显式打开时指令要原样带上',
+    );
+
+    // 3) 环境变量仍能覆盖默认（部署时不用改代码）
+    process.env['COSYVOICE_EMOTION_MODE'] = 'instruction';
+    const fromEnv = cosyVoiceTts({ apiKey: 'sk-test', url: server.url });
+    for await (const chunk of fromEnv.synthesize('在，哥。', 'calm')) void chunk;
+    assert.equal(server.params[2]?.['instruction'], EMOTION_INSTRUCTIONS.calm);
+  } finally {
+    if (prev === undefined) delete process.env['COSYVOICE_EMOTION_MODE'];
+    else process.env['COSYVOICE_EMOTION_MODE'] = prev;
+    await server.close();
+  }
+});
+
 test('静音块判定：数字静音算静音，正常说话不算', () => {
   // 全零
   assert.equal(isSilentChunk(Buffer.alloc(8000)), true);
@@ -112,10 +154,13 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
   texts: string[][];
   /** 每条连接收到的 run-task 次数，按连接建立顺序（预开省没省就看它） */
   runs: number[];
+  /** 每个 run-task 的 `parameters`（情绪模式就看它带没带 instruction） */
+  params: Array<Record<string, unknown>>;
   close: () => Promise<void>;
 }> {
   const texts: string[][] = [];
   const runs: number[] = [];
+  const params: Array<Record<string, unknown>> = [];
   const loud = Buffer.alloc(4800);
   for (let i = 0; i < loud.length; i += 2) {
     loud.writeInt16LE(Math.round(3000 * Math.sin(i / 20)), i);
@@ -146,13 +191,14 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
     socket.on('message', (data) => {
       const msg = JSON.parse(String(data)) as {
         header: { action: string; task_id: string };
-        payload: { input: { text?: string } };
+        payload: { input: { text?: string }; parameters?: Record<string, unknown> };
       };
       const reply = (event: string): void => {
         socket.send(JSON.stringify({ header: { event, task_id: msg.header.task_id } }));
       };
       if (msg.header.action === 'run-task') {
         runs[myRuns] = (runs[myRuns] ?? 0) + 1;
+        params.push(msg.payload.parameters ?? {});
         reply('task-started');
       }
       if (msg.header.action === 'continue-task') {
@@ -185,6 +231,7 @@ async function fakeCosyVoice(options: { finishDelayMs?: number; frames?: Buffer[
     url: `ws://127.0.0.1:${address.port}`,
     texts,
     runs,
+    params,
     close: async () => {
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((resolve) => { wss.close(() => { resolve(); }); });

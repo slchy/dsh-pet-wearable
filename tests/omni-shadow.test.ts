@@ -652,6 +652,40 @@ test('等「下一份」的时候车道断了：流正常结束，不挂死', as
   assert.equal(got.length, 0);
 });
 
+test('预留认领期间被 discard：读端立刻退出，不空等（每圈 5 s）', { timeout: 4000 }, async () => {
+  // 只预留、还没建出来的那一份，被 discard() 作废之后 `state` 仍是 `busy` ——
+  // 原来只看 state 的循环会一圈接一圈地 `waitLive()`（每圈 5 s），
+  // 而那一份永远不会再交过来了。
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  // 同一句的第二段把第一份顶掉 → claim 只能预留「排队中」的那份
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.shadow.seal(2, 40);
+  const answer = h.shadow.claim();
+  assert.ok(answer !== null);
+
+  const started = Date.now();
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  // 让读端先挂到 `waitLive` 上，再作废预留（委派轮 / 判据否决就是这条路径）
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  h.shadow.discard();
+  await drain;
+
+  const waited = Date.now() - started;
+  assert.equal(got.length, 0);
+  assert.ok(waited < 1000, `discard 之后应当立刻退出，实际等了 ${waited} ms`);
+});
+
 test('serve=full 的工具描述里必须带「先说一句再调」：委派轮的声音就靠这一句', () => {
   const h = make('full');
   h.ready();
