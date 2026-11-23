@@ -1256,8 +1256,17 @@ class VoiceConnection {
   private onSentence(text: string, index: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
     this.archive?.event(EVENTS.asrSentence, { text, index });
-    // 插话闸要用：这之后还有没有新的有声帧，决定后面那些 partial 是真插话
-    // 还是同一截缓冲的重复解码（见 `barge-voicing.ts`）
+    // 上面那句已经出过结论、之后一直没人说话 → 这一条是同一截缓冲的重复解码。
+    // 它既不该打断播放，也不该开一轮（真机档案里 `Okay.` / `对。` / `好。` 共 13 条，
+    // 底下一条有声帧都没有；回放里它们每个都会开出一轮「答无可答」的轮次，
+    // 直接把 omni 车道撞成 `lane.fallback`）。
+    // 真人说「对。」必然带新的有声帧，所以这条不会误杀确认。
+    if (!voicedSinceLastSentence(this.assembler.lastVoicedAtMs, this.lastSentenceAtMs)) {
+      console.log(`  句 ${index}  ↳ 定稿之后没有新声音 → 重复解码，丢弃`);
+      return;
+    }
+    // 后面的 partial 拿它当「上一句」：这之后还有没有新的有声帧，决定那些 partial
+    // 是真插话还是重复解码（见 `barge-voicing.ts`）
     this.lastSentenceAtMs = this.clock.now();
     const effects = this.dialog.dispatch({ type: 'sentence', text });
     // 打断有两处入口（中间结果 / 定稿），日志必须都打 —— 否则统计打断率会漏掉
