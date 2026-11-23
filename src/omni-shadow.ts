@@ -32,7 +32,7 @@
 import WebSocket from 'ws';
 
 import type { RealtimeSocket, RealtimeSocketFactory } from './qwen-realtime-asr.ts';
-import type { AgentAudioAnswer, DelegateReason, FastLaneAudioLane } from './providers.ts';
+import type { AgentAudioAnswer, DelegateReason, FastLaneAudioLane, InjectKind } from './providers.ts';
 
 /** 上行格式：与 `UplinkPipeline` 一致（16 kHz / 单声道 / s16le） */
 const UPSTREAM_RATE = 16_000;
@@ -339,6 +339,14 @@ export class OmniShadow {
   private turnSeqs: number[] = [];
   /** 等 `ready` 再发的回注文本（见 `injectAnswer()`） */
   private injects: string[] = [];
+  /**
+   * 一共回注过几笔。
+   *
+   * 为什么要计数：回注成功一直是**静默**的，档案里查不到，只能从 `in_text_tok`
+   * 的跳变反推（真机 `20261123-053719` 是 1195 → 1296）。有了这个数，
+   * 回放就能直接对账「第 N 段之前注过几笔」。落进 `omni.shadow` 那条记录。
+   */
+  private injectsSent = 0;
   /**
    * 生成期攒下的音频（见 `append()`）。
    *
@@ -795,18 +803,34 @@ export class OmniShadow {
    * 忙的时候排队，回到 `ready` 再发 —— `conversation.item.create` 在 `busy` 态
    * 虽然不报错，但插在一条正在生成的回复中间会让它自己那轮的指代也乱。
    */
-  injectAnswer(userText: string, said: string): void {
+  injectAnswer(userText: string, said: string, kind: InjectKind = 'spoken'): void {
     const answer = clipText(said.trim(), MAX_INJECT_CHARS);
     if (answer === '') {
       return;
     }
     const question = clipText(userText.trim(), MAX_INJECT_CHARS);
-    const text = `（系统旁注：用户刚才问的「${question}」已经由另一位助手回答，`
-      + `回答是：${answer}）`;
+    // `spoken` 用第一人称：这话是**同一副嗓子**（`omni-tts` 朗读连接）念给用户的，
+    // 所以对 omni 来说「我说过」是真的，后面引述不用克制。`unspoken` 反过来，
+    // 明说用户还不知道 —— 否则它会讲「我刚才告诉过你」。
+    const text = kind === 'unspoken'
+      ? `（系统旁注：用户刚才问的「${question}」已经由另一位助手回答，`
+        + `但那段回答没能说给用户听，用户并不知道内容。回答是：${answer}）`
+      : `（系统旁注：用户刚才问的「${question}」，你已经用语音把下面这段念给他了：`
+        + `${answer}）`;
+    this.injectsSent += 1;
+    this.log(
+      `[omni] 回注 ${[...answer].length} 字（${kind === 'unspoken' ? '没念出去' : '已播完'}）`
+      + `：${answer.slice(0, 20)}${[...answer].length > 20 ? '…' : ''}`,
+    );
     if (this.state === 'broken' || this.state === 'idle') {
-      this.log(`[omni] 回注丢弃：车道不在（${this.state}）`);
-      return;
-    }    if (this.injects.length >= MAX_PENDING_INJECTS) {
+      // **不能扔**：`idle` 只是「还没封过段」，下一次 `finish()` 就会把队列刷出去。
+      // 原来是直接丢，于是「连接刚建好、第一轮就被委派」这种情况下永远补不进记忆。
+      if (this.state === 'broken') {
+        this.log('[omni] 回注丢弃：车道已断');
+        return;
+      }
+    }
+    if (this.injects.length >= MAX_PENDING_INJECTS) {
       this.injects.shift();
       this.log('[omni] 回注队列满，丢掉最早的一条');
     }
@@ -1258,6 +1282,7 @@ export class OmniShadow {
         text_ms: resp.firstTextAt === null ? null : Math.round(resp.firstTextAt - meta.anchor),
         // ★ 主指标：封段 → 首块音频。与我们 `①b+②+③` 同起点，直接可比
         audio_ms: audioMs === null ? null : Math.round(audioMs),
+      injects_sent: this.injectsSent,
         cancel_wait_ms: Math.round(resp.sentAt - meta.anchor),
         out_s: Number((resp.outBytes / (DOWNSTREAM_RATE * 2)).toFixed(2)),
         status: ev.response?.status ?? null,

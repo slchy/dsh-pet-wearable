@@ -172,6 +172,22 @@ export interface UtteranceAssemblerOptions {
    */
   readonly commitAfterMs?: number;
   /**
+   * 静音到这一刻再请 ASR **封段解码**（默认 = {@link commitAfterMs}，即不拆）。
+   *
+   * 为什么要和 {@link commitAfterMs} 拆开：那一条现在同时是两个动作的起跑线，
+   * 而两者的最优值差一个数量级。
+   *
+   * - **omni 车道**（`OmniShadow.seal`）越早起跑越好 —— 它自己听音频、自己判句，
+   *   20 ms 只是「别把下一句的音频切进来」的下限。
+   * - **ASR 封段**切早了会把同一句话切成两半：真机 `20261123-053719` 两轮都断在
+   *   书名中间（`《习术》` / `《奇》书`），第二个碎片失去中文语境之后被
+   *   `qwen3-asr-flash-realtime` 解成了德语（`würde ich schreiben.`）。
+   *
+   * 150 ms 是「不花延迟的上限」：判停本来就要等 200–300 ms 静音，ASR 在这之前
+   * 封段，解码那 261 ms 与判停那一拍仍然重叠。
+   */
+  readonly sttCommitAfterMs?: number;
+  /**
    * 静音到 {@link commitAfterMs} 时调一次，宿主拿去 `stt.commit()`。
    *
    * `silenceMs` = **距最后一个有声帧多久**。它一定 ≥ `commitAfterMs`，多出来的那截
@@ -180,6 +196,23 @@ export interface UtteranceAssemblerOptions {
    * 直接变成每一轮的固定开销。落档才知道它有多大（`asr.commit`）。
    */
   readonly onCommit?: (silenceMs: number) => void;
+  /** 静音到 {@link sttCommitAfterMs} 时调一次，宿主拿去 `stt.commit()`（见该字段） */
+  readonly onSttCommit?: (silenceMs: number) => void;
+  /**
+   * 开轮前的最后一道闸：ASR 手上还有一段没解完就先别抢跑。
+   *
+   * 返回 `null` = 没有在解的。判停那一拍（静音 200–300 ms）经常在解码（261 ms）
+   * 之前就到 —— 这时开轮拿到的是半句话，后半句解回来就成了「插话」，把自己这一轮
+   * 掐掉（真机 `20261123-053719` 第 2 轮：dsh 的正确答案 `audio_s=0.00`）。
+   */
+  readonly awaitDecode?: () => Promise<void> | null;
+  /**
+   * 等解码的上限（ms，默认 240）。超了就照常开轮 —— 等 ASR 这一层绝不能把话吞掉。
+   *
+   * 240 的依据：`commit → 定稿` 实测中位 261 ms，而封段已经比判停早 50–150 ms，
+   * 正常轮次只需要等几十毫秒。
+   */
+  readonly decodeWaitMs?: number;
   /**
    * 开轮的**静音门槛**：定稿到达时，「截至此刻」的连续静音必须够这么久才开轮。
    *
@@ -316,10 +349,21 @@ const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
 /**
  * 声学判据到了这个置信度就不等语义判停了。
  *
- * 语义判停的意义在「声学拿不准」（p 落在 0.3–0.85 那条带），p 已经 0.88–0.98
- * 时再等 256–324 ms 纯属白搭 —— 真机 `20261123-051448` 全场语义一次没拦住 MORE。
+ * 语义判停的意义在「声学拿不准」（p 落在 0.3–0.80 那条带），p 已经 0.83–0.98
+ * 时再等 256–324 ms 纯属白搭 —— 真机 `20261123-051448` 与 `-053719` 两场
+ * 语义一次没拦住 MORE，而 p=0.834 那轮白等了 273 ms。
  */
-const SEMANTIC_SKIP_P = 0.85;
+const SEMANTIC_SKIP_P = 0.80;
+
+/**
+ * 一轮最多在**说话期间**发几次语义判停。
+ *
+ * 中间结果会逐字改写，原先的门槛只有「≥8 字且比上次多/少 4 字」，真机
+ * `20261123-053719` 第 4 轮一共发了 **9 趟**（`würde ich` / `würde ich sch` /
+ * `würde ich schreiben` / `Thank you` 逐个问了一遍），没有一趟影响结论 ——
+ * 全是白花的往返和服务端配额。定稿那一趟（`addSentence`）不受这条限制。
+ */
+const MAX_SPEECH_SEMANTIC_ASKS = 2;
 
 /**
  * 「定稿只是中间结果的收尾」允许差几个字。
@@ -397,6 +441,8 @@ export class UtteranceAssembler {
   private readonly semanticSettled = new Map<string, 'end' | 'more' | null>();
   /** 上一次因为中间结果发出去的文字（避免同一个中间结果反复问） */
   private semanticLastAsked = '';
+  /** 这一轮说话期间已经问了几次语义判停（见 `MAX_SPEECH_SEMANTIC_ASKS`） */
+  private speechAsks = 0;
   /** 已经因为语义判停延长过的那段文字（同一段只延长一次） */
   private semanticExtended = '';
   /** 上一段定稿的时刻 / 汉字数（去抖判据用，见 `isJunkAfterLongSentence`） */
@@ -440,12 +486,14 @@ export class UtteranceAssembler {
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
   private preFiredAt = Number.NEGATIVE_INFINITY;
   /**
-   * 这一段语音是否已经请求过 ASR 封段（每段只封一次）。
+   * 这一段语音是否已经请求过**车道起跑**（omni 的 `seal`，每段只一次）。
    *
    * 「一段」的边界是 `lastVoicedAt`：又来声音就自然重新武装（比较的是时刻，
    * 不是布尔），静音期内反复进 `trackSilence` 只封一次。
    */
-  private commitFiredAt = Number.NEGATIVE_INFINITY;
+  private sealFiredAt = Number.NEGATIVE_INFINITY;
+  /** 这一段语音是否已经请 ASR 封段解码（和 `sealFiredAt` 分开，见 `sttCommitAfterMs`） */
+  private sttCommitFiredAt = Number.NEGATIVE_INFINITY;
   /** 上一次问过、但接收方没发出去的那一版（同一版不重复问，免得每个静音帧刷一次） */
   private specTriedText = '';
   /** 上一次投机的时刻 / 这一句已经投机几次（`addSentence` 归零） */
@@ -586,40 +634,69 @@ export class UtteranceAssembler {
     this.maybeSpeculate(t);
     this.maybePrefirePrediction(t);
     this.maybeCommit(t);
+    this.maybeSttCommit(t);
+  }
+
+  /** 两条封段闸共用的前提：这一段说过话、且还没为它动过手 */
+  private canCommit(t: number, after: number | undefined, firedAt: number): boolean {
+    if (after === undefined || after <= 0) {
+      return false;
+    }
+    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
+      return false;
+    }
+    if (this.lastVoicedAt <= firedAt) {
+      return false;
+    }
+    return t - this.lastVoicedAt >= after;
   }
 
   /**
-   * 静音满 `commitAfterMs` 就让 ASR 封段（端点由我们控时才有这一步）。
+   * 静音满 `commitAfterMs` 就让**车道起跑**（omni 的 `seal`）。
    *
    * 为什么不等判停：判停要 200 ms 静音才有把握，而封段只要「这句停下来了」——
    * 封早了顶多多一段碎片（并段逻辑照拼），封晚了整段延迟都是白等。
-   * 解码那 ~260 ms 与判停那一拍是**并行**的，谁慢谁说话。
    *
-   * 一段语音只封一次（`commitFiredAt`），长时间静音不会反复 commit ——
-   * 空缓冲的 commit 会被服务端回 `maybe no invalid audio stream`。
+   * 一段语音只封一次（`sealFiredAt`），长时间静音不会反复 commit。
    */
   private maybeCommit(t: number): void {
-    const after = this.options.commitAfterMs ?? 0;
-    if (after <= 0 || this.options.onCommit === undefined) {
+    if (this.options.onCommit === undefined) {
       return;
     }
-    if (this.lastVoicedAt === Number.NEGATIVE_INFINITY || this.lastVoicedAt <= this.lastUtteranceAt) {
+    if (!this.canCommit(t, this.options.commitAfterMs, this.sealFiredAt)) {
       return;
     }
-    if (this.lastVoicedAt <= this.commitFiredAt) {
-      return;
-    }
-    if (t - this.lastVoicedAt < after) {
-      return;
-    }
-    this.commitFiredAt = t;
+    this.sealFiredAt = t;
     // `after` 是**配置值**，实际静音是 `t - lastVoicedAt` —— 两者之差就是「静音开始
     // 到真有音频帧到达」的等待。日志和档案都要记实际值，否则永远看不见那截开销。
     const silenceMs = t - this.lastVoicedAt;
     this.options.log(
-      `  封段    静音 ${after} ms（实际 ${silenceMs.toFixed(0)} ms）→ ASR 开始解码`,
+      `  封段    静音 ${this.options.commitAfterMs} ms（实际 ${silenceMs.toFixed(0)} ms）→ 车道起跑`,
     );
     this.options.onCommit(silenceMs);
+  }
+
+  /**
+   * 静音满 `sttCommitAfterMs` 才请 ASR 封段解码（见 {@link UtteranceAssemblerOptions.sttCommitAfterMs}）。
+   *
+   * 为什么要晚于车道起跑：ASR 一收到 `commit` 就把这一段切走，切在 20 ms 静音上
+   * 等于把「换气」当句尾。真机 `20261123-053719` 两轮都断在书名中间，第二个碎片
+   * 被解成德语。判停本来要等 200–300 ms，所以晚到 150 ms **不花延迟**。
+   */
+  private maybeSttCommit(t: number): void {
+    if (this.options.onSttCommit === undefined) {
+      return;
+    }
+    if (!this.canCommit(t, this.options.sttCommitAfterMs, this.sttCommitFiredAt)) {
+      return;
+    }
+    this.sttCommitFiredAt = t;
+    const silenceMs = t - this.lastVoicedAt;
+    this.options.log(
+      `  封段    ASR 静音 ${this.options.sttCommitAfterMs} ms`
+        + `（实际 ${silenceMs.toFixed(0)} ms）→ 开始解码`,
+    );
+    this.options.onSttCommit(silenceMs);
   }
 
   /**
@@ -854,6 +931,7 @@ export class UtteranceAssembler {
     this.extensions = 0;
     this.unsureExtensions = 0;
     this.waitedMs = 0;
+    this.speechAsks = 0;
     const text = this.pendingText.trim();
     this.pendingText = '';
     if (!text) {
@@ -883,7 +961,7 @@ export class UtteranceAssembler {
 
     const predict = this.options.predict;
     if (!predict) {
-      this.flush();
+      await this.flushOrWait(seq);
       return;
     }
 
@@ -903,7 +981,7 @@ export class UtteranceAssembler {
       this.options.log(`  判停    ${shown} → 判停器不可用，直接结束本轮`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'error' });
       if (await this.semanticAllowsFlush(seq, probability)) {
-        this.flush();
+        await this.flushOrWait(seq);
       }
       return;
     }
@@ -934,7 +1012,7 @@ export class UtteranceAssembler {
           p: probability, waitMs: 0, action: 'accept', whyAccept: 'cap',
           threshold, silenceMs: Math.round(quietNow),
         });
-        this.flush();
+        await this.flushOrWait(seq);
         return;
       }
     }
@@ -985,7 +1063,7 @@ export class UtteranceAssembler {
       this.options.log(`  判停    ${shown} → 音频和文本都没变，不再等（阈值 ${threshold}）`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
       if (await this.semanticAllowsFlush(seq, probability)) {
-        this.flush();
+        await this.flushOrWait(seq);
       }
       return;
     }
@@ -1029,7 +1107,7 @@ export class UtteranceAssembler {
       this.options.log(`  判停    ${shown} → 收下这一轮（阈值 ${threshold}）`);
       this.reportJudge({ p: probability, waitMs: 0, action: 'accept', threshold });
       if (await this.semanticAllowsFlush(seq, probability)) {
-        this.flush();
+        await this.flushOrWait(seq);
       }
       return;
     }
@@ -1059,6 +1137,11 @@ export class UtteranceAssembler {
     if (this.options.semanticEndpoint === undefined) {
       return;
     }
+    // 只发前两版：中间结果逐字改写，真机一轮发过 9 趟、一趟都没影响结论
+    // （见 `MAX_SPEECH_SEMANTIC_ASKS`）。
+    if (this.speechAsks >= MAX_SPEECH_SEMANTIC_ASKS) {
+      return;
+    }
     const trimmed = text.trim();
     if (trimmed.length < 8 || trimmed === this.semanticLastAsked) {
       return;
@@ -1070,6 +1153,7 @@ export class UtteranceAssembler {
       return;
     }
     this.semanticLastAsked = trimmed;
+    this.speechAsks += 1;
     void this.askSemantics(trimmed);
   }
 
@@ -1079,7 +1163,7 @@ export class UtteranceAssembler {
     if (endpoint === undefined || text.trim() === '') {
       return Promise.resolve(null);
     }
-    const cached = this.semanticAsks.get(text);
+    const cached = this.semanticAsks.get(text) ?? this.semanticAskedNear(text);
     if (cached !== undefined) {
       return cached;
     }
@@ -1096,6 +1180,27 @@ export class UtteranceAssembler {
       }
     }
     return promise;
+  }
+
+  /**
+   * 已经问过「同一句话的另一个版本」吗。
+   *
+   * 两个版本互为前缀、长度差不超过 {@link SEMANTIC_PREFIX_SLACK_CHARS} 就算同一句：
+   * 中间结果的收尾和定稿常常只差一个句号或一个语气词。真机 `20261123-053719`
+   * 第 4 轮先问了 `…《奇》书。`（309 ms）又问 `…《奇》书`（342 ms），
+   * 两趟结论都是 `end`，第二趟纯属白等。
+   */
+  private semanticAskedNear(text: string): Promise<'end' | 'more' | null> | undefined {
+    for (const [asked, promise] of this.semanticAsks) {
+      if (asked === text) {
+        return promise;
+      }
+      const [shorter, longer] = asked.length <= text.length ? [asked, text] : [text, asked];
+      if (longer.startsWith(shorter) && longer.length - shorter.length <= SEMANTIC_PREFIX_SLACK_CHARS) {
+        return promise;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -1184,6 +1289,50 @@ export class UtteranceAssembler {
       }
     });
     return verdict;
+  }
+
+  /**
+   * 收下这一轮 —— 先等 ASR 手上那段解完（如果有的话）。
+   *
+   * 不等会怎样：判停那一拍（静音 200–300 ms）常常早于解码（`commit→定稿` 261 ms），
+   * 于是拿**半句话**开轮；后半句解回来时状态机已经在播回执，它被当成插话，
+   * 一轮正确的回答就这么被自己掐掉（真机 `20261123-053719` 第 2 轮
+   * `audio_s=0.00 barge_in=1`，dsh 那份答案完全正确）。
+   *
+   * 等回来之后**不自己收**：那段定稿如果进了组装器，`seq` 已经变了 —— 新那拍
+   * 会拿拼齐的整句重新判定，这里直接放手。等超预算照常收（判停这层绝不能吞话）。
+   */
+  private async flushOrWait(seq: number): Promise<void> {
+    const waiting = this.options.awaitDecode?.() ?? null;
+    if (waiting === null) {
+      this.flush();
+      return;
+    }
+    const budget = this.options.decodeWaitMs ?? 240;
+    const startedAt = this.now();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timedOut = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), budget);
+    });
+    const decoded = await Promise.race([waiting.then(() => true), timedOut]).finally(() => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+    });
+    if (this.disposed) {
+      return;
+    }
+    const waited = this.now() - startedAt;
+    this.waitedMs += waited;
+    if (seq !== this.seq) {
+      // 等回来了，而且那段定稿已经进过组装器（`seq` 变了）→ 新那拍会重新判定
+      this.options.log(`  判停    等解码 ${Math.round(waited)} ms，同一句又长了 → 重新判`);
+      return;
+    }
+    if (!decoded) {
+      this.options.log(`  判停    等解码超 ${budget} ms，不再等（按当前文本收下）`);
+    }
+    this.flush();
   }
 
   /** 有没有哪份**前缀**判定说了「还有下文」（定稿往往只是中间结果的延长）。 */

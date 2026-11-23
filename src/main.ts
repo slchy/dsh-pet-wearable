@@ -994,6 +994,11 @@ async function main(): Promise<void> {
         // 把一个整句切成两段。40 ms 是标定后的默认值（配合下面的开轮门槛
         // 300/200，有声拆句 0）；单独用 40 而不要门槛会把「换气」当句尾。
         commitMs: envNumber('VOICE_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 20 : 0),
+        // **ASR 封段**比车道起跑晚多少。`commitMs` 同时点着两件事：omni 车道起跑
+        // （越早越好）和 ASR 切段（切早了把句子切成两半 —— 真机 2026-11-23 13:37
+        // 两轮都断在书名中间，第二个碎片被解成德语）。判停本来就要等 200–300 ms
+        // 静音，所以晚到 150 ms 不花延迟。
+        sttCommitMs: envNumber('VOICE_STT_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 150 : 0),
         // 开轮门槛：定稿到达时「截至此刻」的连续静音够不够。SOTA 那边按「40 ms 窗
         // + 261 ms 解码 ≈ 301 ms」推的起点，中位数上几乎不增加等待；p 高的轮次用
         // 短档（听起来完整就不必等那么久）。只对 commit 路径生效。

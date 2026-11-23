@@ -148,9 +148,30 @@ export interface FastLaneAudioLane {
    *
    * 没有它，omni 不知道自己那一轮被 dsh 接走了；下一轮用户顺着 dsh 的回答追问，
    * omni 会答非所问。实现方应自行决定「什么时候能发」（如等 `ready`）。
+   *
+   * @param kind 这句话有没有真的念给用户听（见 {@link InjectKind}）
    */
-  injectAnswer?(userText: string, said: string): void;
+  injectAnswer?(userText: string, said: string, kind?: InjectKind): void;
 }
+
+/**
+ * 回注的口气 —— **用户到底听到没有**。
+ *
+ * 分清这一条的前提是搞清「谁念的」：dsh 的答案**确实是 omni 念的**，但走的是
+ * `omni-tts` 那条**专用朗读连接**（`念这段：<文本>`，实测逐字 100%），和聊天用的
+ * `omni-shadow` 不是同一条 —— 朗读连接念完就 `item.delete`，是无状态的。
+ * 所以「用户听到了」而「omni 的对话历史里没发生过」是同一件事的两面。
+ *
+ * 两条口径：
+ * - `spoken`：**用第一人称**说「你已经用语音把这段话念给用户了」。因为真是同一副
+ *   嗓子念的，从用户视角就是 omni 说的 —— 这样它后面讲「我刚才说过」是**真话**，
+ *   不用让它克制。
+ * - `unspoken`：一个字都没下发，用户不知道内容。真机 `20261123-053719` 第 2 轮：
+ *   dsh 答出了《其主之声》，`audio_s=0.00`，结果 omni 后面把书名当成《奇书》。
+ *
+ * 播了一半（`truncated`）**不注** —— 那是"用户少听了一段"，不是"没播"。
+ */
+export type InjectKind = 'spoken' | 'unspoken';
 
 /** Agent 回复。只保留编排层真正需要的字段。 */
 export interface AgentReplyView {
@@ -250,10 +271,10 @@ export interface AgentProvider {
    * 历史里只有「用户问了什么」，**不知道 dsh 答了什么**。下一轮用户顺着 dsh 的
    * 回答追问，omni 接不上。
    *
-   * 宿主只在**这一轮真的播完了**时叫（被打断的正文不回注 —— 用户没听到的东西
-   * 不该变成 omni 的记忆）。没挂车道时是空操作。
+   * @param kind 用户到底听到了没有（见 `providers.ts` 的 `InjectKind`）。
+   *   **没播出去也要注**：那是这一轮的事实结论，用户下一轮问的就是它。
    */
-  injectAnsweredTurn?(userText: string, said: string): void;
+  injectAnsweredTurn?(userText: string, said: string, kind?: InjectKind): void;
   /**
    * 可选能力：**取消在途的一轮**（宿主侧能力，走 dsh 的 `session/cancel`）。
    *
@@ -394,6 +415,22 @@ export interface SttSession {
    * 再把回来的文本扔掉。不实现这个方法就表示「作废不了，别扔」。
    */
   discard?(): void;
+  /**
+   * 可选能力：**手上还有一段没解完**（`commit` 已经发出去、定稿还没回来）。
+   *
+   * 为什么要暴露：封装段的时刻是我们定的（`commitMs`），而定稿要 261 ms ——
+   * 判停那一拍（静音 200–300 ms）经常在解完之前就到了。这时开轮拿到的是**半句话**，
+   * 后半句解码回来就变成「插话」，把自己这一轮掐掉。真机 `20261123-053719`
+   * 第 2 轮就是这么杀了 dsh 一份正确答案（`audio_s=0.00 barge_in=1`）。
+   */
+  decoding?(): boolean;
+  /**
+   * 可选能力：等手上那段解完。没有在解的返回 `null`。
+   *
+   * 复位在 `onSentence` **之后**的微任务里才生效，所以等它回来时，
+   * 新定稿已经进过组装器（`seq` 已经变了）—— 抢跑那一轮自然作废重排。
+   */
+  whenDecoded?(): Promise<void> | null;
 }
 
 export interface SttHandlers {

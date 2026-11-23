@@ -144,6 +144,8 @@ export class DialogFsm {
   private readonly log: (line: string) => void;
   /** 「本轮被作废」的订阅者（见 {@link onInvalidate}） */
   private readonly invalidateListeners: Array<(reason: 'bargeIn' | 'closed') => void> = [];
+  /** 状态转移的观察者（只读，不参与决策） */
+  private readonly stateListeners: Array<(state: DialogState, why: string) => void> = [];
 
   constructor(log: (line: string) => void) {
     this.log = log;
@@ -181,6 +183,24 @@ export class DialogFsm {
   /** 当前代次的票据。入队任务应当持有它，出队时用 {@link isStale} 校验。 */
   ticket(): TurnTicket {
     return { no: this._turn, gen: this._gen };
+  }
+
+  /**
+   * 订阅「状态变了」。
+   *
+   * 宿主用它记「这一轮是什么时候开的」—— 判断一条转写是开轮前录的还是开轮后的，
+   * 只有它知道（见 `VoiceSession.turnStartedAt`）。回调里不要做耗时的事。
+   *
+   * @returns 退订函数
+   */
+  onState(cb: (state: DialogState, why: string) => void): () => void {
+    this.stateListeners.push(cb);
+    return () => {
+      const at = this.stateListeners.indexOf(cb);
+      if (at >= 0) {
+        this.stateListeners.splice(at, 1);
+      }
+    };
   }
 
   /**
@@ -386,5 +406,8 @@ export class DialogFsm {
     this.log(`  状态    ${this._state} → ${to}   (${why})`);
     this._state = to;
     this._lastWhy = why;
+    for (const cb of [...this.stateListeners]) {
+      cb(to, why);
+    }
   }
 }

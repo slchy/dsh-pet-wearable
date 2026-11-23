@@ -9,7 +9,7 @@
 
 ## 一、环境变量（`.env` 可调）
 
-共 27 项。
+共 28 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
@@ -30,16 +30,17 @@
 | `VOICE_PAUSE_DETECT_MS` | 200 | wall | `src/main.ts:989` | ASR 解出句之前（提前起跑，不额外等） | — |
 | `VOICE_SPECULATE_MS` | 100 | wall | `src/main.ts:991` | 同上（投机与 ASR 并行） | — |
 | `VOICE_COMMIT_MS` | 20（仅 qwen-realtime） | wall→audio（见下方备注） | `src/main.ts:996` | 无 —— 它就是封段的那一刻，实际门槛被上行包长盖住 | 实际门槛 = 一整个上行包（75 ms），配置值被它盖住 |
-| `VOICE_OPEN_QUIET_MS` | 300 | audio | `src/main.ts:1002` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
-| `VOICE_OPEN_QUIET_SHORT_MS` | 200 | audio | `src/main.ts:1003` | 同上（p ≥ 0.8 时走这条） | — |
-| `MIAI_PHOTO_TIMEOUT_MS` | 60000 | wall | `src/main.ts:1036` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_HQ_ARM_TIMEOUT_MS` | 15000 | wall | `src/main.ts:1043` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_IDLE_TIMEOUT_MS` | 45000 | wall | `src/main.ts:1048` | 无关首声（不在停嘴→出声路径上） | — |
-| `PET_GREET_AWAY_MS` | DEFAULT_PET_TIMING.greetAfterAwayMs | wall | `src/main.ts:1054` | 无关首声（不在停嘴→出声路径上） | — |
-| `PET_CHATTER_IDLE_MS` | DEFAULT_PET_TIMING.chatterAfterIdleMs | wall | `src/main.ts:1055` | 无关首声（不在停嘴→出声路径上） | — |
-| `PET_MIC_OPEN_TIMEOUT_MS` | 1500 | wall | `src/main.ts:1057` | 无关首声（不在停嘴→出声路径上） | — |
-| `PET_LISTEN_MS` | DEFAULT_PROACTIVE.listenMs | wall | `src/main.ts:1059` | 无关首声（不在停嘴→出声路径上） | — |
-| `PET_TICK_MS` | 3000 | wall | `src/main.ts:1060` | 无关首声（不在停嘴→出声路径上） | — |
+| `VOICE_STT_COMMIT_MS` | 150（仅 qwen-realtime） | wall→audio（同 VOICE_COMMIT_MS，见下方备注） | `src/main.ts:1001` | 无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠） | — |
+| `VOICE_OPEN_QUIET_MS` | 300 | audio | `src/main.ts:1007` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
+| `VOICE_OPEN_QUIET_SHORT_MS` | 200 | audio | `src/main.ts:1008` | 同上（p ≥ 0.8 时走这条） | — |
+| `MIAI_PHOTO_TIMEOUT_MS` | 60000 | wall | `src/main.ts:1041` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_HQ_ARM_TIMEOUT_MS` | 15000 | wall | `src/main.ts:1048` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_IDLE_TIMEOUT_MS` | 45000 | wall | `src/main.ts:1053` | 无关首声（不在停嘴→出声路径上） | — |
+| `PET_GREET_AWAY_MS` | DEFAULT_PET_TIMING.greetAfterAwayMs | wall | `src/main.ts:1059` | 无关首声（不在停嘴→出声路径上） | — |
+| `PET_CHATTER_IDLE_MS` | DEFAULT_PET_TIMING.chatterAfterIdleMs | wall | `src/main.ts:1060` | 无关首声（不在停嘴→出声路径上） | — |
+| `PET_MIC_OPEN_TIMEOUT_MS` | 1500 | wall | `src/main.ts:1062` | 无关首声（不在停嘴→出声路径上） | — |
+| `PET_LISTEN_MS` | DEFAULT_PROACTIVE.listenMs | wall | `src/main.ts:1064` | 无关首声（不在停嘴→出声路径上） | — |
+| `PET_TICK_MS` | 3000 | wall | `src/main.ts:1065` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 二、布尔开关（会改变时刻或路径）
 
@@ -55,7 +56,7 @@
 
 ## 三、硬编码常量（改要动代码）
 
-共 32 项。
+共 33 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
@@ -64,6 +65,7 @@
 | `CLOCK_MISMATCH_MS` | 1e9 | —（判据） | `src/barge-voicing.ts:52` | 无（纯判据：只用来发现两把时钟接错，不放慢任何东西） | — |
 | `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:235` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
 | `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:364` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
+| `TRUNCATED_EPSILON_MS` | 300 | —（判据） | `src/engine-contract.ts:108` | 无（纯判据：轮末判「用户少听了没有」，不产生任何等待） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:70` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |
@@ -82,15 +84,15 @@
 | `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:66` | 无关首声（不在停嘴→出声路径上） | — |
 | `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:182` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
-| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:38` | 设备播报期间（轮询，不加延迟） | — |
-| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:46` | 无关首声（不在停嘴→出声路径上） | — |
-| `OMNI_DELEGATE_MAX_SPOKEN_MS` | 1500 | wall | `src/turn-runner.ts:55` | 无（判据：超过它就不再把 dsh 的答案拼在后面） | — |
+| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:39` | 设备播报期间（轮询，不加延迟） | — |
+| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:47` | 无关首声（不在停嘴→出声路径上） | — |
+| `OMNI_DELEGATE_MAX_SPOKEN_MS` | 1500 | wall | `src/turn-runner.ts:56` | 无（判据：超过它就不再把 dsh 的答案拼在后面） | — |
 | `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:109` | ASR 出句之后（兜底，正常不触发） | — |
 | `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:122` | ASR 出句之前 | — |
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:131` | 无关首声（不在停嘴→出声路径上） | — |
 | `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:142` | 无关首声（不在停嘴→出声路径上） | — |
 | `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:160` | 判停侧车输入预处理（不额外等） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:395` | 无关首声（不在停嘴→出声路径上） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:404` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 四、还没标注的
 

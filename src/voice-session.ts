@@ -271,6 +271,15 @@ export interface VoiceSessionOptions {
      */
     readonly commitMs?: number;
     /**
+     * 静音多久才让 **ASR** 封段解码（默认 = {@link commitMs}，即不拆）。
+     *
+     * `commitMs` 同时点着两个动作：omni 车道起跑（`OmniShadow.seal`）和 ASR 封段。
+     * 前者越早越好（20 ms），后者切早了会把一句话切成两半 —— 真机
+     * `20261123-053719` 两轮都断在书名中间，第二个碎片被解成了德语。
+     * 判停本来要等 200–300 ms 静音，所以 ASR 晚到 150 ms **不花延迟**。
+     */
+    readonly sttCommitMs?: number;
+    /**
      * 开轮的静音门槛（ms）：定稿到达时「截至此刻」的连续静音不够就再等。
      *
      * 只对「端点由我们控」的 provider 有意义 —— 提交得早，定稿会在用户可能
@@ -496,12 +505,32 @@ class VoiceConnection {
    */
   private readonly omni: OmniShadow | null;
   /**
-   * 封段序号。**同一个值写进两处**：`asr.commit` 与 `omni.shadow`。
+   * **ASR** 封段序号：每发一次 `input_audio_buffer.commit` +1。
    *
-   * 没有它两份事件对不上：真机有二次封段（并段）、咳嗽误触发（没有 `turn.end`）、
-   * 打断轮（也没有 `turn.end`），光靠自增 seq 几轮就会错位。
+   * 曾经和 `omni.shadow` 的序号是同一个值（同一条日志行里发两份事件）。
+   * 2026-11-23 拆开之后**不再相等**：车道 20 ms 起跑（{@link sealSeq}），
+   * ASR 150 ms 才切段。两份事件的配对看 `asr.commit.lane_seq`。
+   *
+   * 它还是「这段音频是哪一代的」的**因果序号**：转写回来时比较
+   * {@link turnBaseCommitSeq} 就知道这段是不是开轮之前录的。
    */
   private commitSeq = 0;
+  /**
+   * 车道封段序号（omni 的 `seal`）。
+   *
+   * 和 {@link commitSeq} **不是同一个号**了：车道 20 ms 就起跑，ASR 150 ms 才切段
+   * （见 `sttCommitMs`）。两份档案事件用 `asr.commit.lane_seq` 配对。
+   */
+  private sealSeq = 0;
+
+  /**
+   * 开轮瞬间**已发出**的最大 ASR commit 序号。
+   *
+   * 这是判「旧段」的**精确**依据：转写回来时若 `commitSeq <= turnBaseCommitSeq`，
+   * 说明那一段音频是在我们出声之前封出去的 —— 它不可能是插话，只能是判停抢跑之后
+   * 补回来的后半句。比时钟干净：不用猜「这一段是什么时候录的」。
+   */
+  private turnBaseCommitSeq = -1;
 
   private control: ToolControl | null = null;
 
@@ -575,6 +604,13 @@ class VoiceConnection {
         onDialogState: (state) => { this.app?.onDialogState(state); },
       },
       log,
+    });
+    // 开轮时记下「已经发出到第几发 commit」——判「这条转写是开轮前录的还是开轮后的」
+    // 全靠它（见 `turnBaseCommitSeq` / `fromPreTurnSegment`）。**是因果序号，不是时钟**。
+    this.dialog.core.fsm.onState((state) => {
+      if (state === 'thinking' || state === 'speaking') {
+        this.turnBaseCommitSeq = this.commitSeq;
+      }
     });
     // 应用层**总是**要建：话筒（user / reply / announce）必须在同一张表里仲裁，
     // 没有宠物也要（ADR-0001 §6）。宠物只是这套应用层里的一个子系统。
@@ -692,17 +728,32 @@ class VoiceConnection {
         : {
           commitAfterMs: options.gate.commitMs,
           onCommit: (silenceMs) => {
-            const seq = (this.commitSeq += 1);
-            this.archive?.event(EVENTS.asrCommit, {
-              seq,
-              silence_ms: Math.round(silenceMs),
-              want_ms: options.gate.commitMs,
-            });
-            this.stt.commit?.();
-            // 与 ASR **同一行**起跑：这是「封段 → 首块」两边同口径的前提，
-            // 差几行就会把 ② 那段等待算成 omni 的耗时。
-            this.omni?.seal(seq, silenceMs);
+            const laneSeq = (this.sealSeq += 1);
+            // 车道起跑（omni 的 `seal`）。**ASR 的 commit 在更晚的 `onSttCommit`**，
+            // 所以这里不再写 `asr.commit` —— 否则 ①a/①b（停嘴→封段→定稿）
+            // 会拿 20 ms 的车道时刻冒充 150 ms 的封段时刻，整份延迟报告偏 130 ms。
+            this.omni?.seal(laneSeq, silenceMs);
           },
+          // ASR 那一路**晚一点**再切（见 `sttCommitMs`）：车道要的是「这半句结束」，
+          // ASR 要的是「这一句结束」，两者的最优值差一个数量级。
+          ...(options.gate.sttCommitMs === undefined || options.gate.sttCommitMs <= 0
+            ? {}
+            : {
+              sttCommitAfterMs: options.gate.sttCommitMs,
+              onSttCommit: (silenceMs) => {
+                const seq = (this.commitSeq += 1);
+                this.archive?.event(EVENTS.asrCommit, {
+                  seq,
+                  silence_ms: Math.round(silenceMs),
+                  want_ms: options.gate.sttCommitMs,
+                  // 与 `omni.shadow` 的 join key：同一段语音的车道序号。
+                  // 两个号从 2026-11-23 起**不再相等**（车道 20 ms 先跑、ASR 150 ms 后切），
+                  // 想配对就看这一个字段，别再假设 `seq` 一样。
+                  lane_seq: this.sealSeq,
+                });
+                this.stt.commit?.();
+              },
+            }),
         }),
       // 开轮门槛：提交早 → 定稿也早，可能人还在说。定稿到达时看「截至此刻的
       // 连续静音」，不够就等 —— 那本来就不该开轮。
@@ -739,6 +790,9 @@ class VoiceConnection {
       // 返回 false（没投出去）时组装器不会记「这段语音已投机」，下一个静音 tick
       // 还会再问一次 —— 否则「静音 100 ms 时只凑到 2 个字」就等于整轮放弃。
       onPartial: (text) => this.options.agent.speculatePartial?.(text) ?? false,
+      // 开轮前先等 ASR 那段解完（见 `UtteranceAssemblerOptions.awaitDecode`）。
+      // 闭包里取 `this.stt`：它在本行之后才赋值，构造期不能摸。
+      awaitDecode: () => this.stt?.whenDecoded?.() ?? null,
       log,
     });
 
@@ -1246,6 +1300,16 @@ class VoiceConnection {
   private onPartial(text: string): void {
     console.log(`  … ${text}`);
     this.archive?.event(EVENTS.asrPartial, { text });
+    // **开轮前录的那一段**：产出它的 commit 早于开轮
+    // 时刻说明这些音频是在我们出声之前录的 —— 那不可能真是插话，是我们抢在
+    // 用户说完之前开了口。真机 `20261123-053719` 第 2 轮：开轮 71 ms 后
+    // `置身吗` 到达，被当成插话，dsh 那份**完全正确**的答案 `audio_s=0.00` 没了。
+    if (this.fromPreTurnSegment()) {
+      console.log(
+        `  … ${text}（开轮前录的那段还没解完 → 不算插话）`,
+      );
+      return;
+    }
     // 插话的**声学**闸：服务端会把同一截缓冲再解一遍，在尾静音上吐 `Thank you`，
     // 它一旦 ≥2 个字就把正在播的回答整条掐掉（真机两次各丢一整条答案）。
     // 判据不是语种、不是音量、也不是「距上次有声多久」，而是
@@ -1265,6 +1329,27 @@ class VoiceConnection {
     if (effects.some((effect) => effect.type === 'call' && effect.call.op === 'audio.stop')) {
       console.log('  打断    听到识别结果 → 停止播放，已排队的轮次作废');
     }
+  }
+
+  /**
+   * 这条转写是不是「开轮之前录进 ASR 的那一段」。
+   *
+   * 判据只有一条：**产出它的那发 commit 早于开轮**（`commitSeq <= turnBaseCommitSeq`）。
+   * commit 之后音频就被切走了，所以这条等价于「这段音频全部录在开轮之前」——
+   * 那种时候的转写绝不可能是用户在插话，只能是判停抢跑之后补回来的后半句。
+   *
+   * 比时钟判据干净：`封段时刻 <= 开轮时刻` 也能用，但那是在比两个不同来源的时刻，
+   * 一旦某处换时钟就静默失效（这个坑今天刚踩过）。序号是因果量。
+   *
+   * 为什么不拿「有没有新声音」（`gatedByVoicing`）判：这里**确实**有新声音
+   * （用户真的说了那半句），声学闸会放行。两条闸回答的是两个不同的问题。
+   */
+  private fromPreTurnSegment(): boolean {
+    const state = this.dialog.core.fsm.state;
+    if (state !== 'speaking' && state !== 'thinking') {
+      return false;
+    }
+    return this.commitSeq <= this.turnBaseCommitSeq;
   }
 
   /**
@@ -1289,6 +1374,13 @@ class VoiceConnection {
   private onSentence(text: string, index: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
     this.archive?.event(EVENTS.asrSentence, { text, index });
+    // **开轮前录的那一段**（同 `onPartial`）：它的音频早于这一轮，定稿回来时
+    // 拿去「插话」就是自己掐自己。这里连开轮都不开 —— 用户下一句会重新说到它。
+    if (this.fromPreTurnSegment()) {
+      console.log(`  句 ${index}  ↳ 开轮前录的那段定稿 → 不当插话，也不开轮`);
+      this.archive?.event(EVENTS.asrSentence, { text, index, dropped: 'pre-turn' });
+      return;
+    }
     // 上面那句已经出过结论、之后一直没人说话 → 这一条是同一截缓冲的重复解码。
     // 它既不该打断播放，也不该开一轮（真机档案里 `Okay.` / `对。` / `好。` 共 13 条，
     // 底下一条有声帧都没有；回放里它们每个都会开出一轮「答无可答」的轮次，

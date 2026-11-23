@@ -40,7 +40,7 @@
 import { cleanForSpeech } from './agent.ts';
 import { EVENTS } from './events.ts';
 import { parseEmotion } from './emotion.ts';
-import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, TurnContext } from './providers.ts';
+import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TurnContext } from './providers.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
 /** 快模型说「这个我答不了」的唯一暗号 */
@@ -258,6 +258,34 @@ export function awaitsReply(speech: string): boolean {
   const t = speech.trim();
   if (t === '') return false;
   return ASK_MARKERS.some((w) => t.includes(w));
+}
+
+/**
+ * 承接句的记号：只说「怎么讲」，不说讲什么。
+ *
+ * 纯机械，不做语义推断（和 `looksLikeAnswer` / `looksUnfinished` 同一条原则）。
+ */
+const FOLLOW_UP_CUES: readonly string[] = [
+  '讲讲', '说说', '讲一下', '说一下', '展开', '详细', '具体', '梗概', '大概',
+  '然后呢', '后来呢', '接着', '还有呢', '为什么', '怎么说',
+];
+
+/**
+ * 这句像不像在**接着上一轮追问**（没有主语，全靠上文）。
+ *
+ * 为什么要它：上一轮由 dsh 答完、用户紧接着说「你讲讲梗概。」——只有 6 个字，
+ * 过得了快车道的字数闸，于是被送去 omni 直出。而 omni 那边只听过音频、
+ * 不知道 dsh 答了什么，只能**编**（真机 `20261123-053719` 第 5 轮：10.40 s
+ * 「人类在宇宙里发现一本神秘的书」）。这类句子必须留在**知道上文的那条路**上。
+ *
+ * 只认「短 + 有承接记号 + 没带专名」：带了《》「」或者超过 12 个字就是新问题，
+ * 不敢拦 —— 拦错了是把能用 omni 的轮次白白扔给 dsh。
+ */
+export function looksLikeFollowUp(text: string): boolean {
+  const t = text.trim();
+  if (t === '' || t.length > 12) return false;
+  if (/[《》「」『』"]/.test(t)) return false;
+  return FOLLOW_UP_CUES.some((w) => t.includes(w));
 }
 
 export interface FastLaneOptions {
@@ -835,19 +863,24 @@ export class FrontedAgent implements AgentProvider {
     const lane = this.audioLane;
     const hasLane = lane !== null;
     const laneOk = hasLane && lane.willServe();
+    const sticky = this.followsDsh(text);
     const textOk = this.textEligible(text);
     // 布尔看不出卡在哪一条，四种原因的修法完全不同 —— 落档（`agent.lane`）
     this.auditSink(EVENTS.agentLane, {
       has_lane: hasLane,
       lane_ok: laneOk,
       text_ok: textOk,
-      ok: laneOk && textOk,
+      ok: laneOk && textOk && !sticky,
+      ...(sticky ? { stick_to_dsh: true } : {}),
       ...(lane?.explain?.() ?? {}),
     });
     if (!hasLane) {
       this.log('  车道    ✗ 没有挂上 omni 车道（`attachAudioLane` 没到这一层）');
     }
-    return laneOk && textOk;
+    if (sticky) {
+      this.log('  车道    上一轮由 dsh 答的，这一轮是接着追问 → 不交给 omni');
+    }
+    return laneOk && textOk && !sticky;
   }
 
   /**
@@ -858,7 +891,23 @@ export class FrontedAgent implements AgentProvider {
    */
   private laneWouldServe(text: string): boolean {
     const lane = this.audioLane;
-    return lane !== null && lane.willServe() && this.textEligible(text);
+    return lane !== null && lane.willServe() && this.textEligible(text)
+      && !this.followsDsh(text);
+  }
+
+  /**
+   * 这一句是不是**接着上一轮 dsh 的追问**（见 `looksLikeFollowUp`）。
+   *
+   * omni 只听过用户的声音，不知道 dsh 答了什么 —— 这种「接着上文说话」的短句
+   * 交给它只能编（真机 `20261123-053719` 第 5 轮「你讲讲梗概。」→ 10.40 s 胡话）。
+   * dsh 那边有完整会话，同一条链路 1–3 s 也能答。
+   */
+  private followsDsh(text: string): boolean {
+    if (this.audioLane === null || !looksLikeFollowUp(text)) {
+      return false;
+    }
+    const last = this.history[this.history.length - 1];
+    return last !== undefined && last.who === 'dsh';
   }
 
   /**
@@ -891,12 +940,12 @@ export class FrontedAgent implements AgentProvider {
    * 只该在**这一轮真的播完了**时叫。被打断的正文不回注：用户没听到的东西
    * 不该变成 omni 的记忆。
    */
-  injectAnsweredTurn(userText: string, said: string): void {
+  injectAnsweredTurn(userText: string, said: string, kind: InjectKind = 'spoken'): void {
     const speech = said.trim();
     if (speech === '' || this.audioLane === null) {
       return;
     }
-    this.audioLane.injectAnswer?.(userText, speech);
+    this.audioLane.injectAnswer?.(userText, speech, kind);
   }
 
   /**

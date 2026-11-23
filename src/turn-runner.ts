@@ -14,6 +14,7 @@
 import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
 import { EVENTS } from './events.ts';
+import { outcomeOf } from './engine-contract.ts';
 import { loopLagSnapshot } from './loop-lag.ts';
 import { diffNetCounters, netFields, readNetCounters } from './net-counters.ts';
 import { sampleSockets } from './socket-stats.ts';
@@ -723,12 +724,7 @@ export class TurnRunner {
         interrupted = fsm.isStale(ticket);
       }
 
-      // 用户听到的时长按「首块发出之后过了多久」算，不按字节算：
-      // 回答是整段先合成完再等的，插话那会儿音频早就全发出去了。
-      const heardSeconds = firstAudioAtMs < 0
-        ? 0
-        : Math.min(audioSeconds, (this.options.clock.now() - firstAudioAtMs) / 1000);
-
+      // 用户听到的时长按「首块发出之后过了多久」算 —— 见 `outcomeOf()`。
       // **用户到底少听了没有**，和上面的 `interrupted` 是两件事，别合成一个变量：
       //
       // - `interrupted` = 票据被作废（控制面）。它决定老轮还能不能动 FSM，
@@ -736,15 +732,33 @@ export class TurnRunner {
       //   用户 26 ms 后才开口，`heard_s` 因为 `Math.min` 封顶在 19.44，
       //   按 `heard == audio` 判「没打断」的话，那一轮就会以为还能去收尾。
       // - `truncated` = 内容面。只有它才该管记账与「要不要当成没听完」。
-      const HEARD_EPSILON_S = 0.3;
-      const truncated = audioSeconds > 0 && heardSeconds + HEARD_EPSILON_S < audioSeconds;
+      //
+      // 算法本身在 `engine-contract.ts`（纯函数，回放可对账）：四层契约④。
+      const outcome = outcomeOf({
+        stale: interrupted,
+        firstAudioAtMs,
+        nowMs: this.options.clock.now(),
+        totalAudioMs: audioBytes === 0 ? 0 : audioSeconds * 1000,
+      });
+      const heardSeconds = outcome.heardMs / 1000;
+      const truncated = outcome.truncated;
 
       // 委派轮：把 dsh 的答案回注给 omni 的上下文，否则它不知道自己那一轮被接走了。
       // 按 `truncated` 而不是 `interrupted`：插话落在最后一个字之后（上面第 3 轮那种）
       // 用户其实听全了，该注；少听了一段才不注。
+      //
+      // **不再要求 `audioBytes > 0`**：*一个字都没下发*不等于*用户少听了*。委派轮的
+      // 答案是这一轮的事实结论，用户下一轮问的就是它 ——
+      // 真机 `20261123-053719` 第 2 轮，dsh 答出了《其主之声》，`audio_s=0.00`
+      // 被这条守卫拦下，于是 omni 至今不知道书名，第 5 轮把《奇书》当真书名编了 10.4 s。
+      // 内容照注，口气（`spoken`/`unspoken`）按实际下发情况标 —— 见 `InjectKind`。
+      //
       // 快车道答的轮次不注：它们走 `reply()`，omni 那边由 `noteServedTurn` 覆盖。
-      if (replyPath === 'dsh' && !truncated && audioBytes > 0 && speech.trim() !== '') {
-        agent.injectAnsweredTurn?.(text, speech);
+      if (replyPath === 'dsh' && !truncated && speech.trim() !== '') {
+        if (audioBytes === 0) {
+          this.log('  omni    答案一个字都没念出去，但仍回注（下一轮会接着问）');
+        }
+        agent.injectAnsweredTurn?.(text, speech, audioBytes === 0 ? 'unspoken' : 'spoken');
       }
 
       this.options.onEvent?.(EVENTS.turnEnd, {
@@ -756,8 +770,13 @@ export class TurnRunner {
         // `path=dsh` 另有 `session.v4.jsonl.zstd` 里的 `assistant/message` 可对；
         // 快车道（qwen-flash）没有 session log，这是它唯一的口供。记实际播出的
         // 文本（多步时是全部增量，见上方 `speech` 注释），回执不在这条里。
-        said: speech,
-        said_chars: [...speech].length,
+        //
+        // **一个字节都没下发就记空**：真机 `20261123-053719` 第 2 轮
+        // `audio_s=0.00 / barge_in=1`，`said` 却记了 39 字 —— 档案看着"它答了"，
+        // 用户一个字都没听到。`speech` 本身还要留给续话用（它决定「还剩几个字」），
+        // 所以清的是这一条记录，不是变量。
+        said: audioBytes === 0 ? '' : speech,
+        said_chars: audioBytes === 0 ? 0 : [...speech].length,
         dsh_ms: agentLatencyMs,
         tts_first_ms: firstChunkAtMs === 0 ? -1 : firstChunkAtMs,
         // 这一轮是谁答的。没有它，档案里分不出快车道和 dsh —— `dsh_ms` 两组重叠，

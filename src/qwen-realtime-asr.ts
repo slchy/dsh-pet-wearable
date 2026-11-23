@@ -159,6 +159,12 @@ export class QwenRealtimeAsr {
    * 会发（静音窗口 `flushHeld` 什么都不置，`commit()` 自然跳过）。
    */
   private commitDeferred = false;
+  /**
+   * 在等这一段解码结束的宿主动作（见 {@link whenDecoded}）。
+   *
+   * 只用来回答一个问题：「判停要开轮了，可这段还没解完 —— 还值得等吗？」
+   */
+  private decodeWaiters: Array<() => void> = [];
   private seq = 0;
   /** 还有几条 `commit` 的结果要扔掉（打断用，`clear` 不存在） */
   private discardLeft = 0;
@@ -237,6 +243,9 @@ export class QwenRealtimeAsr {
     this.ringBytes = 0;
     this.holdActive = false;
     this.commitDeferred = false;
+    // 连接没了：等解码的那几个不能再挂下去（判停那边有预算，但挂住的 promise 会漏）
+    this.awaitingDecode = false;
+    this.resolveDecode();
     return true;
   }
 
@@ -420,6 +429,30 @@ export class QwenRealtimeAsr {
     this.log(`[asr] 标记丢弃下一段结果（待丢 ${this.discardLeft}）`);
   }
 
+  /** 手上还有一段没解完吗（见 `SttSession.decoding`）。 */
+  decoding(): boolean {
+    return this.awaitingDecode;
+  }
+
+  /**
+   * 等手上那段解完（见 `SttSession.whenDecoded`）。
+   *
+   * 没有在解的返回 `null` —— 调用方据此走「不用等」的同步路径。
+   */
+  whenDecoded(): Promise<void> | null {
+    if (!this.awaitingDecode) {
+      return null;
+    }
+    return new Promise<void>((resolve) => { this.decodeWaiters.push(resolve); });
+  }
+
+  /** 唤醒所有等解码的调用方（`.completed` / `.error` 都要调，否则会挂着） */
+  private resolveDecode(): void {
+    for (const wake of this.decodeWaiters.splice(0)) {
+      wake();
+    }
+  }
+
   /**
    * 「这段说完了」。
    *
@@ -487,6 +520,9 @@ export class QwenRealtimeAsr {
       const t = (ev.transcript ?? '').trim();
       const index = this.seq;
       this.seq += 1;
+      // **在 `onSentence` 之后**才真正唤醒（微任务），顺序不能挪到前面：
+      // 等的人要以「新定稿已经进过组装器」为前提决定要不要抢跑。
+      this.resolveDecode();
       if (this.discardLeft > 0) {
         this.discardLeft -= 1;
         this.log(`[asr] 丢弃第 ${index} 段（迟到 ${t.length} 字）`);
@@ -499,6 +535,7 @@ export class QwenRealtimeAsr {
       // 这一发废了：重新武装，否则 `awaitingDecode` 永远挂着，后面再也 commit 不出去
       this.awaitingDecode = false;
       this.flushHeld();
+      this.resolveDecode();
       const msg = ev.error?.message ?? text.slice(0, 200);
       this.opts.onError?.(new QwenRealtimeAsrError(`服务端错误: ${msg}`));
     }
@@ -521,11 +558,13 @@ export function qwenRealtimeStt(
         log,
       });
       return {
-        feed: (pcm) => { asr.feed(pcm); },
+        feed: (pcm, voiced) => { asr.feed(pcm, voiced); },
         hangup: () => { asr.hangup(); },
         close: () => { asr.close(); },
         commit: () => { asr.commit(); },
         discard: () => { asr.discard(); },
+        decoding: () => asr.decoding(),
+        whenDecoded: () => asr.whenDecoded(),
       };
     },
   };
