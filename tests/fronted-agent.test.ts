@@ -140,7 +140,7 @@ test('模型判 [[DELEGATE]] 时交给 dsh，一个字的正文都不出', async
     asked += 1;
     return sse(['[[DELEGATE]]']);
   });
-  const reply = await agent.reply('帮我查一下订单');
+  const reply = await agent.reply('订单查到哪了');
   assert.equal(asked, 1, '本地不再按词挡 —— 是模型自己判的委派');
   assert.equal(reply.path, 'dsh');
   assert.equal(inner.calls.length, 1);
@@ -539,7 +539,7 @@ test('dsh 上一条在问话：短回话必须交给 dsh，不能被快模型抢
   );
   agent.attachLiveSink(() => {});
 
-  const first = await agent.reply('帮我查一下订单');
+  const first = await agent.reply('订单查到哪了');
   assert.equal(first.path, 'dsh', '模型判委派 → 交给 dsh');
   const reply = await agent.reply('好的');
   assert.equal(fastCalls, 1, '「好的」是对 dsh 那句问话的回答，不是闲聊');
@@ -559,7 +559,7 @@ test('dsh 上一条不是问话：短回话照旧走快车道（别过度拦）'
   );
   agent.attachLiveSink(() => {});
 
-  await agent.reply('帮我查一下订单');
+  await agent.reply('订单查到哪了');
   const reply = await agent.reply('好的');
   assert.equal(fastCalls, 2, '上一句 dsh 不是问话 → 「好的」照旧问快模型');
   assert.equal(reply.path, 'fast');
@@ -854,7 +854,7 @@ test('禁用委派：提示词不带暗号，模型写出暗号也不转 dsh', a
   });
   agent.attachLiveSink(() => {});
 
-  const reply = await agent.reply('帮我查一下订单');
+  const reply = await agent.reply('订单查到哪了');
 
   assert.ok(!systemMsg.includes('[[DELEGATE]]'), '纯聊天版提示词不该提暗号');
   assert.ok(!systemMsg.includes('委派'), '也不该提「委派」这件事');

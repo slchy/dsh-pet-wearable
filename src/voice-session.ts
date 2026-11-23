@@ -1316,9 +1316,9 @@ class VoiceConnection {
     // 时刻说明这些音频是在我们出声之前录的 —— 那不可能真是插话，是我们抢在
     // 用户说完之前开了口。真机 `20261123-053719` 第 2 轮：开轮 71 ms 后
     // `置身吗` 到达，被当成插话，dsh 那份**完全正确**的答案 `audio_s=0.00` 没了。
-    if (this.fromPreTurnSegment()) {
+    if (this.partialFromPreTurnSegment()) {
       console.log(
-        `  … ${text}（开轮前录的那段还没解完 → 不算插话）`,
+        `  … ${text}（开轮前录的那段还在解 → 不算插话）`,
       );
       return;
     }
@@ -1362,6 +1362,27 @@ class VoiceConnection {
       return false;
     }
     return this.commitSeq <= this.turnBaseCommitSeq;
+  }
+
+  /**
+   * 这个中间结果是不是**在解那一段旧音频**时吐出来的。
+   *
+   * 和 {@link fromPreTurnSegment} 分开，因为中间结果和定稿的来源不一样：
+   *
+   * - **定稿**只会在 `.completed` 之后出现，那时手上那段必然是最后发出的那发
+   *   commit —— 所以「那股 commit 早于开轮」就够了。
+   * - **中间结果**是 `.text` 增量，它既可能是正在解的那一段，也可能是**新开的一段**
+   *   （用户已经在说下一句）。回放里看得很清楚：只按序号判，会把用户**正在说**的
+   *   一整句都当成旧段丢掉（`… 我问（开轮前录的那段还没解完）` 连打 10 行），
+   *   于是插话要等到下一发 commit（150 ms）+ 解码（~290 ms）之后才可能发生。
+   *
+   * 所以中间结果要两个条件同时成立：**正在解**（`decoding`）且那段是开轮前封的。
+   */
+  private partialFromPreTurnSegment(): boolean {
+    if (!this.fromPreTurnSegment()) {
+      return false;
+    }
+    return this.stt.decoding?.() === true;
   }
 
   /**

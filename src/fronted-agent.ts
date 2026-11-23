@@ -893,14 +893,19 @@ export class FrontedAgent implements AgentProvider {
    * 上一轮谁答的。**规则只写在 `routeTurn()` 里一次**。
    */
   private decisionFor(text: string): RouteDecision {
-    const last = this.history[this.history.length - 1];
-    const lastLane: Lane | null = last === undefined
-      ? null
-      : last.who === 'dsh'
-        ? 'dsh'
-        : last.who === 'you'
-          ? 'live'
-          : 'cascade';
+    // **只看「上一轮谁答的」**：`history` 里还有用户自己的话（`who: 'user'`），
+    // 而 `reply()` 会把这一句先 push 进去 —— 从末尾取第一个会取到用户那条，
+    // 于是「上一轮是 dsh」这个事实在第二次问的时候凭空消失了
+    // （回放里就是：`willServeAudio` 说 stick-to-dsh，`reply()` 里却走了 omni，
+    //   结果 omni 对「你讲讲更改。」编了 12.32 s）。
+    // 所以从后往前找**回答**的那条。
+    let lastLane: Lane | null = null;
+    for (let i = this.history.length - 1; i >= 0; i -= 1) {
+      const turn = this.history[i];
+      if (turn === undefined || turn.who === 'user') continue;
+      lastLane = turn.who === 'dsh' ? 'dsh' : 'live';
+      break;
+    }
     return routeTurn(text, {
       live: this.audioLane === null ? 'off' : (this.audioLane.willServe() ? 'ready' : 'down'),
       cascade: this.apiKey !== '',
@@ -1289,37 +1294,43 @@ export class FrontedAgent implements AgentProvider {
     this.currentTicket = ticket;
     this.innerMode = 'pass';
     const hasFacts = this.statusFacts !== undefined;
-    // 这几条判据原来各自 `return delegate(...)`，预跑就**留在原地没人管**：
-    // 白花一次模型调用，还可能被后面同文本的一轮认领到陈旧结果。
-    // 所以先把「这一轮会不会走快车道」算完，再一次性认领/作废。
-    const askedAnswer = this.lastDsh?.asked === true && looksLikeAnswer(userText);
-    const memorable = looksMemorable(userText);
-    // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多
+    // **路由一次算完**（内核纯函数 `routeTurn`）。以前这里排着三条独立的早退
+    // （在等回话 / 像长期事实 / 不是候选），`willServeAudio` 那边又各算一遍 ——
+    // 回放里现形：宿主说「这一轮不走 omni：stick-to-dsh」，这里照样认领。
+    const route = this.decisionFor(userText);
+    // 问进度的句子即使含任务字也放进来 —— 事实能照实答，比让 dsh 重跑一轮快得多。
+    // 这一条**只决定级联值不值得跑**，不参与路由。
     const candidate = this.apiKey !== ''
       && image === undefined
       && (isFastCandidate(userText, this.maxChars)
         || (hasFacts && isStatusQuestion(userText)));
     const overCap = this.keepTurns > 0 && this.pending.length / 2 >= this.keepTurns;
-    // 判停之前就已经问出去的那一轮：**文本一字不差**才认领，见 `prefetch()`
-    const pre = this.takePrefetch(
-      userText,
-      !askedAnswer && !memorable && candidate && !overCap,
-    );
-    // dsh 上一条在问话，用户这句是短回话（好的/对/不用）—— 那是**对话里的回应**，
-    // 不是闲聊。放给快模型就是「确认指令被抢答」，业务状态机直接断链。
-    if (askedAnswer) {
-      this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
-      return await this.delegate(userText, image, note, ticket, 'answer');
+    // 判停之前就已经问出去的那一轮：**文本一字不差**才认领，见 `prefetch()`。
+    // 路由说 live 时也要作废 —— 那一轮 omni 会直出，文本模型这趟必然白花。
+    const pre = this.takePrefetch(userText, route.lane === 'cascade' && candidate && !overCap);
+    if (route.lane === 'dsh') {
+      // 四条硬规则的落地：在等回话 / 长期事实 / 有副作用的动作 / 接着 dsh 追问。
+      // 理由要落进 `delegate=`，否则档案里分不出「为什么走了 dsh」。
+      const why = route.why === 'dsh-awaiting'
+        ? 'answer'
+        : route.why === 'memorable'
+          ? 'memory'
+          : 'task';
+      if (route.why === 'dsh-awaiting') {
+        // 那是**对话里的回应**，不是闲聊。放给快模型就是「确认指令被抢答」，业务断链。
+        this.log('  快车道    上一轮 dsh 在等回话，这句直接交给 dsh');
+      } else if (route.why === 'memorable') {
+        // **必须让 dsh 亲耳听到**：实测它只对「用户自己说的」话写记忆，
+        // 转述过去（试过 5 种措辞）一次都不写。
+        this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
+      } else if (route.why === 'stick-to-dsh') {
+        this.log('  快车道    接着上一轮 dsh 的追问，继续交给 dsh');
+      } else if (route.why === 'action') {
+        this.log('  快车道    这一轮要动手（有副作用），只有 dsh 能做');
+      }
+      return await this.delegate(userText, image, note, ticket, why);
     }
-    // 像「长期事实」的一句话：**必须让 dsh 亲耳听到**。
-    // 实测 dsh 只对「用户自己说的」话写记忆 —— 把它塞进系统注记里转述（试过 5 种措辞，
-    // 包括在 profile 里明确授权），一次都不写。所以这里的「提议」就是**把话交过去**，
-    // 让 L2 用自己的判断决定记不记；L1 不替它写、也不替它猜。
-    if (memorable) {
-      this.log('  快车道    像长期事实，交给 dsh 自己判断要不要记');
-      return await this.delegate(userText, image, note, ticket, 'memory');
-    }
-    if (!candidate) {
+    if (image !== undefined || !candidate) {
       return await this.delegate(userText, image, note, ticket, 'task');
     }
     if (overCap) {
@@ -1327,10 +1338,13 @@ export class FrontedAgent implements AgentProvider {
       return await this.delegate(userText, image, note, ticket, 'overcap');
     }
     // omni 直出：它**从封段就起跑了**，这里只是认领（首块通常还没到）。
-    // 判据与 `isPrefetchable` 共用 `textEligible` —— 一处放松就会「文本路预跑过、
-    // omni 也答了」，同一个问题付两次钱。
-    if (this.audioLane !== null && image === undefined
-      && this.audioLane.willServe() === true && this.textEligible(userText)) {
+    //
+    // 判据必须和 `willServeAudio()` 同源（都是 `decisionFor`）：原来是
+    // `willServe()` + `textEligible()`，而 `willServeAudio()` 走的是另一套 ——
+    // 回放里就现形了：宿主说「这一轮不走 omni：stick-to-dsh」，`reply()` 里
+    // 照样认领，omni 对「你讲讲更改。」编了 14.56 s。
+    if (route.lane === 'live' && image === undefined
+      && this.audioLane !== null && this.audioLane.willServe() === true) {
       const audio = this.audioLane.claim();
       if (audio !== null) {
         this.log('  快车道    走 omni 直出音频（不经过文本模型）');
