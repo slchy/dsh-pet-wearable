@@ -42,6 +42,7 @@ import { EVENTS } from './events.ts';
 import { parseEmotion } from './emotion.ts';
 import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TurnContext } from './providers.ts';
 import { routeTurn, type Lane, type RouteDecision } from './turn-router.ts';
+import { ConversationLedger, type LedgerLane } from './conversation-ledger.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
 /** 快模型说「这个我答不了」的唯一暗号 */
@@ -695,15 +696,26 @@ export class FrontedAgent implements AgentProvider {
    * 不是塞在系统提示词里的字符串 —— 这样前缀是「只往后长」的，缓存命中率高。
    */
   private readonly history: Array<{ who: 'user' | 'you' | 'dsh'; text: string }> = [];
-  /** 上一轮 dsh 说了什么、是不是在问话（从窗口里取，不另存） */
+  /**
+   * 这一场发生过什么（四层的账本，见 `conversation-ledger.ts`）。
+   *
+   * `history` 是**给模型的 prompt 窗口**（顺序、角色、截断都由 prompt 需要决定），
+   * 账本是**给内核判断用的**：上一轮谁答的、那一轮用户听到多少。
+   * 两者在每轮结束时同时写入 —— 判断只看账本，prompt 只看窗口。
+   */
+  private readonly ledger = new ConversationLedger();
+  /**
+   * 上一轮 dsh 说了什么、是不是在问话。
+   *
+   * 从**账本**取，不再从 `history` 倒着扫：窗口里还有用户自己那句，从末尾取第一个
+   * 会取到它 —— 回放里「上一轮是 dsh」就是这么凭空消失的。
+   */
   private get lastDsh(): { speech: string; asked: boolean } | null {
-    for (let i = this.history.length - 1; i >= 0; i -= 1) {
-      const turn = this.history[i];
-      if (turn !== undefined && turn.who === 'dsh') {
-        return { speech: turn.text, asked: awaitsReply(turn.text) };
-      }
+    const last = this.ledger.lastAnswered();
+    if (last === null || last.lane !== 'dsh') {
+      return null;
     }
-    return null;
+    return { speech: last.assistantText, asked: awaitsReply(last.assistantText) };
   }
   private sink: ((text: string) => void) | null = null;
   /**
@@ -893,19 +905,12 @@ export class FrontedAgent implements AgentProvider {
    * 上一轮谁答的。**规则只写在 `routeTurn()` 里一次**。
    */
   private decisionFor(text: string): RouteDecision {
-    // **只看「上一轮谁答的」**：`history` 里还有用户自己的话（`who: 'user'`），
-    // 而 `reply()` 会把这一句先 push 进去 —— 从末尾取第一个会取到用户那条，
-    // 于是「上一轮是 dsh」这个事实在第二次问的时候凭空消失了
-    // （回放里就是：`willServeAudio` 说 stick-to-dsh，`reply()` 里却走了 omni，
-    //   结果 omni 对「你讲讲更改。」编了 12.32 s）。
-    // 所以从后往前找**回答**的那条。
-    let lastLane: Lane | null = null;
-    for (let i = this.history.length - 1; i >= 0; i -= 1) {
-      const turn = this.history[i];
-      if (turn === undefined || turn.who === 'user') continue;
-      lastLane = turn.who === 'dsh' ? 'dsh' : 'live';
-      break;
-    }
+    // **只看「上一轮谁答的」**，而且只问账本：账本里只有**已经结束**的轮次，
+    // 所以不会取到用户自己那一句 —— 回放里 `willServeAudio` 说 stick-to-dsh、
+    // `reply()` 里却走了 omni，就是栽在「从 history 末尾取第一个」上。
+    const answered = this.ledger.lastAnsweredLane();
+    // `pet`（主动开口）不是「谁答了用户这一轮」，按没有上文处理
+    const lastLane: Lane | null = answered === null || answered === 'pet' ? null : answered;
     return routeTurn(text, {
       live: this.audioLane === null ? 'off' : (this.audioLane.willServe() ? 'ready' : 'down'),
       cascade: this.apiKey !== '',
@@ -936,7 +941,9 @@ export class FrontedAgent implements AgentProvider {
     if (speech === '') {
       return;
     }
-    this.recordSaid(userText, speech);
+    // `recordSaid` 已经按 `cascade` 记了一笔 —— 这一轮实际是 **live** 答的，
+    // 把刚记的那笔改成 live（账本用来判断「上一轮谁答的」，记错了路由就错）。
+    this.recordSaid(userText, speech, 'live');
     this.auditSink(EVENTS.agentDone, {
       path: 'omni',
       len: [...speech].length,
@@ -1475,7 +1482,7 @@ export class FrontedAgent implements AgentProvider {
    * 文本快车道与 omni 直出**共用这一处** —— 分开写就会一边记账一边不记，
    * 于是「omni 答过的轮次 dsh 从没见过」，跨车道失忆。
    */
-  private recordSaid(userText: string, speech: string): void {
+  private recordSaid(userText: string, speech: string, lane: LedgerLane = 'cascade'): void {
     this.pending.push(`用户: ${userText.trim()}`, `你: ${speech}`);
     // **硬上限**：纯聊天模式下 `keepTurns=0`（永不因计数转交），`pending` 会一直长 ——
     // 快车道的 prompt 本来有 `windowChars` 截断，但数组本身不封顶就会吃内存。
@@ -1491,6 +1498,13 @@ export class FrontedAgent implements AgentProvider {
       this.reportedDropped = this.droppedTurns;
     }
     this.remember(userText, speech);
+    this.ledger.record({
+      userText,
+      assistantText: speech,
+      lane,
+      truncated: false,
+      endedAtMs: this.now(),
+    });
   }
 
   /** 把一轮记进窗口（dsh 答的也记，用户听得到的话 L1 就得知道） */
@@ -1660,6 +1674,13 @@ export class FrontedAgent implements AgentProvider {
     }
     this.push('dsh', speech);
     this.trim();
+    this.ledger.record({
+      userText,
+      assistantText: speech,
+      lane: 'dsh',
+      truncated: false,
+      endedAtMs: this.now(),
+    });
   }
 
   /**
