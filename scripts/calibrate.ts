@@ -1,7 +1,7 @@
 /**
- * silero-vad 阈值标定。
+ * silero-vad 阈值标定 —— 一次性工具，不在生产路径上。
  *
- *   node src/calibrate.ts ../tmp/voice_1793905201973.wav [more.wav ...]
+ *   node scripts/calibrate.ts ../tmp/voice_1793905201973.wav [more.wav ...]
  *
  * 目标：找出一个阈值，让 silero 的判停点与已验证的 Python webrtcvad 基准一致。
  * 基准（voice_1793905201973.wav）：最后语音 16.38 s，之后 20 秒全静音；
@@ -9,10 +9,15 @@
  *
  * 注意：silero 帧长 32 ms，webrtcvad 30 ms，两者不能逐帧对齐，
  * 所以比较的是**时间轴上的判停点**，不是帧号。
+ *
+ * 为什么在 `scripts/` 而不是 `src/`：`src/` 是语音栈本体（`main.ts` 的静态 import
+ * 闭包），会被同步进 `packages/dsh-voice-web`。标定脚本没人 import，放一起只会
+ * 让「哪些文件是线上路径」变模糊。这里也从另一个角度说明它不参与类型检查
+ * （`tsconfig.json` 的 include 只有 `src/` 与 `tests/`）。
  */
 import { readFileSync } from 'node:fs';
 
-import { SileroVad, SAMPLE_RATE, WINDOW } from './vad.ts';
+import { SileroVad, SAMPLE_RATE, WINDOW } from '../src/vad.ts';
 
 const SR = SAMPLE_RATE;
 const WIN = WINDOW;       // 32 ms
@@ -66,7 +71,7 @@ function cutPoint(probs: number[], threshold: number): { lastSpeech: number; cut
 async function main(): Promise<void> {
   const files = process.argv.slice(2);
   if (files.length === 0) {
-    console.error('用法: node src/calibrate.ts <a.wav> [b.wav ...]');
+    console.error('用法: node scripts/calibrate.ts <a.wav> [b.wav ...]');
     process.exit(2);
   }
 
