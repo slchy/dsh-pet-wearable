@@ -41,6 +41,7 @@ import { cleanForSpeech } from './agent.ts';
 import { EVENTS } from './events.ts';
 import { parseEmotion } from './emotion.ts';
 import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TurnContext } from './providers.ts';
+import { routeTurn, type Lane, type RouteDecision } from './turn-router.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
 /** 快模型说「这个我答不了」的唯一暗号 */
@@ -853,34 +854,59 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
+  /**
    * 这一轮会不会走音频直出。
    *
    * 宿主在**起跑流式 TTS 之前**问一次 —— 那一步会真的开一个合成 task，而 omni 轮
    * 没有任何文本可送（服务端会拒空文本、整轮退化成兜底）。判据必须与 `reply()`
-   * 内部完全一致，所以两处都走 {@link textEligible} + `lane.willServe()`。
+   * 内部完全一致，所以两边都问 {@link decisionFor}。
+   *
+   * **走 `routeTurn()`（内核），不再拿级联的判据**：原来 `textEligible()` 里那几条
+   * （14 字上限、`apiKey !== ''`、快车道历史深度）是 qwen-flash 的文本窗限制，
+   * omni 吃整段音频，这些前提对它没有物理依据 —— 后果是「把 qwen-flash 的 key
+   * 删掉，omni 也跟着不答了」。现在 Live 只看健康度，答不答得了由它自己决（`tool_call`）。
    */
   willServeAudio(text: string): boolean {
+    const decision = this.decisionFor(text);
     const lane = this.audioLane;
-    const hasLane = lane !== null;
-    const laneOk = hasLane && lane.willServe();
-    const sticky = this.followsDsh(text);
-    const textOk = this.textEligible(text);
-    // 布尔看不出卡在哪一条，四种原因的修法完全不同 —— 落档（`agent.lane`）
     this.auditSink(EVENTS.agentLane, {
-      has_lane: hasLane,
-      lane_ok: laneOk,
-      text_ok: textOk,
-      ok: laneOk && textOk && !sticky,
-      ...(sticky ? { stick_to_dsh: true } : {}),
+      has_lane: lane !== null,
+      lane_ok: lane !== null && lane.willServe(),
+      ok: decision.lane === 'live',
+      lane: decision.lane,
+      why: decision.why,
       ...(lane?.explain?.() ?? {}),
     });
-    if (!hasLane) {
+    if (lane === null) {
       this.log('  车道    ✗ 没有挂上 omni 车道（`attachAudioLane` 没到这一层）');
     }
-    if (sticky) {
-      this.log('  车道    上一轮由 dsh 答的，这一轮是接着追问 → 不交给 omni');
+    if (decision.lane !== 'live' && decision.why !== 'live-ready') {
+      this.log(`  车道    这一轮不走 omni：${decision.why}`);
     }
-    return laneOk && textOk && !sticky;
+    return decision.lane === 'live';
+  }
+
+  /**
+   * 路由决定 —— 内核的纯函数，见 `turn-router.ts`。
+   *
+   * 输入全部与引擎实现无关：Live 的健康度、级联可用性、dsh 是否在等回话、
+   * 上一轮谁答的。**规则只写在 `routeTurn()` 里一次**。
+   */
+  private decisionFor(text: string): RouteDecision {
+    const last = this.history[this.history.length - 1];
+    const lastLane: Lane | null = last === undefined
+      ? null
+      : last.who === 'dsh'
+        ? 'dsh'
+        : last.who === 'you'
+          ? 'live'
+          : 'cascade';
+    return routeTurn(text, {
+      live: this.audioLane === null ? 'off' : (this.audioLane.willServe() ? 'ready' : 'down'),
+      cascade: this.apiKey !== '',
+      dshAwaiting: this.lastDsh?.asked === true,
+      lastLane,
+    });
   }
 
   /**
@@ -890,24 +916,7 @@ export class FrontedAgent implements AgentProvider {
    * 打 `agent.lane` 会把档案刷满，也会让「这一轮到底谁答的」失真。
    */
   private laneWouldServe(text: string): boolean {
-    const lane = this.audioLane;
-    return lane !== null && lane.willServe() && this.textEligible(text)
-      && !this.followsDsh(text);
-  }
-
-  /**
-   * 这一句是不是**接着上一轮 dsh 的追问**（见 `looksLikeFollowUp`）。
-   *
-   * omni 只听过用户的声音，不知道 dsh 答了什么 —— 这种「接着上文说话」的短句
-   * 交给它只能编（真机 `20261123-053719` 第 5 轮「你讲讲梗概。」→ 10.40 s 胡话）。
-   * dsh 那边有完整会话，同一条链路 1–3 s 也能答。
-   */
-  private followsDsh(text: string): boolean {
-    if (this.audioLane === null || !looksLikeFollowUp(text)) {
-      return false;
-    }
-    const last = this.history[this.history.length - 1];
-    return last !== undefined && last.who === 'dsh';
+    return this.decisionFor(text).lane === 'live';
   }
 
   /**

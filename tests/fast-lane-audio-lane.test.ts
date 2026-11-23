@@ -83,19 +83,21 @@ test('车道接管时不许再花文本模型的钱：预跑被闸住', () => {
   assert.equal(asked, 0);
 });
 
-test('willServeAudio 与 reply() 判据一致：机械不可答的句子不进车道', async () => {
+test('willServeAudio 与 reply() 判据一致：路由说 live 就真的走 live', async () => {
   const agent = makeAgent(async () => sse(['在呢哥。']));
   agent.attachAudioLane(fakeLane({ serve: true, chunks: ['在呢。'] }));
 
-  // `isFastCandidate` 只挡三种**形态**（空串 / 超字数 / 阿拉伯数字），不判语义 ——
-  // 「帮我记一下明天下午三点的会」这种是**快车道候选**，要不要转 dsh 靠模型自己
-  // 输出 `[[DELEGATE]]`（omni 那边对应的是 tool_call）。所以这里只用机械判据验。
-  assert.equal(agent.willServeAudio('帮我记一下 3 点的会'), false, '含阿拉伯数字');
-  assert.equal(agent.willServeAudio('这句话实在是太长了长到超过十四个字的上限'), false);
+  // 判据从 `isFastCandidate`（14 字 / 阿拉伯数字）换成了内核的 `routeTurn()`：
+  // 那两条是 qwen-flash 的文本窗限制，omni 吃整段音频，对它没有物理依据。
+  // 现在 Live 只看「车道健康 + 这一轮不需要副作用」，答不答得了由模型自己决定。
   assert.equal(agent.willServeAudio('你好呀'), true);
+  assert.equal(agent.willServeAudio('这句话实在是太长了长到超过十四个字的上限'), true,
+    '字数上限只管 qwen-flash，不再拦 omni');
+  assert.equal(agent.willServeAudio('帮我记一下 3 点的会'), false,
+    '有副作用的动作只有 dsh 能做');
 
   const reply = await agent.reply('帮我记一下 3 点的会');
-  assert.equal(reply.path, 'dsh', '机械判据挡掉的句子必须交给 dsh');
+  assert.equal(reply.path, 'dsh', '动作类必须交给 dsh');
 });
 
 test('认领成功：path=omni、带 audio、text/speech 是活的', async () => {
