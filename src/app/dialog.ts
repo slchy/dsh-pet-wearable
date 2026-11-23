@@ -22,7 +22,6 @@
  * 事件，所以虚拟时间里跑它不需要设备、不需要网络、不需要 ffmpeg。
  */
 import { closeAnnounceMic, speakAnnouncement } from './announce.ts';
-import { isAsrNoise } from '../asr-noise.ts';
 import { isBackchannelOnly } from '../backchannel.ts';
 import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
@@ -292,15 +291,6 @@ export class DialogRuntime {
     // 旁白（后台汇报 / 回执）不占轮次票据，状态机也停在 `listening`，
     // 所以 `bargeIn` 那条路对它不成立，**它是唯一能掐断播报的地方**。
     if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
-      // ASR 在静音上幻觉出的英文短句（`Thank you` / `Yeah`）**一个汉字都没有**，
-      // 却会走完整条链路：打断播放（真机两次各丢一整条答案）、开轮、白烧一次 agent。
-      // 闸放在这个入口：`partial` / `sentence` / `utterance` 三条进来都要过一遍，
-      // 而且「掐回执 / 掐旁白」也在下面，噪声连它们都不该碰。
-      // 判据与实况见 `asr-noise.ts`。
-      if (isAsrNoise(event.text)) {
-        this.options.log(`  （ASR 噪声，丢弃：${JSON.stringify(event.text)}）`);
-        return [];
-      }
       this.lastUserSpeechAt = this.options.clock.now();
       if (event.type !== 'partial') {
         this.lastUserSentenceAt = this.options.clock.now();

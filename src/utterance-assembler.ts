@@ -410,6 +410,17 @@ export class UtteranceAssembler {
    * 从第二帧起才更新 `lastVoicedAt`，之后每帧都推进 —— 它仍然等于真实停嘴时刻。
    */
   private voicedRun = 0;
+  /**
+   * 最近一次「上行有声音」的时刻（毫秒，和 `clock` 同一把尺）。
+   *
+   * 给插话判据用：服务端会把**我们喂进去的静音**解成短句（`Thank you`），
+   * 这种转写底下没有任何有声帧。`Number.NEGATIVE_INFINITY` = 这条连接还没见过音频。
+   * 见 `barge-voicing.ts`。
+   */
+  get lastVoicedAtMs(): number {
+    return this.lastVoicedAt;
+  }
+
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
   private preFiredAt = Number.NEGATIVE_INFINITY;
   /**

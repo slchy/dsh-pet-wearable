@@ -16,7 +16,7 @@
  */
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
-import { isAsrNoise } from './asr-noise.ts';
+import { hasVoicedEvidence } from './barge-voicing.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
 import { performance } from 'node:perf_hooks';
@@ -1227,11 +1227,16 @@ class VoiceConnection {
   private onPartial(text: string): void {
     console.log(`  … ${text}`);
     this.archive?.event(EVENTS.asrPartial, { text });
-    // 幽灵文本（无汉字，见 `asr-noise.ts`）：到这里为止（上面两行）留档就够了。
-    // 它不能算「用户还在说」——静音上凭空冒出来的一句会把该收的那一段又按住；
-    // 也不该让宠物以为用户开口了（话筒会被白占一段）。`DialogRuntime` 那边
-    // 另有一道闸，管的是打断与开轮。
-    if (isAsrNoise(text)) {
+    // 插话的**声学**闸：服务端会把我们喂进去的静音解成 `Thank you` 这类短句，
+    // 它一旦 ≥2 个字就会把正在播的回答整条掐掉（真机两次各丢一整条答案）。
+    // 判据不是语种、也不是音量，是「距上一个有声帧多久」—— 真插话 0–120 ms，
+    // 静音幻觉 885 ms / 2.7 s。见 `barge-voicing.ts`。
+    if (
+      this.dialog.core.fsm.state === 'speaking'
+      && !hasVoicedEvidence(this.clock.now(), this.assembler.lastVoicedAtMs)
+    ) {
+      const gap = this.clock.now() - this.assembler.lastVoicedAtMs;
+      console.log(`  … ${text}（底下 ${Math.round(gap)} ms 没声音 → 不算插话）`);
       return;
     }
     // 判停的**文本判据**：中间结果在出 = 用户还在说。只传信号不拼文本，
