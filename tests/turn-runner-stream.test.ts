@@ -41,6 +41,8 @@ interface Rig {
   /** 事件的载荷，`turn.end.path` / `delegate` 只能从这里看 */
   readonly payloads: Array<{ name: string; data: Record<string, unknown> }>;
   readonly logs: string[];
+  /** 下发给设备的指令（udio.stop 这类） */
+  readonly deviceCalls: Array<{ op?: string }>;
   /** 测试里要能主动插话（`interrupted` / `truncated` 的差别只有它能造出来） */
   readonly fsm: DialogFsm;
   /** 最后一块音频吐出的时刻（`chunkDelayMs` 造流式耗时后用它算「多锁了多久」） */
@@ -72,6 +74,7 @@ function rig(options: {
   /** 事件的载荷（`turn.end` 的 `path` / `delegate` 只能从这里看） */
   const payloads: Array<{ name: string; data: Record<string, unknown> }> = [];
   const logs: string[] = [];
+  const deviceCalls: Array<{ op?: string }> = [];
   const served: Array<[string, string]> = [];
   let sink: ((text: string) => void) | null = null;
   /** 最后一块音频吐出的时刻（验「播完之后还要多锁多久」用） */
@@ -143,6 +146,7 @@ function rig(options: {
     agent,
     tts,
     downlink: { sendAudio: () => {}, sendControl: () => {} },
+    sendCall: (call) => { deviceCalls.push(call as { op?: string }); },
     fsm,
     playbackTailMs: 0,
     onEvent: (name, data) => {
@@ -154,7 +158,7 @@ function rig(options: {
     log: (line) => { logs.push(line); },
   });
   return {
-    streamed, whole, events, payloads, logs, served, fsm,
+    streamed, whole, events, payloads, logs, served, fsm, deviceCalls,
     get lastChunkAt(): number { return lastChunkAt; },
     run: () => runner.run('你好'),
   };
@@ -368,25 +372,34 @@ test('转交后被插话：不再等 dsh 的答案，立刻收轮', async () => 
   assert.equal(result.speech, '行，我这就给你细说。', '`said` 仍是垫话，不是没念的 dsh 答案');
 });
 
-test('omni 已经念了大段正文才发 tool_call：不再把 dsh 的答案拼在后面', async () => {
+test('omni 先念了正文才发 tool_call：先掐掉那截，再让 dsh 从头说', async () => {
   // 真机 2026-11-23 05:14 第 9 轮：omni 先播 4.96 s 瞎编，紧接着 dsh 的 7.44 s 接上，
-  // 整轮 12.40 s 是两段互不相干的回答。
+  // 整轮 12.40 s —— 两份互不相干的回答拼在一起，比只给一份更难听。
+  // 现在的处置：下发 `audio.stop` 清掉设备缓冲，把已经念的那截从本轮账上抹掉，
+  // 再让 dsh 从头说（阈值 800 ms：还停在垫音/开场白的量级）。
   const r = rig({
     deltas: [],
-    reply: { text: '念'.repeat(40), speech: '念'.repeat(40) },
-    audio: Array.from({ length: 160 }, () => '念'), // 160 × 10 ms = 1.6 s > 1.5 s
+    reply: { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' },
+    audio: Array.from({ length: 160 }, () => '念'), // 160 × 10 ms = 1.6 s > 800 ms
     omniDelegate: 'delegate',
   });
   const result = await r.run();
   const end = r.payloads.find((p) => p.name === 'turn.end');
 
   assert.ok(result);
-  assert.ok(r.logs.some((line) => line.includes('不再问 dsh')), '要留痕');
-  assert.equal(end?.data.path, 'omni', '没转交，就不该记成 dsh');
-  assert.equal(end?.data.delegate, undefined);
+  assert.ok(r.logs.some((line) => line.includes('先掐掉再让 dsh 说')), '要留痕');
+  assert.ok(
+    r.deviceCalls.some((call) => call.op === 'audio.stop'),
+    '必须先掐掉前面那截废话',
+  );
+  // 掐掉的部分不进账：`said` / `audio_s` 只记 dsh 那一份
+  assert.equal(end?.data.path, 'dsh', '这一轮最终是 dsh 答的');
+  assert.ok(
+    !String(end?.data.said ?? '').startsWith('念念念'),
+    'omni 那截不该出现在 said 里',
+  );
 });
-
-test('omni 发 tool_call：就地切 dsh，dsh 的文本走整段合成', async () => {
+test('omni 发 tool_call 且一个字都没出声：dsh 的答案走 TTS 念出来', async () => {
   const r = rig({
     deltas: [],
     reply: { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' },

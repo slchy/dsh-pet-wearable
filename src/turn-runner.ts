@@ -53,7 +53,7 @@ const PLAYED_GRACE_MS = 3_000;
  * 真机 2026-11-23 05:14 第 9 轮是 4.96 s 的瞎编正文后面又接了 7.44 s 的 dsh 答案 ——
  * 用户听到的是两段互不相干的回答。
  */
-const OMNI_DELEGATE_MAX_SPOKEN_MS = 1_500;
+const OMNI_DELEGATE_MAX_SPOKEN_MS = 800;
 
 export interface TurnRunnerOptions {
   /** 时钟端口：一轮里的所有等待与计时都走它（模拟器要用虚拟时间） */
@@ -604,21 +604,32 @@ export class TurnRunner {
           // `response.done` 落在同一毫秒，这一轮还是去问了 dsh，白等 2.5 s 之后
           // 一个字都没合成 —— 期间状态机一直挂在 `thinking`，下一轮已经开跑了。
           this.log('  omni    想转交 dsh，但本轮已作废 → 不问了');
-        } else if (why !== null && audioBytes > 0
-          && pcm16DurationMs(audioBytes, audioRate) >= OMNI_DELEGATE_MAX_SPOKEN_MS) {
-          // 已经念出去一大段**正文**才想起要转交：这时再问 dsh、再把它的答案拼在后面，
-          // 用户听到的是两段互不相干的回答（真机 2026-11-23 05:14 第 9 轮：
-          // omni 先播 4.96 s 瞎编，紧接着 dsh 的 7.44 s 接上，整轮 12.40 s）。
-          // 两份答案拼在一起比只有一份更难听，而且 dsh 那一趟还要几秒。
-          const spoken = pcm16DurationMs(audioBytes, audioRate) / 1000;
-          this.log(
-            `  omni    已经念了 ${spoken.toFixed(1)} s 正文才要转交 → 不再问 dsh`
-            + `（两份答案拼起来更难听）`,
-          );
         } else if (why !== null) {
           // omni 自己发了 tool_call：就地切给 dsh。
-          // 已经出过声就不再叠回执（两份不同的声音接在一起很难听，而且收不回来）。
-          this.log('  omni    决定转交 dsh');
+          //
+          // **但先看它前面说了多少**：已经念出去一截正文才想起要转交，就把那截掐掉
+          // （`audio.stop` + 从本轮账上抹掉），再让 dsh 从头说 —— 绝不能把两份答案
+          // 硬拼成缝合怪（真机 2026-11-23 05:14 第 9 轮：omni 先播 4.96 s 瞎编，
+          // 紧接着 dsh 的 7.44 s 接上，整轮 12.40 s）。
+          //
+          // 阈值 800 ms（原 1500）：1500 时那半句已经说完一个意思，截断反而更突兀；
+          // 800 还停在垫音/开场白的量级，截掉损失最小。
+          const spokenMs = pcm16DurationMs(audioBytes, audioRate);
+          if (audioBytes > 0 && spokenMs >= OMNI_DELEGATE_MAX_SPOKEN_MS) {
+            this.log(
+              `  omni    已经念了 ${(spokenMs / 1000).toFixed(1)} s 正文才要转交`
+              + ' → 先掐掉再让 dsh 说',
+            );
+            this.options.sendCall?.({ op: 'audio.stop' });
+            // 掐掉的这截不算进 `audioBytes` / `speech`：用户最终听到的是 dsh 那一份，
+            // `turn.end` 的 `said` / `truncated` 都该按它记。
+            audioBytes = 0;
+            firstAudioAtMs = -1;
+            speech = '';
+          } else {
+            // 已经出过声（垫音）就不再叠回执 —— 两份不同的声音接在一起很难听。
+            this.log('  omni    决定转交 dsh');
+          }
           // 正文用 omni 的转述（它直接听音频，专名比 ASR 准），ASR 原话只作附注 ——
           // 数字、路径、设备名这些"照抄"的东西靠原话兜底。
           const omniText = reply.audio.delegateText?.() ?? null;

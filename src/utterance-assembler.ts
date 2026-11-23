@@ -363,7 +363,6 @@ const SEMANTIC_SKIP_P = 0.80;
  * `würde ich schreiben` / `Thank you` 逐个问了一遍），没有一趟影响结论 ——
  * 全是白花的往返和服务端配额。定稿那一趟（`addSentence`）不受这条限制。
  */
-const MAX_SPEECH_SEMANTIC_ASKS = 2;
 
 /**
  * 「定稿只是中间结果的收尾」允许差几个字。
@@ -439,10 +438,6 @@ export class UtteranceAssembler {
   private readonly semanticAsks = new Map<string, Promise<'end' | 'more' | null>>();
   /** 已经回来的判定（同步可读，见 hasPrefixMore） */
   private readonly semanticSettled = new Map<string, 'end' | 'more' | null>();
-  /** 上一次因为中间结果发出去的文字（避免同一个中间结果反复问） */
-  private semanticLastAsked = '';
-  /** 这一轮说话期间已经问了几次语义判停（见 `MAX_SPEECH_SEMANTIC_ASKS`） */
-  private speechAsks = 0;
   /** 已经因为语义判停延长过的那段文字（同一段只延长一次） */
   private semanticExtended = '';
   /** 上一段定稿的时刻 / 汉字数（去抖判据用，见 `isJunkAfterLongSentence`） */
@@ -794,7 +789,6 @@ export class UtteranceAssembler {
     // 语义判停要藏在静候窗里，就不能等到定稿才发请求：真服务实测 p50 250–310 ms
     // （qwen-flash，见 docs/EOT-SUPPLEMENT.md §11.5），而「定稿→开轮」只有
     // 200–300 ms。中间结果在**说话期间**就到了，从这一刻发才来得及。
-    this.askSemanticsDuringSpeech(text);
   }
 
   /** 一句定稿的识别结果。 */
@@ -931,7 +925,6 @@ export class UtteranceAssembler {
     this.extensions = 0;
     this.unsureExtensions = 0;
     this.waitedMs = 0;
-    this.speechAsks = 0;
     const text = this.pendingText.trim();
     this.pendingText = '';
     if (!text) {
@@ -1124,38 +1117,6 @@ export class UtteranceAssembler {
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
   }
 
-  /**
-   * 说话期间就从中间结果发一次判定。
-   *
-   * 这是「零额外延迟」的全部秘密：真服务实测 p50 250–310 ms，而「定稿→开轮」只有
-   * 200–300 ms —— 等定稿再问，答案永远晚一拍。中间结果在用户还说着的时候就到了。
-   *
-   * 只在**够长**且**变了够多**时才问（中间结果会连续改写，逐字问等于打服务）：
-   * 至少 8 个字、比上一次多/少 4 个字以上。
-   */
-  private askSemanticsDuringSpeech(text: string): void {
-    if (this.options.semanticEndpoint === undefined) {
-      return;
-    }
-    // 只发前两版：中间结果逐字改写，真机一轮发过 9 趟、一趟都没影响结论
-    // （见 `MAX_SPEECH_SEMANTIC_ASKS`）。
-    if (this.speechAsks >= MAX_SPEECH_SEMANTIC_ASKS) {
-      return;
-    }
-    const trimmed = text.trim();
-    if (trimmed.length < 8 || trimmed === this.semanticLastAsked) {
-      return;
-    }
-    if (
-      this.semanticLastAsked !== ''
-      && Math.abs(trimmed.length - this.semanticLastAsked.length) < 4
-    ) {
-      return;
-    }
-    this.semanticLastAsked = trimmed;
-    this.speechAsks += 1;
-    void this.askSemantics(trimmed);
-  }
 
   /** 把某段文字的判定请求发出去（同一段文字只问一次；失败一律回 `null`）。 */
   private askSemantics(text: string): Promise<'end' | 'more' | null> {
@@ -1351,11 +1312,11 @@ export class UtteranceAssembler {
   /**
    * 这条定稿的**前缀**已经被判成「说完了」了吗。
    *
-   * 为什么需要：说话期间从中间结果问过的那一版（`askSemanticsDuringSpeech`），
-   * 和定稿之间通常只差一两个标点/收尾字。没有这条复用，定稿时会对「同一句话」
-   * 再发一次请求 —— 真机 `20261123-051448` 第 6/8/9 轮各发了两趟
-   * （`…《基础之森` 319 ms 和 `…《基础之森》吗？` 398 ms），第二趟等回来的
-   * 时候开轮早该发生了。只复用「延长 ≤ 6 字」的前缀，再长就是另一句话了。
+   * 仍然需要：判停并段时，先定稿的那半句已经问过一趟，延长版不该再问第二趟
+   * （真机 `20261123-051448` 第 6/8/9 轮各发了两趟）。只复用「延长 ≤ 6 字」的前缀。
+   *
+   * ⚠️ 中间结果那一侧**已于 2026-11-23 取消**：`053719` 第 4 轮一句话发了 9 趟语义
+   * 请求，没有一趟改变结论。现在语义判停只在**定稿**（`addSentence`）发一次。
    */
   private hasPrefixEnd(text: string): boolean {
     for (const [asked, verdict] of this.semanticSettled) {

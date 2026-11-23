@@ -1245,72 +1245,66 @@ test('语义判停只能问一次：同一段文字不重复发请求', async ()
   // 两段文字 = 最多两次请求；同一段被 evaluate 多次时不许重复问
   assert.ok(calls <= 2, `同一段只该问一次（实际 ${calls} 次）`);
 });
-test('说话期间就从中间结果发判定（这样才来得及藏在静候窗里）', async () => {
+test('中间结果一律不触发语义判停，只有定稿问一趟', async () => {
+  // 真机 `20261123-053719` 第 4 轮：一句话在中间结果上发了 **9 趟**语义请求
+  // （`würde ich` / `würde ich sch` / `würde ich schreiben` / `Thank you` 各问一遍），
+  // 没有一趟改变结论 —— 全是白花的往返和服务端配额。语义只补「声学拿不准」这一层，
+  // 而声学拿不准的时刻是**定稿**那一刻，不是逐字改写的过程。
   const asked: string[] = [];
-  const { assembler } = makeAssembler({
+  const { assembler, utterances } = makeAssembler({
     semanticEndpoint: async (text) => { asked.push(text); return 'end'; },
   });
 
-  assembler.notePartial('如果你');                 // 太短，不问
-  assembler.notePartial('如果你发现自己在想');       // 够长（9 字），问
-  assembler.notePartial('如果你发现自己在想啊');      // 只多一个字，不问
+  assembler.notePartial('如果你发现自己在想');
+  assembler.notePartial('如果你发现自己在想啊这件事是不是有点奇怪');
+  assembler.notePartial('如果你发现自己在想啊这件事是不是有点奇怪呢');
   await delay(20);
-  assert.deepEqual(asked, ['如果你发现自己在想']);
+  assert.deepEqual(asked, [], '中间结果不花这趟钱');
 
-  assembler.notePartial('如果你发现自己在想啊这件事是不是有点奇怪');  // 变了够多，再问
-  await delay(20);
-  assert.equal(asked.length, 2);
-});
-
-test('声学 p 已经很高时不再等语义判停（那 256–324 ms 是纯成本）', async () => {
-  // 真机 `20261123-051448`：p 0.88–0.98 的几轮各等了 256–324 ms，全场语义一次没拦住 MORE。
-  const { assembler, utterances } = makeAssembler({
-    predict: async () => 0.95,
-    semanticEndpoint: async () => { await delay(200); return 'end'; },
-  });
-  const startedAt = Date.now();
-  assembler.addSentence('你吃过饭了吗？');
+  assembler.addSentence('如果你发现自己在想啊这件事是不是有点奇怪呢？');
   await delay(40);
-  assert.equal(utterances.length, 1, 'p=0.95 不该等判停');
-  assert.ok((utterances[0]?.at ?? 0) - startedAt < 100, '成轮时刻不该被那 200 ms 拖住');
+  assert.equal(asked.length, 1, '定稿才问，且只问一趟');
+  assert.equal(utterances.length, 1, '定稿照常收下');
 });
 
-test('说话期间判过 END，定稿只多一两个标点 → 不再发第二次请求', async () => {
-  // 真机第 6 轮：`…《基础之森` 319 ms 和 `…《基础之森》吗？` 398 ms 是同一句话的两趟。
+test('判停并段：延长版复用前一趟的判定，不再问第二趟', async () => {
+  // 真机 `20261123-051448` 第 6/8/9 轮各对同一句话发了两趟（319 ms / 398 ms）。
+  // 并段时先定稿的那半句已经问过，延长版只多几个字 —— 复用。
   const asked: string[] = [];
   const { assembler, utterances } = makeAssembler({
+    // 两条定稿必须落进**同一轮**才谈得上复用：`quietMs` 要比两次 `addSentence`
+    // 的间隔长，否则第一条已经 flush 成一轮，第二条天然是新的一轮。
+    quietMs: 200,
     predict: async () => 0.5, // 留在模糊带，前缀复用才有意义
     semanticEndpoint: async (text) => { asked.push(text); return 'end'; },
   });
 
-  assembler.notePartial('你看过莱姆写的《基础之森');
+  assembler.addSentence('你看过莱姆写的《基础之森》');
   await delay(20);
-  assert.equal(asked.length, 1, '说话期间的中间结果先问一趟');
+  assert.equal(asked.length, 1, '前半句定稿时问一趟');
 
-  assembler.addSentence('你看过莱姆写的《基础之森》吗？');
-  await delay(40);
-  assert.equal(asked.length, 1, '定稿只是那个前缀的收尾，不该再问一趟');
-  assert.equal(utterances.length, 1, '复用 END 就该收下这一轮');
+  assembler.addSentence('那本书吗？');
+  await delay(400);
+  assert.equal(asked.length, 1, '延长版只多四个字，复用前一趟');
+  assert.equal(utterances.length, 1, '并段后只收下一轮');
 });
 
-test('中间结果判了 MORE，定稿只是它的延长 → 立刻再等一拍，不重新问', async () => {
+test('定稿判了 MORE → 再等一拍，仍不重问', async () => {
   const asked: string[] = [];
   const facts: Array<{ why?: string }> = [];
   const { assembler, utterances } = makeAssembler({
     semanticEndpoint: async (text) => {
       asked.push(text);
-      return text.startsWith('你讲一下') ? 'more' : 'end';
+      return 'more';
     },
     onJudge: (fact) => { facts.push({ why: fact.why }); },
   });
 
-  assembler.notePartial('你讲一下莱姆写的');   // 说话期间：MORE
-  await delay(30);
-  assembler.addSentence('你讲一下莱姆写的棋谱');  // 定稿只多了两个字
-  await delay(10);
-  assert.equal(utterances.length, 0, '前缀判 MORE 就该再等一拍');
-  await delay(80);
-  assert.equal(utterances.length, 1, '等完照样收下');
+  assembler.addSentence('你讲一下莱姆写的棋谱');
+  await delay(20);
+  assert.equal(utterances.length, 0, 'MORE 就该再等一拍');
+  await delay(90);
+  assert.equal(utterances.length, 1, '等完照样收下，不能吞掉');
   assert.equal(facts.filter((f) => f.why === 'meaning').length, 1);
-  assert.equal(asked.filter((t) => t === '你讲一下莱姆写的棋谱').length, 0, '不该为延长后的文字重问');
+  assert.equal(asked.length, 1, '同一段文字只问一趟');
 });
