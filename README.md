@@ -70,6 +70,8 @@
                                能量门 → ASR → 语义判停（UtteranceAssembler / TurnJudge）
                                                │ 整句 / 定稿
                                                ▼
+                              判定层 kernel.ts（纯 step()：能不能打断 / 听到多少 / 该不该回注）
+                                               │
                                DialogFsm（话筒票据 · 轮次生命周期仲裁）
                                                │
                                  ┌─────────────┴─────────────┐
@@ -383,7 +385,7 @@ dsh-pet-wearable/
 |:---|:---|:---|
 | **QoS 规范（推荐首读）** | [QOS.md](./docs/QOS.md) | 指标口径、六条原则、改动五问、测量核查表及在用/否决/待定清单 |
 | | [TIME-KNOBS.md](./docs/TIME-KNOBS.md) | 时间参数总表（脚本生成）：默认值、时钟源、持有者、遮蔽关系与上限 |
-| **状态机** | [state-machines.md](./docs/state-machines.md) | 六大核心状态机（DialogFsm、FloorArbiter 等）时序与真值表 |
+| **状态机** | [state-machines.md](./docs/state-machines.md) | 六大核心状态机（DialogFsm、FloorArbiter 等）时序与真值表；§5.9 是判定层（纯 `step()` + 四正交区域） |
 | **工具与度量** | [TOOLS.md](./docs/TOOLS.md) | 观测脚本矩阵、延迟口径唯一定义与排障路由 |
 | **判停基准** | [EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) | 中文 EoT 基准数据、口径与修订记录（含撤回顾因）；核心结论：瓶颈在策略不在模型 |
 | **ASR / TTS 实测** | [QWEN-REALTIME-ASR-PROBED.md](./docs/QWEN-REALTIME-ASR-PROBED.md) | DashScope realtime 端点与静音窗实测（含「回执会骗人」现象） |
@@ -396,6 +398,7 @@ dsh-pet-wearable/
 | | [OPS-RECORD.md](./docs/OPS-RECORD.md) | 运维排障手记与双仓实操记录 |
 | **架构决策（ADR）** | [ADR-0001: App Layer & Pet](./docs/adr/0001-app-layer-and-pet.md) | 应用层分层、话筒仲裁与主动开口演进 |
 | | [ADR-0002: Simulator](./docs/adr/0002-virtual-time-simulator.md) | 虚拟时间模拟器与因果不变式测试设计 |
+| | [ADR-0003: Deterministic Kernel](./docs/adr/0003-deterministic-kernel.md) | 三种时间（因果 / 媒体 / 墙钟）、四正交区域与纯 `step()` 内核的取舍与验收 |
 | **实现与草稿** | [fsm-align-report.md](./docs/fsm-align-report.md) | 状态机对齐第 0–4 步推进记录与卡点 |
 | | [shared-conversation-log.md](./docs/design/shared-conversation-log.md) | 单一对话日志设计草稿（暂缓实现） |
 | **硬件适配** | [RAYNEO-X3-PRO.md](./docs/devices/RAYNEO-X3-PRO.md) | 雷鸟 X3 Pro 真机接入参考 |

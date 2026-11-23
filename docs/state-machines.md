@@ -1,8 +1,8 @@
 # 状态机一览
 
-以**当前代码**为准（2026-11-17）。旧记录见 [ADR-0001](adr/0001-app-layer-and-pet.md)
-与 [ADR-0002](adr/0002-virtual-time-simulator.md)；两者与本文件冲突的地方已在各自文件里
-标注取代关系。
+以**当前代码**为准（2026-11-23）。旧记录见 [ADR-0001](adr/0001-app-layer-and-pet.md)、
+[ADR-0002](adr/0002-virtual-time-simulator.md)、[ADR-0003](adr/0003-deterministic-kernel.md)；
+与本文件冲突的地方已在各自文件里标注取代关系。
 
 这份文档回答四个问题：每台机器有哪些状态、什么事件推动它、转移条件是什么、
 **谁持有它、谁驱动它**。最后一节是一条对话从开口到播完的完整时序。
@@ -15,7 +15,8 @@
 |---|---|---|
 | 话筒归谁 | `AppSession.floor`（`FloorArbiter.owner`） | `floor.busy` / `floor.owner`；宠物经 `PetWorld.floorBusy` 与 `floorTaken` 输入得知 |
 | 当前轮次 | `DialogFsm`（`ticket()` → `{no, gen}`） | 上游取消、迟到回调一律拿票据比对（`isStale` / `isCurrent`） |
-| 播放进度 | `TurnRunner`（`playedSeen` + 设备 `played` 回执） | 决策「这一轮算说完了吗」只在 `TurnRunner` 内部；`DialogFsm` 只收 `audioDone(ticket)` 这一个结论 |
+| 播放进度 | `TurnRunner`（`playedSeen` + 设备 `played` 回执）；**口径**在内核 | 判"听到多少"只走 `kernel.ts` 的 `settleTurn`（媒体游标 = 字节/采样率），`DialogFsm` 只收 `audioDone(ticket)` 这一个结论 |
+| 这一轮听到多少 / 少听没少听 / 该不该回注 | `kernel.ts`（`step()` 的 `settleTurn` 意图；`stale` 归 `dialog` 区域、`truncated` 归 `playback` 区域） | `TurnRunner` 只喂事实（`audioSent` / `devicePlayed` / `ticketInvalidated` / `turnEnded`），结算数字**不许自己再算一遍**；历史档案对账用 `scripts/kernel-replay.ts` |
 | 判停中的文本 | `UtteranceAssembler`（`pending`） | 上层只在 `accept` 时拿到整句，拿不到半句 |
 | 快车道闸门 | `FrontedAgent.innerMode`（`pass` / `buffer` / `drop`） | dsh 的流式增量按闸门决定直通、缓冲还是丢弃 |
 | 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 只在还没出声时能说；答案的第一块一到就置 `cancelled` 并 `audio.stop`，不再有人读它。**出声期间它占着 `DialogFsm` 的 `speaking`**（`receiptStarted` / `receiptEnded`），所以那会儿用户开口算插话 |
@@ -603,7 +604,19 @@ dsh 继续跑完；回来的答复交给 `setAnnouncer` —— 与「后台任�
 - **放手那一轮的 `idle` 不能唤醒新一轮**。`idle` 不带轮号，只能靠顺序：
   `turn/end` 一定先于同一轮的 `idle`，所以结算时打一个一次性标记把紧随其后的
   那条 idle 吃掉（下一轮 `turn/start` 一到就清掉，防止那条 idle 压根没发时误吃下一轮）。
-  用户已经问了新问题时，旧答案直接丢掉，不补播。
+- **答案回来时用户已经在问新问题**：不补播（会打断他），但**必须回注记忆** ——
+  `onDetachedAnswer(userText, answer, spoken)` → `rememberDsh` + `injectAnsweredTurn`。
+  跑完的活儿是真的，用户听没听到是另一回事；不记的话他之后提起这件事，
+  两条车道都当没发生过。`spoken` 决定回注口径（"已经念过" vs "没来得及念"）。
+- **只有显式下令才取消**：`turn-router.isCancelRequest()`（整句就是"算了/别查了/取消"
+  那几个说法）→ `FrontedAgent.cancelRunningTask()` → `session/cancel`，**连已放手的轮
+  一起取消**（`DshSession.cancelTurn` 认 `detached`，`isBusy()` 报有没有活儿）。
+  插话 ≠ 取消，这两件事在真机上是完全不同的话术。
+
+> **曾经漏了一整条路**：`FrontedAgent` 写的是 `this.inner.detachTurn?.(ticket)`，而
+> `DshAgent` **从来没有实现 `detachTurn()`** —— 可选调用遇到 `undefined` 静默空转，
+> "放手 / 回注"上线以来一次都没生效过。`keepalive.trackActivity` 现在把
+> `detachTurn` / `dshBusy` / `setDetachedAnswerSink` 一起透传。
 
 > **「用户听到多少」只有一处记着**：`playedSeconds`。`reply.text` / `reply.speech`
 > 是**生成**进度（`response.audio_transcript` 累积），被打断时通常是全文。
@@ -660,6 +673,40 @@ node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录 | event
 
 状态事件来自 `dialog.state`（`DialogRuntime.notifyState` 落档）。**老档案没有这个事件**时，
 状态那几条记「缺仪表」跳过 —— 与 `latency-report` 的 `null` 口径一致，不拿「没记录」冒充「没问题」。
+
+## 5.9 确定性内核 —— 判定层是一台纯 Mealy 机
+
+前面每节都是"哪台机器持有什么状态"。这一节是**它们共同的判定层**：
+[`src/kernel.ts`](../src/kernel.ts) 的 `step(state, event) → [state, effects]`。
+文件里没有 `await`、没有定时器、没有 socket —— 所以同一串事件在任何机器上 reduce 出
+完全一致的结果（`scripts/kernel-replay.ts` 就是它的离线执行体）。
+
+四个**正交区域**（Harel orthogonal regions），跨区只通过带因果戳的事件、只读对方快照：
+
+| 区域 | 回答什么 | 尺子 |
+|:--|:--|:--|
+| `input` | 这一句说完没、解码在不在途 | 逻辑因果（`commitSeq`） |
+| `dialog` | 话筒主权在谁手上 | 逻辑因果（票据 `no`/`gen`） |
+| `playback` | 声音播到哪了 | **媒体时间**（字节/采样率） |
+| `ledger` | 谁答过、答的什么 | — |
+
+三条交互律（违反任何一条都会回到"灵异 bug"）：
+
+1. **事件自带出生证**：跨异步边界发出的请求出发时盖上 `commitSeq`/票据，结果回来原样带回。
+   `isCausallyStale()`（[`src/causal.ts`](../src/causal.ts)）是所有转移前的统一守门人。
+2. **控制权与物理结算拆权**：`stale`（票据被顶掉，瞬时）归 `dialog`；
+   `truncated`（少听了，后验）归 `playback`。两者分属不同区域，
+   所以「播完瞬间被新轮顶掉」不会互相打架。
+3. **跨区只读快照**：判打断只比 `event.commitSeq > dialog.ticket.baseCommitSeq`，
+   不回头问 ASR「你是不是还在解」。
+
+边界（**现状**，别搞混）：相位真相仍在 `DialogFsm`（它本身就是同步纯状态机）；
+内核持有结算口径。`TurnRunner` 仍然 `await` TTS/模型，但它**不再自己算账**。
+
+**已知的一次真实事故**：打断那一刻内核就结算了那一轮（用户听到多少是后验事实，
+清了播放区就没了），而那条 `async` 协程还会跑到尾巴再报一次 `turnEnded`。
+不幂等的话，"少听了一半"会被重算成"听了 0 秒、没少听" → 该吞的答案反而被回注。
+现在 `turnEnded` 发现这一轮已结算就**原样重述**同一份结算。
 
 ## 6 一轮对话的完整时序
 

@@ -22,6 +22,7 @@
 │ 传输与协议    │ 上行处理      │ 决策（纯逻辑） │ 执行                   │
 │ transport    │ uplink-…     │ session-core  │ turn-runner           │
 │ frame        │ energy-gate  │ dialog-fsm    │ agent / session(dsh)  │
+│              │ assembler    │ kernel/causal │                       │
 │              │ assembler    │               │                       │
 ├──────────────┴──────────────┴───────────────┴───────────────────────┤
 │ 旁路：archive · announce-store · photo-inbox · tool-control          │
@@ -38,6 +39,7 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
                              ├──▶ uplink-pipeline ──┬──▶ energy-gate
                              │                      └──▶ utterance-assembler ──▶ turn-judge
                              ├──▶ session-core ◀──▶ dialog-fsm
+                             ├──▶ kernel ◀── causal（判定层：纯 Mealy 机 + 因果屏障）
                              ├──▶ turn-runner ──▶ providers ◀── aliyun-asr / mimo / agent
                              ├──▶ photo-inbox
                              ├──▶ archive / announce-store
@@ -49,7 +51,7 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | 边界 | 规则 | 为什么 |
 |---|---|---|
 | `providers.ts` | **只放接口**，不 import 任何具体实现 | 换 STT / TTS / Agent 不改编排代码 |
-| `session-core.ts` · `dialog-fsm.ts` · `emotion.ts` · `hq-intent.ts` · `wake-word.ts` · `backchannel.ts` | 纯函数 / 纯状态机，**不碰 socket、定时器、子进程** | 最容易出错的判断（插话算不算数、这句要不要成轮）用单测钉住，不必起连接 |
+| `session-core.ts` · `dialog-fsm.ts` · `kernel.ts` · `causal.ts` · `emotion.ts` · `hq-intent.ts` · `wake-word.ts` · `backchannel.ts` | 纯函数 / 纯状态机，**不碰 socket、定时器、子进程** | 最容易出错的判断（插话算不算数、听到多少、这句要不要成轮）用单测钉住，不必起连接；`kernel.ts` 还要求无 `await`（同一串事件在任何机器上 reduce 出同一结果） |
 | `transport.ts` · `frame.ts` | 不认识任何业务语义 | 改心跳不该动对话代码 |
 | `pcm.ts` · `util.ts` | 无依赖的纯函数 | 谁都能引，不产生环 |
 
@@ -137,6 +139,9 @@ main.ts ──▶ aliyun-session ──┬──▶ transport ──▶ frame
 | 文件 | 职责 | 关键导出 |
 |---|---|---|
 | `dialog-fsm.ts` | 一轮对话的相位机（见 §4.1），用**票据**（轮次号 + 代次）判"这一轮还算不算" | `DialogFsm` / `TurnTicket` / `DialogState` |
+| `kernel.ts` | **判定层**：`step(state, event) → [state, effects]` 的纯 Mealy 机，四个正交区域（input/dialog/playback/ledger）。听到多少、少听没少听、该不该回注都在这里 | `KernelState` / `KernelEvent` / `Effect` / `step` / `reduceKernel` |
+| `causal.ts` | 逻辑因果屏障：旧段 vs 新话、票据过期。**一秒都不看表**，只比序号 | `isPreTurnSegment` / `mayBargeIn` / `isStaleTicket` |
+| `kernel-runtime.ts` | 内核意图的解释器：`Effect` → `audio.stop` / 作废 / 结算 | `applyEffects` / `KernelPorts` |
 | `session-core.ts` | 事件 → 效果：收听 / 打断 / 识图 / 自助结束 / 挂断都在这里判 | `SessionCore` / `CoreEvent` / `CoreEffect` |
 | `emotion.ts` | 情绪标签 → 规范化 key → TTS 风格串 | `EMOTION_LABELS` 是单一事实来源 |
 | `providers.ts` | `SttProvider` / `TtsProvider` / `AgentProvider` 三个契约 + 测试替身 | `cannedStt` / `silentTts` / `echoAgent` |
@@ -160,7 +165,7 @@ drop            丢弃这句话（纯噪声）
 
 | 文件 | 职责 | 关键点 |
 |---|---|---|
-| `turn-runner.ts` | 跑完一轮：agent → TTS → 下行 → **等播放结束**（按 PCM 时长 + 余量估算） | 旁白与本轮回答共用一条下行，靠 `speechChain` 串行；被打断就停止下发；dsh 超过 `MIAI_ACK_AFTER_MS` 还没回来就先说一句回执 |
+| `turn-runner.ts` | 跑完一轮：agent → TTS → 下行 → **等播放结束**。**它不算账**：把事实（`audioSent` / `devicePlayed` / `ticketInvalidated` / `turnEnded`）喂给 `kernel.ts`，结算数字与"该不该回注"都取内核的 `settleTurn` 意图 | 旁白与本轮回答共用一条下行，靠 `speechChain` 串行；被打断就停止下发；dsh 超过 `MIAI_ACK_AFTER_MS` 还没回来就先说一句回执；omni 转交时**保留**它说的回执、答案接在后面（不掐断重说） |
 | `interrupted-tail.ts` | 按**已播时长**切出「被打断、没说出口」的那一段，交给下一轮当上下文 | 速率是标定值（实测 4.8 字/秒），切点优先落回上一处标点；一次性，隔一轮就丢 |
 
 > **主对话不再跑命令，慢活全在子代理里。**

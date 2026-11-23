@@ -53,6 +53,7 @@
 | 一轮卡在哪、用户等了几秒 | `scripts/latency-report.ts <档案目录>` | ①②③ 分段 + 首字 p50/p90 vs 预算 |
 | **该治哪一段**（谁占大头、p90 是谁顶上去的） | `scripts/latency-attribution.ts <档案目录>` | 各段份额、③ 内部拆分、超预算轮次逐条 |
 | 这条链有没有一处不符合设计 | `scripts/fsm-trace-check.ts <档案>` | 违规列表（退出码 0/1） |
+| **判定逻辑改了以后历史档案还认不认**（听到多少 / 少听没少听 / 该不该回注） | `scripts/kernel-replay.ts <events.jsonl>` | 逐轮 kernel 裁决 vs 档案里 `turn.end` 记的；有分歧退出码 1 |
 | `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
 | 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
 | 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比 |
@@ -118,6 +119,20 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 状态白名单直接照抄 `DialogFsm` 的调用点。加一条转移必须同时改
 `ALLOWED` 和它的测试 —— 目前 `speaking → thinking` 只有 `receiptEnded()`
 一个来源（委派轮回执出声，见 `DialogFsm` 顶部约束 1）。
+
+**「用户听到多少 / 少听没少听 / 该不该回注」**
+
+| | |
+|---|---|
+| 唯一实现 | [`src/engine-contract.ts`](../src/engine-contract.ts) 的 `outcomeOf()`（口径）+ [`src/kernel.ts`](../src/kernel.ts) 的 `step()`（谁该结算、什么时候结） |
+| CLI | `node --experimental-strip-types scripts/kernel-replay.ts <events.jsonl>`（历史档案离线 reduce，与 `turn.end` 对账） |
+| 测试 | [`tests/engine-contract.test.ts`](../tests/engine-contract.test.ts)、[`tests/kernel.test.ts`](../tests/kernel.test.ts) |
+
+**尺子是媒体时间，不是墙钟**：`heard = min(total, elapsed, sentMedia)`。
+`elapsed` 是物理上限（声音播不了比实时快），`sentMedia` 是已送达上限（字节 / 采样率）。
+`stale`（控制面，票据比对）与 `truncated`（内容面，媒体游标）**分属不同正交区域**，
+不许合成一个变量 —— 真机 `20261123-002440` 第 3 轮「19.44 s 正好播完、用户 26 ms 后开口」
+就是 stale 但没少听，该回注记忆。
 
 **`dsh` 内部耗时**
 

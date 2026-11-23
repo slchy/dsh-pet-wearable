@@ -247,8 +247,8 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 
 ### 4.8 委派轮回注：`role` 必须是 `user`
 
-委派轮是 omni 先答了个开头、被掐掉交给 dsh。omni 的服务端历史里只有
-「用户问了什么」，**不知道 dsh 答了什么**——这是「缺失」，不是「污染」。
+委派轮是 omni 先说一句**回执**（「我查查」）然后把活儿交给 dsh。omni 的服务端历史里
+只有「用户问了什么」，**不知道 dsh 答了什么**——这是「缺失」，不是「污染」。
 
 回注的四条约束（前两条来自实测，后两条来自跑起来的教训）：
 
@@ -569,17 +569,46 @@ TTS 链路合成回执，就是两句不同的嗓子接在一起，而且还多�
 `tool_call` 之后我们从不回 `function_call_output`（dsh 的答案另走 `injectAnswer` 注入），
 这条 dangling call 不影响下一轮（3/3 照常回答、不重复调工具）。
 
-### 10.2 委派轮撞上插话：放手，别取消
+### 10.2 委派轮：模型自己说回执，答案接在后面，绝不掐断重说
+
+**omni 在 `tool_call` 之前说的那句就是回执**，不是要清掉的废话 —— 原样保留，
+dsh 的答案接在后面。`TurnRunner` 里那条"已经说了多少"的阈值判断与 `audio.stop`
+截断**已经删掉**（曾经的 `OMNI_DELEGATE_MAX_SPOKEN_MS=800`）。
+
+为什么：`audio.stop` 只清得掉设备**还没播**的缓冲，用户已经听到的那几秒追不回来。
+所以「掐断 → dsh 从头再说一遍」在机制上**必然**是同一段内容听两遍 —— 真机
+（`20261123-072301`）第 8/9 轮：omni 先念 2.2 s / 3.4 s，掐断之后 dsh 又从头说了
+13.52 s / 10.40 s，中间还夹 4.25 s 静音。反过来"检测到说了正文就不转交"则把答案丢了。
+
+「回执要短、别先讲答案」是**提示词纪律**，而且写在哪很关键：`omni-shadow.ts` 里两条
+clause 都挂在**工具描述**上（`LEAD_IN_CLAUSE` = 八个字以内应一声、
+`NO_PREVIEW_CLAUSE` = 应声之后不要先讲答案）。放进 `instructions` 实测拿到 **0 ms 应声**，
+等于没写；把长度收得更紧（"六个字以内"）也会让应声整个消失（4/4 → 2/4）。
+所以在代码里**不用阈值判**：判了就得二选一（掐断重说 / 干脆不转交），两种都难看。
+超过 3 s 只记一行日志当仪表，不参与决定。
+
+### 10.3 委派轮撞上插话：放手 + 回注记忆；只有显式下令才取消
 
 dsh 是**异步**的：`session/cancel` 只作废下游输出，上游的活儿照跑。真机
-（`20261122-210720`）第 9、10 轮两轮委派都撞上了插话 —— 一次是同一口气的尾巴
-（「就是他的」）、一次是一句「对。」，两次都发 `session/cancel`，dsh 那一步总结
-被判 aborted，用户一个字没听到，最后得重问一遍。**取消并没有省下那 10 秒**
+（`20261122-210720`）第 9、10 轮两轮委派都撞上了插话 —— 两次都发 `session/cancel`，
+dsh 那一步总结被判 aborted，用户一个字没听到，最后得重问一遍。**取消并没有省下那 10 秒**
 （`bash` 在取消之后 2 s 才结束），省下的只是总结。
 
-所以委派轮（说过垫话的那一轮）撞插话时改走 `detachTurn()`：`ask` 立刻收尾，
-dsh 跑完，答复从 `setAnnouncer` 出来（同后台任务结算）。边界见
-`docs/state-machines.md` §5.6 的第四种情况。没出过声的轮次照旧取消。
+所以现在的规矩是三条：
+
+| 用户干了什么 | 处理 | 为什么 |
+|:--|:--|:--|
+| **插话**（说别的事） | `detachTurn()` 放手：`ask` 立刻收尾，dsh 跑完 | 回执等于**承诺了答案**，得兑现 |
+| 放手那一轮跑完，用户**已经在问下一句** | **不补播**（会打断他），但 `onDetachedAnswer` → `rememberDsh` + `injectAnsweredTurn` **回注记忆** | 用户之后提起这件事，两条车道都得知道答案 |
+| 用户**显式下令取消**（「算了 / 别查了 / 取消」，`turn-router.isCancelRequest()`） | `session/cancel`，连已放手的轮一起取消 | 「不要了」才是真的不要了 |
+
+没出过声的轮次插话照旧取消（没有承诺要兑现）。
+
+> **曾经漏了一整条路**：`FrontedAgent` 里写的是 `this.inner.detachTurn?.(ticket)`，
+> 而 `DshAgent` **从来没有实现 `detachTurn()`** —— 可选调用遇到 `undefined` 静默空转。
+> 于是"插话后委派轮跑完还能听到答案 / 答案会回注记忆"一次都没生效过，日志里连一行都不出。
+> `keepalive.trackActivity` 现在会把 `detachTurn` / `dshBusy` / `setDetachedAnswerSink`
+> 一起透传；加 `AgentProvider` 新的可选能力时**必须**跟着加一行。
 
 ---
 
@@ -698,5 +727,10 @@ cd <部署路径> && sed -i 's/^OMNI_ANSWER=.*/OMNI_ANSWER=off/' .env && sudo -n
 | 6 | `serve='off'` → `willServe()` 恒 false |
 
 `tests/fast-lane-audio-lane.test.ts`（7 条）：认领、`discard`、`textEligible` 一致性。
-`tests/turn-runner-stream.test.ts`（9 条）：播放分支、打断、tool_call 转交。
+`tests/turn-runner-stream.test.ts`（14 条）：播放分支、打断、tool_call 转交
+（**含「回执保留、答案接在后面、不许 `audio.stop` 掐断」**）。
+`tests/kernel.test.ts`（8 条）：旧段不产意图、乱序不变性、控制面/物理面拆权、
+媒体尺子、换引擎零改内核、`step` 纯性、重复结算幂等。
+`tests/detached-answer.test.ts`（7 条）：放手那一轮——`ask` 立刻收空答复、答案转播报、
+被新题顶掉时**不补播但回注记忆**、显式取消连已放手的轮一起取消。
 `tests/keepalive.test.ts`：「透传**全部**可选能力」清单——防 §6.4 复发。

@@ -81,9 +81,30 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 | 情绪标签 | 模型回复开头 `[开心]` | `providers.ts` 的 `setAnnouncer` 只声明了 `speech` | 后台汇报永远平静语气 |
 | 电量 / 佩戴 | 设备上行 `{"kind":"power","percent":77}` | 只喂给宠物环，`agent` 那条路上没有 | 问「眼镜还剩多少电」，答「读不到，没有接口」 |
 | 情绪标签（离线） | 同上 | `announceStore` 只存 `text` | 离线攒的播报补播时又变回平静 |
+| 「放手」的答复 | `DshSession.onDetachedAnswer` | `DshAgent` **根本没实现 `detachTurn()`**，而 `FrontedAgent` 写的是 `inner.detachTurn?.(ticket)` | 插话后委派轮跑完既没播报也没回注，日志里连一行都不出（上线以来一次没生效） |
+| `voiced`（门控后的人声态） | 能量门 | `qwen-realtime-asr` 的 provider 包装写成 `feed:(pcm)=>asr.feed(pcm)` | 尾静音过滤上线一次没生效，幻觉定音照样入库 |
+
+**可选能力的透传清单在 `src/keepalive.ts` 的 `trackActivity()`**：加
+`AgentProvider` 的新可选方法必须在那里加一行，否则包一层就静默降级。
+`tests/wiring-floor-cancel.test.ts` 卡"生产装配真的接上了"这条。
 
 排查套路：`grep` 数据名，把**每一个**出现点列出来，逐个问「这里是传进来了，还是只是
 在这里定义 / 打印 / 存档」。只在定义处和终点出现、中间跳过的，就是断点。
+
+## 判据放哪儿：三种时间 + 一个家
+
+**全双工链路上的"灵异 bug"几乎都是把「物理到达时刻」当成了因果顺序。** 判据按性质选尺子：
+
+- **因果**（打断算不算数、这份回答归谁）→ 只比序号：`commitSeq` / 票据 `{no, gen}`。
+  唯一的家是 [`src/causal.ts`](src/causal.ts)。**一秒都不看表。**
+- **播放进度**（听到多少、少听没少听）→ 只用媒体时间（字节 / 采样率）。
+  唯一的家是 [`src/engine-contract.ts`](src/engine-contract.ts) 的 `outcomeOf()`。
+- **超时**（等多久算超时、轮询间隔）→ 才用墙钟 `clock.now()`。
+
+**同一件事不许有两个算法**：`TurnRunner` 曾经自己算一遍 `heard`/`truncated`，
+与 `outcomeOf` 各一份，改一处就漂。现在它只喂事实（`audioSent` / `devicePlayed` /
+`turnInvalidated` / `turnEnded`），结算只取 [`src/kernel.ts`](src/kernel.ts) 的意图。
+改判定先看 [ADR-0003](docs/adr/0003-deterministic-kernel.md) 与 `state-machines.md` §5.9。
 
 ## 示例不要用真实地址
 
