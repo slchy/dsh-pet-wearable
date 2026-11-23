@@ -10,7 +10,7 @@
 
 ## 语音栈从哪来
 
-`src/voice/` 是仓根 `src/` 的副本，由 `scripts/sync-voice.mjs` 生成，**不进 git**。`typecheck` 和 `prepack` 都会先跑一次同步。
+`packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/` 和 `demo/`。
 
 为什么不是软连接：实测 npm 11.16 的 packlist **直接跳过 symlink** —— `files: ["src"]`、显式列 `src/voice`、`src/voice/**` 三种写法打出来的 tarball 里都没有链接目标，本地能跑、发出去是空包。
 
@@ -60,7 +60,7 @@ dsh: .env sets "DSH_PATCH", which only the launching environment may set
 
 ```powershell
 $env:DSH_BIN  = 'C:\Users\<你>\AppData\Roaming\npm\dsh.cmd'   # 指向 .cmd 垫片，不是 .ps1
-$env:DSH_PATCH = 'C:/dsh-pet-wearable/mcp/camera.yml'
+$env:DSH_PATCH = '<仓库路径>/mcp/camera.yml'
 dsh --profile voice
 ```
 
@@ -68,7 +68,7 @@ dsh --profile voice
 
 ## 打断：v2 发的是 `Call`，不是 `Control`
 
-服务端对 v1 设备发 `Control: stop`，对 **v2 设备（浏览器就是 v2）发的是 `Call {"op":"audio.stop"}`** —— 见 `src/voice/devices/wire-v1.ts` 里那个 `audio.stop → 'stop'` 的翻译，v1 才有这一层。语义写在 `src/voice/devices/primitives.ts`：*「立刻停止播放并清空播放队列（插话）」*。
+服务端对 v1 设备发 `Control: stop`，对 **v2 设备（浏览器就是 v2）发的是 `Call {"op":"audio.stop"}`** —— 见 `src/voice/devices/wire-v1.ts`（仓根 `src/devices/wire-v1.ts` 的同步副本）里那个 `audio.stop → 'stop'` 的翻译，v1 才有这一层。语义写在 `src/voice/devices/primitives.ts`（仓根 `src/devices/primitives.ts` 的同步副本）：*「立刻停止播放并清空播放队列（插话）」*。
 
 所以浏览器客户端必须自己认 `audio.stop` 去 `playback.stop()`。只处理 `Control: stop` 的后果很隐蔽：***一切都正常，只是用户插话之后，已经排进队列的回答还会继续播完***。
 
@@ -87,7 +87,7 @@ dsh --profile voice
 
 ## 回声：要求戴耳机，不做回声消除
 
-整个语音栈**假定声学回声不存在**（见 `src/devices/primitives.ts`：真机眼镜在端侧做 AEC，插件不再重复做），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（默认 −40 dBFS）。
+整个语音栈**假定声学回声不存在**（见 `src/devices/primitives.ts`：真机眼镜在端侧做 AEC，插件不再重复做），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（本 web 插件默认 −40 dBFS，见 `packages/dsh-voice-web/src/driver.ts`；独立进程 `src/main.ts` 默认 −30 dBFS）。
 
 浏览器这边只有 `echoCancellation: true` 兜一层。**这个项目的决定是：要求戴耳机，不建回波抑制。** 戴耳机之后声学回声路径根本不存在，AEC 只是兜底；外放时残余电平取决于音量、房间、以及浏览器 AEC 的质量，靠调门限是治不了的，而真做自适应滤波是另一个量级的活。
 
