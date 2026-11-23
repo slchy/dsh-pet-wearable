@@ -383,6 +383,9 @@ export class UtteranceAssembler {
   private semanticLastAsked = '';
   /** 已经因为语义判停延长过的那段文字（同一段只延长一次） */
   private semanticExtended = '';
+  /** 上一段定稿的时刻 / 汉字数（去抖判据用，见 `isJunkAfterLongSentence`） */
+  private lastSentenceAt = -1e9;
+  private lastSentenceChars = 0;
   /**
    * 其中「判停说没说完」用掉了几次。
    *
@@ -695,6 +698,14 @@ export class UtteranceAssembler {
     if (this.disposed) {
       return;
     }
+    // **一次发声被提交两次**：真机 20261122-232814 的 66.8 s / 67.2 s 两条定稿有道区间同为
+    // 2.70 s（「那你给我讲讲…剧情。」+「Okay.」），90.2 s / 90.8 s 同为 0.56 s（「你。」+「滚吧。」）。
+    // 前一条是长句时，紧随的小残片是同一段音频的第二次识别 —— 留着会被并进真问题或自己开一轮。
+    // 判据里必须有「两条之间没有新的有声帧」：否则「前半句 + 短后半句」的正常并段会被误杀。
+    if (this.isJunkAfterLongSentence(text)) {
+      this.options.log(`  定稿    ✗ 丢弃残片 ${JSON.stringify(text)}（上一段 ${this.lastSentenceChars} 字，同一段音频）`);
+      return;
+    }
     // 上一截的结尾像「还有下文」（数字/井号/连词）时，那个句号是 ASR 误切出来的
     // 句尾 —— 留着会把订单号拦腰切开（「W866。5881」），模型读起来是两个 token。
     // 判据是**纯文本**的，不依赖这一轮为什么合并（`unfinishedWaitMs` 已删）：
@@ -719,6 +730,8 @@ export class UtteranceAssembler {
     this.lastPartialText = '';
     // 句子定稿 = 文本这一刻已经定了，判停只决定「要不要并下一段」。
     // 先把它交出去起跑，真并了下一段再换 —— 见 `VoiceSession` 的接线。
+    this.lastSentenceAt = this.now();
+    this.lastSentenceChars = [...this.pendingText].filter((c) => /[\u4e00-\u9fff]/.test(c)).length;
     this.options.onSentence?.(this.pendingText);
     // 语义判停**立刻**发出去：它是一次网络往返（150–300 ms），现在发就跟下面这个
     // 静候窗重叠；等判定那一刻再发就变成纯加延迟了。
@@ -1147,6 +1160,28 @@ export class UtteranceAssembler {
     return false;
   }
   /** 判停决定落档（见 {@link UtteranceAssemblerOptions.onJudge}）。没有出口就算了 */
+  /**
+   * 这条定稿是不是「上一段长句的第二次识别」。
+   *
+   * 四条同时成立才丢：上一段是真句子（≥6 汉字）、上一段还在等（`pendingText` 非空）、
+   * 时间挨着（<800 ms）、这一条是残片（≤2 汉字或纯 ASCII 词如「Okay.」）。
+   *
+   * 还有一条是「**两条之间没有新的有声帧**」（`lastVoicedAt <= lastSentenceAt`）——
+   * 没有它，「前半句 + 短后半句」这种正常并段会被一起吃掉（判停那批用例就是）。
+   */
+  private isJunkAfterLongSentence(text: string): boolean {
+    const t = text.trim();
+    const cjk = [...t].filter((c) => /[\u4e00-\u9fff]/.test(c)).length;
+    const junk = cjk <= 2 || /^[A-Za-z][A-Za-z './-]*\.?$/.test(t);
+    return junk
+      && this.pendingText.trim() !== ''
+      && this.lastSentenceChars >= 6
+      && this.now() - this.lastSentenceAt < 800
+      // lastVoicedAt > 0 = 这一轮真的见过有声帧。纯合成输入（没有音频证据）时不去抖：
+      // 宁可多并一次，也不要把用户真的说出来的短句丢掉。
+      && this.lastVoicedAt > 0
+      && this.lastVoicedAt <= this.lastSentenceAt;
+  }
   private reportJudge(fact: JudgeFact): void {
     // 落档时补上「这一轮花掉多少 / 预算是多少」：`②` 的成因只有 p 是看不出来的，
     // 有这两个数才能事后算「预算用超了没」「序列豁免生效没」。
