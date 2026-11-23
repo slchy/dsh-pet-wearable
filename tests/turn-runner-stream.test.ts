@@ -57,6 +57,8 @@ function rig(options: {
   audio?: readonly string[];
   /** omni 决定转交 dsh（`tool_call`） */
   omniDelegate?: DelegateReason;
+  /** 转交之后 dsh 永不回话：用来验「本轮作废就不再等它」 */
+  delegateHang?: boolean;
   /** 这一轮会不会走 omni（宿主据此不启流式 TTS） */
   willServe?: boolean;
 }): Rig & { served: Array<[string, string]> } {
@@ -95,6 +97,10 @@ function rig(options: {
             })(),
           },
         };
+      }
+      if (calls === 2 && options.delegateHang === true) {
+        // 模拟 dsh 的软取消：`session/cancel` 发出去之后那边要几秒才回，甚至不回
+        return new Promise<AgentReplyView>(() => { /* 永不 resolve */ });
       }
       for (const delta of options.deltas) {
         sink?.(delta);
@@ -294,6 +300,34 @@ test('omni 直出：不启流式 TTS、音频原样下行、path=omni、播完�
   assert.ok(result.audioBytes > 0, '音频必须真的下发');
   assert.equal(result.speech, '我在呢。', 'drain 之后才是完整的一句');
   assert.deepEqual(r.served, [['你好', '我在呢。']], '播完必须回写，否则跨车道失忆');
+});
+
+test('转交后被插话：不再等 dsh 的答案，立刻收轮', async () => {
+  // 真机 2026-11-23 第 5 轮白等 2.5 s；`235949` 回放第 6 轮 3.2 s —— 这段里串行链
+  // 卡着，下一轮的「出句→开轮」从源 187 ms 涨到 1304 ms。
+  const r = rig({
+    deltas: [],
+    reply: { text: '行，我这就给你细说。', speech: '行，我这就给你细说。' },
+    audio: ['行，我这就给你细说。'],
+    omniDelegate: 'delegate',
+    delegateHang: true,
+  });
+  const running = r.run();
+  // 等 omni 那份音频出完、进入转交（`speaking` 是它已经出声的证据）
+  for (let i = 0; i < 50 && r.fsm.state !== 'speaking'; i += 1) {
+    await sleep(10);
+  }
+  await sleep(50);
+
+  const bargedAt = Date.now();
+  r.fsm.bargeIn('插话');
+  const result = await running;
+
+  assert.ok(result, '这一轮照样要有结果，只是提前收');
+  assert.equal(result.interrupted, true);
+  assert.ok(Date.now() - bargedAt < 1_000, `作废后还等了 ${Date.now() - bargedAt} ms`);
+  assert.ok(r.logs.some((line) => line.includes('不再等 dsh')), '要留痕，否则只表现为"快了一点"');
+  assert.equal(result.speech, '行，我这就给你细说。', '`said` 仍是垫话，不是没念的 dsh 答案');
 });
 
 test('omni 发 tool_call：就地切 dsh，dsh 的文本走整段合成', async () => {

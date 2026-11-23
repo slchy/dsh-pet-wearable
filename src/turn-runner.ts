@@ -406,10 +406,25 @@ export class TurnRunner {
     this.receipt = null;
     this.firstAudioSeen = false;
 
+    /**
+     * 「本轮已作废」的信号，用来把**已经没必要等的 await** 提前放掉。
+     *
+     * 为什么需要：委派轮在等 dsh 的答案时被插话，`cancelTurn` 只是软取消，
+     * dsh 那边要几秒才回（真机 2026-11-23 第 5 轮 2.5 s；`235949` 回放第 6 轮 3.2 s）。
+     * 这段时间 `DialogRuntime` 的串行链还卡着，**下一轮开不了**（回放里
+     * `出句→开轮` 从源 187 ms 涨到 1304 ms）。答案回来也没人要了。
+     */
+    const STALE = Symbol('stale');
+    let markStale: (() => void) | null = null;
+    const staleSignal = new Promise<typeof STALE>((resolve) => {
+      markStale = () => { resolve(STALE); };
+    });
+
     // **上游取消的唯一入口**：插话与连接结束都从 `DialogFsm.onInvalidate` 发出来。
     // 带着票据说清楚要取消哪一轮 —— 迟到的取消由 session 层按代次丢弃。
     const offInvalidate = fsm.onInvalidate((reason) => {
       this.log(`  取消    ${reason === 'bargeIn' ? '插话' : '连接结束'} → 取消在途请求（第 ${ticket.no} 轮）`);
+      markStale?.();
       // 回执也要停：`audio.stop` 只是清掉设备已经收到的缓冲，合成循环还在往下发，
       // 不掐掉就会在用户说话时接着播（试过：用户一开口「我看看」又从头上响一遍）。
       if (this.receipt !== null && !this.receipt.cancelled) {
@@ -588,7 +603,7 @@ export class TurnRunner {
           const omniText = reply.audio.delegateText?.() ?? null;
           const leadIn = speech;
           const bytesBeforeDelegate = audioBytes;
-          reply = await agent.reply(
+          const pending = agent.reply(
             omniText === null ? text : `${omniText}\n用户原话：「${text}」`,
             image, note, {
               ticket,
@@ -596,16 +611,26 @@ export class TurnRunner {
               receiptSpoken: speech.trim() !== '',
             },
           );
-          replyPath = reply.path;
-          delegateReason = reply.delegate;
-          speech = reply.speech;
-          await pump?.drain(reply.speech);
-          if (fsm.isStale(ticket) && audioBytes === bytesBeforeDelegate) {
-            // dsh 答了，但一个字都没合成出去（这条在到达前就被作废了）。
-            // `said` 记的必须是**念出去的**文本，不能是这段没念的答案 ——
-            // 否则档案里看着"它答了罗马史"，实际播出去的只有 omni 那半句垫话。
-            this.log(`  omni    dsh 的答案没来得及合成 → said 仍是垫话`);
-            speech = leadIn;
+          // 可能不等它了：留一个 catch，别让迟到的那次失败变成进程级错误
+          pending.catch(() => undefined);
+          const raced = await Promise.race([pending, staleSignal]);
+          if (raced === STALE) {
+            // 已经作废：不再等 dsh 的取消往返（真机 2.5–3.2 s），否则串行链卡着，
+            // 用户下一句要排队。`cancelTurn` 在作废那一刻已经发出去了，答案回来也没人要。
+            this.log('  omni    转交后本轮被作废 → 不再等 dsh 的答案');
+          } else {
+            reply = raced;
+            replyPath = reply.path;
+            delegateReason = reply.delegate;
+            speech = reply.speech;
+            await pump?.drain(reply.speech);
+            if (fsm.isStale(ticket) && audioBytes === bytesBeforeDelegate) {
+              // dsh 答了，但一个字都没合成出去（这条在到达前就被作废了）。
+              // `said` 记的必须是**念出去的**文本，不能是这段没念的答案 ——
+              // 否则档案里看着"它答了罗马史"，实际播出去的只有 omni 那半句垫话。
+              this.log(`  omni    dsh 的答案没来得及合成 → said 仍是垫话`);
+              speech = leadIn;
+            }
           }
         }
       } else if (streaming !== null) {

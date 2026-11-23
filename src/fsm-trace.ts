@@ -229,15 +229,26 @@ export function checkTrace(input: readonly TraceEvent[], options: AuditOptions =
       bad(span.startAt, 'turn.tooLong', `第 ${span.no} 轮持续 ${Math.round(span.endAt - span.startAt)} ms`);
     }
 
-    // 插话必须停音频
+    // 插话必须停音频。
+    //
+    // 时间锚点是**插话那一刻**，不是轮结束：作废之后这一轮还要等取消回来
+    // （委派轮等 dsh 2.5–3.2 s），拿结束时刻 ±500 ms 去找会把正常的 audio.stop
+    // 判成缺失（`235949` 回放第 6 轮就是这么误报的）。
     const endedAt = span.endAt;
     if (span.interrupted && endedAt !== null) {
+      const barge = events.find((e) => e.ev === 'dialog.state'
+        && e.t >= span.startAt
+        && e.t <= endedAt
+        && String(e['from'] ?? '') === 'speaking'
+        && String(e['to'] ?? '') === 'listening'
+        && String(e['why'] ?? '').includes('插话'));
+      const anchor = barge?.t ?? endedAt;
       const stop = events.find((e) => e.ev === 'call.send'
-        && e.t >= endedAt - bargeStopWithin
-        && e.t <= endedAt + bargeStopWithin
+        && e.t >= anchor - bargeStopWithin
+        && e.t <= anchor + bargeStopWithin
         && String(e['json'] ?? '').includes('audio.stop'));
       if (stop === undefined) {
-        bad(endedAt, 'barge.noAudioStop', `第 ${span.no} 轮被判插话，但没发 audio.stop`);
+        bad(anchor, 'barge.noAudioStop', `第 ${span.no} 轮被判插话，但没发 audio.stop`);
       }
     }
 
