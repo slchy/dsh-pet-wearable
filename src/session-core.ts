@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 对话层的**决策**：给定事件，产出「接下来做什么」。
  *
  * 这里没有 socket、没有 ffmpeg、没有定时器 —— 副作用都以 `CoreEffect` 返回，
@@ -13,7 +13,7 @@ import {
   type DeviceCapabilities,
 } from './devices/primitives.ts';
 import { V1_BASELINE } from './devices/wire-v1.ts';
-import { DialogFsm, type DialogState, type TurnTicket } from './dialog-fsm.ts';
+import { DialogFsm, type DialogFsmContext, type DialogState, type TurnTicket } from './dialog-fsm.ts';
 import { wantsHighRes } from './hq-intent.ts';
 import type { CaptureRequest } from './photo-inbox.ts';
 import type { ImageAttachment } from './session.ts';
@@ -98,6 +98,11 @@ export interface SessionCoreOptions {
   /** 没人等图时的默认提问 */
   readonly imageQuestion: string;
   readonly log: (line: string) => void;
+  /**
+   * 票据上的 `baseCommitSeq` / `startedAtMs` 从哪来（见 `dialog-fsm.ts` 的
+   * `DialogFsmContext`）。由 `VoiceSession` 注入 —— 只有它认识 ASR。
+   */
+  readonly ticketContext?: DialogFsmContext;
 }
 
 export class SessionCore {
@@ -118,7 +123,7 @@ export class SessionCore {
   constructor(options: SessionCoreOptions) {
     this.options = options;
     this.caps = options.capabilities ?? V1_BASELINE;
-    this.fsm = new DialogFsm(options.log);
+    this.fsm = new DialogFsm(options.log, options.ticketContext);
   }
 
   /** 取消正在等的拍照：解散设备侧流程，并清掉已经在播的旁白。 */

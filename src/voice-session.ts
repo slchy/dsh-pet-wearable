@@ -512,7 +512,7 @@ class VoiceConnection {
    * ASR 150 ms 才切段。两份事件的配对看 `asr.commit.lane_seq`。
    *
    * 它还是「这段音频是哪一代的」的**因果序号**：转写回来时比较
-   * {@link turnBaseCommitSeq} 就知道这段是不是开轮之前录的。
+   * 票据上的 aseCommitSeq 就知道这段是不是开轮之前录的。
    */
   private commitSeq = 0;
   /**
@@ -530,7 +530,6 @@ class VoiceConnection {
    * 说明那一段音频是在我们出声之前封出去的 —— 它不可能是插话，只能是判停抢跑之后
    * 补回来的后半句。比时钟干净：不用猜「这一段是什么时候录的」。
    */
-  private turnBaseCommitSeq = -1;
   /**
    * 最近一帧的**前端**静音时长（`AudioFrame.silenceMs`，能量门算的）。
    *
@@ -562,6 +561,11 @@ class VoiceConnection {
     // 在 `app/dialog.ts`；这里只把环境接上（ADR-0002 §3.1）
     this.dialog = new DialogRuntime({
       clock: this.clock,
+      // 票据上的两个因果字段：谁认识 ASR 谁注入（FSM 自己不认识转写层）
+      ticketContext: {
+        baseCommitSeq: () => this.commitSeq,
+        now: this.assemblerNow,
+      },
       caps: this.caps,
       agent: options.agent,
       tts: options.tts,
@@ -617,7 +621,6 @@ class VoiceConnection {
     // 全靠它（见 `turnBaseCommitSeq` / `fromPreTurnSegment`）。**是因果序号，不是时钟**。
     this.dialog.core.fsm.onState((state) => {
       if (state === 'thinking' || state === 'speaking') {
-        this.turnBaseCommitSeq = this.commitSeq;
       }
     });
     // 应用层**总是**要建：话筒（user / reply / announce）必须在同一张表里仲裁，
@@ -1361,7 +1364,13 @@ class VoiceConnection {
     if (state !== 'speaking' && state !== 'thinking') {
       return false;
     }
-    return this.commitSeq <= this.turnBaseCommitSeq;
+    // 序号从**票据**上取（开轮时锁存的），不是现取 —— 现取的话下一轮开始后
+    // 老段的迟到转写会被判成「开轮之后录的」，又变成自己打断自己。
+    const base = this.dialog.core.fsm.ticket().baseCommitSeq;
+    if (base === undefined) {
+      return false;
+    }
+    return this.commitSeq <= base;
   }
 
   /**

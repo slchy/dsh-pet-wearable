@@ -110,6 +110,28 @@ export type DialogState = 'listening' | 'awaiting_shot' | 'thinking' | 'speaking
 export interface TurnTicket {
   readonly no: number;
   readonly gen: number;
+  /**
+   * 开轮瞬间**已发出**的最大 ASR commit 序号（见 `engine-contract.ts` 契约③）。
+   *
+   * 判「这条转写是开轮前录的还是开轮后的」用它 —— 比时钟干净，也不会因为
+   * 某一处换了时钟就静默失效（这个坑今天踩过）。
+   *
+   * 可选：只有装配层注入了 {@link DialogFsmContext} 才有（单测/离线场景没有 ASR）。
+   */
+  readonly baseCommitSeq?: number;
+  /** 开轮时刻（宿主时钟），同上 */
+  readonly startedAtMs?: number;
+}
+
+/**
+ * 票据上那两个**随时间变化**的字段从哪来：装配层注入，FSM 自己不认识 ASR。
+ *
+ * 为什么不放进构造参数属性：Node 的类型擦除不支持参数属性（见上面的说明）。
+ */
+export interface DialogFsmContext {
+  /** 已经发出几发 ASR commit（单调） */
+  readonly baseCommitSeq?: () => number;
+  readonly now?: () => number;
 }
 
 export class DialogFsm {
@@ -146,9 +168,20 @@ export class DialogFsm {
   private readonly invalidateListeners: Array<(reason: 'bargeIn' | 'closed') => void> = [];
   /** 状态转移的观察者（只读，不参与决策） */
   private readonly stateListeners: Array<(state: DialogState, why: string) => void> = [];
+  /** 票据上那两个随时间变化的字段的来源（见 {@link DialogFsmContext}） */
+  private readonly context: DialogFsmContext;
+  /**
+   * 本轮开轮时锁存的那两个值。
+   *
+   * 必须在**进入** `thinking`/`speaking` 时锁存，不能在 `ticket()` 里现取：
+   * 现取的话，下一轮开始后同一个老票据拿到的会是新值 —— 迟到的转写就会被判成
+   * 「开轮之后录的」，于是又一次自己打断自己。
+   */
+  private turnBase: { baseCommitSeq?: number; startedAtMs?: number } = {};
 
-  constructor(log: (line: string) => void) {
+  constructor(log: (line: string) => void, context: DialogFsmContext = {}) {
     this.log = log;
+    this.context = context;
   }
 
   get state(): DialogState {
@@ -182,7 +215,7 @@ export class DialogFsm {
 
   /** 当前代次的票据。入队任务应当持有它，出队时用 {@link isStale} 校验。 */
   ticket(): TurnTicket {
-    return { no: this._turn, gen: this._gen };
+    return { no: this._turn, gen: this._gen, ...this.turnBase };
   }
 
   /**
@@ -404,6 +437,21 @@ export class DialogFsm {
       return;
     }
     this.log(`  状态    ${this._state} → ${to}   (${why})`);
+    // 新的一轮开始：把「已经发出到第几发 ASR commit」「现在几点」锁进票据。
+    // 从 `listening` / `awaiting_shot` 进来才算开轮（`speaking ↔ thinking` 回摆
+    // 是同一轮内部的事，不能重记 —— 否则「开轮前录的那段」判据会被自己刷新掉）。
+    if ((to === 'thinking' || to === 'speaking')
+      && (this._state === 'listening' || this._state === 'awaiting_shot')) {
+      this.turnBase = {};
+      const base = this.context.baseCommitSeq?.();
+      if (base !== undefined) {
+        this.turnBase.baseCommitSeq = base;
+      }
+      const at = this.context.now?.();
+      if (at !== undefined) {
+        this.turnBase.startedAtMs = at;
+      }
+    }
     this._state = to;
     this._lastWhy = why;
     for (const cb of [...this.stateListeners]) {

@@ -25,7 +25,7 @@ import { closeAnnounceMic, speakAnnouncement } from './announce.ts';
 import { isBackchannelOnly } from '../backchannel.ts';
 import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
-import type { TurnTicket, DialogState } from '../dialog-fsm.ts';
+import type { DialogFsmContext, TurnTicket, DialogState } from '../dialog-fsm.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
 import {
   announceInterruptionNote, interruptionNote, remainingSpeech, TTS_CHARS_PER_SEC,
@@ -149,6 +149,11 @@ export interface DialogOptions {
   /** 时钟端口：超时与等待全走它 */
   readonly clock: Clock;
   readonly caps: DeviceCapabilities;
+  /**
+   * 票据上的 aseCommitSeq / startedAtMs 从哪来（见 dialog-fsm.ts 的
+   * DialogFsmContext）。由 VoiceSession 注入 —— 只有它认识 ASR。
+   */
+  readonly ticketContext?: DialogFsmContext;
   readonly agent: AgentProvider;
   readonly tts: TtsProvider;
   readonly downlink: DownlinkSink;
@@ -228,6 +233,7 @@ export class DialogRuntime {
       imageQuestion: options.imageQuestion,
       log: options.log,
       capabilities: options.caps,
+      ...(options.ticketContext === undefined ? {} : { ticketContext: options.ticketContext }),
     });
     this.lastDialogState = this.core.fsm.state;
 
