@@ -479,6 +479,14 @@ export class DshSession {
   liveDropCount = 0;
   /** 侧通道接收端；懒启动 */
   private liveRelay: LiveTextRelay | null = null;
+  /**
+   * 侧通道端口；拉起 dsh 子进程时以 `VOICE_LIVE_PORT` 塞进**它自己的**环境。
+   *
+   * 为什么不是 `process.env['VOICE_LIVE_PORT']`：那是整个宿主进程的全局状态，
+   * 同一进程里起两个会话（或测试并行跑）会互相覆盖，dsh 之外的东西也读得到。
+   * 环境变量的作用域应当只是「这一个子进程」。
+   */
+  private liveRelayPort: number | null = null;
   private readonly liveThreshold: number;
   private liveGate: LiveGate;
   /**
@@ -1211,8 +1219,11 @@ export class DshSession {
   }
 
   /**
-   * 起侧通道（幂等）。端口通过 `VOICE_LIVE_PORT` 传给 dsh 子进程 —— 这一行就是
+   * 起侧通道（幂等）。端口通过 `VOICE_LIVE_PORT` 传给 dsh 子进程 —— 这就是
    * `mcp/voice-live` 插件的开关：读不到就不启用。
+   *
+   * 端口存在**实例字段**里、spawn 时局部拼进 env：不写 `process.env`，否则同一
+   * 进程里的第二个会话 / 并行测试会互相污染（见字段上的注释）。
    */
   private async ensureLiveRelay(): Promise<void> {
     if (this.liveRelay !== null) {
@@ -1227,7 +1238,7 @@ export class DshSession {
     }
     relay.onMessage((msg) => { this.onLiveMessage(msg); });
     this.liveRelay = relay;
-    process.env['VOICE_LIVE_PORT'] = String(port);
+    this.liveRelayPort = port;
   }
 
   /**
@@ -1494,9 +1505,14 @@ export class DshSession {
     const isShim = process.platform === 'win32' && /\.(cmd|bat)$/i.test(this.program);
     const argv = isShim ? ['/c', this.program, ...args] : args;
     const command = isShim ? (process.env['COMSPEC'] ?? 'cmd.exe') : this.program;
+    // 侧通道端口只传给**这个子进程**：不写 `process.env`（那会污染同一进程里的
+    // 其他会话与测试）。端口没起来就原样继承，插件读不到自然不启用。
+    const env = this.liveRelayPort === null
+      ? process.env
+      : { ...process.env, VOICE_LIVE_PORT: String(this.liveRelayPort) };
     return spawn(command, argv, {
       cwd: this.workDir,
-      env: process.env,
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });

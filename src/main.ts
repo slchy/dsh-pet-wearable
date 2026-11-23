@@ -8,8 +8,9 @@
  *   node src/main.ts --listen 8766 --stt canned --tts silent --agent echo   # 零密钥
  *
  * 旧路径（`--replay`、本地 silero-vad、MiMo ASR）见 `legacy-pipeline.ts`。
+ * 它**按需加载**：`--stt` 流式启动的依赖图里没有 VAD/ONNX（见文件末尾的说明）。
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,7 +21,7 @@ import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { qwenRealtimeStt } from './qwen-realtime-asr.ts';
-import { cosyVoiceTts } from './cosyvoice.ts';
+import { cosyVoiceTts, DEFAULT_COSYVOICE_EMOTION_MODE } from './cosyvoice.ts';
 import { omniTts } from './omni-tts.ts';
 import { mimoTts } from './mimo.ts';
 import { EMOTIONS } from './emotion.ts';
@@ -48,7 +49,10 @@ import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
 import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './http-agent.ts';
-import { Pipeline, type ReplyMode } from './legacy-pipeline.ts';
+// **只借类型，不加载模块**：`legacy-pipeline.ts` 会一路拉进 `silero-vad` 与
+// `onnxruntime-node`（几十 MB、启动多几百毫秒），而生产走的是 `--stt` 流式路径，
+// 一行都用不到。真正的 `Pipeline` 在末尾的回放/旧监听分支里按需 `await import()`。
+import type { Pipeline, ReplyMode } from './legacy-pipeline.ts';
 import {
   describeTokenProblem,
   readTokenFile,
@@ -120,20 +124,24 @@ async function buildTts(spec: string): Promise<TtsProvider> {
     //   prosody（默认）：rate/pitch 缩放，系统音色可用，最省延迟
     //   instruction：自由指令，只有复刻/设计音色吃，首包多 ~90 ms
     // 系统音色配 instruction 会被服务端拒（428）。
+    // **默认值只有一处**：`cosyvoice.ts` 的 `DEFAULT_COSYVOICE_EMOTION_MODE`。
+    // （以前这里写死 `=== 'instruction'`，等于默认值在两处「碰巧一致」，
+    // 那边一改就漂成「main 说关、provider 说开」。）
     return cosyVoiceTts({
       apiKey: process.env['DASHSCOPE_API_KEY'],
       url: process.env['COSYVOICE_URL'],
       model: process.env['COSYVOICE_MODEL'],
       voice: process.env['COSYVOICE_VOICE'],
-      useInstruction: process.env['COSYVOICE_EMOTION_MODE'] === 'instruction',
+      useInstruction:
+        (process.env['COSYVOICE_EMOTION_MODE'] ?? DEFAULT_COSYVOICE_EMOTION_MODE) === 'instruction',
       // 每个 task 的「建立 / 首包」两段，常开落到当前档案（见 `tts.task`）
-      onTask: (info) => { auditSink?.(EVENTS.ttsTask, { ...info }); },
+      onTask: (info) => { auditSlot.emit(EVENTS.ttsTask, { ...info }); },
       // 流式 task 的分批送达明细，收尾时落一次（见 `tts.done`）
-      onDone: (info) => { auditSink?.(EVENTS.ttsDone, { ...info }); },
+      onDone: (info) => { auditSlot.emit(EVENTS.ttsDone, { ...info }); },
       // 首块 600 ms 还没回来：**当场**采这一条 socket（`unacked`/`rto` 只在那一瞬有意义）
       onStall: (info) => {
         void sampleSocket(info.local_port).then((socket) => {
-          auditSink?.(EVENTS.ttsStall, { ...info, socket });
+          auditSlot.emit(EVENTS.ttsStall, { ...info, socket });
         });
       },
     });
@@ -456,16 +464,126 @@ function installLogClock(): void {
   };
 }
 
+/** 审计出口的形状：`agent.*` / `tts.*` 事件往哪儿写。 */
+export type AuditSink = (name: string, data: Record<string, unknown>) => void;
+
+/**
+ * 审计出口的**槽位**：进程里所有共用件（`FrontedAgent`、TTS provider）都往这里写，
+ * 而真正的接收方（档案）是**每连接一份**。
+ */
+export interface AuditSlot {
+  /** 当前挂着的那个（`null` = 没人接）。排障/单测用，不参与装配。 */
+  peek(): AuditSink | null;
+  /**
+   * 挂上 / 摘掉。
+   *
+   * 传 `expected` 时是**所有权守卫**：只有「槽里现在挂的正是我当初挂的那个」才摘，
+   * 否则什么也不做 —— 旧连接断开时不能把后来那条连接的档案摘掉。
+   * 不传 `expected`（`undefined` / `null`）保持老语义：直接覆盖。
+   */
+  set(sink: AuditSink | null, expected?: AuditSink | null): void;
+  /** 转发一条事件；没有持有者、或持有者抛错，都只当没发生。 */
+  emit(name: string, data: Record<string, unknown>): void;
+  /** 挂上并返回**只摘自己那一份**的卸载函数。 */
+  register(sink: AuditSink): () => void;
+}
+
+/**
+ * 造一个审计槽位。
+ *
+ * 为什么要有所有权守卫：`FrontedAgent` 和 TTS provider 是**进程级共用**的，它们的
+ * 回调只能写「当前这条连接」的档案。多设备并发（或快速重连）时，旧连接的生命周期
+ * 收拾得比新连接晚，它那句 `setAudit(null)` 会把新连接的档案出口一起摘掉 ——
+ * 之后所有 `agent.*` / `tts.*` 事件静默丢失，日志里一个字都没有。
+ *
+ * 现在 `voice-session` 传不传令牌由它自己决定：不传（1 参调用）就仍是
+ * 「最后挂上的赢、`null` 直接清」；传了（2 参）就走所有权守卫。装配层两参都转发，
+ * 所以那一侧改签名时这里不用再动。
+ */
+export function createAuditSlot(): AuditSlot {
+  let current: AuditSink | null = null;
+
+  const set = (sink: AuditSink | null, expected?: AuditSink | null): void => {
+    if (sink === null && expected != null) {
+      // 只摘自己挂上去的那一个：别人后来居上时保持原样
+      if (current === expected) {
+        current = null;
+      }
+      return;
+    }
+    current = sink;
+  };
+
+  return {
+    peek: () => current,
+    set,
+    emit: (name, data) => {
+      const sink = current;
+      if (sink === null) {
+        return;
+      }
+      // 审计抛错不能把一轮通话带下水（档案可能刚好在关）
+      try {
+        sink(name, data);
+      } catch {
+        // 忽略
+      }
+    },
+    register: (sink) => {
+      set(sink);
+      return () => { set(null, sink); };
+    },
+  };
+}
+
 /**
  * 审计出口的**当前持有者**：哪条连接在写档案。
  *
- * `FrontedAgent` 和 TTS provider 都是进程级共用的（在 `main()` 之前就建好了），
- * 而档案是**每连接一份** —— 所以出口必须是模块级可变量：连接建立时把自己接上，
- * 断开时摘掉。同时只有一个设备在用时归属精确；多设备并发会写到最后连上的那条。
- *
  * 承载两类事件：`agent.*`（快车道问了什么/答了什么）和 `tts.task`（建立/首包两段）。
+ * 同时只有一个设备在用时归属精确；多设备并发会写到最后连上的那条（见
+ * {@link createAuditSlot} 的所有权守卫）。
  */
-let auditSink: ((name: string, data: Record<string, unknown>) => void) | null = null;
+const auditSlot = createAuditSlot();
+
+/** `FrontedAgent` 的装配结论，见 {@link shouldCreateFrontedAgent}。 */
+export interface FrontedPlan {
+  /** 要不要造这个装饰器。`false` 时 agent 保持原样（纯 `VoiceAgent`）。 */
+  readonly create: boolean;
+  /** 传给 `FrontedAgent` 的 `apiKey`：`''` = 级联文本模型关，只留 omni + dsh。 */
+  readonly cascadeKey: string;
+  /** 为什么是这个结论（`cascade` / `omni-only` / `off` / `no-key`），只用于日志与单测。 */
+  readonly why: 'cascade' | 'omni-only' | 'off' | 'no-key';
+}
+
+/**
+ * 造不造 `FrontedAgent` —— 纯判据，装配层照它执行。
+ *
+ * 这里错一次的代价是**静默**的：`FrontedAgent` 同时拿着级联文本快车道和 omni 音频
+ * 车道的挂载点（`attachAudioLane` / `willServeAudio` / `noteServedTurn`）。以前它只在
+ * 「有 `FAST_LANE_API_KEY`」时才造，于是删掉 qwen-flash 的 key 就顺手把 omni 也删了：
+ * `VoiceAgent` 没有那些可选方法，`trackActivity` 转发的也是 `undefined`，宿主一路
+ * 静默降级，日志里只有一句「快车道 关」。
+ *
+ * 所以现在的判据是**两件事任一成立**：
+ * - 有 key 且没被 `FAST_LANE=0` 关掉 → 级联照旧；
+ * - omni 车道会启用（`omniWillEnable`）→ 也必须造，但 `apiKey: ''`
+ *   （`routeTurn()` 见 `cascade: false` 就直接跳过级联，只留 `live` + `dsh`）。
+ *
+ * **别把 `fastOff` 当成「omni 也关」**：那个开关只管文本快车道。
+ */
+export function shouldCreateFrontedAgent(input: {
+  readonly fastOff: boolean;
+  readonly fastKey: string;
+  readonly omniEnabled: boolean;
+}): FrontedPlan {
+  if (!input.fastOff && input.fastKey !== '') {
+    return { create: true, cascadeKey: input.fastKey, why: 'cascade' };
+  }
+  if (input.omniEnabled) {
+    return { create: true, cascadeKey: '', why: 'omni-only' };
+  }
+  return { create: false, cascadeKey: '', why: input.fastOff ? 'off' : 'no-key' };
+}
 
 async function main(): Promise<void> {
   installLogClock();
@@ -514,6 +632,25 @@ async function main(): Promise<void> {
   const mode: ReplyMode = agentSpec === 'dsh'
     ? 'agent'
     : agentSpec === 'echo' ? 'echo' : 'none';
+
+  /**
+   * STT 选型与 omni 车道的**前置条件**必须在这里就定下来（不是等走到流式分支）。
+   *
+   * 原因：omni 是挂在 `FrontedAgent` 上的可选能力（`attachAudioLane` / `willServeAudio`），
+   * 没有 `FrontedAgent` 就没有那条车道。而要不要造 `FrontedAgent`，以前只看
+   * `FAST_LANE_API_KEY` —— 于是「删掉 qwen-flash 的 key」顺手把 omni 也删了：
+   * 音频直出整条失效，日志里只看到「快车道 关」，没有任何一行提到 omni。
+   *
+   * omni 的硬前提是 `qwen-realtime` STT：车道的起跑线是 `onCommit`（我们主动封段
+   * 那一刻），而 NLS 的 `commitMs` 是 0 —— 没有这个回调，车道会**一条数据都不出**
+   * 却不报错。这种静默失效比直接报错难查得多，所以判据也提前。
+   */
+  const asrBackend = opt('--asr', 'mimo');
+  const resolvedStt = sttSpec === '' ? (asrBackend === 'aliyun' ? 'aliyun' : '') : sttSpec;
+  const omniWanted = envString('OMNI_SHADOW') === '1';
+  const omniKey = process.env['DASHSCOPE_API_KEY'] ?? '';
+  /** omni 车道**真的**会挂上（三件事同时成立）。装配层据此决定要不要造 `FrontedAgent`。 */
+  const omniWillEnable = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime';
 
   if (!replay && !listen && !askImage) {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
@@ -569,6 +706,16 @@ async function main(): Promise<void> {
    */
   let stopKeepalive: () => void = () => {};
   if (dshSession && agent) {
+    /**
+     * 保活专线：**在包 `FrontedAgent` 之前**把内层（纯 `VoiceAgent`）存下来。
+     *
+     * 保活要焐热的是 **dsh 那一侧**的前缀缓存。走 `FrontedAgent` 就变成先由它判一遍
+     * 快车道 —— 「（保活信号，不需要回应）」是短句、没有数字，妥妥被 qwen-flash 认领：
+     * dsh 一次都没被叫到（前缀照样凉），还往快车道的账本和历史里塞了一条用户从没
+     * 说过的话（下一轮委派时它会跟着进 dsh 的上下文）。
+     */
+    const dshAgent = agent;
+
     // 快车道：短句纯闲聊直接答，其余零开销交给 dsh。放在 `trackActivity` **里面**，
     // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
     const fastKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
@@ -589,7 +736,10 @@ async function main(): Promise<void> {
     }
     const speculate = wantSpeculate && canCancel;
 
-    if (fastOff || fastKey === '') {
+    // 造不造这个装饰器由纯判据决定（见 `shouldCreateFrontedAgent` 的注释：
+    // omni 车道的挂载点也在它身上，不能因为「没有 qwen-flash key」就不造）。
+    const fronted = shouldCreateFrontedAgent({ fastOff, fastKey, omniEnabled: omniWillEnable });
+    if (!fronted.create) {
       console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
     } else {
       /**
@@ -602,7 +752,9 @@ async function main(): Promise<void> {
       const fastModel = process.env['FAST_LANE_MODEL'] ?? 'qwen-flash';
       agent = new FrontedAgent({
         inner: agent,
-        apiKey: fastKey,
+        // `''` = 级联文本模型关（omni-only 装配）：`FrontedAgent` 内部按
+        // `apiKey !== ''` 报 `cascade: false`，`routeTurn()` 于是只可能给 `live` 或 `dsh`
+        apiKey: fronted.cascadeKey,
         model: fastModel,
         ...(process.env['FAST_LANE_BASE_URL'] === undefined
           ? {}
@@ -649,27 +801,39 @@ async function main(): Promise<void> {
         memory: (text: string) => memoryFile.relevant(text),
         log: (line) => { console.log(line); },
         // 全量审计：每次请求的 messages、模型的原文、以及被作废的那几趟
-        audit: (name, data) => { auditSink?.(name, data); },
+        audit: (name, data) => { auditSlot.emit(name, data); },
       });
-      console.log(
-        `快车道    开（${delegateEnabled ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
-        + `model=${fastModel}`
-        // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
-        + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
-        + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
-        + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
-        + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
-        + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
-        + ` delegate=${delegateEnabled ? 'on' : 'OFF（纯聊天）'}`,
-      );
-      // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
-      // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
-      console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
+      if (fronted.why === 'omni-only') {
+        // 这一行必须说清「为什么还有 FrontedAgent，但 qwen-flash 不会响」：
+        // 否则日志上看到的是「快车道 关」，而装配自检里又冒出个 FrontedAgent。
+        console.log(
+          '快车道    仅启用 omni 音频车道（级联文本模型已关：'
+          + `${fastOff ? 'FAST_LANE=0' : '没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY'}）`
+          + '；闲聊/长句走 omni 或 dsh',
+        );
+      } else {
+        console.log(
+          `快车道    开（${delegateEnabled ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
+          + `model=${fastModel}`
+          // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
+          + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
+          + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
+          + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
+          + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
+          + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
+          + ` delegate=${delegateEnabled ? 'on' : 'OFF（纯聊天）'}`,
+        );
+        // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
+        // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
+        // 只在级联真会用到它时打：omni-only 装配下没人读这份记忆
+        console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
+      }
     }
     const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
     const activity = newActivityState(Date.now());
-    const trackedAgent = trackActivity(agent, activity);
-    agent = trackedAgent;
+    // 包在最外层（`FrontedAgent` 已在上一步换进 `agent`）：真对话走 `reply()` 记账。
+    // 保活不走这里 —— 它直连 `dshAgent` 并自己记（见 `ping`）。
+    agent = trackActivity(agent, activity);
     console.log(keepaliveMinutes > 0
       ? `保活      空闲 ${keepaliveMinutes} 分钟发一次前缀保活（KEEPALIVE_MINUTES=0 关闭）\n`
       : '保活      关（KEEPALIVE_MINUTES=0）\n');
@@ -680,7 +844,17 @@ async function main(): Promise<void> {
       isBusy: () => activity.inflight > 0,
       ping: async () => {
         const started = Date.now();
-        await trackedAgent.reply(KEEPALIVE_PROMPT);
+        // **直连 dsh 那一层**（见上面 `dshAgent`）：不经过 `FrontedAgent`，
+        // 否则快车道会认领这条短句，dsh 根本没被叫到，前缀照样凉。
+        // 活动账自己记：`inflight` 让「有人在飞」对下一次真对话、下一个保活周期
+        // 都成立；`last` 要在这里刷新，否则 `idleFor()` 永远停在上一轮真对话的时刻。
+        activity.inflight += 1;
+        try {
+          await dshAgent.reply(KEEPALIVE_PROMPT);
+        } finally {
+          activity.inflight -= 1;
+          activity.last = Date.now();
+        }
         console.log(`  [keepalive] 完成 ${Date.now() - started} ms`);
       },
       log: (line) => { console.log(line); },
@@ -714,8 +888,7 @@ async function main(): Promise<void> {
 
   // ---------------------------------------------------------------- 流式分支
   // `--stt` 显式给了就走流式路径；`--asr aliyun` 是旧写法，继续认。
-  const asrBackend = opt('--asr', 'mimo');
-  const resolvedStt = sttSpec === '' ? (asrBackend === 'aliyun' ? 'aliyun' : '') : sttSpec;
+  // `resolvedStt` 在参数解析后就算好了（omni 车道要不要挂取决于它，见上面）。
   if (resolvedStt !== '') {
     if (!listen) {
       console.error('流式识别只支持 --listen（没有 --replay 语义）');
@@ -767,12 +940,9 @@ async function main(): Promise<void> {
     /**
      * omni 一体化车道。默认关。
      *
-     * 硬前提是 `qwen-realtime` STT：车道的起跑线是 `onCommit`（我们主动封段那一刻），
-     * 而 NLS 的 `commitMs` 是 0 —— 没有这个回调，车道会**一条数据都不出**却不报错。
-     * 这种静默失效比直接报错难查得多，所以在启动时就拦住并说清原因。
+     * 硬前提（`omniWillEnable`）在参数解析后就判过了 —— 这里只把它变成实际配置。
+     * 原因见那一段：`FrontedAgent` 要先造出来，车道才挂得上。
      */
-    const omniWanted = envString('OMNI_SHADOW') === '1';
-    const omniKey = process.env['DASHSCOPE_API_KEY'] ?? '';
     const omniModel = envString('OMNI_SHADOW_MODEL');
     /**
      * `OMNI_ANSWER`：让 omni 真的答，而不只是量。
@@ -789,7 +959,7 @@ async function main(): Promise<void> {
       console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|full）`);
       process.exit(2);
     }
-    const omniShadow = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime'
+    const omniShadow = omniWillEnable
       ? {
         apiKey: omniKey,
         serve: omniAnswer as 'off' | 'full',
@@ -1031,8 +1201,13 @@ async function main(): Promise<void> {
       archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
       archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
       archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
-      // 连接建立/断开时把审计（快车道 + TTS 两段）接到这条档案上（见 `auditSink`）
-      setAudit: (sink) => { auditSink = sink; },
+      // 连接建立/断开时把审计（快车道 + TTS 两段）接到这条档案上（见 `auditSlot`）。
+      // 两参都转发：`voice-session` 只传 `sink` 时保持「最后挂上的赢」，传了
+      // `expected` 令牌时由槽位做所有权守卫（旧连接收尾摘不掉新连接的档案）。
+      setAudit: (
+        sink: ((name: string, data: Record<string, unknown>) => void) | null,
+        expected?: ((name: string, data: Record<string, unknown>) => void) | null,
+      ) => { auditSlot.set(sink, expected); },
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),
@@ -1070,6 +1245,15 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  /**
+   * 旧路径（`--replay` / 无 `--stt` 的本地监听）：**到这里才**加载 `legacy-pipeline`。
+   *
+   * 它一路拉进 `silero-vad` 与 `onnxruntime-node`（几十 MB 的 native 包），而生产的
+   * 流式路径（`--stt ... --listen`）在上面那个分支就 `process.exit()` 了，永远走不到这里。
+   * 顶层 `import` 会让每次启动都付这份加载钱 —— 改成按需之后，`--stt` 启动的
+   * 依赖图里不再有 VAD/ORT（`tests/main-wiring.test.ts` 卡着这条）。
+   */
+  const { Pipeline } = await import('./legacy-pipeline.ts');
   const pipe = new Pipeline(ffmpeg, mode, agent);
   await sleep(200);       // 等 VAD 初始化
 
@@ -1082,4 +1266,43 @@ async function main(): Promise<void> {
   process.exit(code);
 }
 
-void main();
+/**
+ * 本文件是「被当成入口跑」（`node src/main.ts`）还是只是被 import 进来？
+ *
+ * 为什么需要这道守卫：`tests/main-wiring.test.ts` 要 import 本文件取纯函数做单测，
+ * 而顶层 `void main()` 会当场打印用法并 `process.exit(2)` —— 整个测试进程直接死。
+ *
+ * 判据按 **URL** 比，不按字符串：`process.argv[1]` 可能是相对路径、盘符大小写也可能
+ * 与 `import.meta.url` 不一致（Windows），所以两边都 realpath 再转 URL。
+ * 不能只判「`argv[1]` 存在」：`node --test` 下它是测试文件，不是本文件。
+ */
+export function isMainModule(entry = process.argv[1], moduleUrl = import.meta.url): boolean {
+  if (entry === undefined || entry === '') {
+    return false;
+  }
+  let entryUrl: string;
+  try {
+    entryUrl = pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    // 文件不存在（打错/已删）时退回 resolve：比较结果同样可信
+    entryUrl = pathToFileURL(resolve(entry)).href;
+  }
+  return normalizeFileUrl(entryUrl) === normalizeFileUrl(moduleUrl);
+}
+
+/** 盘符大小写、URL 里中文/空格的转义形式都可能不同，只比「像不像同一个文件」。 */
+function normalizeFileUrl(url: string): string {
+  let decoded = url;
+  try {
+    decoded = decodeURIComponent(url);
+  } catch {
+    // 非法转义：保持原样再比
+  }
+  return process.platform === 'win32' ? decoded.toLowerCase() : decoded;
+}
+
+// `node src/main.ts`（含 `npm start`）仍然原样进 `main()`：无参运行时打印用法并以
+// 退出码 2 结束，那是 `docs/CLOUD-ARCHITECTURE.md` §8 的启动自检。
+if (isMainModule()) {
+  void main();
+}
