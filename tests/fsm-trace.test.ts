@@ -165,6 +165,8 @@ test('停嘴到首块超预算', () => {
 test('一次呼吸被切成两轮：停嘴只算给第一轮，第二轮记缺仪表', () => {
   // 真机日志里的那一处：「嗯，是的。」开一轮之后，「辣椒炒肉。」又开一轮，
   // 两轮共享同一个停嘴。把同一个停嘴记两次，第二轮会虚高到 3–5 秒。
+  // 这条不变式现在由 `latency-report.computeTurns()` 的「一个 gate.close 只给
+  // 一轮用」保证 —— 审计器只映射它的结果，不再自己配对（旧逻辑靠 usedStops）。
   const rows: Ev[] = [
     [0, 'asr.partial', { text: '嗯' }],
     [3200, 'gate.close', { gapMs: 600 }], // 停嘴 = 2600
@@ -216,6 +218,37 @@ test('接管成功的轮次不报 lane.fallback', () => {
   rows.splice(4, 0, [at(0, 505), 'agent.lane', { lane_ok: true, text_ok: true }]);
   const r = checkTrace(trace(rows));
   assert.deepEqual(r.violations.filter((v) => v.rule === 'lane.fallback'), []);
+});
+
+test('新版 agent.lane：车道挂了退回级联（why=live-down）要报红', () => {
+  // 新版事件已经没有 `text_ok`。以前按 `lane_ok:false && text_ok:true` 判，
+  // 这条规则永远不成立 —— 上线以来一次没报过（静默失明）。
+  const rows = healthyTurn(0);
+  rows.splice(4, 0, [at(0, 505), 'agent.lane', {
+    has_lane: true, lane_ok: false, ok: false, lane: 'cascade', why: 'live-down', state: 'broken',
+  }]);
+  const r = checkTrace(trace(rows));
+  assert.ok(r.violations.some((v) => v.rule === 'lane.fallback'), JSON.stringify(r.violations));
+});
+
+test('新版 agent.lane：正常交给 dsh（lane=dsh, why=action）不报', () => {
+  // lane_ok:false 只说明车道没接活，这一句本来就归 dsh（含动作词），
+  // 用户只会听到一副嗓子，不该算「退回级联」。
+  const rows = healthyTurn(0);
+  rows.splice(4, 0, [at(0, 505), 'agent.lane', {
+    has_lane: true, lane_ok: false, ok: false, lane: 'dsh', why: 'action',
+  }]);
+  const r = checkTrace(trace(rows));
+  assert.deepEqual(r.violations.filter((v) => v.rule === 'lane.fallback'), []);
+});
+
+test('旧版 agent.lane（无 lane 字段）：text_ok:true + lane_ok:false 仍兼容报红', () => {
+  // 历史档案里 `agent.lane` 只有 {lane_ok, text_ok}，没有 lane/why。
+  // 兼容分支必须继续认得这种格式，否则旧档案回放时会漏掉违约。
+  const rows = healthyTurn(0);
+  rows.splice(4, 0, [at(0, 505), 'agent.lane', { lane_ok: false, text_ok: true }]);
+  const r = checkTrace(trace(rows));
+  assert.ok(r.violations.some((v) => v.rule === 'lane.fallback'), JSON.stringify(r.violations));
 });
 
 /** 健康轮里的相对时刻 */
