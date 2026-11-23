@@ -84,9 +84,17 @@ export function trackActivity(
       }
     },
     ...(agent.setAnnouncer === undefined ? {} : { setAnnouncer: agent.setAnnouncer.bind(agent) }),
+    // 放手那一轮的答案回注记忆：漏转发 = 被打断的委派轮答案彻底消失（静默降级）
+    ...(agent.setDetachedAnswerSink === undefined
+      ? {}
+      : { setDetachedAnswerSink: agent.setDetachedAnswerSink.bind(agent) }),
     ...(agent.attachLiveSink === undefined ? {} : { attachLiveSink: agent.attachLiveSink.bind(agent) }),
     // 每个可选能力都必须显式透传 —— 漏一个就是静默降级（`keepalive.ts` 顶部踩过）
     ...(agent.cancelTurn === undefined ? {} : { cancelTurn: agent.cancelTurn.bind(agent) }),
+    // 放手 / 有没有活儿：漏这两条 = 委派轮被打断时既不取消也不放手，
+    // dsh 跑完之后答案直接消失（`FrontedAgent` 里的 `inner.detachTurn?.()` 静默空转）
+    ...(agent.detachTurn === undefined ? {} : { detachTurn: agent.detachTurn.bind(agent) }),
+    ...(agent.dshBusy === undefined ? {} : { dshBusy: agent.dshBusy.bind(agent) }),
     // 「交给慢车道了」的回执钩子：漏转发 = 委派轮永远没有回执（静默降级）
     ...(agent.setDelegateHook === undefined
       ? {}

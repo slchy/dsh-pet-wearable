@@ -405,6 +405,10 @@ export class DshSession {
    * 放手那一轮的答复文本（独立一份：新一轮开起来会清 `assistantText`）
    */
   private detachedText = '';
+  /** 放手那一轮的用户原话（回注记忆要成对，见 `onDetachedAnswer`） */
+  private detachedUserText = '';
+  /** 正在跑的那一轮的用户原话（`detachTurn` 时抄进 `detachedUserText`） */
+  private activeUserText = '';
   /**
    * 轮号：`turn/start` / `turn/end` 的 `data.turn`（dsh 自己发的单调递增整数）。
    *
@@ -443,6 +447,16 @@ export class DshSession {
    * 就是接住它的唯一入口 —— 不接就是静默丢弃。
    */
   onAnnounce: ((text: string) => void) | null = null;
+  /**
+   * 放手那一轮的答案回来了 —— **无论用户是不是已经问了新问题**都要回注记忆。
+   *
+   * 与 `onAnnounce` 分工：`onAnnounce` 是"播出去"（用户已经在问新问题时不该补播，
+   * 会打断他），这条是"记下来"。委派轮被打断之后，dsh 的活儿照样跑完了，答案就在
+   * 会话里；不记的话用户之后提起这件事，快车道和 omni 都当没发生过。
+   */
+  onDetachedAnswer:
+    | ((userText: string, answer: string, spoken: boolean) => void)
+    | null = null;
   /**
    * 流式文本（侧通道）。三个事件：`start` 交出前 N 个 token、`delta` 逐 token 直通、
    * `end` 这条流结束。**没到阈值的整段也走 start+end**，调用方据 `gate.streaming`
@@ -570,7 +584,8 @@ export class DshSession {
   cancelTurn(ticket?: TurnTicket): void {
     const sessionId = this.openSessionId ?? this.readSession();
     const waiter = this.onIdle;
-    if (this.proc === null || sessionId === null || waiter === null) {
+    // 放手的委派轮没有等待者，但它**还在跑** —— 那里也要能取消（用户显式下令取消）
+    if (this.proc === null || sessionId === null || (waiter === null && !this.detached)) {
       return;
     }
     // **按代次丢弃迟到的取消**：只有「当前在途那一轮」的票据才允许取消。
@@ -597,11 +612,30 @@ export class DshSession {
       );
     }
     setTimeout(() => {
-      if (this.onIdle === waiter) {
+      if (waiter !== null && this.onIdle === waiter) {
         this.onIdle = null;
         waiter();
       }
     }, CANCEL_GRACE_MS).unref?.();
+    // 放手那一轮被取消：它不会再结算了，把等着回注的那份也一起清掉 ——
+    // 用户说了"不要了"，答案就不该再回注记忆
+    if (this.detached) {
+      this.detached = false;
+      this.detachedTurn = null;
+      this.detachedText = '';
+      this.detachedUserText = '';
+      this.log('  取消    放手的委派轮也一起取消（用户显式说了不要）');
+    }
+  }
+
+  /**
+   * dsh 那边有没有在跑的活儿（含**放手的**委派轮）。
+   *
+   * 用户说「算了 / 别查了」时要据此决定是否真的发取消 —— 没有在跑的东西，那就是
+   * 一句普通闲聊，别去打扰 dsh。
+   */
+  isBusy(): boolean {
+    return this.proc !== null && (this.onIdle !== null || this.detached);
   }
 
   /**
@@ -650,6 +684,7 @@ export class DshSession {
     this.detached = true;
     this.detachedTurn = this.currentTurn;
     this.detachedText = this.assistantText.trim();
+    this.detachedUserText = this.activeUserText;
     if (this.detachedTurn === null) {
       // 还没收到 turn/start：下一次 turn/end 就是它的（dsh 串行，不会有别人的）
       this.log('  放手    放手的时刻还没开轮 → 认下一次 turn/end');
@@ -698,11 +733,22 @@ export class DshSession {
     this.detachedText = '';
     this.assistantText = '';
     if (text === '') {
+      this.detachedUserText = '';
       return;
+    }
+    // 回注记忆**先于**「要不要补播」这个判断：答案是真的，用户听没听到是另一回事
+    const userText = this.detachedUserText;
+    this.detachedUserText = '';
+    // `onIdle === null` 表示没有新一轮在等 → 下面会走播报，用户能听到
+    const willSpeak = this.onIdle === null && this.onAnnounce !== null;
+    try {
+      this.onDetachedAnswer?.(userText, text, willSpeak);
+    } catch (error) {
+      this.log(`  放手    ✗ 回注失败：${(error as Error).message}`);
     }
     // 用户已经问了新问题时旧答案直接丢掉，别补播一次他不想听的
     if (this.onIdle !== null) {
-      this.log('  放手    答案回来时用户已经问了新问题 → 丢掉这一条');
+      this.log('  放手    答案回来时用户已经问了新问题 → 不补播（已回注记忆）');
       return;
     }
     if (this.onAnnounce) {
@@ -819,6 +865,7 @@ export class DshSession {
     this.spontaneous.reset();
     // 记下这一轮的票据：`cancelTurn(ticket)` 靠它丢弃迟到的取消
     this.activeTicket = ticket ?? null;
+    this.activeUserText = text;
     this.cancelRequested = false;
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
 

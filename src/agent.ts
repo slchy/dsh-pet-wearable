@@ -154,6 +154,13 @@ export class VoiceAgent {
     this.announcer = cb;
   }
 
+  /** 放手那一轮跑完之后把答案交出去（回注记忆，见 `DshSession.onDetachedAnswer`）。 */
+  setDetachedAnswerSink(
+    cb: ((userText: string, answer: string, spoken: boolean) => void) | null,
+  ): void {
+    this.session.onDetachedAnswer = cb;
+  }
+
   /** 当前会话 id（新会话时为 null，第一次 ask 之后才有值）。 */
   get sessionId(): string | null {
     return this.session.currentSessionId;
@@ -172,6 +179,22 @@ export class VoiceAgent {
   /** 取消在途一轮（快车道胜出后，慢车道那一轮已经没人要了）。 */
   cancelTurn(ticket?: TurnTicket): void {
     this.session.cancelTurn(ticket);
+  }
+
+  /**
+   * 放手：不取消 dsh 那一轮，只把「有人在等它」摘掉（见 `DshSession.detachTurn`）。
+   *
+   * **曾经漏了这个方法**：`FrontedAgent` 里是 `this.inner.detachTurn?.(ticket)`，
+   * 可选调用遇到 undefined 就静默空转 —— 于是"插话后委派轮跑完还能听到答案 /
+   * 答案会回注记忆"从来没发生过，日志里连一行都不出。
+   */
+  detachTurn(ticket?: TurnTicket): void {
+    this.session.detachTurn(ticket);
+  }
+
+  /** dsh 手上有没有活儿（含放手的委派轮）。 */
+  dshBusy(): boolean {
+    return this.session.isBusy();
   }
 
   /** 硬中断：SIGINT 给 dsh 子进程（会退出，下一轮重启）。 */

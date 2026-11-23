@@ -372,31 +372,39 @@ test('转交后被插话：不再等 dsh 的答案，立刻收轮', async () => 
   assert.equal(result.speech, '行，我这就给你细说。', '`said` 仍是垫话，不是没念的 dsh 答案');
 });
 
-test('omni 先念了正文才发 tool_call：先掐掉那截，再让 dsh 从头说', async () => {
-  // 真机 2026-11-23 05:14 第 9 轮：omni 先播 4.96 s 瞎编，紧接着 dsh 的 7.44 s 接上，
-  // 整轮 12.40 s —— 两份互不相干的回答拼在一起，比只给一份更难听。
-  // 现在的处置：下发 `audio.stop` 清掉设备缓冲，把已经念的那截从本轮账上抹掉，
-  // 再让 dsh 从头说（阈值 800 ms：还停在垫音/开场白的量级）。
+test('omni 念了一段回执才发 tool_call：回执保留，dsh 的答案接在后面', async () => {
+  // 真机 2026-11-23 15:2x 第 8/9 轮：omni 先念 2.2 s / 3.4 s，代码掐断重来，
+  // 于是同一段内容听两遍（还夹 4.25 s 静音）。`audio.stop` 只清得掉设备**还没播**的
+  // 缓冲，已经听到的追不回来 —— 掐断重说永远比"接在后面"更差。
+  //
+  // 现在的处置：omni 说的那句就是**回执**，留着；dsh 的答案接在后面。
+  // "回执要短"靠提示词纪律（`omni-shadow.ts` 的 `DEFAULT_INSTRUCTIONS`），
+  // 不在这里用阈值判 —— 判了就得二选一，"掐断重说"和"干脆不转交"两种都难看。
   const r = rig({
     deltas: [],
     reply: { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' },
-    audio: Array.from({ length: 160 }, () => '念'), // 160 × 10 ms = 1.6 s > 800 ms
+    audio: Array.from({ length: 160 }, () => '念'), // 160 × 10 ms = 1.6 s 回执
     omniDelegate: 'delegate',
+    // 真机这一轮走的就是 omni：宿主据此不启流式 TTS，垫在后头的 dsh 答案才有泵可用
+    willServe: true,
   });
   const result = await r.run();
   const end = r.payloads.find((p) => p.name === 'turn.end');
 
   assert.ok(result);
-  assert.ok(r.logs.some((line) => line.includes('先掐掉再让 dsh 说')), '要留痕');
   assert.ok(
-    r.deviceCalls.some((call) => call.op === 'audio.stop'),
-    '必须先掐掉前面那截废话',
+    r.logs.some((line) => line.includes('回执 → 转交 dsh')),
+    '要留痕，否则"保留回执"这件事在档案里看不见',
   );
-  // 掐掉的部分不进账：`said` / `audio_s` 只记 dsh 那一份
-  assert.equal(end?.data.path, 'dsh', '这一轮最终是 dsh 答的');
   assert.ok(
-    !String(end?.data.said ?? '').startsWith('念念念'),
-    'omni 那截不该出现在 said 里',
+    !r.deviceCalls.some((call) => call.op === 'audio.stop'),
+    '不许掐断：掐断之后 dsh 从头再说一遍就是同一段听两遍',
+  );
+  assert.equal(end?.data.path, 'dsh', '这一轮最终是 dsh 答的');
+  assert.deepEqual(
+    r.whole,
+    ['慢车道答复。'],
+    '回执已经原样下行过，dsh 的答案只能补在后面，不能被回执替换',
   );
 });
 test('omni 发 tool_call 且一个字都没出声：dsh 的答案走 TTS 念出来', async () => {

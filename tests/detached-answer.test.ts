@@ -109,6 +109,8 @@ function makeSession(
 ): {
   readonly session: DshSession;
   readonly announced: string[];
+  /** 回注记忆的出口：`[用户原话, 答案, 会不会补播]` */
+  readonly recalled: Array<[string, string, boolean]>;
   readonly logs: string[];
   readonly dir: string;
   /** 等到假 dsh 真的收到第 n 条 prompt（握手是异步的，等睡固定毫秒不算） */
@@ -128,9 +130,15 @@ function makeSession(
   });
   const announced: string[] = [];
   session.onAnnounce = (text) => { announced.push(text); };
+  /** 回注记忆的出口：`[用户原话, 答案, 会不会补播]` */
+  const recalled: Array<[string, string, boolean]> = [];
+  session.onDetachedAnswer = (userText, answer, spoken) => {
+    recalled.push([userText, answer, spoken]);
+  };
   return {
     session,
     announced,
+    recalled,
     logs,
     dir,
     waitPrompt: async (n = 1) => {
@@ -204,6 +212,51 @@ test('放手后又开新一轮：旧答案既不播、也不能串成新一轮�
 
     await wait(300);
     assert.deepEqual(h.announced, [], '已经被新一轮顶掉的旧答案不能再补播一次');
+    assert.deepEqual(
+      h.recalled,
+      [['查一下机器', '答案1', false]],
+      '不补播 ≠ 丢掉：用户之后提起这件事，模型得知道答案是什么',
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test('放手后被播报出来的那一轮：`spoken` 为真（回注措辞要照实说"已经念过"）', async () => {
+  const h = makeSession();
+  try {
+    const pending = h.session.ask('查一下机器', undefined, { ticket });
+    await h.waitPrompt();
+    h.session.detachTurn(ticket);
+    await pending;
+    await wait(400);
+    assert.deepEqual(h.announced, ['查到两台，都在跑。1']);
+    assert.deepEqual(
+      h.recalled,
+      [['查一下机器', '查到两台，都在跑。1', true]],
+      '播出去了就要让回注口径是"已经用语音念过"',
+    );
+  } finally {
+    h.dispose();
+  }
+});
+
+test('用户显式下令取消：连**已放手**的那一轮也一起取消，答案不再回注', async () => {
+  const h = makeSession('答案', 400);
+  try {
+    const pending = h.session.ask('查一下机器', undefined, { ticket });
+    await h.waitPrompt();
+    h.session.detachTurn(ticket);
+    await pending;
+
+    assert.equal(h.session.isBusy(), true, '放手的轮还在跑，用户说"算了"才有东西可取消');
+    // 不带票据：放手的轮没有等待者，票据比对在那里也不成立
+    h.session.cancelTurn();
+    assert.equal(h.session.isBusy(), false, '取消之后就没有活儿了');
+
+    await wait(600);
+    assert.deepEqual(h.recalled, [], '用户说了不要了，答案不该再回注记忆');
+    assert.deepEqual(h.announced, [], '也不该补播');
   } finally {
     h.dispose();
   }

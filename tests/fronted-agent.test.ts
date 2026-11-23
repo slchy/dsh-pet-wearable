@@ -955,3 +955,35 @@ test('对冲：第 2 份赢的时候，插话取消必须掐得住它', async ()
     '★ 胜出的那份也必须被取消掐住 —— 否则插话之后快模型还在生成、继续往 TTS 推字',
   );
 });
+
+test('「算了」且有活儿在跑：取消那一轮，回一句短的，不再交给 dsh', async () => {
+  // 用户显式下令取消是**唯一**会真的取消在跑 dsh 任务的路径：插话只放手
+  // （活儿取消不了，答案跑完回注记忆），"不要了"才是取消。
+  const inner = fakeInner();
+  let cancelled = 0;
+  const busyInner: AgentProvider = {
+    ...inner.agent,
+    dshBusy: () => true,
+    cancelTurn: () => { cancelled += 1; },
+  };
+  const agent = agentWith(busyInner, async () => sse(['不该被问到']));
+
+  const reply = await agent.reply('算了。');
+  assert.equal(cancelled, 1, '要真的发出取消，不能只回一句话');
+  assert.equal(reply.speech, '好，不查了。');
+  assert.deepEqual(inner.calls, [], '取消轮不该再往 dsh 送一轮');
+});
+
+test('「算了」但手上没活儿：它就是一句普通闲聊，不要回执也不要乱取消', async () => {
+  const inner = fakeInner();
+  const idleInner: AgentProvider = {
+    ...inner.agent,
+    dshBusy: () => false,
+    cancelTurn: () => {},
+  };
+  const agent = agentWith(idleInner, async () => sse(['算就算了吧。']));
+
+  const reply = await agent.reply('算了。');
+  assert.notEqual(reply.speech, '好，不查了。', '没有在跑的东西，就别假装替他取消了');
+  assert.equal(reply.speech, '算就算了吧。', '照常走快车道/慢车道');
+});

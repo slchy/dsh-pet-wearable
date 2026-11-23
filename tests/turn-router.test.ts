@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { routeTurn, type RouteContext } from '../src/turn-router.ts';
+import { isCancelRequest, routeTurn, type RouteContext } from '../src/turn-router.ts';
 
 const base: RouteContext = { live: 'ready', cascade: true, dshAwaiting: false, lastLane: null };
 
@@ -65,4 +65,15 @@ test('两条快车道都不可用 → dsh（出声优先于速度）', () => {
     lane: 'dsh',
     why: 'no-fast-lane',
   });
+});
+
+test('显式取消：只认短句，别把正常说话当成中断指令', () => {
+  // 用户明确说「不要了」才取消在跑的 dsh 任务；插话（打断）走的是**放手**，
+  // 答案跑完会回注记忆。这条判据把两种意图分开。
+  for (const said of ['算了', '算了。', '别查了', '不用了', '取消', '停一下']) {
+    assert.equal(isCancelRequest(said), true, `「${said}」应当算取消`);
+  }
+  for (const said of ['算了算了他算得对', '你算什么？', '不用了但我还想知道结果', '那台机器算什么配置']) {
+    assert.equal(isCancelRequest(said), false, `「${said}」是正常说话`);
+  }
 });

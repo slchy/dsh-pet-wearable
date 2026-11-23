@@ -36,6 +36,30 @@ export type Lane = 'live' | 'cascade' | 'dsh';
 const ACTION_CUES =
   /(记一下|记下来|提醒我|定个|订一下|预约|开个|打开|关掉|关闭|删除|删掉|清掉|发个|发一条|查一下|搜一下|查查|搜搜|读一下|念一下)/u;
 
+/**
+ * 「不要了」——用户**显式下令取消**在跑的委派任务。
+ *
+ * 与「插话」严格分开：插话是"我先说别的"，dsh 那一轮**不取消**（活儿取消不了，
+ * 取消只作废下游输出，丢的是用户唯一能听到的答案），跑完的答案回注记忆；
+ * 只有这一句才是真的"别查了"。
+ *
+ * 判据要求整句就是那几个说法：`算了算了他算得对` 这种是正常说话，不能当中断指令。
+ */
+const CANCEL_CUES: ReadonlySet<string> = new Set([
+  '算了', '不要了', '不用了', '别查了', '不查了', '不用查了',
+  '取消', '停下', '停', '停一下', '别弄了', '不用弄了',
+]);
+
+/** 这句是不是"取消在跑的任务"。调用方还要自己确认真有活儿在跑 */
+export function isCancelRequest(text: string): boolean {
+  const t = text.replace(/[\s，。、！？；：,.!?;:"'“”‘’]/gu, '');
+  if ([...t].length > 8) {
+    return false;
+  }
+  const bare = t.replace(/(吧|啊|呀|嘛|呗|哈)$/u, '');
+  return CANCEL_CUES.has(bare) || CANCEL_CUES.has(t);
+}
+
 export interface RouteContext {
   /** 音频直出车道（Live）现在能不能接活。**只报事实**：off=没开、down=断了 */
   readonly live: 'ready' | 'down' | 'off';

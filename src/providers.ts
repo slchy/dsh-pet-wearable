@@ -339,6 +339,13 @@ export interface AgentProvider {
    */
   detachTurn?(ticket?: TurnTicket): void;
   /**
+   * 可选能力：慢车道**手上有没有活儿**（含放手的委派轮）。
+   *
+   * 用户说「算了 / 别查了」时要据此决定是否真的发取消：没有在跑的东西，那就是一句
+   * 普通闲聊，不该去打扰 dsh。
+   */
+  dshBusy?(): boolean;
+  /**
    * 可选能力：**后台任务状态**的一句话事实（「在跑什么 / 刚跑完什么 / 什么都没有」）。
    *
    * 数据来自 dsh 自己发的事件（`job/registered`、`job/settled`、`subagent/catalog`），
@@ -367,6 +374,18 @@ export interface AgentProvider {
    * 汇报的语气标签在这里就被截掉了 —— 模型写 `[开心]跑完了`，播出来还是平静。
    */
   setAnnouncer?(cb: ((speech: string, emotion?: string) => void) | null): void;
+  /**
+   * 可选能力：**放手那一轮**（委派轮被打断、但没取消）跑完之后，把答案交出来。
+   *
+   * 与 `setAnnouncer` 的分工：`setAnnouncer` 是"播出去"，用户已经在问新问题时不该
+   * 补播；这条是"记下来"—— 无论用户听没听到，都要回注记忆，否则用户之后提起这件
+   * 事，两条车道都当没发生过。
+   *
+   * `spoken` 表示这次答案会不会顺带播出去（播报口还挂着、也没人在等新答案）。
+   */
+  setDetachedAnswerSink?(
+    cb: ((userText: string, answer: string, spoken: boolean) => void) | null,
+  ): void;
   /**
    * 可选能力：**这一轮交给慢车道了**，编排层可以给用户一句回执（「我看看。」）。
    *

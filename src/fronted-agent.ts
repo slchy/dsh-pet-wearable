@@ -41,7 +41,7 @@ import { cleanForSpeech } from './agent.ts';
 import { EVENTS } from './events.ts';
 import { parseEmotion } from './emotion.ts';
 import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TurnContext } from './providers.ts';
-import { routeTurn, type Lane, type RouteDecision } from './turn-router.ts';
+import { isCancelRequest, routeTurn, type Lane, type RouteDecision } from './turn-router.ts';
 import { ConversationLedger, type LedgerLane } from './conversation-ledger.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
@@ -815,6 +815,10 @@ export class FrontedAgent implements AgentProvider {
         // 忽略
       }
     };
+    // 放手那一轮跑完之后：答案回注记忆（见 `onDetachedAnswer`）
+    this.inner.setDetachedAnswerSink?.((userText, answer, spoken) => {
+      this.onDetachedAnswer(userText, answer, spoken);
+    });
   }
 
   get name(): string {
@@ -856,6 +860,16 @@ export class FrontedAgent implements AgentProvider {
 
   setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
     this.inner.setAnnouncer?.(cb);
+  }
+
+  /**
+   * 外层（`main.ts`）一般不用自己挂：`FrontedAgent` 在构造时就装好回注出口。
+   * 这里转发给内层，是为了「套了 `KeepAlive` 之类装饰器」时还能一路传下去。
+   */
+  setDetachedAnswerSink(
+    cb: ((userText: string, answer: string, spoken: boolean) => void) | null,
+  ): void {
+    this.inner.setDetachedAnswerSink?.(cb);
   }
 
   /** 挂/摘音频直出车道（omni）。见 `FastLaneAudioLane` */
@@ -1294,6 +1308,12 @@ export class FrontedAgent implements AgentProvider {
         { silent: turn.receiptSpoken === true },
       );
     }
+    // 用户**显式下令取消**（"算了 / 别查了"）：替他把在跑或已放手的委派任务掐掉。
+    // 与插话严格分开 —— 插话只是"我先说别的"，委派轮会放手跑完、答案回注记忆；
+    // 只有这一句才是"不要了"。没有活儿在跑时它就是一句普通闲聊，照常往下走。
+    if (isCancelRequest(userText) && this.cancelRunningTask()) {
+      return { text: '好，不查了。', speech: '好，不查了。', path: 'fast' };
+    }
     // 新一轮：投机的次数配额按轮算（上一轮用完不能让下一轮一直没法投机）
     this.speculateStarts = 0;
     this.turnStartedAt = this.now();
@@ -1661,6 +1681,50 @@ export class FrontedAgent implements AgentProvider {
     } finally {
       this.delegating = false;
     }
+  }
+
+  /**
+   * 用户显式下令取消：把 dsh 手上（含已放手的）那一轮真的取消掉。
+   *
+   * 不带票据地调 `inner.cancelTurn()` —— 放手的委派轮已经没有等待者，票据比对在
+   * 那里也不成立，唯一的目的就是把在跑的那一轮停掉。返回"确实取消了"，让调用方
+   * 决定要不要回一句「好，不查了」。
+   */
+  private cancelRunningTask(): boolean {
+    if (this.inner.dshBusy?.() !== true) {
+      return false;
+    }
+    this.log('  委派    用户显式下令取消 → 取消 dsh 手上那一轮');
+    try {
+      this.inner.cancelTurn?.();
+    } catch (error) {
+      this.log(`  委派    ✗ 取消失败：${(error as Error).message}`);
+    }
+    return true;
+  }
+
+  /**
+   * 放手那一轮的答案回来了 → **回注记忆**（不管用户有没有已经在问下一句）。
+   *
+   * 委派轮被打断时我们走的是**放手**而不是取消（`session.detachTurn`）：dsh 的活儿
+   * 取消不了，`session/cancel` 只作废下游输出，结果就是「活儿干完了、答案没了」。
+   * 跑完的答案走这里：记进快车道的窗口（下一轮 dsh 同步会带上），并回注 omni 的
+   * 服务端历史 —— 这样用户之后提起这件事，两条车道都知道答案是什么。
+   *
+   * 与播报（`setAnnouncer`）分开：用户已经在问新问题时不该补播，但**必须记下来**。
+   */
+  private onDetachedAnswer(userText: string, answer: string, spoken: boolean): void {
+    const speech = cleanForSpeech(parseEmotion(answer).rest);
+    if (speech === '') {
+      return;
+    }
+    const question = userText.trim() === '' ? '（上一轮被打断的问题）' : userText.trim();
+    this.log(
+      `  委派    放手的答案回来了（${[...speech].length} 字，${spoken ? '会补播' : '不补播'}）`
+      + ' → 回注记忆',
+    );
+    this.rememberDsh(speech, question);
+    this.injectAnsweredTurn(question, speech, spoken ? 'spoken' : 'unspoken');
   }
 
   /** 记下 dsh 最后说的话（快模型下一轮要看：它在问什么、答案是什么） */

@@ -46,15 +46,6 @@ const PLAYBACK_POLL_MS = 100;
  */
 const PLAYED_GRACE_MS = 3_000;
 
-/**
- * omni 已经念出去这么久的**正文**才发 `tool_call`：不再把 dsh 的答案拼在后面。
- *
- * 垫话（「我看看」「行，我这就给你细说」）都在 1–2 s 内，远小于这个值；
- * 真机 2026-11-23 05:14 第 9 轮是 4.96 s 的瞎编正文后面又接了 7.44 s 的 dsh 答案 ——
- * 用户听到的是两段互不相干的回答。
- */
-const OMNI_DELEGATE_MAX_SPOKEN_MS = 800;
-
 export interface TurnRunnerOptions {
   /** 时钟端口：一轮里的所有等待与计时都走它（模拟器要用虚拟时间） */
   readonly clock: Clock;
@@ -605,31 +596,23 @@ export class TurnRunner {
           // 一个字都没合成 —— 期间状态机一直挂在 `thinking`，下一轮已经开跑了。
           this.log('  omni    想转交 dsh，但本轮已作废 → 不问了');
         } else if (why !== null) {
-          // omni 自己发了 tool_call：就地切给 dsh。
+          // omni 自己发了 `tool_call`：转交 dsh。
           //
-          // **但先看它前面说了多少**：已经念出去一截正文才想起要转交，就把那截掐掉
-          // （`audio.stop` + 从本轮账上抹掉），再让 dsh 从头说 —— 绝不能把两份答案
-          // 硬拼成缝合怪（真机 2026-11-23 05:14 第 9 轮：omni 先播 4.96 s 瞎编，
-          // 紧接着 dsh 的 7.44 s 接上，整轮 12.40 s）。
+          // **omni 在转交前说的那句就是回执**，不是要掐掉的废话 —— 留着它，dsh 的
+          // 答案接在后面。绝不掐断重说：`audio.stop` 只清得掉设备**还没播**的缓冲，
+          // 已经听到的追不回来，掐断之后 dsh 从头再讲一遍就是同一段内容听两遍
+          // （真机 2026-11-23 15:2x 第 8/9 轮：omni 先念 2.2 s / 3.4 s，掐断之后
+          //   dsh 又从头说了 13.52 s / 10.40 s，中间还静了 4.25 s）。
           //
-          // 阈值 800 ms（原 1500）：1500 时那半句已经说完一个意思，截断反而更突兀；
-          // 800 还停在垫音/开场白的量级，截掉损失最小。
+          // "回执要短"是**提示词纪律**（`omni-shadow.ts` 的 `DEFAULT_INSTRUCTIONS`），
+          // 不在这里用阈值判：判了就得二选一，"掐断重说"和"干脆不转交"两种都难看。
           const spokenMs = pcm16DurationMs(audioBytes, audioRate);
-          if (audioBytes > 0 && spokenMs >= OMNI_DELEGATE_MAX_SPOKEN_MS) {
-            this.log(
-              `  omni    已经念了 ${(spokenMs / 1000).toFixed(1)} s 正文才要转交`
-              + ' → 先掐掉再让 dsh 说',
-            );
-            this.options.sendCall?.({ op: 'audio.stop' });
-            // 掐掉的这截不算进 `audioBytes` / `speech`：用户最终听到的是 dsh 那一份，
-            // `turn.end` 的 `said` / `truncated` 都该按它记。
-            audioBytes = 0;
-            firstAudioAtMs = -1;
-            speech = '';
-          } else {
-            // 已经出过声（垫音）就不再叠回执 —— 两份不同的声音接在一起很难听。
-            this.log('  omni    决定转交 dsh');
-          }
+          this.log(
+            audioBytes > 0
+              ? `  omni    说了 ${(spokenMs / 1000).toFixed(1)} s 回执 → 转交 dsh，答案接在后面`
+                + (spokenMs > 3_000 ? '（偏长：提示词没管住，见 `omni-shadow.ts` 的指令）' : '')
+              : '  omni    决定转交 dsh（它没出声，回执由 dsh 那边说）',
+          );
           // 正文用 omni 的转述（它直接听音频，专名比 ASR 准），ASR 原话只作附注 ——
           // 数字、路径、设备名这些"照抄"的东西靠原话兜底。
           const omniText = reply.audio.delegateText?.() ?? null;
@@ -640,6 +623,9 @@ export class TurnRunner {
             image, note, {
               ticket,
               forceDelegate: why,
+              // omni 已经说过回执 → 别再叠一句内核的「我查查」（两句回执）；
+              // 同时这让这一轮在被打断时**放手而不是取消**：回执等于承诺了答案，
+              // dsh 的活儿要跑完，答案回来走 `onDetachedAnswer` 回注记忆。
               receiptSpoken: speech.trim() !== '',
             },
           );
@@ -648,8 +634,9 @@ export class TurnRunner {
           const raced = await Promise.race([pending, staleSignal]);
           if (raced === STALE) {
             // 已经作废：不再等 dsh 的取消往返（真机 2.5–3.2 s），否则串行链卡着，
-            // 用户下一句要排队。`cancelTurn` 在作废那一刻已经发出去了，答案回来也没人要。
-            this.log('  omni    转交后本轮被作废 → 不再等 dsh 的答案');
+            // 用户下一句要排队。作废那一刻走的是**放手**（不取消），dsh 跑完之后
+            // 答案由 `session` 的 `onDetachedAnswer` 回注记忆，不会白跑。
+            this.log('  omni    转交后本轮被作废 → 不再等 dsh，答案回来会回注记忆');
           } else {
             reply = raced;
             replyPath = reply.path;
