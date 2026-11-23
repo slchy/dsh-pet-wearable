@@ -15,8 +15,13 @@
  * - **内核**（本文件）只判「这一轮属于哪条车道」，判据全部与引擎实现无关；
  * - **引擎**自己判「我答不答得了」（`isHealthy()` + 模型自己的 `tool_call`）。
  *   引擎说答不了 → 回来转 dsh，那是引擎的事，不是路由的事。
+ *
+ * <h2>依赖方向</h2>
+ *
+ * 这一层是**内核**，不许 import 任何引擎（`fronted-agent.ts` 曾反过来 import 本文件、
+ * 本文件又 import 它 —— 循环依赖在 ESM 下能跑，但谁先初始化谁就踩 TDZ）。
+ * 三个「这句话是什么形态」的判据因此住在这里（路由要用它们），由引擎原样转出。
  */
-import { looksLikeAnswer, looksLikeFollowUp, looksMemorable } from './fronted-agent.ts';
 
 /** 先由谁答。`dsh` 不是「另一个引擎」，它是慢车道，路由可以直接指定它 */
 export type Lane = 'live' | 'cascade' | 'dsh';
@@ -58,6 +63,83 @@ export function isCancelRequest(text: string): boolean {
   }
   const bare = t.replace(/(吧|啊|呀|嘛|呗|哈)$/u, '');
   return CANCEL_CUES.has(bare) || CANCEL_CUES.has(t);
+}
+
+// ---------------------------------------------------------------- 句子的形态
+//
+// 下面三条原来住在 `fronted-agent.ts`，但 `routeTurn()` 要用它们，于是两个模块
+// 互相 import。搬到这里之后依赖只有一个方向：**引擎 → 内核**。
+// 外部（含 `tests/fronted-agent.test.ts`）仍从 `fronted-agent.ts` 导入 —— 那边原样转出。
+
+/**
+ * 「这句值得长期记住」的本地判据 —— 只用来**提议**，不写。
+ *
+ * 记忆是 L2 的单一职责（`MEMORY.md` 只有 `remember` 工具能追加）。L1 在这里只做
+ * 「这句话像长期事实」的粗筛，把**用户原话**原样带去给 L2，由它决定写不写。
+ * 这样提议不可能被模型改写成一句错误的事实，也不需要多一次模型调用。
+ */
+const MEMORY_PROPOSALS: readonly RegExp[] = [
+  /^我(叫|姓|住|在|是)/,
+  /记住/,
+  /别忘了/,
+  /我(最)?(喜欢|讨厌|不吃|爱吃)/,
+  /我的.{0,8}是/,
+];
+
+/** 问句不是事实，绝不能拿去提议（实测「我姓什么来着」被 `^我姓` 误抓过） */
+export const QUESTION_SHAPE = /[?？]|什么|哪|吗|呢|来着|多少|怎么|谁/;
+
+/** 像不像值得提议长期记住的一句话（太长的不算：那是叙述，不是事实） */
+export function looksMemorable(text: string): boolean {
+  const t = text.trim();
+  if (t === '' || t.length > 30) {
+    return false;
+  }
+  if (QUESTION_SHAPE.test(t)) {
+    return false;
+  }
+  return MEMORY_PROPOSALS.some((re) => re.test(t));
+}
+
+/** 短回话的形状：dsh 在等确认时，这类句子必须交给它，不能当闲聊答掉 */
+const CONFIRM_WORDS: readonly string[] = [
+  '好的', '好呀', '好啊', '好', '行', '可以', '对', '是', '嗯', '要', '不',
+  '确认', '取消', '继续', '没错', '算了', '不用', '不要', '谢谢',
+];
+
+/** 这句像不像在回应上一句问话 */
+export function looksLikeAnswer(text: string): boolean {
+  const t = text.trim().replace(/[。！!，,、？?…\s]/g, '');
+  if (t === '' || t.length > 8) return false;
+  return CONFIRM_WORDS.some((w) => t.includes(w));
+}
+
+/**
+ * 承接句的记号：只说「怎么讲」，不说讲什么。
+ *
+ * 纯机械，不做语义推断（和 `looksLikeAnswer` / `looksUnfinished` 同一条原则）。
+ */
+const FOLLOW_UP_CUES: readonly string[] = [
+  '讲讲', '说说', '讲一下', '说一下', '展开', '详细', '具体', '梗概', '大概',
+  '然后呢', '后来呢', '接着', '还有呢', '为什么', '怎么说',
+];
+
+/**
+ * 这句像不像在**接着上一轮追问**（没有主语，全靠上文）。
+ *
+ * 为什么要它：上一轮由 dsh 答完、用户紧接着说「你讲讲梗概。」——只有 6 个字，
+ * 过得了快车道的字数闸，于是被送去 omni 直出。而 omni 那边只听过音频、
+ * 不知道 dsh 答了什么，只能**编**（真机 `20261123-053719` 第 5 轮：10.40 s
+ * 「人类在宇宙里发现一本神秘的书」）。这类句子必须留在**知道上文的那条路**上。
+ *
+ * 只认「短 + 有承接记号 + 没带专名」：带了《》「」或者超过 12 个字就是新问题，
+ * 不敢拦 —— 拦错了是把能用 omni 的轮次白白扔给 dsh。
+ */
+export function looksLikeFollowUp(text: string): boolean {
+  const t = text.trim();
+  if (t === '' || t.length > 12) return false;
+  if (/[《》「」『』"]/.test(t)) return false;
+  return FOLLOW_UP_CUES.some((w) => t.includes(w));
 }
 
 export interface RouteContext {

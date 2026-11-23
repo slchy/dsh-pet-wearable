@@ -13,16 +13,35 @@
  *    `silenceMs` 曾经由三个模块各算一遍（20 / 100 / 150 / 200 ms 四个阈值）。
  * 2. {@link AsrSyncState}——ASR 与组装器共享的因果状态。「手上还有没有没解完的一段」
  *    曾经无处可查，于是判停拿半句话开了轮，后半句解回来成了「插话」，把自己掐死。
- * 3. {@link TurnInput} 的 `baseCommitSeq`——开轮瞬间已发出的最大 commit 序号。
- *    **旧段不可能变成插话**：那段音频是在我们出声之前录的。
+ * 3. `baseCommitSeq`——开轮瞬间已发出的最大 commit 序号。**旧段不可能变成插话**：
+ *    那段音频是在我们出声之前录的。它有两处落点，各回答一个问题：
+ *    - `TurnTicket`（`dialog-fsm.ts`）上的 `baseCommitSeq` / `startedAtMs`：
+ *      开轮瞬间由确定性内核（`kernel.ts` 的 `beginTurn`）经宿主上下文**锁存**，
+ *      此后不再变。判「这条转写是开轮前录的还是开轮后的」用的是它。
+ *    - {@link TurnInput} 上的 `baseCommitSeq`：**交给 `FastVoiceEngine.respond()`
+ *      的输入快照**，引擎据此自己决定要不要丢掉旧段的投机。
+ *    两者同源（同一个 `DialogFsmContext`），但语义不同：票据是因果坐标，
+ *    输入是那一刻交给引擎的一份拷贝。
  * 4. {@link TurnOutcome}——控制面与内容面拆权。`stale` 管 FSM 防越权，
  *    `truncated` 管记账与外部记忆回注；它们曾经是同一个 `interrupted`。
  * 5. {@link FastVoiceEngine}——Live 与级联只在这一个接口后面不同。
  *
- * **为什么 `baseCommitSeq` 不放进 `TurnTicket`**：票据由 `DialogFsm` 铸造，
- * 而 FSM 属于确定性内核、**不认识 ASR**（它只认状态与代次）。把 commit 序号塞进
- * 票据等于让状态机依赖转写层，下一次就会为了填这个字段在 FSM 里反向查 ASR。
- * 它属于「开轮时交给引擎的输入」，所以放在 {@link TurnInput} 上。
+ * ## 当前阶段边界（契约按接入进度分两段，别把「已实现」当「已接线」）
+ *
+ * - **已接热路径**：契约 ①–④（{@link AudioFrame}、{@link AsrSyncState}、
+ *   `baseCommitSeq`、{@link TurnOutcome}）及控制内核（`kernel.ts`）已全面接入生产
+ *   热路径 ——「换引擎零改内核」在这一层已经成立。
+ * - **就绪待接入（下一阶段）**：契约 ⑤（{@link FastVoiceEngine.respond} 及其两份
+ *   实现 `LiveVoiceEngine` / `CascadeVoiceEngine`）**已实现并通过契约测试**
+ *   （`tests/fast-voice-engine.test.ts`），但**尚未切入 `TurnRunner` 生产热路径**：
+ *   `TurnRunner` 当前仍维护 `omni` / `stream` / `pump` 三分支，以保留 `FrontedAgent`
+ *   的双轨投机、流式 TTS 异常回落与逐轮延迟埋点。换引擎目前仍需同步更新
+ *   `TurnRunner` —— 这是**刻意分期，非漏接线**。
+ *
+ * **为什么票上要带水位线、谁负责锁存**：票据由**确定性内核**铸造（`DialogFsm` 只是
+ * 它的门面），内核本身不认识 ASR —— 它只认显式事件。所以宿主在发 `beginTurn` 时
+ * 把「此刻最大 commit 序号」「此刻几点」一起交进来（`DialogFsmContext`），内核把它
+ * 写进票据。把 commit 序号塞进票据不等于让状态机去查 ASR：状态机仍然只读事件里的值。
  */
 
 /**
@@ -61,11 +80,14 @@ export interface AsrSyncState {
 }
 
 /**
- * 开轮时交给引擎的输入。
+ * 交给 `FastVoiceEngine.respond()` 的输入**快照**（开轮那一刻的一份拷贝）。
  *
  * `baseCommitSeq` 是这套契约里**唯一**能彻底堵住「自己后半句杀自己」的字段：
  * 转写回来时比较「它的 commit 序号 ≤ baseCommitSeq」，就该判定为旧段，
  * 既不算插话、也不开轮。不用比时钟、不用比音量——那两个都只是代理量。
+ *
+ * 与 `TurnTicket.baseCommitSeq` 同源、不同用途：票据是随结果走完整条链的因果坐标，
+ * 这里是交给引擎、让它在自己那边判「这段投机还要不要」的那一份。
  */
 export interface TurnInput {
   readonly text: string;
@@ -178,6 +200,15 @@ export type EngineEvent =
  * 铁律：`respond()` 是**唯一**会被内核 `await` 的方法。
  * 其余全部同步 `void`——订阅、放弃投机、回注都是「告诉引擎发生了什么」，
  * 引擎内部可以慢，内核绝不等。这条不靠注释守，靠签名守。
+ *
+ * ## 接入状态：就绪，但**不在**生产热路径上
+ *
+ * 本接口（契约 ⑤）的两份实现都已落地，并由 `tests/fast-voice-engine.test.ts`
+ * 按契约逐条验过。**但 `TurnRunner` 目前不走这里**：它仍按 `omni` / `stream` /
+ * `pump` 三分支调 `AgentProvider`，因为那三条分支上挂着 `FrontedAgent` 的双轨投机、
+ * 流式 TTS 的异常回落、以及逐轮延迟埋点 —— 这些先按现状保留，下一阶段再随引擎
+ * 一起收口。所以「换引擎」目前**还需要**同步改 `TurnRunner`，那是刻意分期：
+ * 契约 ①–④ 与控制内核（`kernel.ts`）已经在热路径上，这一条还没切过去，不是漏接线。
  */
 export interface FastVoiceEngine {
   readonly mode: 'live' | 'cascade';

@@ -10,6 +10,7 @@
  * 2. `willServeAudio()` 与 `reply()` 内部判据一致（宿主据此决定要不要起跑流式 TTS）
  * 3. 认领成功 → `path:'omni'` + `audio`，且 `text`/`speech` 是**活的**
  * 4. 播完回写（`noteServedTurn`）之后，下一轮的 prompt 里能看到这一轮
+ * 5. 结算回来时 `truncated` / `endedAtMs` 按**票据**对回账本，不会改到别的轮次
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -98,6 +99,60 @@ test('willServeAudio 与 reply() 判据一致：路由说 live 就真的走 live
 
   const reply = await agent.reply('帮我记一下 3 点的会');
   assert.equal(reply.path, 'dsh', '动作类必须交给 dsh');
+});
+
+test('P0-1：>14 字 / 含阿拉伯数字的闲聊也必须走 omni —— 级联的字数闸不是 omni 的闸', async () => {
+  // 真机形状：`willServeAudio()` 走的是路由（Live 只看健康度），宿主据此起跑流式
+  // TTS；而 `reply()` 里 `!candidate`（14 字上限 / 阿拉伯数字）曾排在 live 分支**前面**，
+  // 于是同一句话「宿主说走 omni、reply 却交给 dsh」—— TTS 收到空文本，整轮退化。
+  const long = '今天外面天气可真不错我刚才出去溜达了一大圈心情还特别好';
+  assert.ok([...long].length > 14, `用例本身要超过 14 字，实际 ${[...long].length}`);
+
+  for (const text of [long, '下午3点见']) {
+    const agent = makeAgent(async () => {
+      throw new Error('omni 就绪时不该再问文本模型');
+    });
+    agent.attachAudioLane(fakeLane({ serve: true, chunks: ['好呀。'] }));
+
+    assert.equal(agent.willServeAudio(text), true, `${text}：宿主该为它开流式 TTS`);
+    const reply = await agent.reply(text);
+    assert.equal(reply.path, 'omni', `${text}：reply 必须与 willServeAudio 同源`);
+  }
+});
+
+test('没配 qwen-flash key 也不能把 omni 一起关掉（两条车道不共用判据）', async () => {
+  // 曾经「删掉 qwen-flash 的 key，omni 也跟着不答」：`apiKey !== ''` 是级联的前提，
+  // 被错当成 Live 的前提。omni 吃的是整段音频，跟文本模型的 key 无关。
+  const agent = new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: '',
+    fetchImpl: async () => {
+      throw new Error('没有 key，一个请求都不该发');
+    },
+    speculate: false,
+    log: () => {},
+  });
+  agent.attachAudioLane(fakeLane({ serve: true, chunks: ['在呢。'] }));
+
+  assert.equal(agent.willServeAudio('你好呀'), true, 'Live 只看健康度，不看 apiKey');
+  const reply = await agent.reply('你好呀');
+  assert.equal(reply.path, 'omni');
+});
+
+test('账本记的是真实 truncated：noteServedTurn 的第三参直达 ledger', () => {
+  // P1-4：上游结算时才知道「用户少听了一段」，所以这个值必须是记进账本的那一个，
+  // 不能像以前那样硬编码 `false` —— 否则回注/粘性判断永远以为用户听全了。
+  const agent = makeAgent(async () => sse(['在呢哥。']));
+
+  agent.noteServedTurn('你叫什么', '我叫米馍。');
+  assert.equal(agent.ledgerTurns.at(-1)?.truncated, false, '旧的两参调用行为不变（默认听全）');
+  assert.equal(agent.ledgerTurns.at(-1)?.lane, 'live');
+
+  agent.noteServedTurn('刚才那个', '说到一半就被打断了', true);
+  const last = agent.ledgerTurns.at(-1);
+  assert.equal(last?.truncated, true, '结算说少听了一段，账本必须记下来');
+  assert.equal(last?.assistantText, '说到一半就被打断了');
+  assert.equal(last?.userText, '刚才那个');
 });
 
 test('认领成功：path=omni、带 audio、text/speech 是活的', async () => {
@@ -211,4 +266,85 @@ test('票据对不上时不动车道：迟到的取消不能掐掉下一轮', as
   await agent.reply('你好呀', undefined, undefined, { ticket: { no: 3, gen: 3 } });
   agent.cancelTurn({ no: 2, gen: 2 });
   assert.equal(lane.discarded, 0);
+});
+
+/** 可拨动的时钟：`reconcileTurnOutcome` 要验 `endedAtMs` 真的被结算值覆盖 */
+function makeTimedAgent(fetchImpl: typeof fetch, clock: { t: number }): FrontedAgent {
+  return new FrontedAgent({
+    inner: fakeInner(),
+    apiKey: 'k',
+    fetchImpl,
+    speculate: false,
+    log: () => {},
+    now: () => clock.t,
+  });
+}
+
+test('reconcileTurnOutcome 按票据把结算事实对回账本：只改那一笔', async () => {
+  const clock = { t: 1_000 };
+  const agent = makeTimedAgent(async () => sse(['在呢哥。']), clock);
+
+  // 两轮 dsh，票据不同 —— 结算只该改后记的那一笔
+  clock.t = 1_100;
+  await agent.reply('帮我查一下天气', undefined, undefined, {
+    ticket: { no: 1, gen: 1 }, forceDelegate: 'delegate',
+  });
+  clock.t = 2_000;
+  await agent.reply('帮我查一下股价', undefined, undefined, {
+    ticket: { no: 2, gen: 1 }, forceDelegate: 'delegate',
+  });
+
+  const before = agent.ledgerTurns;
+  assert.equal(before.length, 2, '两轮都该进账本');
+  assert.deepEqual(before.map((turn) => turn.lane), ['dsh', 'dsh']);
+  assert.equal(before[1]?.truncated, false, '记账那一刻还不知道用户听了多少');
+
+  clock.t = 2_500;
+  agent.reconcileTurnOutcome({ ticket: { no: 2, gen: 1 }, truncated: true, endedAtMs: 2_400 });
+
+  const after = agent.ledgerTurns;
+  assert.equal(after[1]?.truncated, true, '结算说少听了一段，账本必须记下来');
+  assert.equal(after[1]?.endedAtMs, 2_400, '结束时刻以结算为准，不是记账那一刻的粗略值');
+  assert.equal(after[0]?.truncated, false, '更早那一轮一个字段都不许动');
+  assert.equal(after[0]?.endedAtMs, 1_100, '更早那一轮的结束时刻也不许动');
+});
+
+test('reconcileTurnOutcome 票据对不上是安全空操作：不许改别的轮次', async () => {
+  const agent = makeAgent(async () => sse(['在呢哥。']));
+  agent.attachAudioLane(fakeLane({ serve: true, chunks: ['我在呢。'] }));
+  await agent.reply('你好呀', undefined, undefined, { ticket: { no: 4, gen: 2 } });
+  agent.noteServedTurn('你好呀', '我在呢。');
+
+  const live = agent.ledgerTurns.at(-1);
+  assert.equal(live?.lane, 'live');
+  assert.deepEqual(live?.ticket, { no: 4, gen: 2 }, '账本里带的是那一轮的票据');
+
+  // `no` 对上、`gen` 对不上：上一次打开的那一轮发来的迟到结算
+  agent.reconcileTurnOutcome({ ticket: { no: 4, gen: 1 }, truncated: true, endedAtMs: 1 });
+  assert.equal(agent.ledgerTurns.at(-1)?.truncated, false, '票据不匹配就不许改');
+
+  // 完全不存在的一张票
+  agent.reconcileTurnOutcome({ ticket: { no: 999, gen: 9 }, truncated: true, endedAtMs: 1 });
+  assert.equal(agent.ledgerTurns.at(-1)?.truncated, false);
+  assert.equal(agent.ledgerTurns.at(-1)?.lane, 'live');
+});
+
+test('lastLedgerLane 反映最近一轮「有回答」的车道', async () => {
+  const agent = makeAgent(async () => sse(['在呢哥。']));
+  assert.equal(agent.lastLedgerLane(), null, '还没有答过的轮次');
+
+  agent.noteServedTurn('你叫什么', '我叫米馍。');
+  assert.equal(agent.lastLedgerLane(), 'live');
+
+  await agent.reply('帮我查一下天气', undefined, undefined, {
+    ticket: { no: 2, gen: 1 }, forceDelegate: 'delegate',
+  });
+  assert.equal(agent.lastLedgerLane(), 'dsh');
+
+  await agent.reply('那我呢', undefined, undefined, { ticket: { no: 3, gen: 1 } });
+  assert.equal(agent.lastLedgerLane(), 'cascade');
+
+  // 一个字都没念的轮次不算「答过」：`live` 空答复不该把上一轮覆盖掉
+  agent.noteServedTurn('嗯', '   ');
+  assert.equal(agent.lastLedgerLane(), 'cascade');
 });

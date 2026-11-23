@@ -956,6 +956,19 @@ test('对冲：第 2 份赢的时候，插话取消必须掐得住它', async ()
   );
 });
 
+test('判据搬进内核后对外导出不变：fronted-agent 的转出与 turn-router 是同一个函数', async () => {
+  // 拆分（Stage 2A）只搬了实现，**没有搬导出**：外部（含本文件的导入）永远从
+  // `fronted-agent.ts` 拿，拿到的必须还是内核里那一个 —— 否则两份实现迟早漂移。
+  const router = await import('../src/turn-router.ts');
+  const slots = await import('../src/prefetch-slot.ts');
+  const agent = await import('../src/fronted-agent.ts');
+
+  assert.equal(looksLikeAnswer, router.looksLikeAnswer);
+  assert.equal(looksMemorable, router.looksMemorable);
+  assert.equal(agent.looksLikeFollowUp, router.looksLikeFollowUp);
+  assert.equal(agent.acceptsSpeculation, slots.acceptsSpeculation);
+});
+
 test('「算了」且有活儿在跑：取消那一轮，回一句短的，不再交给 dsh', async () => {
   // 用户显式下令取消是**唯一**会真的取消在跑 dsh 任务的路径：插话只放手
   // （活儿取消不了，答案跑完回注记忆），"不要了"才是取消。

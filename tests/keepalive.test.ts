@@ -210,6 +210,36 @@ test('trackActivity 原样透传 attachLiveSink', () => {
   assert.equal(trackActivity(plain, newActivityState(0)).attachLiveSink, undefined);
 });
 
+test('trackActivity 兼容 class 的 getter 与 #私有字段（get 的 receiver 必须是原对象）', () => {
+  class PrivateAgent implements AgentProvider {
+    readonly #tag: string;
+    readonly #seen: string[] = [];
+    constructor(tag: string) {
+      this.#tag = tag;
+    }
+    get name(): string {
+      // 若 `Reflect.get` 把 Proxy 当 receiver，这一行会抛
+      // "Receiver must be an instance of class PrivateAgent"
+      return `private-${this.#tag}`;
+    }
+    get sessionId(): string {
+      return this.#tag;
+    }
+    async reply(): Promise<AgentReplyView> {
+      return { text: '', speech: '' };
+    }
+    dshBusy(): boolean {
+      this.#seen.push('busy');
+      return this.#seen.length === 1;
+    }
+  }
+  const inner = new PrivateAgent('x');
+  const wrapped = trackActivity(inner, newActivityState(0));
+  assert.equal(wrapped.name, 'private-x');
+  assert.equal(wrapped.sessionId, 'x');
+  assert.equal(wrapped.dshBusy?.(), true, '方法里的 #私有字段也要能读');
+});
+
 test('保活输入不像用户的话', () => {
   assert.ok(!KEEPALIVE_PROMPT.includes('？'), '别写成一问一答，模型会当成真实对话去回应');
 });
@@ -221,19 +251,29 @@ test('trackActivity 透传**全部**可选能力（漏一个就是静默降级�
   //  omni 一晚上 4 轮全部静默退回文本快车道。）
   const optional = [
     'setAnnouncer',
+    'setDetachedAnswerSink',
     'attachLiveSink',
     'cancelTurn',
     'setDelegateHook',
     'interruptTurn',
+    'detachTurn',
+    'dshBusy',
     'taskStatus',
     'prefetch',
     'speculatePartial',
     'attachAudioLane',
     'willServeAudio',
     'noteServedTurn',
+    'rollbackTurn',
+    'takeRollbackOutcome',
     // 委派轮回注：漏了 → omni 永远不知道 dsh 答了什么，下一轮顺着追问就答非所问。
     // 同样是**静默**的：没有它 omni 照样能答，只是答的内容是错的。
     'injectAnsweredTurn',
+    // 内核端口（`kernel-runtime.ts`）：掐投机、按票据结算、重连时播种上一轮车道。
+    // 漏了不报错 —— 表现分别是「投机白跑到超时」「账本与内核各说一套」「重连后失忆」。
+    'dropPrefetch',
+    'reconcileTurnOutcome',
+    'lastLedgerLane',
   ] as const;
 
   const inner = { name: 'fake', reply: async () => ({ text: '', speech: '' }) } as Record<string, unknown>;
@@ -243,4 +283,55 @@ test('trackActivity 透传**全部**可选能力（漏一个就是静默降级�
   const wrapped = trackActivity(inner as never, newActivityState(0)) as unknown as Record<string, unknown>;
   const missing = optional.filter((key) => typeof wrapped[key] !== 'function');
   assert.deepEqual(missing, [], `这些可选能力没被透传：${missing.join(', ')}`);
+});
+
+test('trackActivity 自动透传没被列举过的新能力，this 绑在原对象上', () => {
+  // 以前的实现是手抄 16 条 `...(agent.xxx === undefined ? {} : …)`：每加一个可选
+  // 方法就得跟着加一行，忘了就是静默降级。`rollbackTurn` / `takeRollbackOutcome`
+  // 就是这么被丢掉的（双向投机赢了也只有 dsh 那一轮被撤回，调用方一无所知）。
+  const receivers: unknown[] = [];
+  const rolled: string[] = [];
+  const inner: AgentProvider = {
+    name: 'fake',
+    reply: async () => ({ text: '', speech: '' }),
+    rollbackTurn(ticket) {
+      receivers.push(this);
+      rolled.push(ticket === undefined ? 'none' : `${ticket.no}/${ticket.gen}`);
+    },
+    takeRollbackOutcome() {
+      receivers.push(this);
+      return 'ok';
+    },
+  };
+  const wrapped = trackActivity(inner, newActivityState(0));
+
+  assert.equal(typeof wrapped.rollbackTurn, 'function', '新能力必须自动透传，不能靠人记得加一行');
+  assert.equal(typeof wrapped.takeRollbackOutcome, 'function');
+  wrapped.rollbackTurn?.({ no: 3, gen: 1 });
+  assert.deepEqual(rolled, ['3/1'], '参数要原样过去');
+  assert.equal(wrapped.takeRollbackOutcome?.(), 'ok', '返回值也要原样回来');
+  assert.deepEqual(receivers, [inner, inner], 'this 必须是原对象，否则私有字段一碰就炸');
+});
+
+test('trackActivity 读不存在的能力是 undefined；运行时挂上去的立刻可见', () => {
+  const dynamic: Record<string, unknown> = {
+    name: 'fake',
+    reply: async () => ({ text: '', speech: '' }),
+  };
+  const wrapped = trackActivity(dynamic as never, newActivityState(0)) as unknown as Record<string, unknown>;
+
+  assert.equal(wrapped['willServeAudio'], undefined, '没有的能力不能凭空造一个函数出来');
+  assert.ok(!('rollbackTurn' in wrapped), '`in` 要照原对象答，否则装配自检会看错');
+  assert.equal(wrapped['sessionId'], null, '没有 sessionId 归成 null（老包装的行为）');
+
+  const receivers: unknown[] = [];
+  dynamic['rollbackTurn'] = function (this: unknown, ticket: { no: number }): number {
+    receivers.push(this);
+    return ticket.no;
+  };
+  assert.equal(typeof wrapped['rollbackTurn'], 'function', '挂上去之后要立刻能取到');
+  assert.ok('rollbackTurn' in wrapped);
+  assert.equal((wrapped['rollbackTurn'] as (ticket: { no: number }) => number)({ no: 7 }), 7);
+  assert.equal(receivers[0], dynamic, 'this 必须是原对象');
+  assert.deepEqual(Object.keys(wrapped), Object.keys(dynamic), 'ownKeys 默认委托给原对象');
 });

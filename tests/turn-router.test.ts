@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { isCancelRequest, routeTurn, type RouteContext } from '../src/turn-router.ts';
+import {
+  isCancelRequest,
+  looksLikeAnswer,
+  looksLikeFollowUp,
+  looksMemorable,
+  routeTurn,
+  type RouteContext,
+} from '../src/turn-router.ts';
 
 const base: RouteContext = { live: 'ready', cascade: true, dshAwaiting: false, lastLane: null };
 
@@ -76,4 +84,32 @@ test('显式取消：只认短句，别把正常说话当成中断指令', () =>
   for (const said of ['算了算了他算得对', '你算什么？', '不用了但我还想知道结果', '那台机器算什么配置']) {
     assert.equal(isCancelRequest(said), false, `「${said}」是正常说话`);
   }
+});
+
+// ---------------------------------------------------------------- 依赖方向
+//
+// 这三条判据原来住在 `fronted-agent.ts`，而 `routeTurn()` 又要用它们 ——
+// `turn-router` → `fronted-agent` → `turn-router` 的循环依赖在 ESM 下能跑，
+// 但谁先初始化谁就踩 TDZ，而且「内核不 import 引擎」这个分层名存实亡。
+
+test('内核不反向依赖引擎：turn-router 不导入 fronted-agent', () => {
+  const source = readFileSync(new URL('../src/turn-router.ts', import.meta.url), 'utf8');
+  const imports = source.match(/from\s+'[^']+'/gu) ?? [];
+  assert.deepEqual(
+    imports.filter((line) => line.includes('fronted-agent')),
+    [],
+    `内核不许 import 引擎（循环依赖）：${JSON.stringify(imports)}`,
+  );
+  // 正向的依赖仍然只有 `conversation-ledger` 之类纯类型（这里不断言具体清单，
+  // 只保证没有回到引擎那条边 —— 上面那条就是它）。
+});
+
+test('句子的形态判据住在内核里：三条都还能用', () => {
+  // 直接引用的是 `turn-router.ts` 的导出（不是 `fronted-agent` 的转出）。
+  assert.equal(looksLikeAnswer('好的。'), true);
+  assert.equal(looksLikeAnswer('你叫什么名字'), false);
+  assert.equal(looksMemorable('我姓袁。'), true);
+  assert.equal(looksMemorable('我姓什么来着'), false);
+  assert.equal(looksLikeFollowUp('你讲讲梗概。'), true);
+  assert.equal(looksLikeFollowUp('那你觉得《其主之声》这本书值得读吗？'), false);
 });
