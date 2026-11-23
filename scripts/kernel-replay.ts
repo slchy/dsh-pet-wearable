@@ -32,6 +32,8 @@ interface Row {
 
 function parse(path: string): Row[] {
   return readFileSync(path, 'utf8')
+    // Windows 工具（PowerShell 的 `Out-File -Encoding utf8`）会带 BOM，JSON.parse 会炸
+    .replace(/^\uFEFF/u, '')
     .split('\n')
     .filter((line) => line.trim() !== '')
     .map((line) => JSON.parse(line) as Row);
