@@ -734,9 +734,9 @@ ofo 2 / dsack 79`。三件事：
 
 判据的**唯一住处**：
 
-- 因果比较 → [`src/causal.ts`](../src/causal.ts)（以前散在五个文件八处）
+- 因果比较 → 入口是 [`src/kernel.ts` 的 `isPreTurnCommit()`](../src/kernel.ts)（`bargeIn` 与定稿/中间结果共用同一个谓词，`commitSeq` 从 ASR 经 `SessionCore` 传进来）；底层序号比较在 [`src/causal.ts`](../src/causal.ts) 的 `isPreTurnSegment()`（以前散在五个文件八处）
 - 媒体/超时口径 → [`src/engine-contract.ts` 的 `outcomeOf()`](../src/engine-contract.ts)
-- 四区域状态机（纯函数 `step(state, event) → [state, effects]`）→ [`src/kernel.ts`](../src/kernel.ts)
+- 四区域状态机（纯函数 `step(state, event) → [state, effects]`，按区域拆成 `stepInput` / `stepPlayback` / `stepDialog`）→ [`src/kernel.ts`](../src/kernel.ts)
 
 看一只 bug 时先问"它用错了哪把尺子"，比读代码快。
 

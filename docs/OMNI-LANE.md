@@ -1,4 +1,4 @@
-﻿# omni 一体化车道
+# omni 一体化车道
 
 > **状态：现行。** 本文描述的是**已上线并在真机跑过的形态**，不是设计草案。
 > 初版设计稿（S0，只量不发声）与本形态的偏差集中在 §十二，别拿旧稿子对账。
@@ -39,10 +39,13 @@ omni：     封段 ────── 670 ──────▶ 首块
 
 1. `commit` 与 `response.create` 必须**连发**（pipe 形态），不能等 `committed` 回执。
 2. 挂载点是 `onCommit`（我们自己发封段的时刻），不是 `onSentence`。
-3. `seal()` 必须与 `stt.commit()` **同一行**发出（[voice-session.ts:669](../../src/voice-session.ts)）——
-   差几行，②那段等待就会被算成 omni 的耗时，整个口径作废。
+3. `seal()` 必须在**车道封段**（`VOICE_COMMIT_MS`，默认 20 ms）那一刻发出
+   （[voice-session.ts](../src/voice-session.ts) 的 `onCommit`）。**ASR 封段已经拆成
+   另一条闸**（`VOICE_STT_COMMIT_MS`，默认 150 ms）：那条闸才发 `stt.commit()`。
+   两者不再是同一行，档案里用 `asr.commit.lane_seq` 配对 —— 序号不能混用，
+   混了之后「omni 的 `audio_ms` 从哪一刻起算」就说不清，整个口径作废。
 
-好在封段归我们控：`commitAfterMs` 默认 20 ms，`utterance-assembler.ts` 零改动。
+好在两条闸都归我们控：`VOICE_COMMIT_MS` 默认 20 ms，`utterance-assembler.ts` 零改动。
 
 ### 1.2 pipe 形态的固有代价
 
@@ -62,15 +65,24 @@ omni：     封段 ────── 670 ──────▶ 首块
 ├─ 4  宿主层   voice-session.ts     挂点、连接生命周期
 │              fronted-agent.ts     认领、记账、压投机
 │              turn-runner.ts       播放、打断、转交
+│              engines/live-voice-engine.ts  车道 → FastVoiceEngine 契约适配
 ├─ 3  车道层   omni-shadow.ts       willServe / claim / discard / explain
 ├─ 2  段层     omni-shadow.ts       mute 状态机、ring、pipe 封段
 └─ 1  传输层   omni-shadow.ts       WS、握手、事件流、计时、usage
 ```
 
-2/3/1 三层在同一个文件里（[omni-shadow.ts](../../src/omni-shadow.ts)，850 行），
+2/3/1 三层在同一个文件里（[omni-shadow.ts](../src/omni-shadow.ts)），
 但它们**互不知道对方的存在**：传输层不知道有「段」，段层不知道有「车道」，
 车道层不知道有 `TurnRunner`。分开文件会更"干净"，但这条通路的时序是全耦合的，
 拆开只会让「一次改动要跳三个文件」——所以刻意留在一个文件里，靠注释分节。
+
+> **与引擎契约的关系**：[`src/engines/live-voice-engine.ts`](../src/engines/live-voice-engine.ts)
+> 把 `FastLaneAudioLane`（生产上是 `OmniShadow`）适配成 `FastVoiceEngine` ——
+> 内核只认 `respond()` 一条出口，不知道这背后是 omni 还是级联。`LiveVoiceEngine` /
+> `CascadeVoiceEngine` 已通过契约测试（`tests/fast-voice-engine.test.ts`），是**下一阶段**
+> `TurnRunner` 重构的就绪前提；当前生产热路径仍由 `FrontedAgent` + `TurnRunner` 的
+> 三分支泵直接调用 `FastLaneAudioLane`。这是**刻意分期，不是漏接线**：三分支上还挂着
+> 双轨投机、流式 TTS 回落与延迟埋点，换泵要连它们一起搬。
 
 ---
 
@@ -78,8 +90,16 @@ omni：     封段 ────── 670 ──────▶ 首块
 
 > **硬约束：omni 开着的时候，快车道的每一轮都必须由它答。**
 > 一轮退回级联，用户就会在同一段对话里听到两副嗓子。所以下面对 `willServe()`
-> 的判据是**宽**的（宁可等，也不放），而任何 `lane_ok:false && text_ok:true`
-> 的 `agent.lane` 都是缺陷，要清零。§12.4 列了剩余路径。
+> 的判据是**宽**的（宁可等，也不放）。
+>
+> 违约的判据在 [`fsm-trace.ts`](../src/fsm-trace.ts) 的 `isLaneFallback()`：
+> `why === 'live-down'`（路由自己说车道挂了、退到级联），或者
+> `has_lane === true && lane_ok === false && lane !== 'dsh'`（车道挂着却没接住）。
+> **这个数应当是 0**，§12.4 列了剩余路径。
+>
+> `text_ok` 这一栏**已经没了**：路由搬进 `routeTurn()` 之后，`agent.lane` 报的是
+> `{has_lane, lane_ok, ok, lane, why}` 加 `explain()` 摊开的排障字段。旧的
+> `lane_ok:false && text_ok:true` 只剩审计器对老会话的向后兼容，别拿它当现行判据。
 
 ```ts
 interface FastLaneAudioLane {
@@ -87,15 +107,17 @@ interface FastLaneAudioLane {
   claim(): AgentAudioAnswer | null;   // 认领，一份只给一个消费者
   discard(): void;                    // 这一轮不采纳：cancel + 删半句
   interrupt?(): void;                 // 播到一半被打断：cancel 但保留
-  injectAnswer?(user: string, said: string): void;  // 委派轮回注
+  injectAnswer?(userText: string, said: string, kind?: InjectKind): void;  // 委派轮回注（kind = 听没听到）
   explain?(): Record<string, unknown>;// 只进档案，不参与决策
 }
 ```
 
 **为什么车道层不含「要不要用」的判断**：它有两个调用方——
 `turn-runner`（决定要不要开流式 TTS）和 `fronted-agent`（决定要不要认领）。
-两处判据必须完全一致，所以都走 `textEligible()` + `willServe()`。
-一处放松就会「文本路预跑过、omni 也答了」，同一个问题付两次钱。
+两处判据必须完全一致：都问 `turn-router.ts` 的 `routeTurn()`，其中 `live` 这一档
+**只看车道健康度**（`willServe()`），不拿级联的 14 字 / key / 历史深度当前提 ——
+omni 吃的是整段音频，那些前提对它没有物理依据。一处放松就会「文本路预跑过、
+omni 也答了」，同一个问题付两次钱。
 
 ### 3.1 `AgentAudioAnswer` 的 `chunks` 是 async generator
 
@@ -104,13 +126,15 @@ readonly chunks: AsyncIterable<Buffer>;
 readonly sampleRate: number;
 transcript(): string;
 delegateReason?(): DelegateReason | null;
+delegateText?(): string | null;   // tool_call 里那句「用户要什么」，转交时当正文
 ```
 
 不是数组、不是 `Promise`。两个原因：
 
 - **认领时首块通常还没到**（认领在定稿 ~220 ms，首块 600–760 ms），所以必须能等。
 - **判停延拍时认领会晚到 700–870 ms**，那时首块**已经发过来了**。
-  所以 `resp.audio` 从 `seal()` 那一刻就开始攒，不等认领（[omni-shadow.ts:446](../../src/omni-shadow.ts)）。
+  所以音频从 `seal()` 那一刻就开始攒，不等认领（[`omni-shadow.ts`](../src/omni-shadow.ts)
+  的 `response.audio.delta` 分支：先 push 进 `resp.audio` 再唤醒读端）。
   不缓冲的版本会吞掉句首一两个字。
 
 ### 3.2 `transcript()` 是活 getter，不是 `Promise<string>`
@@ -118,7 +142,8 @@ delegateReason?(): DelegateReason | null;
 被打断时 `Promise` 永远不 resolve，而**当前值正好是「已经播出去的那部分」**——
 `said` 审计、记忆回写、打断续话要的就是它。
 
-所以 `reply()` 返回的是活 getter（[fronted-agent.ts:1224](../../src/fronted-agent.ts)）：
+所以 `FrontedAgent.reply()` 的 omni 分支返回的是活 getter（[`fronted-agent.ts`](../src/fronted-agent.ts)
+的 `get text()` / `get speech()`）：
 
 ```ts
 return {
@@ -138,7 +163,7 @@ return {
 ### 4.1 封段之后必须闭嘴
 
 能量门 `holdMs` 默认 **2000 ms**，`commitMs` 默认 **20 ms**。
-所以 `seal()` 之后还有 ~1980 ms 的**静音**会继续从 `onSpeech` 流进来。
+所以 `seal()` 之后还有 ~1980 ms 的**静音**会继续从 `onFrame` 流进来。
 
 无条件转发 = 每轮白灌两秒静音，既计费（Manual 模式静音不免费），
 又会让下一轮 `restart()` 把这段残留 commit 成一条空白用户消息。
@@ -151,7 +176,9 @@ feed(voiced)  → muted = false，先补 ring 再追加
 
 `voiced` 必须由**能量门给**（`EnergyGateDecision.voiced`），不能自己按能量重算——
 两处门限一漂移就会开始丢字或灌静音，而且从数据上分不出来。
-这是唯一一条跨层数据约定，`onSpeech(pcm, voiced)` 一路透传。
+这是唯一一条跨层数据约定：能量门之后只有 `onFrame(frame)` 一个出口，
+`frame.pcm` / `frame.voiced` 由 `UplinkPipeline` 一路透传给 `assembler.addFrame` /
+`stt.feed` / `omni.feed`。
 
 ### 4.2 忙的时候不能 `response.create`
 
@@ -169,7 +196,7 @@ feed(voiced)  → muted = false，先补 ring 再追加
 
 委派轮会踩到：`seal()` 之后立刻 `discard()`，此时 `created` 还没到。
 所以 `cancelCurrent()` 先置 `cancelPending`，等 `onMessage` 收到 `created` 再补发
-（[omni-shadow.ts:545](../../src/omni-shadow.ts)）。这条错误也不计入协议错误计数。
+（[`OmniShadow.cancelCurrent()`](../src/omni-shadow.ts)）。这条错误也不计入协议错误计数。
 
 ### 4.4 不自动重连
 
@@ -261,9 +288,19 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 4. **等 `ready` 再发**。忙的时候排队（上限 4 条），`response.done` 之后 flush。
    插在一条正在生成的回复中间会让它自己那轮的指代也乱。
 
-宿主只在**这一轮真的播完了**时调 `injectAnsweredTurn`（`turn-runner` 的
-`replyPath === 'dsh' && !interrupted && audioBytes > 0`）。被打断的正文不回注——
-用户没听到的东西不该变成 omni 的记忆。
+宿主按内核 `settleTurn.inject` 的**三态**决定要不要回注、以什么口气回注 ——
+判定只有一份，在 [`kernel.ts`](../src/kernel.ts) 的 `settleTurn` 里：
+
+| `inject` | 条件 | 宿主做什么 |
+|:---|:---|:---|
+| `spoken` | 用户听全了（有声音下发且没少听） | 回注，按「用户听到了」 |
+| `unspoken` | 这一轮有结论，但一个字都没播出去 | **仍然回注**（否则下一轮它会照旧编）；只是不标「他听到了」 |
+| `none` | `truncated`（用户少听了一段） | 不回注 —— 没听到的东西不该变成 omni 的记忆 |
+
+**不再是旧的 `audioBytes > 0` 硬门槛**：0 字节 ≠ 少听。真机 `20261123-053719`
+第 2 轮，dsh 答出了《其主之声》，`audio_s=0.00` 被 `audioBytes > 0` 拦下，
+于是 omni 至今不知道书名，第 5 轮把《奇书》当真书名编了 10.4 s。现在内容照注，
+只有「少听了一段」才吞。
 
 ---
 
@@ -277,7 +314,7 @@ response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
 | 放弃一条流（调用方 `return` 掉生成器） | 服务端**继续推**它的 `response.audio.delta`；单队列读法会把这些字节当成下一句的音频（真机 2026-11-23：4 个字的回执合成出 **506880 B / 10.56 s**、首块 0 ms） | 必须 `response.cancel` + 丢弃到 `response.done` 才放行下一条 —— `omni-tts.ts` 这样修；`bench/tts/reader-probe.mjs` 可复现 |
 | `created` 前 `cancel` | 报 `Cannot cancel response before response.created` | `cancelPending` |
 | 50 ms 短音频 `commit` | **不报错**（空转写、`completed`） | 但会造空白用户消息，所以看 `dirtyBytes` |
-| `conversation.item.delete` | **有效**（三次复现，省 13–39 token） | 洗脏历史可用，**尚未接入** |
+| `conversation.item.delete` | **有效**（三次复现，省 13–39 token） | **已接入**：`discard()` / 未认领的取消在 `response.done` 之后延迟删除助手项（见 §4.7） |
 | `conversation.item.create`（**`user` 角色**） | 注入文本 → 下一轮**照做**（3/3） | **回注 dsh 答案可行**，见 §5.2 |
 | `conversation.item.create`（`assistant` 角色） | 回 `created` 和 item id，但模型**当没看见** | 伪造自己的历史被拒。**不能拿 token 数判定**，见 §5.2 |
 | `conversation.item.truncate` | **静默忽略**：14.5 s 的回答截到 800 ms → 无 ack、无 error（6 s 超时）；追问「你刚才数到几？」照样答「二十」，追问轮 `in_text_tok` 与对照组**一模一样**（769/769） | 不能用。想对齐「用户听到了多少」只剩 delete + `user` 回注（§5.2） |
@@ -320,20 +357,25 @@ input_audio_transcription: { model: 'qwen3-asr-flash-realtime' },  // 没它就�
 
 ### 6.1 `voice-session.ts` — 挂点与生命周期
 
-三个回调各挂一行：
+四个挂点，各管一件事：
 
 ```text
-onCommit     → archive(asr.commit) → stt.commit() → omni.seal(seq, silenceMs)
-onSpeechOpen → assembler.resetAudio → stt.feed → omni.restart(preroll)
-onSpeech     → stt.feed → omni.feed(pcm, voiced)
+onCommit(20 ms)     → omni.seal(laneSeq, silenceMs)              // 车道先起跑
+onSttCommit(150 ms) → stt.commit() → archive(asr.commit, {seq, lane_seq})
+onSpeechOpen        → assembler.resetAudio → stt.feed(预卷逐块) → omni.restart(preroll)
+onFrame(frame)      → assembler.addFrame(frame) → stt.feed(pcm, voiced)
+                                                → omni.feed(pcm, voiced)
 ```
 
 **连接按设备连接创建和销毁**（`start()` 里 `omni.start()` + `attachAudioLane(omni)`，
 `onClose()` 里 `attachAudioLane(null)` 再 `omni.stop()`）。
 不能在进程启动时建连——服务空跑几十分钟后 WS 早就空闲断链了。
 
-`commitSeq` 是关键：**同一个值写进 `asr.commit` 和 `omni.shadow` 两处**。
-真机有二次封段、咳嗽误触发、打断轮，没有 join key 三轮之后就错位了。
+**两个封段序号已经分拆**：车道封段序号（`omni.shadow.seq`，20 ms 那把闸）与 ASR
+封段序号（`asr.commit.seq`，150 ms 那把闸）**不再相等，也不许混用** —— 混了之后
+「omni 的 `audio_ms` 从哪一刻起算」就说不清，整份延迟报告偏 130 ms。两份事件靠
+`asr.commit.lane_seq` 配对（同 §1.1）：真机有二次封段、咳嗽误触发、打断轮，
+没有 join key 三轮之后就错位了。
 
 ### 6.2 `fronted-agent.ts` — 认领与记账
 
@@ -348,45 +390,68 @@ omni 答过的轮次就不进历史，下一轮委派给 dsh 就**失忆**。
 | `isPrefetchable()` | `audioLane?.willServe() === true → return false`。**压住旧车道的投机**，不压就每轮双倍烧 LLM 钱 |
 | `reply()` 认领块 | `claim()` → 返回带活 getter 的 `AgentReplyView` |
 | `delegate()` | 第一件事是 `audioLane?.discard()`，不让影子在后台把废音频生成完 |
-| `noteServedTurn()` | 把 omni 实际播出的 `(userText, said)` 写回 `pending` —— **「记忆就来了」的全部内容** |
+| `noteServedTurn()` | 把 omni 实际播出的 `(userText, said, truncated)` 写回 `pending` —— **「记忆就来了」的全部内容**。`truncated` 是内核结算出来的**真实**结果，直接写进 `ConversationLedger`；`cascade` / `dsh` 的轮次由 `KernelPorts.settleTurn` → `reconcileTurnOutcome()` 按票据回写同一本账 |
 
-`willServeAudio()` 必须与 `reply()` 内部判据完全一致，所以都走 `textEligible()`。
-`textEligible()` 复用 `isFastCandidate()`（只挡形态：空串 / >14 字 / 阿拉伯数字）
-+ 记忆类 + 攒满上限。
+`willServeAudio()` 必须与 `reply()` 内部判据完全一致：两边都走 `decisionFor()` →
+`routeTurn()`（内核纯函数）。**`live` 这一档只看车道健康度**；级联能不能答另由
+`textEligible()` 决定（`isFastCandidate()` 的形态闸 + 记忆类 / 攒满上限）——
+那几条是 qwen-flash 的文本窗前提，不再是 omni 的准入条件。把 qwen-flash 的 key
+删掉，omni 照样答。
 
 ### 6.3 `turn-runner.ts` — 播放与转交
 
 ```ts
-const omniTurn = agent.willServeAudio?.(text) === true;   // 必须在起流式 TTS 之前
+const omniTurn = image === undefined && agent.willServeAudio?.(text) === true;  // 必须在起流式 TTS 之前
 
-if (reply.audio !== undefined) {
-  audioRate = reply.audio.sampleRate;          // 不做假设，按回答走
-  for await (const chunk of reply.audio.chunks) { emit(chunk); }
-  speech = reply.speech;                       // drain 之后才完整
-  agent.noteServedTurn?.(text, speech);
-  const why = reply.audio.delegateReason?.() ?? null;
-  if (why !== null) {
-    reply = await agent.reply(text, image, note, {
-      forceDelegate: why,
-      receiptSpoken: speech.trim() !== '',     // 已经出过声就不再叠回执
-    });
-  }
+// —— 播放分支：omni 音频直出 ——
+audioRate = reply.audio.sampleRate;            // 不做假设，按回答走
+for await (const chunk of reply.audio.chunks) { emit(chunk); }
+speech = reply.speech;                         // drain 之后才完整（活 getter）
+
+// omni 自己发了 tool_call → 转交 dsh：重挂流式 TTS，dsh 的增量接着合成
+const why = reply.audio.delegateReason?.() ?? null;
+if (why !== null && !fsm.isStale(ticket)) {
+  delegateStreaming = /* 重新挂 onLiveAvailable → streamTts */;
+  delegated = true;
+  const pending = agent.reply(
+    reply.audio.delegateText?.() ?? text, image, note,
+    { ticket, forceDelegate: why, receiptSpoken: speech.trim() !== '' },
+  );
+  pending.catch(() => undefined);              // 作废时不等它，迟到的失败别变成进程级错误
+  const raced = await Promise.race([pending, staleSignal]);
+  if (raced !== STALE) { reply = raced; replyPath = reply.path; speech = reply.speech; }
+}
+
+// —— 结算之后（内核 settleTurn 的意图照单执行）——
+if (replyPath === 'dsh' && settlement.inject !== 'none') {
+  agent.injectAnsweredTurn?.(text, speech, settlement.inject);   // spoken / unspoken 都注
+}
+if (replyPath === 'omni' && !delegated) {
+  agent.noteServedTurn?.(text, speech, settlement.truncated);    // 真实 truncated 进账本
 }
 ```
+
+**`noteServedTurn()` 在结算之后、而且只在「omni 自己答完」时调**（`replyPath === 'omni' && !delegated`）。
+不能放在 `delegateReason` 判出来之前：转交轮 omni 说的那句只是**垫话**，dsh 那一轮由
+`injectAnsweredTurn`（回注 omni 上下文）与 `onDetachedAnswer` / `rememberDsh`（记账）负责 ——
+记两遍会让路由以为「上一轮是 live 答的」。
 
 **`willServeAudio()` 必须在起流式 TTS 之前问**：那一步会真开一个合成 task，
 而 omni 轮没文本可送，服务端拒空文本，整轮退化成兜底（比不走 omni 还慢）。
 
 ### 6.4 `keepalive.ts` — 装配层最大的坑
 
-`trackActivity()` 用**对象字面量**包装 `AgentProvider`，每个可选能力都必须显式转发。
-漏一个就是**静默降级、不报错**。
+`trackActivity()` 现在用 **`Proxy`** 包装 `AgentProvider`：除 `reply` 被包一层记账外，
+**所有属性自动转发**（包括以后新加的可选能力、甚至运行时才挂上去的）。加能力不用再手抄
+一行。两条实现细节别改：`Reflect.get` 的第三参必须是 `target`（私有字段 getter 在
+`receiver` 上找不到槽），方法要 `.bind(target)`（宿主会拿下来再调）。
 
-线上踩过整整一晚：`attachAudioLane` / `willServeAudio` / `noteServedTurn` 三个漏转发，
-表现是「omni 一次都不接管」而日志里一条错误都没有。
+当年它是**对象字面量**包装，每项都得显式转发。线上踩过整整一晚：
+`attachAudioLane` / `willServeAudio` / `noteServedTurn` 三个漏转发，表现是
+「omni 一次都不接管」而日志里一条错误都没有。
 
-防复发：`tests/keepalive.test.ts` 有一条「透传**全部**可选能力」的清单测试，
-`main.ts` 启动打 `装配 agent=Object attach=function will=function`。
+防复发：`tests/keepalive.test.ts` 仍有一条「透传**全部**可选能力」的清单测试，
+`main.ts` 启动打 `装配 agent=… attach=function will=function`。
 
 ---
 
@@ -396,10 +461,10 @@ if (reply.audio !== undefined) {
 
 ```json
 {
-  "seq": 2,                // 与 asr.commit 共用的 join key
+  "seq": 2,                // 车道封段序号；ASR 侧在 asr.commit.lane_seq 里引用（两个序号不再相等）
   "warmup": false,         // 连接后第一份，分析时排除
   "seal_s": 2.27,          // restart→seal 推了多少音频（秒）
-  "silence_ms": 66,        // 封段时距最后一个有声帧多久（与 asr.commit 同值）
+  "silence_ms": 66,        // 封段时距最后一个有声帧多久（与 asr.commit 同一把尺）
   "ack_ms": 88,            // → input_audio_buffer.committed
   "final_ms": 262,         // → 转写定稿
   "text_ms": 365,          // → 首条响应文本
@@ -422,13 +487,18 @@ if (reply.audio !== undefined) {
 ### 7.2 `agent.lane`（每次 `willServeAudio()` 一条）
 
 ```json
-{ "has_lane": true, "lane_ok": false, "text_ok": true, "ok": false,
-  "serve": "full", "state": "busy", "has_resp": true,
+{ "has_lane": true, "lane_ok": false, "ok": false, "lane": "cascade", "why": "live-down",
+  "serve": "full", "state": "busy", "has_resp": true, "pending": false,
   "cancelled": false, "claimed": false, "turn_seqs": 2 }
 ```
 
+前五栏是路由的判据快照（`has_lane` / `lane_ok` / `ok` / `lane` / `why`，来自
+`FrontedAgent.willServeAudio()` + `routeTurn()`）；后面是 `explain()` 摊开的车道内部状态，
+**只进档案、不参与决策**。
+
 **为什么需要**：`willServe()` 是个布尔，false 的时候看不出是「没开」「没 response」
-「被取消了」还是「文本闸拒了」——这几种的修法完全不同，而线上没法打日志重放。
+「被取消了」还是「路由判给了 dsh」——这几种的修法完全不同，而线上没法打日志重放。
+`why === 'live-down'` 正是 §3 那条违约判据的来源。
 
 ---
 
@@ -542,8 +612,8 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 **决定权在 `description`，不在提示词。** `instructions` 里任何关于「要不要调工具」的
 暗示都会把闲聊推向调用；而「调之前先说一句」这句**只有挂在 `description` 上才生效**
 （换到 `instructions`：实测 2/2 仍是 0 ms 音频，白写）。见
-[omni-shadow.ts:66](../../src/omni-shadow.ts) 的注释、`LEAD_IN_CLAUSE` 的实测记录，
-以及 [omni-shadow.ts:584](../../src/omni-shadow.ts) 的警告。
+[`omni-shadow.ts`](../src/omni-shadow.ts) 的 `DELEGATE_TOOL` 注释、
+`LEAD_IN_CLAUSE` 的实测记录，以及 `DEFAULT_INSTRUCTIONS` 顶部的警告。
 
 ### 10.1 委派轮那一声（垫话）
 
@@ -607,8 +677,9 @@ dsh 那一步总结被判 aborted，用户一个字没听到，最后得重问�
 > **曾经漏了一整条路**：`FrontedAgent` 里写的是 `this.inner.detachTurn?.(ticket)`，
 > 而 `DshAgent` **从来没有实现 `detachTurn()`** —— 可选调用遇到 `undefined` 静默空转。
 > 于是"插话后委派轮跑完还能听到答案 / 答案会回注记忆"一次都没生效过，日志里连一行都不出。
-> `keepalive.trackActivity` 现在会把 `detachTurn` / `dshBusy` / `setDetachedAnswerSink`
-> 一起透传；加 `AgentProvider` 新的可选能力时**必须**跟着加一行。
+> `keepalive.trackActivity` 现在用 `Proxy` 自动透传（`detachTurn` / `dshBusy` /
+> `setDetachedAnswerSink` 都在里面），但**别的自实现包装层**仍要逐项转发；
+> `tests/wiring-floor-cancel.test.ts` 卡"生产装配真的接上了"。
 
 ---
 
@@ -644,7 +715,7 @@ dsh 那一步总结被判 aborted，用户一个字没听到，最后得重问�
 | 事件字段 `feed_bytes` | `local_port` + `dropped_ms` | 排障用 `ss -ti` 更直接 |
 | 无 `created_ms` | 无（`created` 只是内部布尔） | 没用到 |
 | `~380 行`，`fronted-agent.ts` 零改动 | 850 + 4 处改动 | 记忆复用 `pending` |
-| 无「删半句」 | `discard()` 标 `deleteOnDone`，`done` 到了才删（见 §4.6） | 那会儿才有 item id |
+| 无「删半句」 | `discard()` 标 `deleteOnDone`，`done` 到了才删（见 §4.7） | 那会儿才有 item id |
 | 无「回注」 | `injectAnswer()`：`user` 角色 + 带原问题 + 硬截断 + 等 `ready`（见 §4.8） | 委派轮 omni 会失忆 |
 | 写在 `QOS.md` 里 | 独立本文 + `QOS.md` 附录一行 | 篇幅 |
 
@@ -653,7 +724,8 @@ dsh 那一步总结被判 aborted，用户一个字没听到，最后得重问�
 1. **两副嗓子**：omni 轮与级联轮音色不同（omni 是 Tina，级联是龙安欢）。
    全量之后降成「委派轮偶尔切」（dsh 链路在 S5 之前仍是 CosyVoice），不是完全消失。
 2. **tool_call 自委派从未在真机触发过**：两场 `delegate` 只有 1 个 `task`
-   （本地 `isFastCandidate` 拦的）。代码与单测都在，缺一次真机验证。
+   （当时是本地 `isFastCandidate` 的 14 字闸拦的；现在路由走 `routeTurn()`，
+   那条闸只作用于级联，不再挡 omni）。代码与单测都在，缺一次真机验证。
 3. **`✗ ASR: maybe no invalid audio stream`** 偶发，归属未确认（疑为既有问题，
    不是 omni —— 分属两条 WS）。
 4. **上下文双轨**：omni 的服务端历史与 `FrontedAgent.pending` 各记一份，
@@ -665,9 +737,9 @@ dsh 那一步总结被判 aborted，用户一个字没听到，最后得重问�
 | 曾经的空档 | 怎么解决的 |
 |:---|:---|
 | 并段轮被 `clip` 拒（约 27% 轮走级联） | **砍掉 `clip`**：探针实测并段轮回答质量 5/5 与单段轮无差别；真正担心的「掐半句」22 轮里只 3 次、全是用户自己插话 |
-| 半句留在服务端历史 | `discard()` 标 `deleteOnDone` → `response.done` 拿到 item id 再删（§4.6） |
-| 委派轮 omni 失忆 | `user` 角色 `item.create` 回注（§4.7） |
-| 插话时 omni 的 response 没人掐 | `cancelTurn` → `interrupt()`（§4.5） |
+| 半句留在服务端历史 | `discard()` 标 `deleteOnDone` → `response.done` 拿到 item id 再删（§4.7） |
+| 委派轮 omni 失忆 | `user` 角色 `item.create` 回注（§4.8） |
+| 插话时 omni 的 response 没人掐 | `cancelTurn` → `interrupt()`（§4.7 / §6.2） |
 
 ### 12.3 回滚（一直可用）
 
@@ -679,8 +751,10 @@ cd <部署路径> && sed -i 's/^OMNI_ANSWER=.*/OMNI_ANSWER=off/' .env && sudo -n
 
 ### 12.4 硬约束之下还剩哪些「退回级联」的路径
 
-判据统一用档案：`agent.lane` 里 **`lane_ok:false && text_ok:true`** —— 这表示
-不是文本闸把这一轮判给了 dsh，而是车道自己没接住。**这个数应当是 0。**
+判据统一用档案：`agent.lane` 里 **`why === 'live-down'`**，或者
+**`has_lane === true && lane_ok === false && lane !== 'dsh'`**
+（[`fsm-trace.ts`](../src/fsm-trace.ts) 的 `isLaneFallback()`）—— 这表示
+不是路由把这一轮判给了 dsh，而是车道自己没接住。**这个数应当是 0。**
 
 | 路径 | 现在 | 说明 |
 |:---|:---|:---|
@@ -715,7 +789,8 @@ cd <部署路径> && sed -i 's/^OMNI_ANSWER=.*/OMNI_ANSWER=off/' .env && sudo -n
 
 ## 十三、测试
 
-`tests/omni-shadow.test.ts`（假 socket 走 `RealtimeSocketFactory` 注入点）：
+`tests/omni-shadow.test.ts`（36 条，假 socket 走 `RealtimeSocketFactory` 注入点；
+下表只列最早的一批代表用例）：
 
 | # | 用例 |
 |:--|:---|
@@ -726,11 +801,21 @@ cd <部署路径> && sed -i 's/^OMNI_ANSWER=.*/OMNI_ANSWER=off/' .env && sudo -n
 | 5 | `restart()` 时 `muted` + ring → 静音不进 WS，有声才恢复 |
 | 6 | `serve='off'` → `willServe()` 恒 false |
 
-`tests/fast-lane-audio-lane.test.ts`（7 条）：认领、`discard`、`textEligible` 一致性。
-`tests/turn-runner-stream.test.ts`（14 条）：播放分支、打断、tool_call 转交
-（**含「回执保留、答案接在后面、不许 `audio.stop` 掐断」**）。
-`tests/kernel.test.ts`（8 条）：旧段不产意图、乱序不变性、控制面/物理面拆权、
-媒体尺子、换引擎零改内核、`step` 纯性、重复结算幂等。
+`tests/fast-lane-audio-lane.test.ts`（15 条）：认领、`discard`、`willServeAudio` 与
+`reply()` 的 `routeTurn()` 一致性、>14 字 / 无 qwen-flash key 也照样走 omni、
+账本记真实 `truncated`；补充 `reconcileTurnOutcome` 按 `{no, gen}` 票据精确回写与
+`lastLedgerLane()`。
+`tests/turn-runner-stream.test.ts`（19 条）：播放分支、打断、tool_call 转交
+（**含「回执保留、答案接在后面、不许 `audio.stop` 掐断」**）；补充共享内核结算、
+`settleTurn.inject` 三态与 omni 转交 dsh 走流式 TTS。
+`tests/kernel.test.ts`（27 条）：旧段不产意图、乱序不变性、控制面/物理面拆权、
+媒体尺子、换引擎零改内核、`step` 纯性、重复结算幂等；补充 `isPreTurnCommit`、
+`stepInput` / `stepPlayback` / `stepDialog`、`KernelSettlement` 端口执行。
+`tests/kernel-effects-wiring.test.ts`（4 条）：生产 `DialogRuntime.attachPorts()`
+单次执行、摘端口反证、因果屏障、`ConversationLedger` 合一与重连播种。
+`tests/fast-voice-engine.test.ts`（14 条，契约测试：`LiveVoiceEngine` /
+`CascadeVoiceEngine`，下一阶段换泵就绪层）。
 `tests/detached-answer.test.ts`（7 条）：放手那一轮——`ask` 立刻收空答复、答案转播报、
 被新题顶掉时**不补播但回注记忆**、显式取消连已放手的轮一起取消。
-`tests/keepalive.test.ts`：「透传**全部**可选能力」清单——防 §6.4 复发。
+`tests/keepalive.test.ts`（14 条）：含 `dropPrefetch` / `reconcileTurnOutcome` /
+`lastLedgerLane` 等全量可选能力 Proxy 透传清单——防 §6.4 复发。

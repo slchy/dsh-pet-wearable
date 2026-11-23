@@ -14,17 +14,22 @@
 | 事实 | 唯一持有者 | 读法 |
 |---|---|---|
 | 话筒归谁 | `AppSession.floor`（`FloorArbiter.owner`） | `floor.busy` / `floor.owner`；宠物经 `PetWorld.floorBusy` 与 `floorTaken` 输入得知 |
-| 当前轮次 | `DialogFsm`（`ticket()` → `{no, gen}`） | 上游取消、迟到回调一律拿票据比对（`isStale` / `isCurrent`） |
+| 当前相位 / 轮次 / 代次 | `kernel.ts` 的 `dialog` 区域（`KernelRuntime.state.dialog`）；`DialogFsm` 只是它的**薄门面** | `DialogFsm.ticket()` 读 `runtime.state.dialog.ticket` → `{no, gen, baseCommitSeq?, startedAtMs?}`；上游取消、迟到回调一律拿票据比对（`isStale` / `isCurrent`）。内核意图的唯一执行路径是 `KernelRuntime.dispatchAndApply` + `DialogRuntime.attachPorts`（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` / `settleTurn`）；`SessionCore` 不另发插话的 `audio.stop` |
 | 播放进度 | `TurnRunner`（`playedSeen` + 设备 `played` 回执）；**口径**在内核 | 判"听到多少"只走 `kernel.ts` 的 `settleTurn`（媒体游标 = 字节/采样率），`DialogFsm` 只收 `audioDone(ticket)` 这一个结论 |
-| 这一轮听到多少 / 少听没少听 / 该不该回注 | `kernel.ts`（`step()` 的 `settleTurn` 意图；`stale` 归 `dialog` 区域、`truncated` 归 `playback` 区域） | `TurnRunner` 只喂事实（`audioSent` / `devicePlayed` / `ticketInvalidated` / `turnEnded`），结算数字**不许自己再算一遍**；历史档案对账用 `scripts/kernel-replay.ts` |
+| 这一轮听到多少 / 少听没少听 / 该不该回注 | `kernel.ts`（`step()` 的 `settleTurn` 意图；`stale` 归 `dialog` 区域、`truncated` 归 `playback` 区域） | `TurnRunner` 只喂事实（`audioSent` / `devicePlayed` / `ticketInvalidated` / `turnEnded`），结算数字**不许自己再算一遍**；回注口气 `inject` 三态（`spoken` / `unspoken` / `none`）也**只在这里算一次**；历史档案对账用 `scripts/kernel-replay.ts`。**因果旧段拦截唯一归口在 `kernel.ts::isPreTurnCommit`**（`kernel.isCausallyStale` 与 `SessionCore` 都调它；`voice-session.ts` 不再保留 `fromPreTurnSegment` 副本） |
+| 这一轮先由谁答 | `turn-router.ts::routeTurn()`（纯函数，判据与引擎实现无关） | `FrontedAgent.willServeAudio()` 与 `reply()` 都问同一个 `decisionFor()`；`TurnRunner` 只按 `reply.audio !== undefined` 分支，不自己判 |
+| 上一轮谁答的 / 少听没少听（路由与回注要读） | `FrontedAgent.ledger`（`ConversationLedger`，只记已结束的轮次） | `lastAnsweredLane()` 给 `routeTurn()` 的 `lastLane`；`pet` 轮不算"答过用户"。`KernelPorts.settleTurn` 把后验的 `truncated` 与 `endedAtMs` 按 `{no, gen}` 精确回写（`ConversationLedger.reconcileOutcome`）；重连时 `DialogRuntime` 用 `agent.lastLedgerLane()` 播种 `initialKernelState` 的 `lastLane`，两份账不漂 |
 | 判停中的文本 | `UtteranceAssembler`（`pending`） | 上层只在 `accept` 时拿到整句，拿不到半句 |
 | 快车道闸门 | `FrontedAgent.innerMode`（`pass` / `buffer` / `drop`） | dsh 的流式增量按闸门决定直通、缓冲还是丢弃 |
 | 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 只在还没出声时能说；答案的第一块一到就置 `cancelled` 并 `audio.stop`，不再有人读它。**出声期间它占着 `DialogFsm` 的 `speaking`**（`receiptStarted` / `receiptEnded`），所以那会儿用户开口算插话 |
 | 宠物状态 | `PetSession.state`（`PetState`） | 纯函数 `brain.step` 产出；执行器无判断 |
 | 后台汇报什么时候开口 | `DialogRuntime.announceQueue` + 四道闸 | `queue.length > 0` → 宠物闸门 `floorFree` 不通过（`announcePending`），宠物自己不说话；`announce` 抢不动 `reply` |
 | omni 车道状态 | `VoiceConnection.omni`（`OmniShadow.state`：`idle`/`connecting`/`ready`/`busy`/`broken`） | `FrontedAgent.audioLane.willServe()` / `explain()`；宿主只经这两个入口读，不复制状态 |
-| 这一轮由谁答 | `FrontedAgent`（`willServeAudio()` 与 `reply()` 内部**同一套判据**：`lane.willServe()` + `textEligible()`） | `TurnRunner` 只按 `reply.audio !== undefined` 分支，不自己判 |
 | omni 那一份音频归谁 | `OmniShadow.claimedResp`（认领时绑定） | `AgentAudioAnswer.chunks` / `transcript()` 的闭包；**不许事后去 `resp` 里找**（见 §5.6） |
+
+> **两个「封段」旋钮不是一回事**：`VOICE_COMMIT_MS`（20 ms）只让 **omni 车道**起跑
+> （`omni.seal()`），`VOICE_STT_COMMIT_MS`（150 ms）才请 **ASR** 封段解码
+> （`stt.commit()`）。两份档案事件用 `asr.commit.lane_seq` 配对，序号不混用。
 
 > 播放口径：**估算时长是下限，设备回执只能延后**。真机上见过设备在「最后一批字节收到」
 > 就报 `played`（4.58 s 音频 1 s 回执），按它收尾会把尾音那段插话窗口关掉。
@@ -42,14 +47,20 @@
 | 断点 | 现状 | 测试 |
 |---|---|---|
 | `beginTurn` / `audioStarted` / `audioDone` 都在 `TurnRunner.run` 里发生，`DialogRuntime.dispatch` 看不到 | `TurnRunnerOptions.onState` 在这三次转移后各回调一次，`DialogRuntime` 接到 `notifyState()` | `tests/wiring-floor-cancel.test.ts` 第一条 |
-| `trackActivity` 只在方法存在时透传，内层没有 `cancelTurn` 就整条断面 | `FrontedAgent.cancelTurn` 存在；`trackActivity.reply` 原样透传第四参 `turn` | 同文件第二条 |
+| `trackActivity` 只在方法存在时透传，内层没有 `cancelTurn` 就整条断面 | 已改成 `Proxy` 自动转发（`reply` 单独包一层，第四参 `turn` 原样带上） | 同文件第二条 |
 | 票据在 `FrontedAgent` 内部换成 `localGen` 就丢了 | `delegate` / `abandon` / `startInner` 都带票据，`inner.reply(..., { ticket })` | 同文件第二条 |
+| 内核声明的意图没人执行（端口没绑），或旁路又发一份 | `DialogRuntime` 用 `KernelRuntime.attachPorts()` 绑生产端口，`DialogFsm` / `TurnRunner` 全走 `dispatchAndApply()`；`commitSeq` 因果屏障单通道；`settleTurn` 按 `{no, gen}` 回写账本 | `tests/kernel-effects-wiring.test.ts` |
 
-## 1 DialogFsm —— 一轮对话的生命周期
+## 1 DialogFsm —— 一轮对话的生命周期（内核门面）
 
-**持有**：`SessionCore.fsm`（`src/session-core.ts` 构造）。
+**持有**：`SessionCore.fsm`，但它只是 [`kernel.ts`](../src/kernel.ts) +
+[`kernel-runtime.ts`](../src/kernel-runtime.ts) 的**薄门面** —— 真正的状态在
+`KernelRuntime.state.dialog`，本类不再持有 `turn` / `gen` / `endAfterSpeech` /
+`receiptOnly` / `lastWhy` 的第二份，只把方法调用翻译成 `KernelEvent` 并读快照。
+
 **驱动**：`SessionCore`（ASR 整句、插话、模型要求结束）与 `TurnRunner`
-（开轮、首块音频、音频结束）。
+（开轮、首块音频、音频结束）。两者都只是往**同一个** `KernelRuntime.dispatchAndApply()` 喂事件，
+所以相位与账本不会各算一份。
 
 ### 状态
 
@@ -58,7 +69,7 @@
 | `listening` | 话筒在手，等用户说话 |
 | `awaiting_shot` | 已答应「拍张高清的」，等图到手再开这一轮 |
 | `thinking` | 一轮已开，等上游（dsh / 快车道）出结果 |
-| `speaking` | **有声音在播**。可能是答案的首块音频，也可能只是委派轮的回执（靠 `_receiptOnly` 区分） |
+| `speaking` | **有声音在播**。可能是答案的首块音频，也可能只是委派轮的回执（靠 `receiptOnly` 区分） |
 | `ending` | 要收尾了（模型说了再见），本轮播完就关 |
 | `closed` | 吸收态：连接已断，任何迟到回调都不得把状态拉回去 |
 
@@ -70,32 +81,47 @@
 
 | 事件 | 从 | 到 | 条件 / 副作用 |
 |---|---|---|---|
-| `beginTurn()` | `listening`、`awaiting_shot`、**`thinking`** | `thinking` | `no += 1`，发新票据；在 `ending`/`closed` 时返回 `null`，调用方放弃这一轮 |
+| `beginTurn()` | `listening`、`awaiting_shot`、**`thinking`** | `thinking` | 内核铸新票（`no = turn + 1`，`gen` 不变，锁存 `baseCommitSeq` / `startedAtMs`）；在 `ending`/`closed` 时返回 `null`，调用方放弃这一轮 |
 | | | | **`thinking` 是合法前驱**：用户在模型还在跑的时候又说了一句 → 新票据让旧票过期，旧轮的结果被 `isStale` 丢弃。**这就是「出声前吸收窗口」的实现方式**，真机上一半的句中停顿都走这条路。以前这里记成「⚠ 调度 bug」（注释写着「串行队列保证不会到这里」），是**错的** —— 按注释去「修」它，等于取消吸收窗口 |
 | `beginAwaitShot()` | `listening` | `awaiting_shot` | 不在 `listening` 时返回 `null` |
 | `abortAwaitShot()` | `awaiting_shot` | `listening` | 代次不变 |
-| **`receiptStarted()`** | `thinking` | `speaking` | 置 `_receiptOnly`；不在 `thinking` 时返回 `false`（这一轮已被作废/已收尾，不该出声） |
-| **`receiptEnded()`** | `speaking`（且 `_receiptOnly`） | `thinking` | 幂等；不动代次。回执被真音频顶掉后调用它是空操作 |
-| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略；**清 `_receiptOnly`**（真音频接管）。**触发点是首块音频要下发的那一刻**（`turn-runner` 的 `emit()` 里，紧挨着 `sendAudio`），不是回复文本到达时 |
-| `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 迟到票据按 `{no, gen}` 丢弃；`_receiptOnly` 为真时**直接返回**（回执那段 `speaking` 不是本轮音频） |
+| **`receiptStarted()`** | `thinking` | `speaking` | 置 `receiptOnly`；不在 `thinking` 时返回 `false`（这一轮已被作废/已收尾，不该出声） |
+| **`receiptEnded()`** | `speaking`（且 `receiptOnly`） | `thinking` | 幂等；不动代次。回执被真音频顶掉后调用它是空操作 |
+| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略；**清 `receiptOnly`**（真音频接管）。**触发点是首块音频要下发的那一刻**（`turn-runner` 的 `emit()` 里，紧挨着 `sendAudio`），不是回复文本到达时 |
+| `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 迟到票据按 `{no, gen}` 丢弃；`receiptOnly` 为真时**直接返回**（回执那段 `speaking` 不是本轮音频） |
 | `requestEnd()` | `listening`、`awaiting_shot` | `ending` | 在 `speaking`/`thinking` 只置标志，让告别语播完 |
-| `bargeIn(why)` | **仅** `speaking`（含回执那段） | `listening` | `gen += 1`（作废排队轮次）→ 清 `_receiptOnly` → 通知 `onInvalidate('bargeIn')` |
-| `close()` | 任意 | `closed` | 通知 `onInvalidate('closed')` |
+| `bargeIn(why, commitSeq?)` | **仅** `speaking`（含回执那段） | `listening` | 先过因果屏障：带 `commitSeq` 时 `kernel.ts::isPreTurnCommit` 判「开轮前录的旧段」，是旧段就不算插话（相位不动、返回 `false`）。成立时 `gen += 1`（作废排队轮次）→ 清 `receiptOnly` → 内核声明四条意图：`stopDeviceAudio`、`invalidateTurn(ticket, 'bargeIn')`、`abortEngine('barge_in')`、`settleTurn`（当场按媒体游标结算这一轮），由 `KernelRuntime.dispatchAndApply()` 经 `KernelPorts` 各执行一次 |
+| `close()` | 任意 | `closed` | 宣告这一轮作废（内核发 `invalidateTurn(ticket, 'closed')`）→ 清票 |
 
-票据 `{no, gen}` 是**唯一的轮次令牌**：`no` 每轮 +1，用来丢上一轮迟到的回调；
-`gen` 只在插话时 +1，用来作废还排着队的轮次。`onInvalidate` 是**上游取消的唯一触发点**
-——`TurnRunner` 订阅它并调 `agent.cancelTurn(ticket)`，所以「插话」「快车道胜出后掐掉慢车道」
-「连接结束」走的是同一条取消管道。
+票据 `{no, gen, baseCommitSeq?, startedAtMs?}` 是**唯一的轮次令牌**：`no` 每轮 +1，
+用来丢上一轮迟到的回调；`gen` 只在插话时 +1，用来作废还排着队的轮次；
+`baseCommitSeq` 是开轮瞬间锁存的因果水位线（见 `causal.ts`）。
+
+**上游取消只有一个落点，入口按装配分两种**：
+
+| 装配 | `invalidateTurn` 怎么走到 `agent.cancelTurn` |
+|---|---|
+| 生产（`DialogRuntime`） | `KernelRuntime.attachPorts()` 绑的 `ports.invalidateTurn(ticket, reason)` → `TurnRunner.invalidateTurn(ticket, reason)` → `agent.cancelTurn(ticket)`。看见 `fsm.runtime.ports !== null` 时 `TurnRunner` **不再订阅** `fsm.onInvalidate` —— 两条都订就是同一条意图解释两遍（`cancelTurn` 联动 `detachTurn` 会让 dsh 丢答案） |
+| 裸跑 `TurnRunner`（单测 / 离线，没有端口） | 没人执行内核意图，`TurnRunner` 退回订阅 `fsm.onInvalidate`。它本身也只由内核那条 `invalidateTurn` 意图触发（`DialogFsm` 的订阅只看 `effects`，不按事件名重算） |
+
+两条入口都落在同一个 `TurnRunner.invalidateTurn`：严格按 `{no, gen}` 比对 + 幂等。
+所以「插话」和「连接结束」走的是同一条取消管道。**「快车道胜出后掐掉慢车道」不走这条**
+——那是 `FrontedAgent.commit()` 里的 `cancelInner(ticket)`，属于同一轮内部的分支切换，
+不是轮次作废。
 
 ### 出声前的吸收窗口 = `thinking → thinking`
 
 用户说完一句、模型还在跑（`thinking`），这期间他**又开口**，实际发生的是：
 
 1. ASR 定稿 → `SessionCore.dispatch` 的 `utterance` 分支 —— 它**不检查当前相位**
-2. `fsm.beginTurn()` → `no += 1` → 新票据，`thinking → thinking`
-3. 旧票过期 → 旧轮上游的取消走 `onInvalidate` 那条管道（`agent.cancelTurn(ticket)`）
-4. 旧轮的结果回来时 `isStale(ticket)` 为真 → **一个字都不下发**；
-   快车道也不会走 `commit` → **不写进对话历史**
+2. `fsm.beginTurn()`（生产里的调用点在 `TurnRunner.run` 开头）→ 内核 `beginTurn` 铸新票
+   （`no + 1`，`gen` 不变；同一轮谱系内沿用上一张票的 `baseCommitSeq` / `startedAtMs`），
+   顺手结算还留在播放区里的上一轮（有残留音频时才发 `settleTurn`）→ `thinking → thinking`
+3. 旧票不再是「当前轮」：`isCurrent(ticket)`（`no` 已前进）为假，旧轮的结果回来时
+   一个字都不下发。`isStale` 比的是 `gen`，插话那次才 +1，这里不动 ——
+   **`beginTurn` 自己不发 `invalidateTurn`**（只有 `bargeIn` 与 `closed` 发），
+   所以它只让旧轮的输出作废，不去取消旧轮的上游
+4. 快车道也不会走 `commit` → **不写进对话历史**
 
 效果等价于「合并后重答」，但**实现是新轮取代旧轮**，不是把两段文本拼起来。
 
@@ -246,14 +272,15 @@ stateDiagram-v2
 | `push(text)` | 任意 | 追加到 `pending`，重置定时器 |
 | `notePartial(text)` | 任意 | 只更新 `lastPartialText`（不拼文本，中间结果会反复改写）。**静音满 `speculateMs`（100 ms）时**用它给快车道投机，见 §5 |
 | 定时器到期 → `evaluate()` | 预测器说「说完」且不满足「等下文」 | `accept`：整句交给上层 |
-| 同上 | 结尾像没说完（数字、井号、连词…）或刚收到中间结果 | `extend`：再等 `extendMs`（默认 400 ms），最多 `maxExtensions` 次 |
+| 同上 | 结尾像没说完（数字、井号、连词…）或刚收到中间结果 | `extend`：再等 `extendMs`（默认 200 ms），最多 `maxExtensions` 次 |
 | 同上 | 预测器不在 | `predictor-unavailable`：按固定时长兜底 |
 
-**两个新增的门（2026-11-18，只在「端点由我们控」的 ASR 上生效）**：
+**三个新增的门（2026-11-18 起，只在「端点由我们控」的 ASR 上生效）**：
 
 | 门 | 何时 | 做什么 |
 |---|---|---|
-| `commitAfterMs`（`VOICE_COMMIT_MS`，代码默认 40 / **线上 20**） | 上行静音到点、且这段有音频 | 让 ASR 封段开始解码（`SttSession.commit()`），一段只封一次。**omni 也在这里起跑**（同一行 `omni.seal()`，见 §5.6） |
+| `commitAfterMs`（`VOICE_COMMIT_MS`，默认 **20**） | 上行静音到点、且这段有音频 | 让 **omni 车道**起跑（`omni.seal()`，只封车道、不碰 ASR）。封早了多一段碎片，并段照拼 |
+| `sttCommitAfterMs`（`VOICE_STT_COMMIT_MS`，默认 **150**） | 同上，但门槛更晚 | 让 **ASR 封段开始解码**（`SttSession.commit()`），一段只封一次。比车道晚，是为了不把同一个字切成两半；两份档案事件用 `asr.commit.lane_seq` 配对 |
 | `openQuietMs` / `openQuietShortMs`（`VOICE_OPEN_QUIET_MS`，300 / 200；p ≥ 0.8 走短档） | 定稿到达时 | 要求「**截至此刻**」的连续静音 ≥ 门槛才允许 `accept`；不够就 `extend` 差额（`why=silence`）。防的是「换气被当成句尾」 |
 
 > **短档不是死代码**（2026-11-19 核对四份真机档案，69 次判停）：静音门整体只触发 5 次（7%），
@@ -268,7 +295,7 @@ stateDiagram-v2
 
 | 旋钮 | 线上值 | 作用 |
 |---|---:|---|
-| `waitBudgetMs`（`TURN_JUDGE_WAIT_BUDGET_MS`） | 400 | 这一轮为等判停**最多**花多少毫秒，用完就收下。取代「分支额度 × 每拍」那种随分支数量漂移的上限（真机 7/29 轮把额度吃干净，单轮白等 1.4 s） |
+| `waitBudgetMs`（`TURN_JUDGE_WAIT_BUDGET_MS`） | **200** | 这一轮为等判停**最多**花多少毫秒，用完就收下。200 是按「模型段 ~184 ms」定的：等待基本藏进模型耗时；模型变慢要重算。取代「分支额度 × 每拍」那种随分支数量漂移的上限（真机 7/29 轮把额度吃干净，单轮白等 1.4 s） |
 | `waitBudgetSequenceMs`（`TURN_JUDGE_SEQUENCE_BUDGET_MS`） | 1200 | 句尾像**未完成的序列**（数字 / 字母 / 「然后」…）时给**更大的预算**：这类句尾 p 判「没说完」**是对的**，别被总预算掐掉（真机一句手机号被拆成 3–4 轮）。判据复用 `looksUnfinished()`，纯机械。**只换预算，不换拍数**（原来是 12 倍拍数豁免，一个正则压过所有数值限额 —— 已删） |
 | `maxOpenSilenceMs`（`TURN_JUDGE_MAX_OPEN_SILENCE_MS`） | 650 | **统一上限**：开轮时连续静音的天花板。放在所有分支之前，谁都不能绕过 —— 原来静音闸门在预算判断之前 `return`，实测把 ② 顶到 2264 ms。到顶就放行并落 `whyAccept:'cap'` |
 
@@ -283,10 +310,10 @@ stateDiagram-v2
 「② 判停→开轮」在 151 ms 和 625 ms 之间跳，就是这一拍要不要等。
 （开轮门槛例外：定稿本身就晚于停嘴 ~260 ms，多数轮次它不花时间。）
 
-**这 400 ms 和投机的命中率是同一枚硬币**：判停愿意等满预算的轮次，投机更容易命中
+**这 200 ms 和投机的命中率是同一枚硬币**：判停愿意等满预算的轮次，投机更容易命中
 （`agent 段 0–15 ms`）；判停立即收的轮次，投机要么来不及、要么靠 `prefetch` 提前量。
 **但这不是硬地板** —— 真正的浪费是「投机已经跑起来又被并段重起」那个 bug
-（已修 `830768d`，见 §5），以及「提前量够不够」，两者都与 400 ms 这个数字无关。
+（已修 `830768d`，见 §5），以及「提前量够不够」，两者都与 200 ms 这个数字无关。
 实测账见 §5 的「投机什么时候起跑」。
 
 ```mermaid
@@ -294,7 +321,7 @@ stateDiagram-v2
     [*] --> idle
     idle --> pending : push(text)
     pending --> pending : push(text) / 重置定时器
-    pending --> pending : evaluate() → extend（再等 400 ms）
+    pending --> pending : evaluate() → extend（再等 200 ms）
     pending --> settled : evaluate() → accept
     settled --> idle : 下一句
 ```
@@ -306,6 +333,8 @@ stateDiagram-v2
 问不问快模型。
 
 > 判据只挡形态，**不判语义**（2026-11-19 起）：空、超 `FAST_LANE_MAX_CHARS`、含阿拉伯数字。
+> 这是**级联车道内部**「值不值得问快模型」的判据；「这一轮先由谁答」在
+> `turn-router.ts` 的 `routeTurn()`（omni 只看健康度，不吃这几条文本前提）。
 > 语义上该不该转交由模型在流里输出 `[[DELEGATE]]` 决定 —— 本地词表判过一版，
 > 「你看过星球大战没？」「为什么？」因为含「看」「为什么」被一票判成任务，真机 92 轮里 25 轮白走 dsh。
 
@@ -435,8 +464,8 @@ partial，段与段之间一个字都不吐（`071340` 轮 4 从 −764 ms 到 �
 **回执要占 `speaking`**：说不出声的话，用户听完回执再开口，`SessionCore` 会把它当成
 「同一句的下文」合并进去（`thinking` 状态下的语音默认是追问/补充），于是「不用了」
 顶不掉这一轮。所以出声前先 `fsm.receiptStarted()`（`thinking → speaking` + 置
-`_receiptOnly`），那句话播完 `fsm.receiptEnded()`（`speaking → thinking`）。
-`_receiptOnly` 只有一个作用：让 `audioDone()` 知道这段 `speaking` 不是本轮答案的音频，
+`receiptOnly`），那句话播完 `fsm.receiptEnded()`（`speaking → thinking`）。
+`receiptOnly` 只有一个作用：让 `audioDone()` 知道这段 `speaking` 不是本轮答案的音频，
 **不要**据此把轮次推进到 `listening`。真答案首块一到，`audioStarted()` 会清掉这个标志，
 此后就是正常的一轮。回执期间用户开口 → `bargeIn()` 照常生效（`gen += 1` 掐掉 dsh），
 这就是「回执可被打断」。
@@ -470,6 +499,12 @@ partial，段与段之间一个字都不吐（`071340` 轮 4 从 −764 ms 到 �
 下一轮作为系统注记交给模型自己判断补不补。**一个字都没发出去时不算残句** ——
 否则下一轮会把用户从没听过的整条汇报塞进回答里。
 
+`interruptCanned()` 与两个时间戳都**只认不是旧段的开口**：`DialogRuntime.dispatch()`
+先跑 `core.dispatch(event)`，再看返回里有没有 `{ type: 'drop', why: 'pre-turn' }`。
+命中的话，开轮前录进去的迟到 `partial` / `sentence` **既不刷新** `lastUserSpeechAt` /
+`lastUserSentenceAt`，也**不调** `interruptCanned()` —— 判停抢跑补回来的那半句不该让一条
+后台汇报莫名其妙停下，也不该让播报一直让路。
+
 ```mermaid
 stateDiagram-v2
     [*] --> 排队 : enqueueAnnounce
@@ -490,8 +525,11 @@ stateDiagram-v2
 ## 5.6 OmniShadow —— 音频直出车道
 
 **持有**：`VoiceConnection.omni`（`src/omni-shadow.ts`，**按设备连接建、按连接销毁**）。
-**驱动**：`UtteranceAssembler` 的三个回调（`onSpeechOpen` / `onSpeech` / `onCommit`）
-推音频，`TurnRunner` → `FrontedAgent` 认领或丢弃。
+**驱动**：`UplinkPipeline` 发出 `onSpeechOpen(preroll)` 和统一的
+`onFrame(frame: AudioFrame)`（`pcm` / `voiced` / `silenceMs` / `gateSeq` / `tsMs`）。
+`UtteranceAssembler` 把封段拆开：`onCommit`（20 ms，`omni.seal`）与 `onSttCommit`
+（150 ms，`stt.commit()`，用 `asr.commit.lane_seq` 配对）。`TurnRunner` →
+`FrontedAgent` 认领或丢弃。
 
 > **硬约束：`OMNI_ANSWER=full` 时，快车道每一轮都必须由 omni 答。**
 > 一轮退回级联，用户就在同一段对话里听到两副嗓子。验收口径见本节末。
@@ -571,7 +609,7 @@ stateDiagram-v2
 
 | 位置 | 做什么 |
 |---|---|
-| `voice-session` 三个回调 | `onSpeechOpen` → `restart(preroll)`；`onSpeech` → `feed(pcm, voiced)`；`onCommit` → `seal(seq, silenceMs)`，**与 `stt.commit()` 同一行** |
+| `voice-session` 接到的回调 | `onSpeechOpen` → `restart(preroll)`；`onFrame` → `feed(frame.pcm, frame.voiced)`；`onCommit`（20 ms）→ `seal(laneSeq, silenceMs)`；`onSttCommit`（150 ms）→ `stt.commit()`（`asr.commit.lane_seq` 配对） |
 | `FrontedAgent` | `isPrefetchable()` 里压住投机（不压就是每轮双花 LLM 钱）；`reply()` 认领；`delegate()` 先 `discard()`（omni 已经说过垫话时它落空，见下）；`noteServedTurn()` 写回 `pending`；`injectAnsweredTurn()` 回注委派轮 |
 | `TurnRunner` | 起跑流式 TTS **之前**问 `willServeAudio()`；`reply.audio !== undefined` 走直出分支；drain 之后才读 `speech` |
 
@@ -615,8 +653,10 @@ dsh 继续跑完；回来的答复交给 `setAnnouncer` —— 与「后台任�
 
 > **曾经漏了一整条路**：`FrontedAgent` 写的是 `this.inner.detachTurn?.(ticket)`，而
 > `DshAgent` **从来没有实现 `detachTurn()`** —— 可选调用遇到 `undefined` 静默空转，
-> "放手 / 回注"上线以来一次都没生效过。`keepalive.trackActivity` 现在把
-> `detachTurn` / `dshBusy` / `setDetachedAnswerSink` 一起透传。
+> "放手 / 回注"上线以来一次都没生效过。`keepalive.trackActivity` 现在用 `Proxy`
+> 自动转发 `AgentProvider` 上的全部可选方法（`detachTurn` / `dshBusy` /
+> `setDetachedAnswerSink` / `dropPrefetch` / `reconcileTurnOutcome` /
+> `lastLedgerLane` 等），只有 `reply` 被包一层记账。
 
 > **「用户听到多少」只有一处记着**：`playedSeconds`。`reply.text` / `reply.speech`
 > 是**生成**进度（`response.audio_transcript` 累积），被打断时通常是全文。
@@ -640,14 +680,20 @@ dsh 继续跑完；回来的答复交给 `setAnnouncer` —— 与「后台任�
 
 ### 验收：怎么知道硬约束还成立
 
-`agent.lane` 每次 `willServeAudio()` 落一条，其中：
+`agent.lane` 每次 `FrontedAgent.willServeAudio()` 落一条。`routeTurn()` 之后的格式是：
 
 ```text
-lane_ok:false && text_ok:true   ⇒  该 omni 答却没答，整轮退回级联
+{ has_lane, lane_ok, ok, lane, why, ...explain() }
 ```
 
-**这个数必须是 0。** 文本闸（`text_ok:false`）不是违约 —— 那种轮次本来就不属于快车道，
-一直是交给 dsh 的。`omni.shadow` 的 `cancelled`/`skipped` 另有口径（影子数据，不是接管）。
+`text_ok` 已经不在这张单子里。`src/fsm-trace.ts` 的 `isLaneFallback()` 认「该 omni 答却退回级联」：
+
+- 新档案：`why === 'live-down'`，或者 `has_lane === true && lane_ok === false && lane !== 'dsh'`
+- 旧档案（只有 `lane_ok` / `text_ok`）：仍是 `lane_ok:false && text_ok:true`
+
+**这个数必须是 0。** 正常交给 dsh 的路由（`lane === 'dsh'`，以及旧档案里 `text_ok:false`）
+不是违约 —— 那种轮次本来就不属于这条车道。`omni.shadow` 的 `cancelled`/`skipped`
+另有口径（影子数据，不是接管）。
 
 ## 5.8 怎么验证状态轮转真的对
 
@@ -669,7 +715,7 @@ node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录 | event
 | `state.settledAfterTurn` | 一轮结束后没落回 `listening`/`ending` |
 | `barge.noAudioStop` | 被判插话却没发 `audio.stop`（喇叭停不下来） |
 | `turn.tooLong` / `timing.stopToFirst` | 挂住，或者用户等太久 |
-| `lane.fallback` | `agent.lane` 里 `lane_ok:false && text_ok:true` —— 该 omni 答却退回级联，**用户会听到两副嗓子**（§5.6） |
+| `lane.fallback` | `isLaneFallback()`：`why === 'live-down'`，或 `has_lane === true && lane_ok === false && lane !== 'dsh'`；`lane_ok:false && text_ok:true` 只用于旧档案 —— 该 omni 答却退回级联，**用户会听到两副嗓子**（§5.6） |
 
 状态事件来自 `dialog.state`（`DialogRuntime.notifyState` 落档）。**老档案没有这个事件**时，
 状态那几条记「缺仪表」跳过 —— 与 `latency-report` 的 `null` 口径一致，不拿「没记录」冒充「没问题」。
@@ -693,15 +739,25 @@ node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录 | event
 三条交互律（违反任何一条都会回到"灵异 bug"）：
 
 1. **事件自带出生证**：跨异步边界发出的请求出发时盖上 `commitSeq`/票据，结果回来原样带回。
-   `isCausallyStale()`（[`src/causal.ts`](../src/causal.ts)）是所有转移前的统一守门人。
+   `isCausallyStale()` / `isPreTurnCommit()`（定义在 [`src/kernel.ts`](../src/kernel.ts)，
+   底层序号判据在 [`src/causal.ts`](../src/causal.ts) 的 `isPreTurnSegment`）是所有转移前的统一守门人。
 2. **控制权与物理结算拆权**：`stale`（票据被顶掉，瞬时）归 `dialog`；
    `truncated`（少听了，后验）归 `playback`。两者分属不同区域，
    所以「播完瞬间被新轮顶掉」不会互相打架。
 3. **跨区只读快照**：判打断只比 `event.commitSeq > dialog.ticket.baseCommitSeq`，
    不回头问 ASR「你是不是还在解」。
 
-边界（**现状**，别搞混）：相位真相仍在 `DialogFsm`（它本身就是同步纯状态机）；
-内核持有结算口径。`TurnRunner` 仍然 `await` TTS/模型，但它**不再自己算账**。
+边界（**现状**，别搞混）：`step()` 按正交区域拆成 `stepInput` / `stepPlayback` /
+`stepDialog`，自己只做因果屏障、吸收态守门和按区域路由。相位真相在 `dialog` 区域，
+`KernelRuntime` 持有**唯一一份** `KernelState`。`DialogRuntime` 用 `attachPorts()` 绑上
+生产 `KernelPorts`；`DialogFsm` 与 `TurnRunner` 都经 `dispatchAndApply()` 执行意图，
+四条（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` / `settleTurn`）**只跑一次**。
+`KernelPorts.settleTurn` 把播完才知道的 `truncated` 与 `endedAtMs` 按 `{no, gen}` 票据
+写进 `FrontedAgent` 的账本（`ConversationLedger.reconcileOutcome`）；重连用
+`agent.lastLedgerLane()` 播种 `initialKernelState`。`DialogFsm` 仍是薄门面（翻译事件、
+读 `runtime.state.dialog`）。`TurnRunner` 仍然 `await` TTS/模型，但它**不再自己算账**，
+也不再持有一份私有内核。`FastVoiceEngine`（`src/engines/*`）契约已经测过，刻意留到
+下一阶段再改 `TurnRunner`，现在不在生产热路径上。
 
 **已知的一次真实事故**：打断那一刻内核就结算了那一轮（用户听到多少是后验事实，
 清了播放区就没了），而那条 `async` 协程还会跑到尾巴再报一次 `turnEnded`。
@@ -716,7 +772,7 @@ sequenceDiagram
     participant U as 用户（设备）
     participant A as UtteranceAssembler
     participant SC as SessionCore
-    participant FSM as DialogFsm
+    participant FSM as DialogFsm（内核门面）
     participant AS as AppSession/FloorArbiter
     participant TR as TurnRunner
     participant FA as FrontedAgent
@@ -772,18 +828,30 @@ sequenceDiagram
     autonumber
     participant U as 用户
     participant SC as SessionCore
-    participant FSM as DialogFsm
+    participant FSM as DialogFsm（内核门面）
+    participant KR as KernelRuntime
+    participant KP as KernelPorts
     participant TR as TurnRunner
+    participant FA as FrontedAgent
     participant D as dsh
 
-    U->>SC: 说话（speaking 期间）
-    SC->>FSM: bargeIn(text)
-    FSM->>FSM: gen += 1 → listening
-    FSM->>TR: onInvalidate('bargeIn')
-    TR->>D: cancelTurn(ticket)
-    Note over D: 迟到的增量按 {no, gen} 丢弃<br/>下一轮的票据不会被打到
-    TR-->>SC: 本轮结束（playedSeconds 记已播部分）
-    SC->>FSM: beginTurn() → 新票据（gen 已 +1）
+    U->>SC: 说话（speaking 期间，带 commitSeq）
+    SC->>SC: isPreTurnCommit(commitSeq)
+    alt 开轮前的旧段
+        Note over SC: 返回 drop，why 为 pre-turn，不调用 bargeIn
+    else 这一段算数
+        SC->>FSM: bargeIn(text, commitSeq)
+        FSM->>KR: dispatchAndApply
+        KR->>KP: 四条意图，只执行一次
+        KP->>U: stopDeviceAudio，设备 audio.stop
+        KP->>TR: invalidateTurn
+        TR->>D: cancelTurn(ticket)
+        KP->>FA: abortEngine(barge_in)，dropPrefetch
+        KP->>FA: settleTurn，reconcileTurnOutcome
+        Note over FSM: gen + 1，回到 listening
+        Note over D: 迟到的增量按票据 no 与 gen 丢弃，打不到下一轮
+        SC->>FSM: beginTurn，新票据（gen 已 +1）
+    end
 ```
 
 ### 分支 B：快车道胜出
@@ -804,18 +872,18 @@ sequenceDiagram
     FA-->>TR: 快车道的整句
     TR->>T: 合成并下发
     D-->>FA: rejection（被掐后没文本）／或已作废
-    Note over FA: 起跑时就挂了 catch<br/>迟到的结局不会带走进程
+    Note over FA: 起跑时就挂了 catch，迟到的结局不会带走进程
 ```
 
 ### 分支 C：omni 直出（`OMNI_ANSWER=full`）
 
-omni **不等定稿**：它的起跑线是 `onCommit`（封段），与 `stt.commit()` 同一行。
+omni **不等定稿**：封段在 `onCommit`（20 ms）先跑，早于 `onSttCommit`（150 ms）的 `stt.commit()`，用 `asr.commit.lane_seq` 配对。
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as 用户（设备）
-    participant G as 能量门
+    participant P as UplinkPipeline
     participant A as UtteranceAssembler
     participant VS as VoiceConnection
     participant OS as OmniShadow
@@ -823,35 +891,39 @@ sequenceDiagram
     participant TR as TurnRunner
     participant FA as FrontedAgent
 
-    U->>G: 上行音频
-    G->>VS: onSpeechOpen(preroll)
+    U->>P: 上行音频
+    P->>VS: onSpeechOpen(preroll)
     VS->>A: resetAudio(preroll)
     VS->>OS: restart(preroll)（cancel 上一份 + 解除闭嘴）
-    G->>VS: onSpeech(pcm, voiced)
-    VS->>OS: feed(pcm, voiced)（静音只进 ring，不发）
+    P->>VS: onFrame(AudioFrame)
+    VS->>OS: feed(frame.pcm, frame.voiced)（静音只进 ring，不发）
     Note over A: 静音 20 ms
     A->>VS: onCommit(silenceMs)
-    VS->>OS: seal(seq, silenceMs) —— 与 stt.commit() 同一行
+    VS->>OS: seal(laneSeq, silenceMs) —— 车道 20 ms 起跑
     OS->>OS: commit + create 连发 → busy
+    Note over A: 静音到 150 ms
+    A->>VS: onSttCommit(silenceMs)
+    VS->>VS: stt.commit()，用 asr.commit.lane_seq 与 laneSeq 配对
     rect rgb(235,245,255)
     Note over A,VS: 判停 / 定稿（①b，~210 ms）与 omni 生成并行
     end
     A->>SC: accept（整句）
     SC->>TR: run(text, ticket)
     TR->>FA: willServeAudio(text)  ← 起流式 TTS **之前**
-    FA->>FA: lane.willServe() + textEligible()
+    FA->>FA: routeTurn()（live 只看 willServe 健康度）
     FA-->>TR: true → 不开 TTS task
     TR->>FA: reply(text, …, {ticket})
     FA->>OS: claim()
-    Note over OS: 首块通常还没到（认领 ~220 ms，首块 ~640 ms）<br/>手里那份被顶掉时认领「排队中的下一份」
+    Note over OS: 首块通常还没到（认领约 220 ms，首块约 640 ms）。手里那份被顶掉时，认领排队中的下一份
     FA-->>TR: AgentAudioAnswer（text/speech 是**活 getter**）
     loop 每个音频块
         TR->>OS: chunks.next()
         OS-->>TR: PCM 24 kHz
         TR->>U: 下发（首块前 fsm.audioStarted → speaking）
     end
-    TR->>FA: noteServedTurn(text, speech)（drain 之后读 getter）
-    TR->>FA: interrupt() / discard() / (委派轮) injectAnsweredTurn()
+    TR->>FA: interrupt() / discard()
+    TR->>FA: noteServedTurn(text, speech, truncated)（内核结算；仅 !delegated 时记）
+    TR->>FA: 委派轮 injectAnsweredTurn(text, speech, inject)（settleTurn.inject：spoken / unspoken）
 ```
 
 三条与 §6 主图不同的地方，都是有意的：

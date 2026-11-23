@@ -4,7 +4,7 @@
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.18.0-brightgreen.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/tests-684%20passing-success.svg)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-910%2B%20passing-success.svg)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Status: Active](https://img.shields.io/badge/status-active%20development-orange.svg)](#)
 
@@ -40,11 +40,12 @@
 
 - **快慢双轨推理（Fast Lane + `dsh`）**
   - **快车道直答**：日常短句走轻量模型直接响应，真机实测端到端首字 **p50 906–1296 ms**（七场配对，n=14–39；差值与时段、台词相关，见下文基准表）。
-  - **按语义而非词表委派**：本地仅拦截三类固定形态（空文本、超过 `FAST_LANE_MAX_CHARS`、含阿拉伯数字），其余统一先走快模型，可选由模型在输出流中发出 `[[DELEGATE]]` 触发转交（见 `FAST_LANE_DELEGATE`）。早期基于关键词表判路由时，「你看过吗」「为什么」这类闲聊常被误判为任务，真机 92 轮里有 25 轮白走了 `dsh`。默认 `FAST_LANE_KEEP_TURNS=0`，不按轮数强制转交（该策略曾导致每 4 轮出现 1 轮 6–8 秒长等）。
+  - **omni 音频直出（可选）**：`OMNI_SHADOW=1` 时把「封段 → 首块音频」整段交给 omni 一体模型（`OMNI_ANSWER=full` 才真出声）；真机同场 **p50 省 164–200 ms、p90 省 527–951 ms**，见 [docs/OMNI-LANE.md](./docs/OMNI-LANE.md)。
+  - **路由收成一个纯函数**：`turn-router.ts` 的 `routeTurn()` 先判四条硬规则（dsh 在等回话 / 像长期事实 / 动作动词 / 接着 dsh 的短追问），之后 Live 只看车道健康度、cascade 只看有没有 key；形态闸（空文本 / 超 `FAST_LANE_MAX_CHARS` / 阿拉伯数字）留在级联自己的 `reply()` 里，**不再挡 omni 的路**。模型仍可在输出流中发出 `[[DELEGATE]]` 触发转交（见 `FAST_LANE_DELEGATE`）。早期基于关键词表判路由时，「你看过吗」「为什么」这类闲聊常被误判为任务，真机 92 轮里有 25 轮白走了 `dsh`。默认 `FAST_LANE_KEEP_TURNS=0`，不按轮数强制转交（该策略曾导致每 4 轮出现 1 轮 6–8 秒长等）。
   - **深度推理与工具调用**：多步推理、事实检索与多模态任务交由 `dsh` 及子代理执行。
   - **投机并发与委派回执**：快慢双轨支持并行起跑；快车道超时或判定转交时，先下发短回执（如「我看看。」）填补静默，正文就绪后立即顶掉回执并清空下行缓冲。
 - **全双工与即时打断（Full-Duplex & Barge-in）**
-  - 基于上行能量门（-40 dBFS）与语义判停（TurnJudge）完成免唤醒切句。
+  - 基于上行能量门（`VOICE_PEAK_DBFS`，代码默认 -30 dBFS，随增益成对标定，见 [docs/OPERATIONS.md](./docs/OPERATIONS.md)）与语义判停（TurnJudge）完成免唤醒切句。
   - 流式 ASR 捕获用户新发言（过滤纯语气词）后，立即下发 `audio.stop` 截断下行音频，同时中止在途上游推理与排队轮次。
 - **情境感知的主动开口**
   - 依据佩戴状态、剩余电量、深夜时段、环境静默时长与发言间隔构建确定性时机状态机。
@@ -54,7 +55,7 @@
   - 缺失能力自动降级（如无摄像头则不触发视觉链路），接入新设备（如[雷鸟 X3 Pro](./docs/devices/RAYNEO-X3-PRO.md)）无需改动核心状态机。
 - **零密钥本地闭环与虚拟时间仿真**
   - 内置 `canned` STT、`silent` TTS 与 `echo` Agent，无需 API Key 与真机即可跑通全链路。
-  - 内置纯虚拟时间模拟器（`npm run sim`），支持随机状态空间探索与因果不变式校验，全仓 684 个测试用例覆盖核心时序路径。
+  - 内置纯虚拟时间模拟器（`npm run sim`），支持随机状态空间探索与因果不变式校验，全仓 910+ 个测试用例覆盖核心时序路径。
 
 ---
 
@@ -67,21 +68,57 @@
   AudioRecord / AudioTrack  ────────►  TLS 长连接（帧协议 · 鉴权 · 心跳）
   Camera / 佩戴 / 电量 / 触摸  ─────►          │
                                                ▼
-                               能量门 → ASR → 语义判停（UtteranceAssembler / TurnJudge）
-                                               │ 整句 / 定稿
-                                               ▼
-                              判定层 kernel.ts（纯 step()：能不能打断 / 听到多少 / 该不该回注）
+                                 voice-session.ts（连接编排，不含判定）
                                                │
-                               DialogFsm（话筒票据 · 轮次生命周期仲裁）
-                                               │
-                                 ┌─────────────┴─────────────┐
-                                 ▼                           ▼
-                         快车道 FrontedAgent          dsh（工具 / 后台 Job / 子代理）
-                           短句闲聊直答                  复杂推理 · 检索 · 多模态
-                                 └─────────────┬─────────────┘
                                                ▼
-                                    TTS（CosyVoice）→ PCM 流式下发
+                                 SessionCore（上行事件 → 内核事实）
+                                               │
+         ┌─────────────────────────────────────┼─────────────────────────────────────┐
+         ▼                                     ▼                                     ▼
+  上行：UplinkPipeline                应用：AppSession + DialogRuntime        判定：kernel.ts
+  （msbc / pcm16 → 能量门）           （FloorArbiter 话筒仲裁、一轮串行队列）   （纯 step()：stepInput /
+         │                                     │                                stepPlayback / stepDialog）
+         ▼                                     │                                     ▲
+  ASR → UtteranceAssembler（判停）             │                                     │ KernelEvent
+         │  commitSeq                          │                            DialogFsm / TurnRunner
+         └──────────► 一句话定稿 ───────────────┘                            dispatchAndApply()
+                                               ▼
+                                     routeTurn()（turn-router.ts：这一轮先由谁答）
+                                               │
+              ┌────────────────────────────────┼────────────────────────────────┐
+              ▼                                ▼                                ▼
+      live：OmniShadow                cascade：FrontedAgent                 dsh：DshSession
+      （LiveVoiceEngine）             （CascadeVoiceEngine）                工具 / 后台 Job / 子代理
+              └────────────────────────────────┼────────────────────────────────┘
+                                               ▼
+                              TurnRunner：TTS（CosyVoice）→ PCM 流式下发
+
+判定闭环（Effect 只有这一条执行路径）：
+
+  DialogFsm / TurnRunner ──KernelEvent──► KernelRuntime.dispatchAndApply()
+                                                  │
+                                                  ▼
+                              kernel.ts::step()（stepInput / stepPlayback / stepDialog）
+                                                  │ Effect[]
+                                                  ▼
+                        KernelPorts（DialogRuntime 经 attachPorts() 绑定一次）
+                        ├─ stopDeviceAudio / invalidateTurn / abortEngine
+                        └─ settleTurn → 按 {no, gen} 回写 ConversationLedger
 ```
+
+> 判定层是**闭环**的：`DialogRuntime` 用 `KernelRuntime.attachPorts()` 绑定生产
+> `KernelPorts`，`DialogFsm` / `TurnRunner` 把每一条 `KernelEvent` 都送进
+> `dispatchAndApply()` —— 这是 `stopDeviceAudio` / `invalidateTurn` / `abortEngine` /
+> `settleTurn` 的**唯一执行路径**，`SessionCore` 不再另发一份插话 `audio.stop`。
+> 因果旧段屏障只在 `kernel.ts::isPreTurnCommit` 一处（`commitSeq` 从 ASR 经
+> `SessionCore` 传进 `bargeIn`）；`KernelPorts.settleTurn` 按 `{no, gen}` 票据把
+> 播完后的 `truncated` 与 `endedAtMs` 回写 `ConversationLedger`。
+>
+> `engines/` 是**刻意分期**的边界：`LiveVoiceEngine` / `CascadeVoiceEngine` 已实现
+> `FastVoiceEngine` 契约，并由 `tests/fast-voice-engine.test.ts` 做契约测试，是下一阶段
+> 泵重构的就绪层；生产热路径目前仍走 `FrontedAgent` + `TurnRunner` 的三分支泵
+> （`omni` / `stream` / `pump`），以保留双轨投机、流式 TTS 回落与逐轮延迟埋点 ——
+> **不是漏接线**。
 
 ### 2. 双轨时序路径
 
@@ -170,8 +207,9 @@ cp .env.example .env
 # 2. 安装 dsh 人设 Profile 补丁（启用 dsh 时必做，自动写入 ~/.dsh/profiles/sdk/cordis.patch.yml）
 npm run install-profile
 
-# 3. 启动生产服务
-node src/main.ts --listen 8766
+# 3. 启动生产服务（显式给三个可替换件；不给 --stt 会走旧链路 legacy-pipeline）
+node src/main.ts --listen 8766 --stt qwen-realtime --tts cosyvoice --agent dsh
+# 现网 NLS 版：--stt aliyun
 ```
 
 ---
@@ -257,7 +295,13 @@ node src/main.ts --listen 8766
 
 ## 配置说明
 
-支持**独立进程模式**（`src/main.ts`）与 **`dsh` / Cordis 插件模式**（`src/driver.ts`）。
+支持两种**能跑起来的**形态：**独立进程**（`src/main.ts`，线上用的就是这个）与
+**Web 插件**（`packages/dsh-voice-web`，浏览器侧，语音栈是 `src/` 的副本）。
+
+`src/driver.ts` 是 dsh / Cordis 的插件入口，**目前只有 0.0.1 的配置骨架**：声明插件
+`name` / `inject`、定义 `Config` schema、在 `apply` 里跑一遍绑定安全检查 —— 它不建监听、
+不连设备、不接 ASR / TTS / agent。装进 dsh 只会看到一条「骨架就位」。**别把下面的配置表
+当成「插件模式已可用」的证据。**
 
 ### 1. 独立进程模式（`src/main.ts`）
 
@@ -267,10 +311,11 @@ node src/main.ts --listen 8766
 | | `MIAI_TOKENS` | - | 设备鉴权 Token（逗号分隔，公网部署必配） |
 | | `MIAI_TLS_KEY` / `_CERT` | - | TLS 私钥与证书路径（绑定非本机地址时必配） |
 | | `MIAI_HTTP_KEEPALIVE_MS` | `50000` | 出站 HTTP 保活上限（ms）。默认 `fetch` 仅 4 s，真机间隔 5–7 s 会导致每轮重做 TLS 握手（+130–190 ms）。**必须短于服务端空闲超时**，否则复用瞬间遇对端断连会直接失败 |
-| **语音链路** | `MIAI_STT` / `--stt` | (空) | STT 实现：`aliyun`（现网 NLS）、`qwen-realtime`（实验）、`canned` / `noop` / `<path>`；留空不启用 |
-| | `MIAI_TTS` / `--tts` | (空) | TTS 实现：`cosyvoice`、`mimo`、`silent`、`<path>` |
+| **语音链路** | `MIAI_STT` / `--stt` | (空) | STT 实现：`aliyun`（现网 NLS）、`qwen-realtime`（DashScope，端点由我们控）、`canned` / `noop` / `<path>`；留空不启用 |
+| | `MIAI_TTS` / `--tts` | (空) | TTS 实现：`cosyvoice`（线上）、`omni`（omni 当朗读机）、`mimo`（留空时的兜底）、`silent`、`<path>` |
 | | `VOICE_PAUSE_DETECT_MS` | `200` | 静音达到该时长即预跑判停侧车（不触发提交，仅提前计算） |
-| | `VOICE_COMMIT_MS` | `20` | **仅 `qwen-realtime`**（其它 STT 为 `0` 关闭）：静音达标即发 `commit` 封段（只切段不开轮）。因包内尾静音不参与计时，**实际下限受上行包长量化约束**，20 与 40 仅在包边界有差异 |
+| | `VOICE_COMMIT_MS` | `20` | **仅 `qwen-realtime`**（其它 STT 为 `0` 关闭）：静音达标即让 **omni 车道起跑**（`seal()`，只封车道、不碰 ASR）。因包内尾静音不参与计时，**实际下限受上行包长量化约束**，20 与 40 仅在包边界有差异 |
+| | `VOICE_STT_COMMIT_MS` | `150` | **仅 `qwen-realtime`**：静音达标才请 **ASR 封段解码**（`stt.commit()`）。比车道晚，是为了不把同一个字切成两半；两份档案事件用 `asr.commit.lane_seq` 配对 |
 | | `VOICE_OPEN_QUIET_MS` | `300` | **仅 `qwen-realtime`**：定稿到达时要求的连续静音门槛，不足则继续等待以防换气误切 |
 | | `VOICE_OPEN_QUIET_SHORT_MS` | `200` | **仅 `qwen-realtime`**：判停置信度 $p \ge 0.8$（当前硬编码）时启用的短静音门槛 |
 | **快车道** | `FAST_LANE_MODEL` | - | 轻量闲聊模型名（如 `qwen-flash`） |
@@ -296,11 +341,13 @@ node src/main.ts --listen 8766
 | | `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | `650` | **QoS 统一天花板**：开轮连续静音硬上限，任何分支不可绕过（`0` 不限） |
 | **TTS（CosyVoice）** | `COSYVOICE_PREWARM` | `1` | 定稿即预开 task（将 `run-task → task-started` ~66 ms 移入空窗）。`instruction` 模式下因语气在建 task 时锁定，自动禁用预热 |
 | | `COSYVOICE_FIRST_BATCH_CHARS` | `1` | 首批送字数。实测仅送 1 字时服务端不会起算，需等后续文本到达（间隔 2 s 首包 2328 ms，间隔 50 ms 为 371 ms），因此该项只省「等第 2 个 token」的时间 |
-| | `COSYVOICE_EMOTION_MODE` | `instruction` | 情绪表达模式；设为 `prosody`（仅调 rate/pitch）时可在定稿前预开 task |
+| | `COSYVOICE_EMOTION_MODE` | `prosody` | 情绪表达模式（唯一默认值在 `src/cosyvoice.ts` 的 `DEFAULT_COSYVOICE_EMOTION_MODE`）。`prosody` 只调 rate/pitch，系统音色可用、可在定稿前预开 task；`instruction` 只有复刻/设计音色吃，首包多 ~90 ms，系统音色配它会被服务端拒（428） |
 | **主动开口** | `PET_PROACTIVE` | `0` | 主动开口总开关（`1` 开启） |
 | | `VOICE_HOLD_MS` | `2000` | 能量门从判定静音到完全关门的保持时间（ms） |
 
-### 2. `dsh` 插件模式（`src/driver.ts`）
+### 2. `dsh` 插件入口（`src/driver.ts`，0.0.1 配置骨架）
+
+> 这些字段只决定「真接上语音栈时怎么配」。当前 `apply` 不监听端口，改它们不会让设备连上。
 
 | 配置项 | 默认值 | 说明 |
 |:---|:---:|:---|
@@ -316,40 +363,49 @@ node src/main.ts --listen 8766
 ## 开发与测试
 
 ```bash
-# 1. 运行全量单元测试（684 个用例）
+# 1. 运行全量单元测试（910+ 个用例）
 npm test
 
 # 2. TypeScript 静态类型检查
 npm run typecheck
 
-# 3. 会话归档综合诊断报告
+# 3. DialogFsm 穷尽状态空间验证（36 个配置 / 330 条转移，含不变量自检）
+node --experimental-strip-types tests/fsm-verify.ts
+
+# 4. 离线内核回放：把档案 events.jsonl 喂进纯 step()，与当时的 turn.end 对账
+node --experimental-strip-types scripts/kernel-replay.ts <events.jsonl>
+
+# 5. 定向变异检查：确认延迟 / QoS 不变量的测试真的会咬（单独跑，不要与 npm test 并行）
+npm run mutate
+
+# 6. 会话归档综合诊断报告
 node --experimental-strip-types scripts/observe.ts <档案目录>
 
-# 4. 状态机转移与话筒抢占合规审计
+# 7. 状态机转移与话筒抢占合规审计
 node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录>
 
-# 5. 逐轮内容审计：用户原话 → 模型输入 → 模型输出 → 端侧实听
+# 8. 逐轮内容审计：用户原话 → 模型输入 → 模型输出 → 端侧实听
 node --experimental-strip-types scripts/said-audit.ts <档案目录>
 
-# 6. 标准延迟报告：按车道 / 判停是否等待 / 台词类别分组（口径见 docs/QOS.md）
+# 9. 标准延迟报告：按车道 / 判停是否等待 / 台词类别分组（口径见 docs/QOS.md）
 node --experimental-strip-types scripts/latency-report.ts <档案目录> --standard
 
-# 7. 重新生成时间参数总表（改动任何时间旋钮后必须执行，否则测试报错）
+# 10. 重新生成时间参数总表（改动任何时间旋钮后必须执行，否则测试报错）
 python scripts/time-knobs.py --write
 
-# 8. 生成或管理设备配对凭证
+# 11. 生成或管理设备配对凭证
 npm run pair -- new
 
-# 9. partial 时序分析：投机提前量统计（三口径覆盖 + 按句长分组）
+# 12. partial 时序分析：投机提前量统计（三口径覆盖 + 按句长分组）
 python scripts/partial-timeline.py <档案目录>
 
-# 10. 封段统计：句内静音分布及 20/40/60 ms 门槛下的误封次数
+# 13. 封段统计：句内静音分布及 20/40/60 ms 门槛下的误封次数
 python scripts/silence-runs.py <档案目录>
 
-# 11. TTS 首包分批送达探针（测试首字/标点与后续文本间隔对首包的影响）
+# 14. TTS 首包分批送达探针（测试首字/标点与后续文本间隔对首包的影响）
 MODE=live ROUNDS=80 IDLE_MS=5000 node bench/latency/probe-cosyvoice-feed.mjs
 
-# 12. 真机向量回放（独立拉起隔离实例，不影响线上端口）
+# 15. 真机向量回放（独立拉起隔离实例，不影响线上端口）
 python bench/replay/run.py --archive <会话名> --turns 16
 ```
 
@@ -363,14 +419,39 @@ python bench/replay/run.py --archive <会话名> --turns 16
 ```text
 dsh-pet-wearable/
 ├── src/
-│   ├── main.ts                # 独立进程入口
-│   ├── driver.ts              # Cordis / dsh 插件入口
-│   ├── fronted-agent.ts       # 快车道轻量推理引擎
+│   ├── main.ts                # 独立进程入口（装配层：环境闸 → provider → 监听）
+│   ├── voice-session.ts       # 一条连接的编排（不含判定）
+│   ├── session-core.ts        # 对话层决策：事件 → CoreEffect；commitSeq 原样带进 bargeIn
+│   ├── driver.ts              # dsh / Cordis 插件入口（0.0.1 配置骨架，未接语音栈）
+│   ├── kernel.ts              # 判定层：纯 step()（stepInput/Playback/Dialog）+ isPreTurnCommit
+│   ├── kernel-runtime.ts      # 内核解释器：唯一 KernelState；attachPorts / dispatchAndApply
+│   ├── causal.ts              # 逻辑因果时间：commitSeq 与 {no, gen} 票据的唯一家
+│   ├── engine-contract.ts     # 四层类型契约与播放结算 outcomeOf()
+│   ├── dialog-fsm.ts          # 对话相位薄门面（只翻译事件、只读 kernel 快照）
+│   ├── turn-router.ts         # 路由：routeTurn() 判「这一轮先由谁答」
+│   ├── turn-runner.ts         # 跑完一轮：agent → TTS → 下行 → 等播放，只喂事实不算账
+│   ├── conversation-ledger.ts # 对话账本：上一轮谁答的、少听没少听；按票据结算
+│   ├── fronted-agent.ts       # 快车道轻量推理引擎与账本回注
+│   ├── fast-llm-client.ts     # 快车道文本模型客户端（对冲 / 两段超时 / SSE）
+│   ├── prefetch-slot.ts       # 判停前预跑与中间结果投机的槽位
+│   ├── omni-shadow.ts         # omni 音频直出车道（传输 / 段 / 车道三层同文件）
+│   ├── engines/
+│   │   ├── live-voice-engine.ts    # Live：把 omni 车道适配到 FastVoiceEngine 契约
+│   │   └── cascade-voice-engine.ts # Cascade：LLM → TTS（流式或整段）
+│   ├── persona.ts             # 代码层短人设的唯一导出源（与 mcp/profile.cordis.yml 分工）
+│   ├── barge-voicing.ts       # 插话 / 幽灵定稿的声学判据（定稿之后有没有新声音）
+│   ├── silence-triggers.ts    # 静音四路提前触发（投机 / 判停预跑 / 车道封段 / ASR 封段）
 │   ├── utterance-assembler.ts # 语音分段与语义判停协调
-│   ├── dialog-fsm.ts          # 全双工对话状态机
+│   ├── tool-control.ts        # 服务级常驻本机 HTTP 控制口（MCP 取照 / 收会话 / 调试说一句）
 │   ├── providers.ts           # STT / TTS / Agent 契约与工厂注入
-│   ├── app/session.ts         # 话筒抢占仲裁（Floor Arbiter）
+│   ├── app/
+│   │   ├── session.ts         # 话筒抢占仲裁（Floor Arbiter）
+│   │   └── dialog.ts          # DialogRuntime：一轮串行队列、播报与拍照；绑定 KernelPorts
+│   ├── devices/               # 设备协议：v1 基线与 v2 能力协商
 │   └── pet/                   # 主动开口状态机与仿真调度
+├── scripts/                   # 观测（observe / latency-report / said-audit）、VAD 标定（calibrate.ts）、
+│                              # 离线内核回放（kernel-replay.ts）、时间参数总表与变异检查
+├── packages/dsh-voice-web/    # 浏览器 WebSocket 桥与前端 demo（语音栈是 src/ 的副本）
 ├── docs/                      # 状态机规范、实测记录、协议与运维文档
 ├── bench/                     # 真机向量回放、延迟探针与 EoT 基准适配
 ├── tools/                     # 设备模拟器（fake-phone / fake-v2-device）
@@ -385,7 +466,7 @@ dsh-pet-wearable/
 |:---|:---|:---|
 | **QoS 规范（推荐首读）** | [QOS.md](./docs/QOS.md) | 指标口径、六条原则、改动五问、测量核查表及在用/否决/待定清单 |
 | | [TIME-KNOBS.md](./docs/TIME-KNOBS.md) | 时间参数总表（脚本生成）：默认值、时钟源、持有者、遮蔽关系与上限 |
-| **状态机** | [state-machines.md](./docs/state-machines.md) | 六大核心状态机（DialogFsm、FloorArbiter 等）时序与真值表；§5.9 是判定层（纯 `step()` + 四正交区域） |
+| **状态机** | [state-machines.md](./docs/state-machines.md) | 六大核心状态机（DialogFsm、FloorArbiter 等）时序与真值表；§5.9 是判定层：纯 `step()` 按区域拆 `stepInput` / `stepPlayback` / `stepDialog`，`dispatchAndApply()` 唯一执行，`isPreTurnCommit` 唯一屏障 |
 | **工具与度量** | [TOOLS.md](./docs/TOOLS.md) | 观测脚本矩阵、延迟口径唯一定义与排障路由 |
 | **判停基准** | [EOT-BENCH-RESULTS.md](./docs/EOT-BENCH-RESULTS.md) | 中文 EoT 基准数据、口径与修订记录（含撤回顾因）；核心结论：瓶颈在策略不在模型 |
 | **ASR / TTS 实测** | [QWEN-REALTIME-ASR-PROBED.md](./docs/QWEN-REALTIME-ASR-PROBED.md) | DashScope realtime 端点与静音窗实测（含「回执会骗人」现象） |
@@ -393,12 +474,13 @@ dsh-pet-wearable/
 | | [MIMO-API-PROBED.md](./docs/MIMO-API-PROBED.md) | MiMo 淘汰记录（不支持上行流式） |
 | | [STT-TTS-REALTIME-QUESTIONS.md](./docs/STT-TTS-REALTIME-QUESTIONS.md) | 选型前调研清单（已结案） |
 | **系统与协议** | [CLOUD-ARCHITECTURE.md](./docs/CLOUD-ARCHITECTURE.md) | 云端模块分层、并发模型与接口契约 |
+| | [OMNI-LANE.md](./docs/OMNI-LANE.md) | omni 音频直出车道分层、协议实测、延迟口径、委派垫话与排障 |
 | | [device-protocol.md](./docs/device-protocol.md) | 穿戴端线协议（帧结构、控制指令与状态帧） |
 | **运维** | [OPERATIONS.md](./docs/OPERATIONS.md) | 生产部署、TLS 配置与证书轮换 |
-| | [OPS-RECORD.md](./docs/OPS-RECORD.md) | 运维排障手记与双仓实操记录 |
+| | `OPS-RECORD.md` | **本地私有运维手记（不进 git）**：部署事实、证书与设备台账；仓库里没有这份文件，以源码与 `docs/` 为准 |
 | **架构决策（ADR）** | [ADR-0001: App Layer & Pet](./docs/adr/0001-app-layer-and-pet.md) | 应用层分层、话筒仲裁与主动开口演进 |
 | | [ADR-0002: Simulator](./docs/adr/0002-virtual-time-simulator.md) | 虚拟时间模拟器与因果不变式测试设计 |
-| | [ADR-0003: Deterministic Kernel](./docs/adr/0003-deterministic-kernel.md) | 三种时间（因果 / 媒体 / 墙钟）、四正交区域与纯 `step()` 内核的取舍与验收 |
+| | [ADR-0003: Deterministic Kernel](./docs/adr/0003-deterministic-kernel.md) | 三种时间（因果 / 媒体 / 墙钟）、四正交区域、纯 `step()` 与单份 `KernelPorts` 执行的取舍与验收（含账本按 `{no, gen}` 结算） |
 | **实现与草稿** | [fsm-align-report.md](./docs/fsm-align-report.md) | 状态机对齐第 0–4 步推进记录与卡点 |
 | | [shared-conversation-log.md](./docs/design/shared-conversation-log.md) | 单一对话日志设计草稿（暂缓实现） |
 | **硬件适配** | [RAYNEO-X3-PRO.md](./docs/devices/RAYNEO-X3-PRO.md) | 雷鸟 X3 Pro 真机接入参考 |
@@ -421,4 +503,4 @@ dsh-pet-wearable/
 
 - `turn_judge/whisper_features.py`：BSD 2-Clause (Daily) / Apache 2.0 (Hugging Face)
 - 判停模型权重：BSD 2-Clause (Pipecat / Smart Turn)
-- VAD 模型：MIT License (Silero VAD)——可选依赖，`--stt aliyun` 路径不启用
+- VAD 模型：MIT License (Silero VAD)——可选依赖；`--stt aliyun` / `--stt qwen-realtime` 生产路径不加载 `legacy-pipeline` / `onnxruntime-node`（仅 `--replay` 或无 `--stt` 的旧链路按需动态 `import()`）

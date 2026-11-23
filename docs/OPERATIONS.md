@@ -14,13 +14,17 @@
 `dsh` 当子进程拉起来说话（`--agent dsh`）：
 
 ```
-node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
+node src/main.ts --listen 8766 --stt qwen-realtime --tts cosyvoice --agent dsh
   └─ dsh --profile sdk --patch <patch.yml>      ← stdio JSON-RPC，一辈子跟着父进程
      ├─ mcp/mcp-camera.mjs       拍照
      ├─ mcp/mcp-session.mjs      挂断
      ├─ mcp/mcp-memory.mjs       remember（写 MEMORY.md）
      └─ mcp/mcp-sessions.mjs     搜过去的对话
 ```
+
+这行是现网组合：`--stt qwen-realtime`（DashScope，端点由我们控，`VOICE_COMMIT_MS` /
+`VOICE_STT_COMMIT_MS` 才有意义）＋ `--tts cosyvoice`。换回 NLS 写 `--stt aliyun`；
+`--tts` 留空会兜底成 `mimo`（不是静音）。
 
 `MEMORY.md` 放在 `--work-dir` 目录下，由 dsh 的 `agent-instructions` **每轮注入**
 系统提示词（不用调工具，省一轮往返）；改它会让下一轮前缀缓存失效一次。
@@ -163,7 +167,19 @@ node tools/fake-phone.ts --port 8768 --sbc tmp/voice.sbc --tls --ca cert.pem
 
 ## 本机控制口
 
-连接建立后，进程在 `--listen + 2` 端口开一个只绑本机的 HTTP 口（`PHOTO_CTL_PORT` 可覆盖）：
+**控制口是服务级的**：进程起来时建一次（`--listen + 2`，`PHOTO_CTL_PORT` 可覆盖，只绑
+`127.0.0.1`），到进程退出才 `close()`。设备重连**不重开端口**，靠热切换 handlers：
+
+- 连接上来 → `setHandlers(handlers, token)` 接管路由；
+- 连接断开 → `setHandlers(null, 自己)` 摘回「没有设备」，**必须带令牌** —— 旧连接迟到的
+  收尾不许把已经接管的新连接清掉（弱网重连时「旧断开晚于新接管」是常态）；
+- 早先「每条连接建一个」的写法会在重连时 `EADDRINUSE`，而且还在监听的旧 server 会把
+  `/say`、`/take_photo` 路由给**上一条已经关闭的连接** —— 现场表现是「手机重连一次之后，
+  MCP 拍照就全都没反应了」（原委见 [`src/tool-control.ts`](../src/tool-control.ts) 顶部）。
+
+`--serve`（或 `MIAI_SERVE=1`）下允许多条连接并存，但**同一时间只有一个活跃连接**：新连接
+完成鉴权就 `evict()` 掉旧的（断开旧 TCP，共享槽整体交给新连接；旧连接迟到的收尾只收自己
+的 TTS / ASR / 档案，不许再动控制口与播报）。
 
 | 路由 | 作用 |
 |---|---|
@@ -232,7 +248,9 @@ node scripts/said-audit.ts <会话目录>            # 逐轮「用户说了什�
 （`audioSeconds + playbackTailMs`）。
 
 回执（委派轮那句「我看看。」）虽然也占 `speaking`，但**不走这条**：它只要播完就
-`receiptEnded()` 回到 `thinking`，不等设备回执（`audioDone` 在 `_receiptOnly` 时直接返回）。
+`receiptEnded()` 回到 `thinking`，不等设备回执（`audioDone` 在 `receiptOnly` 为真时直接
+忽略）。这个字段在共享内核 [`src/kernel.ts`](../src/kernel.ts) 的 `dialog` 区域里，
+`DialogFsm` 现在只是 `KernelRuntime` 的薄门面，读的是 `runtime.state.dialog.receiptOnly`。
 
 两种情况的上限都是「估算 + 余量」，事件丢了不会把一轮挂死。改这块之前先看
 `src/turn-runner.ts` 里等待环的注释。
@@ -244,6 +262,10 @@ node scripts/said-audit.ts <会话目录>            # 逐轮「用户说了什�
 
 标定口径：**放大前**的门限 = `VOICE_PEAK_DBFS − 20·log10(MIAI_MIC_GAIN)`。
 这个值才是「多大声算开口」，换增益时保持它不变。
+
+**代码默认值不是现网值**：`src/main.ts` 里是 `4 / −30`（放大前 −42.0 dBFS），web 插件的
+`packages/dsh-voice-web/src/driver.ts` 是 `1 / −40`；现网 `.env` 用的是下面这对
+`2 / −46`（放大前仍是 −52.0 dBFS）—— 别把源码默认值当成线上配置。
 
 2026-11-23 从 `4 / −40`（放大前 −52.0 dBFS）改成 `2 / −46`（放大前 −52.0 dBFS）：
 

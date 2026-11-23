@@ -1,12 +1,20 @@
 # 协作约定
 
-## 开工先读运维记录
+## 开工先读运维记录（如果本机有的话）
 
 **部署形态、密钥与环境变量在哪、设备怎么装 App、协议三层、bench 与生产怎么共存 ——
-全部在 [docs/OPS-RECORD.md](docs/OPS-RECORD.md)。**
+这些事实记在 `docs/OPS-RECORD.md`。**
 
-那份是**核对过的事实清单**（末尾写了怎么重新核对），不是设计文档。别靠上下文记忆：
-本项目多次出现「把 bench 的临时做法当历史协议」「以为密钥在本机」这类错误，每次都浪费一轮。
+那份文件**已经移出版本库并写进 `.gitignore`**：它含真实主机、证书与设备信息，
+只作为**本机私有运维台账**存在。所以：
+
+- 本机有这份文件 —— 先读它。里面是**核对过的事实清单**（末尾写了怎么重新核对），
+  不是设计文档；
+- 本机没有 —— 不要去找、也不要从别处猜，直接以 `src/` 与 `docs/` 的现行内容为准。
+
+别靠上下文记忆：本项目多次出现「把 bench 的临时做法当历史协议」「以为密钥在本机」
+这类错误，每次都浪费一轮。
+
 ## 生产级手段：先说，再动手
 
 **自动化 / 自愈 / 监控这类"生产级"的东西，加之前先讨论，不要直接实现。**
@@ -69,6 +77,18 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 - 【情绪标签】那行的八个标签必须与 `src/emotion.ts` 的 `EMOTION_LABELS` 一致，
   `tests/profile-prompt.test.ts` 会卡住不一致。
 
+### 代码层短人设也只写一份
+
+全量系统人设是 `personaPrefix`；但快车道与 omni 这两条**不走 dsh 系统提示词**的
+链路，各自只有一个 `instructions` 字段。它们的身份头统一从
+[`src/persona.ts`](src/persona.ts) 导出（`PERSONA_NAME` / `OMNI_SHORT_INSTRUCTIONS` /
+`FAST_LANE_PERSONA_HEADER`），**不要在 `fronted-agent.ts` / `omni-shadow.ts` 里手写
+字面量**。两处抄一份的下场是「只改了一边，用户听出换了个人」—— 而代码不会报错。
+
+`tests/profile-prompt.test.ts` 守着同源：名字、定位、身份措辞要能被同一个来源解释，
+`personaPrefix` 里那八个标签也必须与 `EMOTION_LABELS` 对齐（快车道六种是刻意的既有
+行为，见 `persona.ts` 注释，别顺手「修正」成八种）。
+
 ## 跨层数据要一路接到底
 
 **一处产生、另一处需要的数据，中间每一层的签名都必须带上它。** 用可选字段
@@ -84,8 +104,12 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 | 「放手」的答复 | `DshSession.onDetachedAnswer` | `DshAgent` **根本没实现 `detachTurn()`**，而 `FrontedAgent` 写的是 `inner.detachTurn?.(ticket)` | 插话后委派轮跑完既没播报也没回注，日志里连一行都不出（上线以来一次没生效） |
 | `voiced`（门控后的人声态） | 能量门 | `qwen-realtime-asr` 的 provider 包装写成 `feed:(pcm)=>asr.feed(pcm)` | 尾静音过滤上线一次没生效，幻觉定音照样入库 |
 
-**可选能力的透传清单在 `src/keepalive.ts` 的 `trackActivity()`**：加
-`AgentProvider` 的新可选方法必须在那里加一行，否则包一层就静默降级。
+**可选能力的透传已经不再靠手抄**：`src/keepalive.ts` 的 `trackActivity()` 用 `Proxy`
+自动转发 `AgentProvider` 上的所有属性，只有 `reply` 被包一层记账 —— 以后新加的可选
+方法（甚至运行时才挂上去的）都会自动透传。两条实现细节别改：`Reflect.get` 的第三参
+必须是 `target`（私有字段的 getter 会在 receiver 上找不到槽），方法要 `.bind(target)`。
+
+仍然要守的是**别的包装层**：任何自己实现 `AgentProvider` 再转发的模块，都得逐项透传。
 `tests/wiring-floor-cancel.test.ts` 卡"生产装配真的接上了"这条。
 
 排查套路：`grep` 数据名，把**每一个**出现点列出来，逐个问「这里是传进来了，还是只是
@@ -103,7 +127,26 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 
 **同一件事不许有两个算法**：`TurnRunner` 曾经自己算一遍 `heard`/`truncated`，
 与 `outcomeOf` 各一份，改一处就漂。现在它只喂事实（`audioSent` / `devicePlayed` /
-`turnInvalidated` / `turnEnded`），结算只取 [`src/kernel.ts`](src/kernel.ts) 的意图。
+`ticketInvalidated` / `turnEnded`），结算只取 [`src/kernel.ts`](src/kernel.ts) 的意图。
+
+相位的家也在这里：`DialogFsm` 已收口成 [`src/kernel.ts`](src/kernel.ts) +
+[`src/kernel-runtime.ts`](src/kernel-runtime.ts) 的**薄门面** —— 它只把方法调用翻译成
+`KernelEvent`、只读 `runtime.state.dialog`，自己不再持有 `turn` / `gen`。回注口径
+（`inject: 'spoken' | 'unspoken' | 'none'`）与因果屏障也唯一归口在 `kernel.ts`，
+执行层照单执行，不许按 `audioBytes` 再判一遍。
+
+- 内核 `Effect`（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` / `settleTurn`）
+  由 `DialogRuntime` 通过 `KernelRuntime.attachPorts()` + `dispatchAndApply()` 唯一执行，
+  **不在 `SessionCore` 里另发一份 `call:audio.stop`**。
+- 因果旧段拦截唯一归口在 `kernel.ts::isPreTurnCommit`（`commitSeq` 经 `SessionCore`
+  一路传进 `bargeIn`），**不在 `voice-session.ts` 保留前置副本**（`fromPreTurnSegment` 已删）。
+- `FastVoiceEngine`（`src/engines/*`）当前是契约就绪层、尚未切入 `TurnRunner` 生产热路径
+  —— 三分支泵还挂着双轨投机 / 流式 TTS 回落 / 延迟埋点，**刻意分期，不是漏接线**。
+- 账本同源与 `step()` 结构：`KernelPorts.settleTurn` 按 `{no, gen}` 票据回写
+  `FrontedAgent` 的 `ConversationLedger`（`reconcileTurnOutcome` / `reconcileOutcome`），
+  重连由 `agent.lastLedgerLane()` 播种 `initialKernelState`；`kernel.ts` 的 `step()`
+  已按区域拆为 `stepInput` / `stepPlayback` / `stepDialog`。
+
 改判定先看 [ADR-0003](docs/adr/0003-deterministic-kernel.md) 与 `state-machines.md` §5.9。
 
 ## 示例不要用真实地址

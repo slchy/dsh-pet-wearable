@@ -54,6 +54,7 @@
 | **该治哪一段**（谁占大头、p90 是谁顶上去的） | `scripts/latency-attribution.ts <档案目录>` | 各段份额、③ 内部拆分、超预算轮次逐条 |
 | 这条链有没有一处不符合设计 | `scripts/fsm-trace-check.ts <档案>` | 违规列表（退出码 0/1） |
 | **判定逻辑改了以后历史档案还认不认**（听到多少 / 少听没少听 / 该不该回注） | `scripts/kernel-replay.ts <events.jsonl>` | 逐轮 kernel 裁决 vs 档案里 `turn.end` 记的；有分歧退出码 1 |
+| **状态机还有没有走不到 / 走错的边** | `node tests/fsm-verify.ts` | 36 配置 / 330 转移的穷尽探索；INV1–INV10 + P1–P5 的反例序列（退出码 0/1） |
 | `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
 | 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
 | 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比 |
@@ -66,6 +67,7 @@
 | ASR 握手 40000002 / 权限到底缺哪个 | `scripts/nls-check.mjs` | 各接口交叉验证 |
 | 上行音频被切碎了没有 | `scripts/env-dump.py <uplink.pcm>` | 逐窗能量包络 |
 | 识别出字速度合理吗（幻觉判据） | `scripts/speed-check.py` | 字/秒（中文 3–5，>8 可疑） |
+| 判停 / VAD 阈值该取多少（底噪离人声多远） | `node scripts/calibrate.ts <a.wav> [...]` | 逐秒概率分布 + 10 个阈值下的判停点；底噪段与人声段的概率差就是余量 |
 | 上行 mSBC 损失了多少高频 | `scripts/hf-compare.py` | 对下行 24 kHz 比频谱斜率 |
 | 云端链路通不通（不碰真机） | `tools/fake-phone.ts`（v1）/ `tools/fake-v2-device.ts`（v2） | 退出码 0 = 收到下行 Audio |
 | τ² 任务跑得好不好 | `bench/tau2/run_voice.py` | reward + 时序审计 |
@@ -124,15 +126,20 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 | | |
 |---|---|
-| 唯一实现 | [`src/engine-contract.ts`](../src/engine-contract.ts) 的 `outcomeOf()`（口径）+ [`src/kernel.ts`](../src/kernel.ts) 的 `step()`（谁该结算、什么时候结） |
+| 唯一实现 | [`src/engine-contract.ts`](../src/engine-contract.ts) 的 `outcomeOf()`（口径）+ [`src/kernel.ts`](../src/kernel.ts) 的 `step()`（谁该结算、什么时候结、回注口气） |
 | CLI | `node --experimental-strip-types scripts/kernel-replay.ts <events.jsonl>`（历史档案离线 reduce，与 `turn.end` 对账） |
-| 测试 | [`tests/engine-contract.test.ts`](../tests/engine-contract.test.ts)、[`tests/kernel.test.ts`](../tests/kernel.test.ts) |
+| 测试 | [`tests/engine-contract.test.ts`](../tests/engine-contract.test.ts)、[`tests/kernel.test.ts`](../tests/kernel.test.ts)、[`tests/kernel-effects-wiring.test.ts`](../tests/kernel-effects-wiring.test.ts)（含"摘掉端口之后一条 `audio.stop` 都不发"的反证） |
 
 **尺子是媒体时间，不是墙钟**：`heard = min(total, elapsed, sentMedia)`。
 `elapsed` 是物理上限（声音播不了比实时快），`sentMedia` 是已送达上限（字节 / 采样率）。
 `stale`（控制面，票据比对）与 `truncated`（内容面，媒体游标）**分属不同正交区域**，
 不许合成一个变量 —— 真机 `20261123-002440` 第 3 轮「19.44 s 正好播完、用户 26 ms 后开口」
 就是 stale 但没少听，该回注记忆。
+
+**回注口气也是内核算的**：`settleTurn` 同时给出 `inject ∈ {spoken, unspoken, none}` ——
+`none` = 用户少听了一段（不回注）；`spoken` = 播完了且念出去了；`unspoken` = 播完了但
+一个字都没念出去（`audio_s=0`，照样要回注：`053719` 第 2 轮的《其主之声》就是这么丢的）。
+执行层**照单执行**，别自己按 `audioBytes === 0` 再判一次。
 
 **`dsh` 内部耗时**
 
@@ -370,6 +377,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/probe-nls-vocab.mjs` | `customization_id` / `vocabulary_id` 真被解码时用了吗 |
 | `scripts/asr-ab.mjs` | 同一段音频 16 kHz vs 8 kHz 识别对比 |
 | `scripts/env-dump.py` | 逐窗能量包络：非语音段是不是数字静音、语音段有没有碎片 |
+| `scripts/calibrate.ts` | silero VAD 阈值标定：逐秒打印概率分布 + 10 个阈值下的判停点。**已从 `src/` 迁出**（`src/` 是 `main.ts` 的静态 import 闭包，会被同步进 web 包，标定工具不该混在里面）。同一段录音里底噪段与人声段的概率差，配 `MIAI_MIC_GAIN` / `VOICE_PEAK_DBFS` 时当余量参考 |
 | `scripts/speed-check.py` | 字/秒（判断"音频问题 vs 模型幻觉"最硬的定量指标） |
 | `scripts/hf-compare.py` | 上行 mSBC 对下行 24 kHz 的频谱斜率 |
 | `scripts/sbc-sync-test.py` | ffmpeg 解 mSBC 是否依赖 syncword（HFP 用 0xAD 不是 0x9C） |
@@ -434,8 +442,10 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `tools/fake-v2-device.ts` | 假 v2 设备：`CaptureImage` / 电量上报。`--host <服务器地址> --port <端口> --tls --token <hex>` |
 | `scripts/watch-tune.sh` | 两端日志同时抓、按时间对齐（本机或能 ssh 到 `<服务器地址>`） |
 | `scripts/env-dump.py` | 见 §7 |
+| `tests/fsm-verify.ts` | `DialogFsm` 穷尽状态空间验证：36 配置 / 330 转移 + INV1–INV10 + P1–P5。**不在 `npm test`**（那份 glob 只收 `tests/*.test.ts`），改状态机后单跑 |
 
-`npm run` 入口只有六个：`start` / `pair` / `sim` / `typecheck` / `test` / `install-profile`。
+`npm run` 入口只有七个：`start` / `pair` / `sim` / `typecheck` / `test` / `mutate` / `install-profile`
+（`prepublishOnly` 是生命周期钩子，不算入口）。
 其余一律直接 `node <路径>`。`.ts` / `.mts` 在 Node ≥ 22.18 上直接跑（类型擦除已默认开，
 本机 v24）；老版本要加 `--experimental-strip-types`，几个 .ts 脚本的头部注释里带着它，
 加上也无害。
@@ -446,7 +456,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 **真机实测（2026-11-17，`v2` 设备，两场共 12 轮；档案目录名见 §12.1 的字段说明）**：
 
-> 这里是**两场 12 轮**的样本；README「标定原始记录」用的是**另一份 13 轮同向量**
+> 这里是**两场 12 轮**的样本；README「真机基准实测」用的是**另一份 13 轮同向量**
 > （`…_46019`），数字不同属正常，别把两套混着引用。
 
 > **这张表里只有「闭嘴→出声」那行的 p50/p90 是项目口径**，其余都是单段中位，
@@ -503,7 +513,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 第三刀（中文阈值 0.35 + 「没变就不等」）在**另一份更新的真机向量**上验的
 （`20261117-221010-…_46019`，13 轮，2026-11-17 22:10 真机）。
-**完整回放日志（两次、逐轮、含状态审计）贴在 [README 的「标定原始记录」](../README.md#标定原始记录可复算) 里** ——
+**完整回放日志（两次、逐轮、含状态审计）贴在 [README 的「真机基准实测」](../README.md#真机基准实测) 里** ——
 那里是标定数据的落地处，本节只放结论：
 
 | 同一份向量 | qwen（fast）p50 | dsh p50 | 全部 p50 |
@@ -527,7 +537,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | 事件 | 关键字段 | 能回答什么 |
 |---|---|---|
 | `gate.open` / `gate.close` | `gapMs` | 真实停嘴时刻 = `gate.close.t − gapMs`（**别直接减 `t`**） |
-| `asr.partial` / `asr.sentence` | `text`、`index`、`at.pcm` | ASR 逐字对比；`at.pcm` 是音频里的字节偏移，离线复算判停要用 |
+| `asr.partial` / `asr.sentence` | `text`、`index`、`at.pcm`；可选 `dropped` | ASR 逐字对比；`at.pcm` 是音频里的字节偏移，离线复算判停要用。`dropped: 'pre-turn'` = 这条定稿的音频早于本轮开轮（内核 `isPreTurnCommit` 拦下的开轮前旧段）→ **不当插话、也不开轮**，用户下一句会重新说到它 |
 | `turn.start` | `text_len`、`image` | 这一轮进来的文字长度（并句后会更长） |
 | **`judge.decide`** | `p`、`waitMs`、`action`、`why`、**`whyAccept`**、**`threshold`**、`silenceMs`、`waitedMs`、`budgetMs` | **② 的成因**：判停每次给的概率 + 还要等多久。`action` = `accept`/`extend`/`error`；`why` = `silence`/`short`/`unsure`（`grace`/`unfinished` 已在 `ed87bc7` 删除，旧档案里还会有）；`whyAccept=cap` = 静音到了统一上限（`TURN_JUDGE_MAX_OPEN_SILENCE_MS`）而放行；`threshold` 是这次用的阈值（中文 0.35 / 其他 0.5），没有它分不清「换语言了」还是「p 变了」 |
 | `llm.first` | `ms` | 模型首字 |
@@ -535,7 +545,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | **`tts.task`** | `setup_ms`、`feed_ms`、`first_ms`、`stream`、`prewarmed`、`conn_new`、`conn_idle_ms`、**`conn_tasks`**、**`conn_peer`** | **TTS 那一段拆三截**，常开（不是调试探针）：`setup_ms` = run-task → task-started（还没轮到我们 / 进程被卡）；`feed_ms` = task-started → 首批文本送出（**我们这侧**没供上字，等模型吐字 / 等攒够批）；`first_ms` = 首批文本送出 → 首块音频（服务端合成）。三截慢起来长得一样、治法完全不同 —— 见 `OPS-RECORD.md` §12.8.1。`feed_ms` 是 2026-11-19 加的：那之前出现「首包 1690 ms」时只能归到「服务端」这一层，再也下不去。非流式（`stream=false`，回执那条）没有分批送字，`feed_ms = -1`。一轮里可能不止一条（回执 + 回答），**回答那条在最后**。`conn_new`/`conn_idle_ms`/`conn_tasks`（2026-11-21 加）是 run-task 发出那刻的连接状态：`conn_new` = 这条连接上还没跑完过 task；`conn_idle_ms` = 距**上一个 task 的 `task-finished`**（厂商说做完了，不是我们的 `tts.done`）多久，首任务报距建连多久；`conn_tasks` = 这条连接上已收尾的 task 数。`conn_peer`（同日加）= 对端 `IP:端口` —— 用来把 `setup_ms` 的双峰分成「落到不同节点」和「同一节点状态差异」（实测 11:34 那场只有 2 条连接、同一 IP 内部来回切，见 `QOS.md` §2.7 第 8 项） |
 | **`tts.done`** | `setup_ms`、`first_ms`、`feed_ms`、`prewarmed`、`batches`、`chars`、`first_text_ms`、`last_text_ms`、`finish_ms`、`head`、`tail` | **流式 task 的分批送达明细**，收尾时落一次。`head`/`tail` 每项是 `[累积字数, 相对 run-task 毫秒, 这批是否以标点结尾]`（只记前 4 批 + 最后一批）。它回答 `tts.task` 答不了的问题：首包慢的时候，**后面那几批文本到底什么时候送上去的**。`first_ms` 是「首批 → 首块」，而 `finish_ms` 是「run-task → finish-task 发出」—— **`first_text_ms + first_ms - finish_ms` 就是 finish 之后纯粹等合成的时间**。2026-11-20 实测：正常轮这段 300 出头（与探针一致），长尾轮 1250/1339，同期 `loop_max_ms` 只有 3 |
 | **`dialog.state`** | `from`、`to`、**`why`** | **为什么进这个状态**。`why` 里写着「回执出声（可打断）」还是「首块音频已下发」—— 没有它，`thinking → speaking` 分不出是回执还是答案（差约 1 s） |
-| **`turn.end`** | `interrupted`、**`truncated`**、`audio_s`、`heard_s`、`dsh_ms`、`tts_first_ms`、`dsh_session`、**`path`**、**`delegate`**、**`said`**、`said_chars`、**`loop_max_ms`**、**`loop_p99_ms`**、**`net_*`** | **`interrupted` = 票据被作废（控制面）**，`truncated` = **用户真的少听了**（`heard_s + 0.3 < audio_s`，内容面）—— 两者不是一回事，别拿 `interrupted` 当「被打断率」：真机 2026-11-23 第 3 轮 19.44 s 音频**正好播完**、用户 26 ms 后才开口，`interrupted=true` 而 `truncated=false`。`path` = `fast`/`dsh`：**这一轮谁答的**；`delegate` = `task`/`answer`/`memory`/`overcap`/`delegate`/`timeout`/`empty`/`error`：**为什么交给 dsh**；`dsh_session` 用来定位 dsh 的 session log；**`said` = 这一轮实际念出去的文本**（已剥情绪标签、多步时含全部增量；回执不算）—— 审计「抢话之后模型有没有接上」靠它，因为快车道（qwen-flash）**没有 session log**，dsh 那侧另有 `assistant/message` 可对；**`loop_max_ms` = 这一轮里事件循环被占住的最大时长**——它跟着 TTS 尖峰一起大，说明是**我们自己被卡住**，不是厂商慢。**`net_*`（2026-11-21 加，六项）** = 这一轮**整机** TCP 计数增量：`net_retrans` / `net_timeouts`（RTO 触发）/ `net_fast_retrans` / `net_lost_retrans`（重传包又丢）/ `net_ofo_queue` / `net_dsack`（入向）。**只能当「这台机器这段时间有没有重传」，不能当「哪条连接丢的」** —— 实测有一轮 `retrans 388` 而该轮 TTS 首包完全正常，那 388 次属于别的连接（见 `QOS.md` §2.7 第 7 项）；要归因看 `net.sockets` |
+| **`turn.end`** | `interrupted`、**`truncated`**、`audio_s`、`heard_s`、`dsh_ms`、`tts_first_ms`、`dsh_session`、**`path`**、**`delegate`**、**`said`**、`said_chars`、**`loop_max_ms`**、**`loop_p99_ms`**、**`net_*`** | **`interrupted` = 票据被作废（控制面）**，`truncated` = **用户真的少听了**（`heard_s + 0.3 < audio_s`，内容面）—— 两者不是一回事，别拿 `interrupted` 当「被打断率」：真机 2026-11-23 第 3 轮 19.44 s 音频**正好播完**、用户 26 ms 后才开口，`interrupted=true` 而 `truncated=false`。`path` = `fast`/`dsh`/`omni`：**这一轮谁答的**（`omni` = omni 一体模型直出）；`delegate` = `task`/`answer`/`memory`/`overcap`/`delegate`/`timeout`/`empty`/`error`：**为什么交给 dsh**；`dsh_session` 用来定位 dsh 的 session log；**`said` = 这一轮实际念出去的文本**（已剥情绪标签、多步时含全部增量；回执不算）—— 审计「抢话之后模型有没有接上」靠它，因为快车道（qwen-flash）**没有 session log**，dsh 那侧另有 `assistant/message` 可对；**`loop_max_ms` = 这一轮里事件循环被占住的最大时长**——它跟着 TTS 尖峰一起大，说明是**我们自己被卡住**，不是厂商慢。**`net_*`（2026-11-21 加，六项）** = 这一轮**整机** TCP 计数增量：`net_retrans` / `net_timeouts`（RTO 触发）/ `net_fast_retrans` / `net_lost_retrans`（重传包又丢）/ `net_ofo_queue` / `net_dsack`（入向）。**只能当「这台机器这段时间有没有重传」，不能当「哪条连接丢的」** —— 实测有一轮 `retrans 388` 而该轮 TTS 首包完全正常，那 388 次属于别的连接（见 `QOS.md` §2.7 第 7 项）；要归因看 `net.sockets` |
 | **`net.sockets`** | `sockets[]`，每项 `peer` / `retrans` / `rto` / `rtt` / `unacked` | **每条连接自己的**计数（`ss -tin` 读，2026-11-21 加）。在 `turn.end` **之后异步**采一次、不占关键路径，所以它可能排在 `turn.end` 后面几条事件 —— 按「最近的上一条 `turn.end`」配对。`retrans` 是这条连接**累计**重传段数（`retrans:1/14` 取 14），跨轮相减才是本轮的增量。判读：335 轮里厂商 socket 的 `retrans` 增 ≥1 → 是丢包；一直 0 → 那 270 ms 是延迟注入 |
 | `call.send` | `json` | 下行原语（`audio.stop` / `listen.stop` …） |
 | `device.played` | — | v2 设备「真播完」回执 |
@@ -544,7 +554,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | **`agent.done`** | `ok`、`ms`、`first_token_ms`、**`raw`**、`opened`、`delegated` / 失败时 `err` | **模型答了什么**：`raw` 是原文（含情绪标签、可能被 `[[DELEGATE]]` 早退）；`opened` = 有没有已经推给 TTS（推过就撤不回） |
 | **`agent.drop`** / **`agent.claim`** | `why` / `ok` + `ran_for_ms` | 预跑为什么作废、有没有被认领 —— **预跑不一定变成一轮**，只有这两条能看见被丢掉的那几趟 |
 | **`agent.spec`** | `spec`、`final`、`coverage`、**`missing`**、`ran_for_ms` | 投机被定稿确认时，**缺了哪几个字**。认领已收紧成「去标点后完全一致」（2026-11-19），所以这一条现在应该几乎总是 `missing: ""`；一旦出现非空，就说明闸门又松了 |
-| **`asr.commit`** | `silence_ms`（实际静音）、`want_ms`（配置的 `commitAfterMs`） | **停嘴→封段**的真实间隔。所有按静音计时的动作（封段 20 / 投机 100 / 判停预跑 200）都跑在 `trackSilence` 里，而它只在 `addAudio` 时调 —— 上行包多大、设备静音时推不推帧，全在这一条上显形 |
+| **`asr.commit`** | `seq`（ASR 自己的封段号）、`silence_ms`（实际静音）、`front_silence_ms`（能量门算的真静音）、`want_ms`（配置的 `VOICE_STT_COMMIT_MS`）、**`lane_seq`** | **停嘴→封段**的真实间隔。`asr.commit` 在 `VOICE_STT_COMMIT_MS`（默认 150 ms）才封段，omni 车道先按 `VOICE_COMMIT_MS`（默认 20 ms）`seal` —— 两个号**不再相等**，想配对看 `lane_seq`（`omni.shadow.seq` 与它同源），别假设 `seq` 一样。静音计时已从组装器拆到 [`src/silence-triggers.ts`](../src/silence-triggers.ts)，由 `AudioFrame`（`UtteranceAssembler.addFrame`）驱动；`silence_ms − front_silence_ms` 就是「静音开始 → 真有音频帧到达」的 tick 延迟 —— 上行包多大、设备静音时推不推帧，全在这一条上显形 |
 | **`receipt`** | `text`、`chars` | 委派轮先说的那句「嗯，我想想」，它不在 `turn.end.said` 里 |
 
 > **为什么 `agent.*` 单独一组**：预跑/投机可能在 `turn.start` **之前**就被作废（换一句、
@@ -597,7 +607,11 @@ qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**
 ### 12.3 ASR 端点自控（实验路径，⚠️ **尚未全量验证**，2026-11-18）
 
 `MIAI_STT=qwen-realtime`：关掉服务端 VAD（`turn_detection: null`），由宿主在静音到点发
-`commit`（`VOICE_COMMIT_MS`，默认 40），开轮另设静音门槛（`VOICE_OPEN_QUIET_MS`）。
+`commit`，开轮另设静音门槛（`VOICE_OPEN_QUIET_MS`）。
+
+**现在的默认已经拆成两个旋钮**：`VOICE_COMMIT_MS=20`（omni 车道 `seal`，只封车道、不碰
+ASR）与 `VOICE_STT_COMMIT_MS=150`（ASR 封段解码）。下面那张 2026-11-18 的表记的是更早
+的 `commit 40` 单旋钮实验 —— 两组数字口径不同，别直接比。
 
 同一份向量（`…_46019`）只动这一段：
 

@@ -1,8 +1,10 @@
 # ADR-0003 确定性内核：三种时间 + 正交区域 + 纯 `step()`
 
-- 状态：已落地（2026-11-23）
+- 状态：已落地并完成收口（2026-11-23）
 - 关系：细化 `docs/state-machines.md` §5.9；口径实现在 `src/kernel.ts`、
-  `src/causal.ts`、`src/engine-contract.ts`；离线执行体是 `scripts/kernel-replay.ts`
+  `src/kernel-runtime.ts`、`src/causal.ts`、`src/engine-contract.ts`、
+  `src/dialog-fsm.ts`、`src/app/dialog.ts`、`src/conversation-ledger.ts`；
+  离线执行体是 `scripts/kernel-replay.ts`
 
 ## 1 要解决的问题
 
@@ -37,9 +39,16 @@
 DashScope 那种「discard 时还没拿到 assistantItemId，必须等 `response.done` 再发
 `item.delete`」的协议脏活全部关在适配器里。
 
-为什么必须纯：`TurnRunner` 是 800 行 `async` 泵，它在 `await` 回执 / dsh / TTS 之间改状态。
+为什么必须纯：`TurnRunner` 是一条 `async` 泵，它在 `await` 回执 / dsh / TTS 之间改状态。
 真机上踩过它的典型死法——「`await` 回执时插话把状态改了，老协程醒来又覆盖回去」。
 `step` 是原子的同步函数，抢占只可能发生在两次 `step` 之间，那时状态已是完整的一份。
+（抽内核时它 835 行 / 20 个 `await`；收口后 1147 行 / 27 个，但**判定已经搬走**。）
+
+**收口后（2026-11-23）**：`step()` 本身只剩三步 —— 因果屏障 → `closed` 吸收态守门 →
+按区域分派，约 25 行。真正的转移拆进 `stepInput` / `stepPlayback` / `stepDialog`
+三个窄函数，每个只读自己那一区；事件分组用 `Extract` / `Exclude` 从 `KernelEvent`
+**派生**而不是手抄，新增事件时三个 switch 会在编译期报「少了一个 case」，不会悄悄
+落进某个 `default`。
 
 ### 2.3 四个正交区域，跨区只读快照
 
@@ -54,13 +63,31 @@ DashScope 那种「discard 时还没拿到 assistantItemId，必须等 `response
    「19.44 s 正好播完、用户 26 ms 后才开口」就是 stale 但没少听 —— 该回注记忆。
 3. **跨区只读快照**：判打断只比 `event.commitSeq > dialog.ticket.baseCommitSeq`。
 
+**收口后（2026-11-23）这三条落在谁身上**：
+
+- **装配与执行**：`DialogRuntime`（`src/app/dialog.ts`）用 `KernelRuntime.attachPorts()`
+  绑一次生产 `KernelPorts`；`DialogFsm` 与 `TurnRunner` 的每条事件都走
+  `dispatchAndApply()`，四种意图（`stopDeviceAudio` / `invalidateTurn` /
+  `abortEngine` / `settleTurn`）**各执行一次** —— `DialogFsm` 不再另发
+  `audio.stop`，`SessionCore` 也不再发第二份 `call:audio.stop`。
+- **唯一的因果屏障**：`isPreTurnCommit(state, commitSeq)`（`src/kernel.ts`）被内核的
+  `isCausallyStale` 与 `SessionCore` 共用；`voice-session.ts` 里的
+  `fromPreTurnSegment` / `partialFromPreTurnSegment` 已删除，不再有前置副本。
+- **结算快照**：`settleTurn` 带 `inject`（`spoken` / `unspoken` / `none`）、
+  `heardMs`、`totalAudioMs`、`lane`、`endedAtMs`；`KernelPorts.settleTurn` 把后验的
+  `truncated` 与 `endedAtMs` 按**精确的** `{no, gen}` 票据经 `reconcileOutcome`
+  回写 `FrontedAgent` 的 `ConversationLedger`（对不上就一个字段都不动）。重连时
+  `initialKernelState` 用 `agent.lastLedgerLane()` 播种 `lastLane` —— 内核可以新建，
+  「上一轮谁答的」不能丢。
+
 ## 3 备选方案与为什么不选
 
 | 方案 | 为什么不选 |
 |:--|:--|
-| 继续在 `TurnRunner` 里加判据 | 已经 800 行、20 个 `await`；每加一条判据都在同一个协程里与 I/O 交错，重入无法证明，只能靠回放碰 |
+| 继续在 `TurnRunner` 里加判据 | 它是一条 1000+ 行的 `async` 泵（抽内核时 835 行 / 20 个 `await`）；每加一条判据都在同一个协程里与 I/O 交错，重入无法证明，只能靠回放碰 |
 | 用时间戳代替序号做因果 | 到达时刻可被网络抖动、服务端重排任意改变（±300 ms 就足以颠倒），序号不可 |
-| 把所有相位也搬进内核 | 动 460 行 `DialogFsm` 与全部调用点，收益是"少一处真相"；今天没有对应 bug，风险大于收益。**留作后续**，边界写在 `kernel.ts` 头部的"运行时边界"表 |
+| 把所有相位也搬进内核 | v1 时**刻意推迟**：要动 460 行 `DialogFsm` 与全部调用点，收益只是"少一处真相"，而当时没有对应 bug，风险大于收益。**已收口（2026-11-23）**：`DialogFsm` 现在是 `runtime.state.dialog` 之上的薄门面 —— 只翻译事件、只读快照，第二份相位（`_turn` / `_gen` / `_endAfterSpeech` / `_receiptOnly`）已删除 |
+| 现在就把 `TurnRunner` 三分支泵换成 `FastVoiceEngine.respond()` | 引擎侧已就绪：`LiveVoiceEngine` / `CascadeVoiceEngine` 都已实现，并通过 `tests/fast-voice-engine.test.ts` 的契约测试，所以「换引擎零改内核」成立。但 `TurnRunner` 的 `omni` / `stream` / `pump` 三分支仍承载双轨投机、流式 TTS 回落与逐轮延迟埋点（`tts.first` / `turn.end` 的 `dsh_ms` / `audio_s`）——「换引擎零改泵」**刻意留给下一阶段**，不是漏接线 |
 | 不做幂等结算 | 打断当场结算过一次，协程收尾会再报一次；不幂等就把"少听一半"重算成"听了 0 秒、没少听"→ 该吞的答案被回注 |
 
 ## 4 验收（三条硬标准）
@@ -71,13 +98,26 @@ DashScope 那种「discard 时还没拿到 assistantItemId，必须等 `response
 | 乱序不变性 | `tests/kernel.test.ts`：打乱到达顺序、插入 `gate`/`devicePlayed`、同一条插话重复到达 | 意图一字不差；重复到达只作废一次 |
 | 换引擎零改内核 | 同一串事件按 live / cascade 两种节奏喂进去 | 状态与意图完全相同，**只有首块墙钟不同**（延迟指标，不是状态） |
 
-回归：`npm test` 827/827；`fsm-trace-check` 对 13 轮真机回放 **✓ 没有违规**；
+**初版落地记录**：`npm test` 827/827；`fsm-trace-check` 对 13 轮真机回放 **✓ 没有违规**；
 同一向量的「停嘴→首块」中位数 884 → 805 → 728 ms（依次为改内核前 / 内核落地 / 结算接入后），
 差异主要是 STT 与 dsh 的 run-to-run 抖动，可归因于改动的部分是**没有引入新的 `await`**。
+
+**收口后全量验收（2026-11-23）**：
+
+| 门 | 结果 |
+|:--|:--|
+| `npm test` | **890/890**（当日实测；比初版 827 多出来的部分在 `tests/kernel.test.ts` 27 条、`tests/kernel-effects-wiring.test.ts` 4 条、`tests/fast-voice-engine.test.ts` 14 条、`tests/main-wiring.test.ts` 7 条、`tests/voice-session-reconnect.test.ts` 4 条；同一天删掉的 `battery-cache` / `device-host` 两套宠物测试是反向的一笔，所以不能拿总数跟旧记录直接横比） |
+| `tests/fsm-verify.ts` | 36 个配置 / 330 条转移，全部不变量通过 |
+| `npm run sim` | **40/40** |
+| 依赖图 | `src/` 96 个模块**零环**（含 type-only import 也无环） |
 
 ## 5 影响
 
 - 新增 `src/kernel.ts`、`src/kernel-runtime.ts`、`src/causal.ts`、`scripts/kernel-replay.ts`。
 - `TurnRunner` 不再自己算 `heard`/`truncated`/`reflect`，只喂事实、取意图。
-- 加 `AgentProvider` 新的可选能力时，`keepalive.trackActivity` 必须跟着透传
-  （已经因为漏转发踩过三次：`voiced` 被吞、`setAnnouncer` 漏、`detachTurn` 从来没实现）。
+- 加 `AgentProvider` 新的可选能力时，不再需要手工改转发表：`keepalive.trackActivity`
+  已改成 `Proxy` + `WeakMap`，所有可选能力（`dropPrefetch` / `reconcileTurnOutcome` /
+  `lastLedgerLane` / `detachTurn` 等，含以后新加的、运行时才挂上去的）自动透传
+  （`tests/keepalive.test.ts` 钉住 `proxy.prefetch === proxy.prefetch` 与私有字段的
+  `this`）。**但自己实现 `AgentProvider` 再转发的包装层仍要逐项透传** ——
+  `tests/wiring-floor-cancel.test.ts` 卡的是"生产装配真的接上了"这条。
