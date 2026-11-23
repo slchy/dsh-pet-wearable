@@ -138,8 +138,17 @@ export class QwenRealtimeAsr {
    */
   private ringDuringDecode: Buffer[] = [];
   private ringBytes = 0;
-  /** 窗口内已经见过有声帧 —— 之后所有帧都转正（含中间的短静音） */
+  /** 窗口内已经见过有声帧（只用来记账，不再决定后面所有帧的去向） */
   private holdActive = false;
+  /**
+   * 上一次 `commit` 之后有没有人真的说过话。
+   *
+   * 与 {@link dirty} 的区别：`dirty` 说「缓冲里有音频」，这个说「**缓冲里有人声**」。
+   * 能量门 `holdMs` 2 s 关得比封段晚得多，尾静音会一直灌进来 —— 只要还没人开口，
+   * 它们就只进 {@link ringDuringDecode}，既不 append 也不点亮 `dirty`。
+   * 没有这道闸，`gate.close` 的 `hangup()` 会拿纯静音封段，换来一句幻觉定稿。
+   */
+  private pendingVoice = false;
   /**
    * 解码窗口里有人来要过 commit。
    *
@@ -281,31 +290,54 @@ export class QwenRealtimeAsr {
    */
   private sendAudio(pcm: Buffer, voiced?: boolean): void {
     if (this.awaitingDecode) {
-      const isVoiced = voiced !== false;
-      if (this.holdActive) {
+      if (voiced !== false) {
+        // 开口了：软起音那几帧在 ring 里，一起转正
+        this.holdActive = true;
+        for (const part of this.ringDuringDecode.splice(0)) {
+          this.pushHeld(part);
+        }
+        this.ringBytes = 0;
         this.pushHeld(pcm);
         return;
       }
-      if (!isVoiced) {
-        // 还没开口：只留最近一小截，防软起音被切掉
-        this.ringDuringDecode.push(pcm);
-        this.ringBytes += pcm.length;
-        while (this.ringBytes > RING_BYTES && this.ringDuringDecode.length > 0) {
-          this.ringBytes -= this.ringDuringDecode.shift()?.length ?? 0;
-        }
-        return;
-      }
-      // 又开口了：软起音那几帧在 ring 里，一起转正
-      this.holdActive = true;
-      for (const part of this.ringDuringDecode.splice(0)) {
-        this.pushHeld(part);
-      }
-      this.ringBytes = 0;
-      this.pushHeld(pcm);
+      // 静音：**不进 `heldDuringDecode`**，只留最近一小截（可能是下一个音的软起音）。
+      //
+      // 曾经是「一旦说过话，之后所有帧都攒」—— 于是封段后那 300–500 ms 尾静音
+      // 被一起补推上去，服务端稳定吐幻觉定稿（真机 2026-11-23 05:14 那场：
+      // 第 4 轮补推 16 帧后吐 `Okay.`、第 6 轮 16 帧后 `Thank you.`、
+      // 第 7 轮 14 帧后 `嗯。`）。
+      this.pushRing(pcm);
       return;
     }
+    // `voiced === undefined`（老调用点 / backlog 补推）= 不知道，按有声处理
+    if (voiced === false && !this.pendingVoice) {
+      // 这段还没人说过话：静音**不进缓冲、不置 `dirty`**。
+      //
+      // 不这么做的话，能量门那 2 s 的 hold 会把尾静音一路 append 上来、把 `dirty`
+      // 重新点亮 —— `gate.close` 的 `hangup()` 于是再 commit 一次，纯静音封出一句
+      // 幻觉定稿（`20261123-051448` 第 5 轮就是这么凭空开出来的 `Okay.` 轮）。
+      this.pushRing(pcm);
+      return;
+    }
+    if (voiced !== false) {
+      this.pendingVoice = true;
+    }
+    // 软起音那几帧在 ring 里：开口那一刻一起带上，别把起音切掉
+    for (const part of this.ringDuringDecode.splice(0)) {
+      this.sendRaw({ type: 'input_audio_buffer.append', audio: part.toString('base64') });
+    }
+    this.ringBytes = 0;
     this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
     this.dirty = true;
+  }
+
+  /** 静音或软起音先进这个小环；开口那一刻再转正 */
+  private pushRing(pcm: Buffer): void {
+    this.ringDuringDecode.push(pcm);
+    this.ringBytes += pcm.length;
+    while (this.ringBytes > RING_BYTES && this.ringDuringDecode.length > 0) {
+      this.ringBytes -= this.ringDuringDecode.shift()?.length ?? 0;
+    }
   }
 
   private pushHeld(pcm: Buffer): void {
@@ -323,6 +355,7 @@ export class QwenRealtimeAsr {
     // 窗口内一直是静音：一个字都没说，推上去只会换来一句「嗯。」
     this.ringDuringDecode = [];
     this.ringBytes = 0;
+    const hadVoice = this.holdActive;
     this.holdActive = false;
     const deferred = this.commitDeferred;
     this.commitDeferred = false;
@@ -339,6 +372,8 @@ export class QwenRealtimeAsr {
       this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
     }
     this.dirty = true;
+    // 补推的是「说过话的那部分」，所以这时才算缓冲里有人声
+    this.pendingVoice = hadVoice;
     this.log(`[asr] 补推解码期暂存的 ${held.length} 帧`);
     if (deferred) {
       // 有人要过 commit：现在缓冲里才有东西，补发它（否则这段语音会一直悬着，
@@ -373,6 +408,8 @@ export class QwenRealtimeAsr {
     }
     this.sendRaw({ type: 'input_audio_buffer.commit' });
     this.dirty = false;
+    // 这段人声已经交出去了：之后灌进来的尾静音不再算「新的一段」
+    this.pendingVoice = false;
     this.awaitingDecode = true;
     this.log('[asr] commit');
   }

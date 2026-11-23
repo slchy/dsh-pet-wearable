@@ -16,6 +16,7 @@
  */
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
+import { pcm16PeakDbfs } from './pcm.ts';
 import { voicingVerdict } from './barge-voicing.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
@@ -771,8 +772,11 @@ class VoiceConnection {
         // 新一轮开口：判停窗口只留这一句（官方也是按句裁的）。预卷就是这段的开头，
         // 前面那些静音 / 上一轮的回答都不该进模型。
         this.assembler.resetAudio(preroll);
+        // 预卷里**大部分是静音**（它是「触发点之前 800 ms」，不是语音起点）。
+        // 按同一套门限逐块标 voiced：静音只进软起音环，不会一开麦就让服务端先在
+        // 静音上吐一个「嗯。」（那一下还会把宠物话筒改成 owner=user）。
         for (const part of preroll) {
-          this.stt.feed(part);
+          this.stt.feed(part, pcm16PeakDbfs(part) >= options.gate.thresholdDbfs);
         }
         // 影子按「这一句」重新起一段。封段后到下一次开口之间的静音**一个字节都不推**
         // （见 `OmniShadow` 的 mute），所以这里只要把预卷补上就行。

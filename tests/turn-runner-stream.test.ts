@@ -43,6 +43,8 @@ interface Rig {
   readonly logs: string[];
   /** 测试里要能主动插话（`interrupted` / `truncated` 的差别只有它能造出来） */
   readonly fsm: DialogFsm;
+  /** 最后一块音频吐出的时刻（`chunkDelayMs` 造流式耗时后用它算「多锁了多久」） */
+  readonly lastChunkAt: number;
   run(): Promise<TurnResult | null>;
 }
 
@@ -59,6 +61,8 @@ function rig(options: {
   omniDelegate?: DelegateReason;
   /** 转交之后 dsh 永不回话：用来验「本轮作废就不再等它」 */
   delegateHang?: boolean;
+  /** 流式合成每块之间隔这么久：用来造「吐音频本身耗时」的场景 */
+  chunkDelayMs?: number;
   /** 这一轮会不会走 omni（宿主据此不启流式 TTS） */
   willServe?: boolean;
 }): Rig & { served: Array<[string, string]> } {
@@ -70,6 +74,8 @@ function rig(options: {
   const logs: string[] = [];
   const served: Array<[string, string]> = [];
   let sink: ((text: string) => void) | null = null;
+  /** 最后一块音频吐出的时刻（验「播完之后还要多锁多久」用） */
+  let lastChunkAt = 0;
 
   let calls = 0;
   const agent: AgentProvider = {
@@ -120,7 +126,13 @@ function rig(options: {
     async* synthesizeStream(chunks) {
       for await (const chunk of chunks) {
         streamed.push(chunk);
-        if (options.streamError === undefined) yield LOUD;
+        if (options.chunkDelayMs !== undefined && options.chunkDelayMs > 0) {
+          await sleep(options.chunkDelayMs);
+        }
+        if (options.streamError === undefined) {
+          lastChunkAt = Date.now();
+          yield LOUD;
+        }
       }
       if (options.streamError !== undefined) throw options.streamError;
     },
@@ -141,7 +153,11 @@ function rig(options: {
     onLiveAvailable: (next) => { sink = next; },
     log: (line) => { logs.push(line); },
   });
-  return { streamed, whole, events, payloads, logs, served, fsm, run: () => runner.run('你好') };
+  return {
+    streamed, whole, events, payloads, logs, served, fsm,
+    get lastChunkAt(): number { return lastChunkAt; },
+    run: () => runner.run('你好'),
+  };
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -302,6 +318,24 @@ test('omni 直出：不启流式 TTS、音频原样下行、path=omni、播完�
   assert.deepEqual(r.served, [['你好', '我在呢。']], '播完必须回写，否则跨车道失忆');
 });
 
+test('播放等待以首块为基准：吐完最后一块之后不该再补等一整段音频', async () => {
+  // 真机 2026-11-23 05:14：6.16 s 的 omni 音频要 1.0 s 才吐完，设备这 1 s 里已经在播；
+  // 旧公式从「吐完的时刻」起算，播完之后又多锁了整整 1.05 s 的 speaking。
+  const r = rig({
+    deltas: Array.from({ length: 10 }, () => '念'),
+    reply: { text: '念'.repeat(20), speech: '念'.repeat(20) },
+    chunkDelayMs: 10, // 10 块 × 10 ms = 100 ms 才吐完；音频本身也是 100 ms
+  });
+  const result = await r.run();
+  const tail = Date.now() - r.lastChunkAt;
+
+  assert.ok(result);
+  assert.ok(
+    tail < 60,
+    `最后一块吐完之后又多锁了 ${tail} ms（音频本身才 100 ms）—— 基准要取首块时刻`,
+  );
+});
+
 test('转交后被插话：不再等 dsh 的答案，立刻收轮', async () => {
   // 真机 2026-11-23 第 5 轮白等 2.5 s；`235949` 回放第 6 轮 3.2 s —— 这段里串行链
   // 卡着，下一轮的「出句→开轮」从源 187 ms 涨到 1304 ms。
@@ -328,6 +362,24 @@ test('转交后被插话：不再等 dsh 的答案，立刻收轮', async () => 
   assert.ok(Date.now() - bargedAt < 1_000, `作废后还等了 ${Date.now() - bargedAt} ms`);
   assert.ok(r.logs.some((line) => line.includes('不再等 dsh')), '要留痕，否则只表现为"快了一点"');
   assert.equal(result.speech, '行，我这就给你细说。', '`said` 仍是垫话，不是没念的 dsh 答案');
+});
+
+test('omni 已经念了大段正文才发 tool_call：不再把 dsh 的答案拼在后面', async () => {
+  // 真机 2026-11-23 05:14 第 9 轮：omni 先播 4.96 s 瞎编，紧接着 dsh 的 7.44 s 接上，
+  // 整轮 12.40 s 是两段互不相干的回答。
+  const r = rig({
+    deltas: [],
+    reply: { text: '念'.repeat(40), speech: '念'.repeat(40) },
+    audio: Array.from({ length: 160 }, () => '念'), // 160 × 10 ms = 1.6 s > 1.5 s
+    omniDelegate: 'delegate',
+  });
+  const result = await r.run();
+  const end = r.payloads.find((p) => p.name === 'turn.end');
+
+  assert.ok(result);
+  assert.ok(r.logs.some((line) => line.includes('不再问 dsh')), '要留痕');
+  assert.equal(end?.data.path, 'omni', '没转交，就不该记成 dsh');
+  assert.equal(end?.data.delegate, undefined);
 });
 
 test('omni 发 tool_call：就地切 dsh，dsh 的文本走整段合成', async () => {

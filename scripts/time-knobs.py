@@ -96,6 +96,9 @@ CLOCK: dict[str, str] = {
     "PLAYBACK_POLL_MS": "wall",
     # 插话闸的时钟自检：两把时钟量级差超过它就算接错（不是等待时长）
     "CLOCK_MISMATCH_MS": "—（判据）",
+    "SEMANTIC_SKIP_P": "—（判据）",
+    "SEMANTIC_PREFIX_SLACK_CHARS": "—（判据）",
+    "OMNI_DELEGATE_MAX_SPOKEN_MS": "wall",
     # TTS 放弃一条已作废的合成后，等服务端 response.done 的上限
     "ABANDON_TIMEOUT_MS": "wall",
     "ASSEMBLER_FALLBACK_WINDOW_MS": "wall",
@@ -142,6 +145,9 @@ SHADED_BY: dict[str, str] = {
     "PREWARM_TTL_MS": "定稿→开轮之间（正常 0–600 ms，用不完）",
     "STALL_PROBE_MS": "无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待）",
     "CLOCK_MISMATCH_MS": "无（纯判据：只用来发现两把时钟接错，不放慢任何东西）",
+    "SEMANTIC_SKIP_P": "无（纯判据：声学已经很确定时**省掉**一段等待）",
+    "SEMANTIC_PREFIX_SLACK_CHARS": "无（纯判据：决定定稿要不要再问一趟语义判停）",
+    "OMNI_DELEGATE_MAX_SPOKEN_MS": "无（判据：超过它就不再把 dsh 的答案拼在后面）",
     "ABANDON_TIMEOUT_MS": "无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环）",
     "ASSEMBLER_PREDICT_LEAD_MS": "ASR 出句之前",
     "PLAYBACK_POLL_MS": "设备播报期间（轮询，不加延迟）",

@@ -313,6 +313,22 @@ const TRAILING_PUNCT = /[\s。．.，,、!！?？~～…\-—:：;；"'“”‘
 /** 这句话里有中日韩汉字吗 —— 用来选判停阈值（见 `thresholdFor`） */
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
 
+/**
+ * 声学判据到了这个置信度就不等语义判停了。
+ *
+ * 语义判停的意义在「声学拿不准」（p 落在 0.3–0.85 那条带），p 已经 0.88–0.98
+ * 时再等 256–324 ms 纯属白搭 —— 真机 `20261123-051448` 全场语义一次没拦住 MORE。
+ */
+const SEMANTIC_SKIP_P = 0.85;
+
+/**
+ * 「定稿只是中间结果的收尾」允许差几个字。
+ *
+ * 中间结果的最后一版和定稿通常差一两个标点/收尾字（`…《基础之森` → `…《基础之森》吗？`）。
+ * 超过这个长度就是另一句话了，前缀判定不再作数。
+ */
+const SEMANTIC_PREFIX_SLACK_CHARS = 6;
+
 /** 丢掉尾部标点，只看最后那个字 */
 function stripTail(text: string): string {
   return text.replace(TRAILING_PUNCT, '');
@@ -746,8 +762,11 @@ export class UtteranceAssembler {
     this.options.onSentence?.(this.pendingText);
     // 语义判停**立刻**发出去：它是一次网络往返（150–300 ms），现在发就跟下面这个
     // 静候窗重叠；等判定那一刻再发就变成纯加延迟了。
-    // 前缀已经判了「还有下文」就不用再问：延长后的文字问回来时，开轮早该发生了
-    if (!this.hasPrefixMore(this.pendingText)) {
+    // 前缀已经判过就不用再问：
+    // - MORE：延长后的文字问回来时，开轮早该发生了；
+    // - END：定稿不过是那个前缀的收尾（多一两个标点/收尾字），再问一趟是纯成本
+    //   （真机 `20261123-051448` 第 6/8/9 轮各对同一句话发了两趟）。
+    if (!this.hasPrefixMore(this.pendingText) && !this.hasPrefixEnd(this.pendingText)) {
       void this.askSemantics(this.pendingText);
     }
     const delay = this.options.predict
@@ -1107,6 +1126,15 @@ export class UtteranceAssembler {
       verdict = settled;
     } else if (this.hasPrefixMore(text)) {
       verdict = 'more';
+    } else if (this.hasPrefixEnd(text)) {
+      // 定稿只是中间结果的收尾（多一两个标点）：前面那趟已经说「说完了」，别再问
+      verdict = 'end';
+    } else if (probability >= SEMANTIC_SKIP_P) {
+      // 声学判据已经很有把握，**不再等**语义：真机 `20261123-051448` 里 p 到
+      // 0.88–0.98 的几轮还各等了 256–324 ms，而全场语义一次没拦住 MORE —— 纯成本。
+      // 只挡住「等」；说话期间已经发出去的那趟请求照旧（它与 ASR 并行，不要钱），
+      // 所以上面那两条「已经回来的判定」仍然优先。
+      verdict = 'end';
     } else {
       verdict = await this.awaitSemantics(text);
     }
@@ -1164,7 +1192,28 @@ export class UtteranceAssembler {
       if (verdict !== 'more' || asked === text || !text.startsWith(asked)) {
         continue;
       }
-      if (text.length - asked.length <= 6) {
+      if (text.length - asked.length <= SEMANTIC_PREFIX_SLACK_CHARS) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 这条定稿的**前缀**已经被判成「说完了」了吗。
+   *
+   * 为什么需要：说话期间从中间结果问过的那一版（`askSemanticsDuringSpeech`），
+   * 和定稿之间通常只差一两个标点/收尾字。没有这条复用，定稿时会对「同一句话」
+   * 再发一次请求 —— 真机 `20261123-051448` 第 6/8/9 轮各发了两趟
+   * （`…《基础之森` 319 ms 和 `…《基础之森》吗？` 398 ms），第二趟等回来的
+   * 时候开轮早该发生了。只复用「延长 ≤ 6 字」的前缀，再长就是另一句话了。
+   */
+  private hasPrefixEnd(text: string): boolean {
+    for (const [asked, verdict] of this.semanticSettled) {
+      if (verdict !== 'end' || asked === text || !text.startsWith(asked)) {
+        continue;
+      }
+      if (text.length - asked.length <= SEMANTIC_PREFIX_SLACK_CHARS) {
         return true;
       }
     }

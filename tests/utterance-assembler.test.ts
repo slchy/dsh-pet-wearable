@@ -1262,6 +1262,37 @@ test('说话期间就从中间结果发判定（这样才来得及藏在静候�
   assert.equal(asked.length, 2);
 });
 
+test('声学 p 已经很高时不再等语义判停（那 256–324 ms 是纯成本）', async () => {
+  // 真机 `20261123-051448`：p 0.88–0.98 的几轮各等了 256–324 ms，全场语义一次没拦住 MORE。
+  const { assembler, utterances } = makeAssembler({
+    predict: async () => 0.95,
+    semanticEndpoint: async () => { await delay(200); return 'end'; },
+  });
+  const startedAt = Date.now();
+  assembler.addSentence('你吃过饭了吗？');
+  await delay(40);
+  assert.equal(utterances.length, 1, 'p=0.95 不该等判停');
+  assert.ok((utterances[0]?.at ?? 0) - startedAt < 100, '成轮时刻不该被那 200 ms 拖住');
+});
+
+test('说话期间判过 END，定稿只多一两个标点 → 不再发第二次请求', async () => {
+  // 真机第 6 轮：`…《基础之森` 319 ms 和 `…《基础之森》吗？` 398 ms 是同一句话的两趟。
+  const asked: string[] = [];
+  const { assembler, utterances } = makeAssembler({
+    predict: async () => 0.5, // 留在模糊带，前缀复用才有意义
+    semanticEndpoint: async (text) => { asked.push(text); return 'end'; },
+  });
+
+  assembler.notePartial('你看过莱姆写的《基础之森');
+  await delay(20);
+  assert.equal(asked.length, 1, '说话期间的中间结果先问一趟');
+
+  assembler.addSentence('你看过莱姆写的《基础之森》吗？');
+  await delay(40);
+  assert.equal(asked.length, 1, '定稿只是那个前缀的收尾，不该再问一趟');
+  assert.equal(utterances.length, 1, '复用 END 就该收下这一轮');
+});
+
 test('中间结果判了 MORE，定稿只是它的延长 → 立刻再等一拍，不重新问', async () => {
   const asked: string[] = [];
   const facts: Array<{ why?: string }> = [];

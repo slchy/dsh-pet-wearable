@@ -851,6 +851,17 @@ export class FrontedAgent implements AgentProvider {
   }
 
   /**
+   * 同一判据，但**不打审计事件** —— 给投机 / 预跑用。
+   *
+   * 那些调用每句话都要走一遍（`speculatePartial` 在中间结果上反复触发），
+   * 打 `agent.lane` 会把档案刷满，也会让「这一轮到底谁答的」失真。
+   */
+  private laneWouldServe(text: string): boolean {
+    const lane = this.audioLane;
+    return lane !== null && lane.willServe() && this.textEligible(text);
+  }
+
+  /**
    * 记一轮**不是自己答的**（omni 直出）—— 让上下文与 dsh 交接不断链。
    *
    * 不记的后果不是「少一条日志」：快车道历史里没有这一轮，下一轮委派给 dsh 时，
@@ -920,6 +931,12 @@ export class FrontedAgent implements AgentProvider {
    */
   prefetch(text: string): boolean {
     if (!this.prefetchEnabled) return this.prefetched !== null;
+    if (this.laneWouldServe(text)) {
+      // omni 会直出这一轮：快车道这趟结果**必然作废**（真机 `20261123-051448`
+      // 第 6/7 轮在 serve=full 下还各发了 2 份 qwen-flash 对冲，跑完直接丢）。
+      this.log('  快车道    预跑跳过：这一轮会由 omni 直出');
+      return false;
+    }
     if (this.prefetched?.text === text) return true;
     // 投机起跑的那一趟对上了定稿：**认它**。它已经跑了几百毫秒，从头再问等于
     // 把投机白送的时间还回去。文本改写成定稿，后面 `takePrefetch` 按一字不差认领。
@@ -979,6 +996,11 @@ export class FrontedAgent implements AgentProvider {
    */
   speculatePartial(text: string): boolean {
     if (!this.prefetchEnabled || !this.partialSpeculate) return false;
+    if (this.laneWouldServe(text)) {
+      // 同上：omni 会直出，投机必然作废。中间结果会反复触发，所以这条不打日志
+      // （`willServeAudio` 那一发已经把 `agent.lane` 落档了）。
+      return false;
+    }
     const trace = process.env['FAST_LANE_TRACE'] === '1';
     // 短于这个长度的结果**认不了**（见 `acceptsSpeculation`），发了也是白花钱。
     // 和认领用同一把尺（`normalizeForCompare`），否则「发得出去、认不回来」。

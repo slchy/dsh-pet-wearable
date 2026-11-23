@@ -332,6 +332,50 @@ test('解码窗口里的纯尾静音不许补推（补上去会换一句幻觉�
     '延后的那发也要落空：没有语音可封段');
 });
 
+test('窗口里先说了话、再灌尾静音：静音不许跟着补推（真机 320 ms 就换一句幻觉定稿）', async () => {
+  // `20261123-051448`：第 4 轮补推 16 帧后吐 `Okay.`、第 6 轮 16 帧后 `Thank you.`、
+  // 第 7 轮 14 帧后 `嗯。` —— 那 16 帧里绝大部分是封段之后的尾静音。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+
+  asr.feed(Buffer.alloc(640, 1), true); // 解码期又开口
+  for (let i = 0; i < 16; i += 1) asr.feed(Buffer.alloc(640), false); // 320 ms 尾静音
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '我刚下班回来。' });
+
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length - before,
+    1,
+    '只补推那一帧有声，尾静音一个字节都不许跟着上去',
+  );
+});
+
+test('封段之后的尾静音不点亮 dirty —— gate.close 的 hangup 不该再 commit', async () => {
+  // 真机 `20261123-051448` 第 5 轮：第 4 轮刚被打断，2 s 后 gate.close 挂断时又 commit 了一发，
+  // 纯静音封出定稿 `Okay.`，白开一轮（还掉回级联）。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '我刚下班回来。' });
+  const commits = socket.types().filter((t) => t === 'input_audio_buffer.commit').length;
+  const appends = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+
+  for (let i = 0; i < 100; i += 1) asr.feed(Buffer.alloc(640), false); // 能量门 hold 的 2 s 静音
+  asr.hangup(); // == gate.close
+
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    commits,
+    '没有新的人声就不该封段',
+  );
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length,
+    appends,
+    '尾静音也不该进缓冲（进去就会改变解码上下文）',
+  );
+});
+
 test('解码窗口里真说了话：补推之后要补发延后的 commit（否则尾巴会粘到下一句句头）', async () => {
   const { asr, socket } = await ready();
   asr.feed(Buffer.alloc(640), true);

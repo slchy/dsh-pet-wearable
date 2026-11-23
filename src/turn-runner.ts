@@ -45,6 +45,15 @@ const PLAYBACK_POLL_MS = 100;
  */
 const PLAYED_GRACE_MS = 3_000;
 
+/**
+ * omni 已经念出去这么久的**正文**才发 `tool_call`：不再把 dsh 的答案拼在后面。
+ *
+ * 垫话（「我看看」「行，我这就给你细说」）都在 1–2 s 内，远小于这个值；
+ * 真机 2026-11-23 05:14 第 9 轮是 4.96 s 的瞎编正文后面又接了 7.44 s 的 dsh 答案 ——
+ * 用户听到的是两段互不相干的回答。
+ */
+const OMNI_DELEGATE_MAX_SPOKEN_MS = 1_500;
+
 export interface TurnRunnerOptions {
   /** 时钟端口：一轮里的所有等待与计时都走它（模拟器要用虚拟时间） */
   readonly clock: Clock;
@@ -594,6 +603,17 @@ export class TurnRunner {
           // `response.done` 落在同一毫秒，这一轮还是去问了 dsh，白等 2.5 s 之后
           // 一个字都没合成 —— 期间状态机一直挂在 `thinking`，下一轮已经开跑了。
           this.log('  omni    想转交 dsh，但本轮已作废 → 不问了');
+        } else if (why !== null && audioBytes > 0
+          && pcm16DurationMs(audioBytes, audioRate) >= OMNI_DELEGATE_MAX_SPOKEN_MS) {
+          // 已经念出去一大段**正文**才想起要转交：这时再问 dsh、再把它的答案拼在后面，
+          // 用户听到的是两段互不相干的回答（真机 2026-11-23 05:14 第 9 轮：
+          // omni 先播 4.96 s 瞎编，紧接着 dsh 的 7.44 s 接上，整轮 12.40 s）。
+          // 两份答案拼在一起比只有一份更难听，而且 dsh 那一趟还要几秒。
+          const spoken = pcm16DurationMs(audioBytes, audioRate) / 1000;
+          this.log(
+            `  omni    已经念了 ${spoken.toFixed(1)} s 正文才要转交 → 不再问 dsh`
+            + `（两份答案拼起来更难听）`,
+          );
         } else if (why !== null) {
           // omni 自己发了 tool_call：就地切给 dsh。
           // 已经出过声就不再叠回执（两份不同的声音接在一起很难听，而且收不回来）。
@@ -680,7 +700,12 @@ export class TurnRunner {
 
       // 状态机在整个等待期间保持 speaking；插话会让票据作废从而提前结束等待。
       if (!interrupted) {
-        const estimateAt = this.options.clock.now() + audioSeconds * 1000;
+        // 基准是**首块下发时刻**，不是「最后一块发完的时刻」：omni 流式吐 6 s 音频
+        // 本身就要 ~1 s，设备在这 1 s 里已经在播了。用发完时刻当基准，播完之后还要
+        // 白锁整整 1 s 的 `speaking`（真机 2026-11-23 05:14：6.16 s 那轮多锁 1.05 s，
+        // 用户已经在说下一句，状态机还卡在 speaking）。
+        const playbackStartAt = firstAudioAtMs >= 0 ? firstAudioAtMs : this.options.clock.now();
+        const estimateAt = playbackStartAt + audioSeconds * 1000;
         // 设备回执只能**延后**，不能提前：真机上 `played` 有时在「最后一批字节收到」
         // 就报上来了（4.58 s 音频 1 s 回执），按它走等于把尾音那段插话窗口关掉。
         // 所以估算时长是下限，played 到了也要等到下限之后；上限只用来兜「事件永远不来」。
