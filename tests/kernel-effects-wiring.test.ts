@@ -23,9 +23,20 @@ import { SystemClock } from '../src/app/clock.ts';
 import { DialogRuntime } from '../src/app/dialog.ts';
 import type { DeviceCapabilities } from '../src/devices/primitives.ts';
 import type { DialogFsmContext } from '../src/dialog-fsm.ts';
+import type { FastVoiceEngine } from '../src/engine-contract.ts';
+import type { LiveAudioLane } from '../src/engines/live-voice-engine.ts';
 import { FrontedAgent } from '../src/fronted-agent.ts';
 import { newActivityState, trackActivity } from '../src/keepalive.ts';
-import type { AgentProvider, AgentReplyView, TtsProvider } from '../src/providers.ts';
+import { isPreTurnCommit } from '../src/kernel.ts';
+import { CascadeAgent } from '../src/pipelines/cascade-agent.ts';
+import { LiveOrchestrator } from '../src/pipelines/live-orchestrator.ts';
+import type {
+  AgentAudioAnswer,
+  AgentProvider,
+  AgentReplyView,
+  DelegateReason,
+  TtsProvider,
+} from '../src/providers.ts';
 import type { DownlinkSink } from '../src/transport.ts';
 
 /** v1 设备：没有 `played`，播放等待走估算（测试不想等 3 s 余量） */
@@ -335,5 +346,242 @@ test('账本合一：结算写回 FrontedAgent，重连时新内核从账本播�
     );
   } finally {
     second.runtime.dispose();
+  }
+});
+
+// ---------------------------------------------------------------- 级联 / 直播
+
+function audioAnswer(
+  chunks: readonly Buffer[],
+  transcript: string,
+  delegate?: { readonly reason: DelegateReason; readonly text: string | null },
+): AgentAudioAnswer {
+  return {
+    sampleRate: 24_000,
+    transcript: () => transcript,
+    ...(delegate === undefined
+      ? {}
+      : {
+        delegateReason: () => delegate.reason,
+        delegateText: () => delegate.text,
+      }),
+    chunks: (async function* iterate() {
+      for (const chunk of chunks) yield chunk;
+    })(),
+  };
+}
+
+interface PipeRig {
+  readonly runtime: DialogRuntime;
+  readonly calls: string[];
+  readonly logs: string[];
+}
+
+/** 生产端口 + 热路径引擎。agent 是 `trackActivity` 包过的那一层。 */
+function makePipedRuntime(
+  agent: AgentProvider,
+  engine: FastVoiceEngine,
+  ticketContext?: DialogFsmContext,
+): PipeRig {
+  const calls: string[] = [];
+  const logs: string[] = [];
+  const runtime = new DialogRuntime({
+    clock: new SystemClock(),
+    caps: CAPS,
+    agent,
+    tts: TTS,
+    engine,
+    downlink: DOWNLINK,
+    imageQuestion: '',
+    photoDir: '',
+    photoTimeoutMs: 1_000,
+    confirmTimeoutMs: 1_000,
+    playbackTailMs: 0,
+    ...(ticketContext === undefined ? {} : { ticketContext }),
+    env: {
+      call: (call) => {
+        calls.push(call.op);
+        return true;
+      },
+      assemble: () => {},
+      end: () => {},
+    },
+    log: (line) => { logs.push(line); },
+  });
+  return { runtime, calls, logs };
+}
+
+const pipeStops = (rig: PipeRig): number => rig.calls.filter((op) => op === 'audio.stop').length;
+
+const omniPlaying = (runtime: DialogRuntime): boolean =>
+  runtime.core.fsm.state === 'speaking'
+  && runtime.core.runtime.state.playback.sentMediaMs > 0;
+
+test('级联：插话按票据把 truncated 写回账本，abortEngine 只 dropPrefetch 一次，audio.stop 一次', async () => {
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: async (): Promise<AgentReplyView> => {
+      await sleep(20);
+      return { text: '慢车道答复。', speech: '慢车道答复。' };
+    },
+    cancelTurn: () => {},
+  };
+  const cascade = new CascadeAgent({ inner, apiKey: '', log: () => {} });
+  assert.equal(cascade.lastLedgerLane(), null, '开场还没有上一轮');
+  const drops: string[] = [];
+  const originalDrop = cascade.dropPrefetch.bind(cascade);
+  cascade.dropPrefetch = (why: string): void => {
+    drops.push(why);
+    originalDrop(why);
+  };
+  const agent = trackActivity(cascade, newActivityState(Date.now()));
+  const engine = cascade.toEngine(TTS);
+  const aborts: string[] = [];
+  const originalAbort = engine.abortSpeculation.bind(engine);
+  engine.abortSpeculation = (reason): void => {
+    aborts.push(reason);
+    originalAbort(reason);
+  };
+  const rig = makePipedRuntime(agent, engine);
+  try {
+    assert.notEqual(rig.runtime.core.runtime.ports, null, '生产装配必须绑好内核端口');
+    rig.runtime.dispatch({ type: 'utterance', text: '你好' });
+    assert.ok(
+      await until(() =>
+        !rig.runtime.core.fsm.speakingIsReceiptOnly
+        && rig.runtime.core.runtime.state.playback.sentMediaMs > 0
+        && rig.runtime.core.fsm.state === 'speaking'),
+      '回答音频要先真的下发（回执那段不算）',
+    );
+
+    const ticket = rig.runtime.core.fsm.ticket();
+    const stopsBefore = pipeStops(rig);
+    rig.runtime.dispatch({ type: 'partial', text: '停一下' });
+
+    assert.equal(
+      pipeStops(rig) - stopsBefore,
+      1,
+      `插话只能带来一次 audio.stop；实际 ${JSON.stringify(rig.calls)}`,
+    );
+    assert.deepEqual(aborts, ['barge_in'], `abortEngine 要进引擎一次；实际 ${JSON.stringify(aborts)}`);
+    assert.deepEqual(
+      drops,
+      ['barge_in'],
+      `abortSpeculation 要落到 dropPrefetch 一次；实际 ${JSON.stringify(drops)}`,
+    );
+
+    const settled = cascade.ledgerTurns.at(-1);
+    assert.equal(settled?.truncated, true, `账本要记下少听了；实际 ${JSON.stringify(settled ?? null)}`);
+    assert.deepEqual(
+      settled?.ticket,
+      { no: ticket.no, gen: ticket.gen },
+      '结算按票据认领那一笔',
+    );
+    assert.equal(cascade.lastLedgerLane(), 'dsh', '这一轮是 dsh 答的，账本车道要更新');
+    assert.equal(
+      rig.runtime.core.runtime.state.ledger.lastOutcome?.truncated,
+      true,
+      '内核账本与 CascadeAgent 账本必须是同一份事实',
+    );
+    assert.equal(rig.runtime.core.fsm.state, 'listening');
+    await until(() => rig.runtime.idle);
+  } finally {
+    rig.runtime.dispose();
+  }
+});
+
+test('直播：播放中插话只 audio.stop 一次并 interrupt 一次，不取消在跑的后台 dsh', async () => {
+  const calls = { n: 0 };
+  const cancels = { n: 0 };
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const inner: AgentProvider = {
+    name: 'dsh',
+    cancelTurn: () => { cancels.n += 1; },
+    reply: async (): Promise<AgentReplyView> => {
+      calls.n += 1;
+      await gate;
+      return { text: '后台结论', speech: '后台结论' };
+    },
+  };
+  const interrupts = { n: 0 };
+  const lane: LiveAudioLane = {
+    willServe: () => true,
+    claim: () => audioAnswer([PCM], '我帮你看看。', { reason: 'delegate', text: '明天天气' }),
+    discard: () => {},
+    interrupt: () => { interrupts.n += 1; },
+  };
+  const live = new LiveOrchestrator({ inner, tts: TTS, log: () => {} });
+  live.attachAudioLane(lane);
+  const agent = trackActivity(live, newActivityState(Date.now()));
+  const rig = makePipedRuntime(agent, live.toEngine());
+  try {
+    assert.notEqual(rig.runtime.core.runtime.ports, null, '生产装配必须绑好内核端口');
+    rig.runtime.dispatch({ type: 'utterance', text: '明天天气怎么样' });
+    assert.ok(
+      await until(() => omniPlaying(rig.runtime) && calls.n >= 1),
+      `Omni 要在播、后台 dsh 要已经派出去；state=${rig.runtime.core.fsm.state} calls=${calls.n}`,
+    );
+
+    const stopsBefore = pipeStops(rig);
+    rig.runtime.dispatch({ type: 'partial', text: '停一下' });
+
+    assert.equal(
+      pipeStops(rig) - stopsBefore,
+      1,
+      `插话只能带来一次 audio.stop；实际 ${JSON.stringify(rig.calls)}`,
+    );
+    assert.equal(interrupts.n, 1, 'abortEngine(barge_in) 要打断 Omni 一次');
+    assert.equal(cancels.n, 0, '插话不许取消已经在跑的后台 dsh');
+    assert.equal(rig.runtime.core.fsm.state, 'listening');
+    await until(() => rig.runtime.idle);
+  } finally {
+    release();
+    rig.runtime.dispose();
+    live.dispose();
+  }
+});
+
+test('直播：开轮前的旧段被 isPreTurnCommit 拦住，audio.stop 与 interrupt 都是 0', async () => {
+  const seq = 5;
+  const interrupts = { n: 0 };
+  const lane: LiveAudioLane = {
+    willServe: () => true,
+    claim: () => audioAnswer([PCM], '今天不错。'),
+    discard: () => {},
+    interrupt: () => { interrupts.n += 1; },
+  };
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: async (): Promise<AgentReplyView> => ({ text: '', speech: '' }),
+  };
+  const live = new LiveOrchestrator({ inner, tts: TTS, log: () => {} });
+  live.attachAudioLane(lane);
+  const agent = trackActivity(live, newActivityState(Date.now()));
+  const rig = makePipedRuntime(agent, live.toEngine(), { baseCommitSeq: () => seq });
+  try {
+    rig.runtime.dispatch({ type: 'utterance', text: '你好' });
+    assert.ok(await until(() => omniPlaying(rig.runtime)), 'Omni 音频要先下发');
+    assert.equal(rig.runtime.core.fsm.ticket().baseCommitSeq, 5, '票据要锁存开轮瞬间的水位线');
+    assert.equal(isPreTurnCommit(rig.runtime.core.runtime.state, 3), true);
+    assert.equal(isPreTurnCommit(rig.runtime.core.runtime.state, 5), true);
+    assert.equal(isPreTurnCommit(rig.runtime.core.runtime.state, 7), false);
+
+    const stopsBefore = pipeStops(rig);
+    const stalePartial = rig.runtime.dispatch({ type: 'partial', text: '旧段', commitSeq: 3 });
+    assert.deepEqual(stalePartial, [{ type: 'drop', why: 'pre-turn' }]);
+    const staleSentence = rig.runtime.dispatch({ type: 'sentence', text: '旧段', commitSeq: 5 });
+    assert.deepEqual(staleSentence, [{ type: 'drop', why: 'pre-turn' }]);
+
+    assert.equal(pipeStops(rig) - stopsBefore, 0, '旧段不许停音频');
+    assert.equal(interrupts.n, 0, '旧段不许 interrupt Omni');
+    assert.equal(rig.runtime.core.fsm.state, 'speaking', '旧段不影响相位');
+    assert.ok(rig.logs.some((line) => line.includes('开轮前录的那段定稿')), '旧段被拦下要有痕迹');
+    await until(() => rig.runtime.idle);
+    assert.equal(pipeStops(rig), stopsBefore, '这一轮自然结束也不该补一次 audio.stop');
+    assert.equal(interrupts.n, 0);
+  } finally {
+    rig.runtime.dispose();
+    live.dispose();
   }
 });
