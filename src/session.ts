@@ -453,13 +453,14 @@ export class DshSession {
   /** 放手那一轮要认领的轮号（`null` = 放手时还没有 turn/start，下一次 turn/end 就是它） */
   private detachedTurn: number | null = null;
   /**
-   * 下一条 `idle` 属于刚结算的「放手」那一轮，**不能拿去唤醒新一轮的等待者**。
-   *
-   * `idle` 不带轮号，只能靠顺序：`turn/end` 一定先于同一轮的 `idle`。所以放手那一轮
-   * 结算时打上这个一次性标记，把紧随其后的那条 idle 吃掉。下一轮 `turn/start` 一到
-   * 就清掉（万一那条 idle 压根没发，别把它留到下一轮去误吃）。
+   * 上一轮残留尾巴的吞噬相位（仅用于主会话串行边界，`idle` 不带轮号只能靠显式相位区分）：
+   * - `'none'`：没有上一轮未收尾的尾巴
+   * - `'awaiting_old_idle'`：旧轮的 `turn/start` 已过（放手轮已 `turn/end`，或自发轮已 `turn/start`），
+   *   只剩旧轮的一条 `status=idle` 待吞；一旦新的 `turn/start` 来了说明旧 `idle` 没发，直接归 `'none'`
+   * - `'awaiting_old_turn_start'`：自发轮只到了 `status=running`，它自己的 `turn/start` 还在管道里；
+   *   先吃掉那条旧 `turn/start` 转入 `'awaiting_old_idle'`，绝不能被旧 `turn/start` 提前解除 `idle` 保护
    */
-  private swallowNextIdle = false;
+  private tailSwallow: 'none' | 'awaiting_old_turn_start' | 'awaiting_old_idle' = 'none';
   /**
    * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
    * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
@@ -769,8 +770,13 @@ export class DshSession {
     const turn = typeof data?.['turn'] === 'number' ? data['turn'] : null;
     if (type === 'turn/start') {
       this.currentTurn = turn;
-      // 新一轮开起来了：上一轮那条 idle 要么已经来过、要么不会来了
-      this.swallowNextIdle = false;
+      if (this.tailSwallow === 'awaiting_old_turn_start') {
+        // 这是被顶掉的旧自发轮自己的 turn/start，它的 idle 还在后面，不能现在解除保护
+        this.tailSwallow = 'awaiting_old_idle';
+      } else if (this.tailSwallow === 'awaiting_old_idle') {
+        // 新一轮开起来了：上一轮那条 idle 要么已经来过、要么不会来了
+        this.tailSwallow = 'none';
+      }
       return;
     }
     // turn/end
@@ -787,7 +793,7 @@ export class DshSession {
       this.turnPhase = 'idle';
     }
     // 同一轮的 idle 紧跟着就来，它属于这一轮（不是新一轮的）
-    this.swallowNextIdle = true;
+    this.tailSwallow = 'awaiting_old_idle';
     const text = (this.detachedText || this.assistantText).trim();
     this.detachedText = '';
     this.assistantText = '';
@@ -924,11 +930,13 @@ export class DshSession {
     this.turnStartedAt = started;
     this.firstTokenMs = null;
     this.exitError = null;
-    // 自发轮还没收尾时，它的 idle 不带轮号。先记一笔，在下一条 turn/start
-    // 之前吃掉（`turn/start` 里会清这个标记），免得它把本轮的等待者提前叫醒。
+    // 自发轮还没收尾时，它的 idle 不带轮号。先按是否已收到旧 turn/start 切入吞尾相位，
+    // 免得旧自发轮的 turn/start 或 idle 提前把本轮等待者叫醒。
     // 放在臂 `onIdle` 之前、且中间没有 await：idle 不可能插进这个窗口。
     if (this.spontaneous.isActive) {
-      this.swallowNextIdle = true;
+      this.tailSwallow = this.currentTurn === null
+        ? 'awaiting_old_turn_start'
+        : 'awaiting_old_idle';
     }
     // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
     this.spontaneous.reset();
@@ -1221,7 +1229,7 @@ export class DshSession {
       this.detachedText = '';
       this.detachedTurn = null;
       this.currentTurn = null;
-      this.swallowNextIdle = false;
+      this.tailSwallow = 'none';
       this.turnPhase = 'idle';
       this.activeTicket = null;
       if (this.proc === proc) this.proc = null;
@@ -1468,11 +1476,17 @@ export class DshSession {
         if (block['type'] === 'text' && typeof block['text'] === 'string') parts.push(block['text']);
       }
       if (parts.length > 0) {
-        this.assistantText = parts.join('');
-        // 被放手那一轮的答复可能在这之后才到，而新一轮的开头会清 `assistantText`
-        // —— 单独留一份，否则「放手」的答案会被下一轮冲掉
+        const text = parts.join('');
         if (this.detached) {
-          this.detachedText = this.assistantText;
+          this.assistantText = text;
+          // 被放手那一轮的答复可能在这之后才到，而新一轮的开头会清 `assistantText`
+          // —— 单独留一份，否则「放手」的答案会被下一轮冲掉
+          this.detachedText = text;
+        } else if (this.tailSwallow !== 'none') {
+          // 被顶掉的旧自发轮（或刚结算放手轮）残余消息：绝不污染新一轮的 assistantText 与用量
+          return;
+        } else {
+          this.assistantText = text;
         }
         // 没挂流式桥时（bench 就是这样）拿不到 token 级时刻，退一步记「首条 assistant
         // 消息到达」。它晚于真正的首 token，但仍是"模型开始产出"的可比口径。
@@ -1496,9 +1510,9 @@ export class DshSession {
         return;
       }
       const status = typeof p['status'] === 'string' ? p['status'] : '';
-      // 这条 idle 属于刚结算的「放手」那一轮 —— 吃掉它，别去唤醒新一轮的等待者
-      if (status === 'idle' && this.swallowNextIdle) {
-        this.swallowNextIdle = false;
+      // 这条 idle 属于刚结算的「放手」轮或被顶掉的旧自发轮 —— 吃掉它，别去唤醒新一轮的等待者
+      if (status === 'idle' && this.tailSwallow !== 'none') {
+        this.tailSwallow = 'none';
         return;
       }
       const waiting = this.onIdle !== null;

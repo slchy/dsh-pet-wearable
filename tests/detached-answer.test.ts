@@ -606,6 +606,95 @@ test('旧自发轮的 idle 不能提前结束新的 ask', async () => {
 });
 
 /**
+ * 假 dsh：自发轮先只发 `status=running`，把自己的 `turn/start` + `assistant/message` + `idle`
+ * 留到新一轮 `session/prompt` 进来之后才发出（模拟管道拆包 / 竞态窗口）。
+ */
+function fakeSpontaneousLateTurnStart(dir: string): string {
+  const source = `
+process.stdin.setEncoding('utf8');
+let buf = '';
+let prompts = 0;
+const send = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); };
+const event = (sessionId, type, seq, data) => {
+  send({ jsonrpc: '2.0', method: 'session.event', params: { sessionId, event: { type, seq, data } } });
+};
+const status = (sessionId, s) => {
+  send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: s } });
+};
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (line === '') continue;
+    const msg = JSON.parse(line);
+    const { id, method, params } = msg;
+    if (method === 'session/prompt') {
+      prompts += 1;
+      send({ jsonrpc: '2.0', id, result: {} });
+      const sessionId = params.sessionId;
+      if (prompts === 1) {
+        setTimeout(() => {
+          status(sessionId, 'running');
+          event(sessionId, 'turn/start', 10, { turn: 1 });
+          event(sessionId, 'assistant/message', 11, {
+            message: { content: [{ type: 'text', text: '第一轮' }] },
+          });
+          event(sessionId, 'turn/end', 12, { turn: 1, reason: { kind: 'completed' } });
+          status(sessionId, 'idle');
+          setTimeout(() => {
+            // 只发 running，turn/start 留在下一包
+            status(sessionId, 'running');
+          }, 20);
+        }, 20);
+        continue;
+      }
+      // 收到第二轮 prompt 后，旧自发轮的 turn/start + 消息 + idle 才姗姗来迟
+      event(sessionId, 'turn/start', 20, { turn: 2 });
+      event(sessionId, 'assistant/message', 21, {
+        message: { content: [{ type: 'text', text: '后台汇报' }] },
+      });
+      status(sessionId, 'idle');
+      setTimeout(() => {
+        status(sessionId, 'running');
+        event(sessionId, 'turn/start', 30, { turn: 3 });
+        event(sessionId, 'assistant/message', 31, {
+          message: { content: [{ type: 'text', text: '第二轮' }] },
+        });
+        event(sessionId, 'turn/end', 32, { turn: 3, reason: { kind: 'completed' } });
+        status(sessionId, 'idle');
+      }, 60);
+      continue;
+    }
+    send({ jsonrpc: '2.0', id, result: {} });
+  }
+});
+`;
+  return installProgram(dir, 'fake-spontaneous-late-start.mjs', source);
+}
+
+test('旧自发轮迟到的 turn/start 与消息不能解除 idle 保护或污染新 ask', async () => {
+  const h = makeSession('不用', 0, [], (dir) => fakeSpontaneousLateTurnStart(dir), 4_000);
+  try {
+    const first = await h.session.ask('第一句', undefined, { ticket });
+    assert.equal(first.text, '第一轮');
+    for (let waited = 0; waited < 5_000; waited += 10) {
+      if (h.logs.some((line) => line.includes('自发开了一轮'))) break;
+      await wait(10);
+    }
+    assert.ok(h.logs.some((line) => line.includes('自发开了一轮')));
+    const second = await h.session.ask('第二句', undefined, { ticket: { no: 2, gen: 1 } });
+    assert.equal(second.text, '第二轮');
+    assert.equal(second.detached, undefined);
+    assert.deepEqual(h.announced, []);
+    assert.equal(h.session.isBusy(), false);
+  } finally {
+    h.dispose();
+  }
+});
+
+/**
  * 假 dsh：第一条进程答完就停在那儿等 shutdown。
  * 测试写 `second-life` 之后拉起的进程会把答案扣住，直到 `release-answer`。
  * 旧进程收到 shutdown 后轮询 `kill-old`，退出前写 `old-exiting`。
