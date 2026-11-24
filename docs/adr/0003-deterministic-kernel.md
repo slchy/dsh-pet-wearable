@@ -5,6 +5,8 @@
   `src/kernel-runtime.ts`、`src/causal.ts`、`src/engine-contract.ts`、
   `src/dialog-fsm.ts`、`src/app/dialog.ts`、`src/conversation-ledger.ts`；
   离线执行体是 `scripts/kernel-replay.ts`
+- 契约 #5 的换泵与管道互斥：见 [ADR-0004](0004-flattened-pipelines.md)
+  （2026-11-23 已接入 `TurnRunner` 生产热路径）
 
 ## 1 要解决的问题
 
@@ -87,8 +89,15 @@ DashScope 那种「discard 时还没拿到 assistantItemId，必须等 `response
 | 继续在 `TurnRunner` 里加判据 | 它是一条 1000+ 行的 `async` 泵（抽内核时 835 行 / 20 个 `await`）；每加一条判据都在同一个协程里与 I/O 交错，重入无法证明，只能靠回放碰 |
 | 用时间戳代替序号做因果 | 到达时刻可被网络抖动、服务端重排任意改变（±300 ms 就足以颠倒），序号不可 |
 | 把所有相位也搬进内核 | v1 时**刻意推迟**：要动 460 行 `DialogFsm` 与全部调用点，收益只是"少一处真相"，而当时没有对应 bug，风险大于收益。**已收口（2026-11-23）**：`DialogFsm` 现在是 `runtime.state.dialog` 之上的薄门面 —— 只翻译事件、只读快照，第二份相位（`_turn` / `_gen` / `_endAfterSpeech` / `_receiptOnly`）已删除 |
-| 现在就把 `TurnRunner` 三分支泵换成 `FastVoiceEngine.respond()` | 引擎侧已就绪：`LiveVoiceEngine` / `CascadeVoiceEngine` 都已实现，并通过 `tests/fast-voice-engine.test.ts` 的契约测试，所以「换引擎零改内核」成立。但 `TurnRunner` 的 `omni` / `stream` / `pump` 三分支仍承载双轨投机、流式 TTS 回落与逐轮延迟埋点（`tts.first` / `turn.end` 的 `dsh_ms` / `audio_s`）——「换引擎零改泵」**刻意留给下一阶段**，不是漏接线 |
 | 不做幂等结算 | 打断当场结算过一次，协程收尾会再报一次；不幂等就把"少听一半"重算成"听了 0 秒、没少听"→ 该吞的答案被回注 |
+
+**曾推迟、现已落地（2026-11-23）**：契约 #5（`FastVoiceEngine`）已经接进 `TurnRunner`
+的生产热路径。`VOICE_PIPELINE=live` 注入 `LiveVoiceEngine`（`LiveOrchestrator.toEngine()`
+里的 omni 音频），`VOICE_PIPELINE=cascade` 注入同一条 `respond()` 上的
+`CascadeVoiceEngine` 契约（生产泵是 `CascadeAgent.toEngine()`）。`run()` 不再内部分
+`omni` / `stream` / `pump`。逐轮延迟埋点（`tts.first` / `turn.end` 的 `dsh_ms` /
+`audio_s`）仍留在泵外：引擎只报事实。决策正文见
+[ADR-0004](0004-flattened-pipelines.md)。
 
 ## 4 验收（三条硬标准）
 
@@ -115,6 +124,8 @@ DashScope 那种「discard 时还没拿到 assistantItemId，必须等 `response
 
 - 新增 `src/kernel.ts`、`src/kernel-runtime.ts`、`src/causal.ts`、`scripts/kernel-replay.ts`。
 - `TurnRunner` 不再自己算 `heard`/`truncated`/`reflect`，只喂事实、取意图。
+- `TurnRunner.run()` 只消费 `FastVoiceEngine.respond()`。`omni` / `stream` / `pump`
+  三分支已离开生产热路径，见 [ADR-0004](0004-flattened-pipelines.md)。
 - 加 `AgentProvider` 新的可选能力时，不再需要手工改转发表：`keepalive.trackActivity`
   已改成 `Proxy` + `WeakMap`，所有可选能力（`dropPrefetch` / `reconcileTurnOutcome` /
   `lastLedgerLane` / `detachTurn` 等，含以后新加的、运行时才挂上去的）自动透传

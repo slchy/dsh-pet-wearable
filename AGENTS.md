@@ -82,8 +82,10 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 全量系统人设是 `personaPrefix`；但快车道与 omni 这两条**不走 dsh 系统提示词**的
 链路，各自只有一个 `instructions` 字段。它们的身份头统一从
 [`src/persona.ts`](src/persona.ts) 导出（`PERSONA_NAME` / `OMNI_SHORT_INSTRUCTIONS` /
-`FAST_LANE_PERSONA_HEADER`），**不要在 `fronted-agent.ts` / `omni-shadow.ts` 里手写
-字面量**。两处抄一份的下场是「只改了一边，用户听出换了个人」—— 而代码不会报错。
+`FAST_LANE_PERSONA_HEADER`）。`LIVE_BACKEND_TASK_DIRECTIVE` 与 `buildLiveReportPrompt`
+也住在同一份 [`src/persona.ts`](src/persona.ts) 里，跟这三个放在一起。
+**不要在 `fronted-agent.ts` / `omni-shadow.ts` 里手写字面量**。两处抄一份的下场是
+「只改了一边，用户听出换了个人」—— 而代码不会报错。
 
 `tests/profile-prompt.test.ts` 守着同源：名字、定位、身份措辞要能被同一个来源解释，
 `personaPrefix` 里那八个标签也必须与 `EMOTION_LABELS` 对齐（快车道六种是刻意的既有
@@ -140,8 +142,11 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
   **不在 `SessionCore` 里另发一份 `call:audio.stop`**。
 - 因果旧段拦截唯一归口在 `kernel.ts::isPreTurnCommit`（`commitSeq` 经 `SessionCore`
   一路传进 `bargeIn`），**不在 `voice-session.ts` 保留前置副本**（`fromPreTurnSegment` 已删）。
-- `FastVoiceEngine`（`src/engines/*`）当前是契约就绪层、尚未切入 `TurnRunner` 生产热路径
-  —— 三分支泵还挂着双轨投机 / 流式 TTS 回落 / 延迟埋点，**刻意分期，不是漏接线**。
+- `TurnRunner` 已收成**一条统一引擎泵**：`run()` 只消费 `FastVoiceEngine.respond`
+  （`LiveVoiceEngine` / `CascadeVoiceEngine` / 旧装配兜底的 `AgentEngineAdapter`）。
+  启动期用 `VOICE_PIPELINE=live | cascade` 显式二选一
+  （[`src/pipeline-mode.ts`](src/pipeline-mode.ts)），会话内严格互斥 ——
+  Pure Live 是 `LiveOrchestrator` + `BackgroundTaskBus`，Pure Cascade 是 `CascadeAgent`。
 - 账本同源与 `step()` 结构：`KernelPorts.settleTurn` 按 `{no, gen}` 票据回写
   `FrontedAgent` 的 `ConversationLedger`（`reconcileTurnOutcome` / `reconcileOutcome`），
   重连由 `agent.lastLedgerLane()` 播种 `initialKernelState`；`kernel.ts` 的 `step()`
