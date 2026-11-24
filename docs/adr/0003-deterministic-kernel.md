@@ -115,7 +115,7 @@ DashScope 那种「discard 时还没拿到 assistantItemId，必须等 `response
 
 | 门 | 结果 |
 |:--|:--|
-| `npm test` | **890/890**（当日实测；比初版 827 多出来的部分在 `tests/kernel.test.ts` 27 条、`tests/kernel-effects-wiring.test.ts` 4 条、`tests/fast-voice-engine.test.ts` 14 条、`tests/main-wiring.test.ts` 7 条、`tests/voice-session-reconnect.test.ts` 4 条；同一天删掉的 `battery-cache` / `device-host` 两套宠物测试是反向的一笔，所以不能拿总数跟旧记录直接横比） |
+| `npm test` | **1032/1032**（2026-11-23 晚实测）。**注意口径**：内核收口当时是 890，随后同日进来的双管道改造（`pipelines/`、引擎热路径、`background-task-bus`）又加了 142 条；这两个数字不能互相验算，只能各自代表当时的门 |
 | `tests/fsm-verify.ts` | 36 个配置 / 330 条转移，全部不变量通过 |
 | `npm run sim` | **40/40** |
 | 依赖图 | `src/` 96 个模块**零环**（含 type-only import 也无环） |

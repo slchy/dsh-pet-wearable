@@ -12,6 +12,21 @@
 
 ## 一、目标与口径
 
+### 1.0 先看管道：一次进程只跑一条
+
+`VOICE_PIPELINE=live | cascade` 二选一（判据 [`src/pipeline-mode.ts`](../src/pipeline-mode.ts)，
+说明见 [`OPERATIONS.md` §语音主管道](./OPERATIONS.md)）：
+
+| 管道 | 前台 | 出话泵 | 文本快车道 |
+|:--|:--|:--|:--|
+| `live` | `pipelines/live-orchestrator`（+ `background-task-bus`） | `LiveVoiceEngine`（omni 直出） | **不加载**（`FastLlmClient` / `PrefetchSlot` 都不建） |
+| `cascade` | `pipelines/cascade-agent` | `CascadeVoiceEngine`（LLM → TTS） | 用 |
+
+**这决定了本文所有基线的可比性**：`live` 与 `cascade` 是两条不同的延迟曲线，
+**同一份音频在两种管道下的数字不能横比**。下表里的「首声延迟 p50」默认是
+**级联快车道**；引用任何数字前先问「这是哪条管道的」，就像引用等长延时前先问
+「什么输入」一样。
+
 ### 1.1 用户能感知的量
 
 | 指标 | 定义 | 怎么算 |
@@ -1018,12 +1033,14 @@ ASR 不一致 **1**（容差 ≤1）、车道 0、轮数 17 —— 全部在容�
 | 文档 | 该看它吗 | 状态 |
 |:---|:---|:---|
 | **本文 `QOS.md`** | **先看这份** | 现行 |
-| `OMNI-LANE.md` | 想知道 omni 一体化车道怎么接的、它省的是哪一段、`OMNI_ANSWER` 怎么升档 | 现行；§八 有本项目口径的两个坑（跨车道、并段轮） |
+| `OMNI-LANE.md` | 想知道 omni 一体化车道怎么接的、它省的是哪一段、`live` 管道里它是前台 | 现行；§八 有本项目口径的两个坑（跨车道、并段轮） |
 | `TIME-KNOBS.md` | 要改任何时间参数时 | 生成物，永远现行 |
 | `LATENCY-CLOSURE.md` | 想知道「某一块为什么砍不动」 | 数字已降为附录，**口径以本文为准**；§3.3 有「335」的歧义提醒、§3.3 末有「预开不是无条件免费」的更正 |
 | `TOOLS.md` | 要知道跑哪个脚本、档案字段是什么意思；**四层闸门的实现细节在 §3.1** | 现行 |
 | `state-machines.md` | 改状态轮转之前；**§5.9 是判定层（`kernel.ts` 四正交区域 + 三条交互律）** | 现行 |
 | `adr/0003-deterministic-kernel.md` | 想知道「为什么判定要收成纯函数、三种时间怎么分」 | 现行 |
+| `adr/0004-flattened-pipelines.md` | 想知道「为什么改成 pure live / pure cascade 两条互斥管道、而不是一条里头分三个分支」 | 现行 |
+| `OPERATIONS.md` §语音主管道 | 要切 `VOICE_PIPELINE`、想知道 `OMNI_*` 旧变量怎么推断 | 现行 |
 | `OPS-RECORD.md` | 排障、踩坑记录 | 现行（记的是当时的事实，不是结论） |
 | `EOT-BENCH-RESULTS.md` | 判停基准 | 现行，含**已撤回的归因** |
 | `QWEN-REALTIME-ASR-PROBED.md` | ASR 端点行为 | 现行 |

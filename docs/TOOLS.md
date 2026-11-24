@@ -53,6 +53,7 @@
 | 一轮卡在哪、用户等了几秒 | `scripts/latency-report.ts <档案目录>` | ①②③ 分段 + 首字 p50/p90 vs 预算 |
 | **该治哪一段**（谁占大头、p90 是谁顶上去的） | `scripts/latency-attribution.ts <档案目录>` | 各段份额、③ 内部拆分、超预算轮次逐条 |
 | 这条链有没有一处不符合设计 | `scripts/fsm-trace-check.ts <档案>` | 违规列表（退出码 0/1） |
+| **这条会话跑的是哪条管道、为什么快车道没接上** | 启动日志第一行（`pipeline-mode` 打出 mode 与理由）+ [`src/pipeline-mode.ts`](../src/pipeline-mode.ts) | `VOICE_PIPELINE` 是否显式、`live` 缺 key 会直接抛错；`live` 下 `FastLlmClient` 根本不建 |
 | **判定逻辑改了以后历史档案还认不认**（听到多少 / 少听没少听 / 该不该回注） | `scripts/kernel-replay.ts <events.jsonl>` | 逐轮 kernel 裁决 vs 档案里 `turn.end` 记的；有分歧退出码 1 |
 | **状态机还有没有走不到 / 走错的边** | `node tests/fsm-verify.ts` | 36 配置 / 330 转移的穷尽探索；INV1–INV10 + P1–P5 的反例序列（退出码 0/1） |
 | `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
@@ -390,6 +391,13 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/fast_lane/run.ts` | 误拦截率 / 命中率 / 两条路径延迟。`--runs N` 看方差，`--offline` 假 fetch 只验 harness |
 | `bench/fast_lane/probe_models.mjs` | 逐供应商量首 token |
 | `bench/fast_lane/cases.json` | 用例（`chitchat` / `task`） |
+| `scripts/probe-omni-inject-speak.mjs` | **live 管道的回注契约**：dangling `tool_call`（不回 `function_call_output`）之后，`injectAndSpeak` 还能不能出声、下一轮还记不记得注入的事实。跑真服务，要 `DASHSCOPE_API_KEY` |
+
+`probe-omni-inject-speak.mjs` 的 instructions / 工具与 `src/persona.ts`、`src/omni-shadow.ts`
+**逐字一致** —— 改这两处要同步它，否则探针量的是另一套提示词。它不 import `.ts`，只依赖已装的 `ws`。
+
+**注意管道**：文本快车道只在 `VOICE_PIPELINE=cascade` 下加载（`live` 里 `FastLlmClient` /
+`PrefetchSlot` 根本不建）。在 `live` 进程里跑本节的门禁，量到的是"没装快车道"的那条路。
 
 误拦截 > 0 → 退出码 1，可以当门禁用。
 
@@ -455,6 +463,9 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 ## 12. 标定值（跑对了应该看到什么）
 
 **真机实测（2026-11-17，`v2` 设备，两场共 12 轮；档案目录名见 §12.1 的字段说明）**：
+
+> 采集时只有**一条**管道（级联：ASR → 文本 → TTS）。两条互斥管道（`VOICE_PIPELINE=live|cascade`）
+> 是 2026-11-23 之后的事，所以这一节的数字**只对 `cascade` 有意义**，别拿它去衡量 `live`。
 
 > 这里是**两场 12 轮**的样本；README「真机基准实测」用的是**另一份 13 轮同向量**
 > （`…_46019`），数字不同属正常，别把两套混着引用。

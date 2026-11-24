@@ -520,6 +520,7 @@ dsh-pet-wearable/
 | **架构决策（ADR）** | [ADR-0001: App Layer & Pet](./docs/adr/0001-app-layer-and-pet.md) | 应用层分层、话筒仲裁与主动开口演进 |
 | | [ADR-0002: Simulator](./docs/adr/0002-virtual-time-simulator.md) | 虚拟时间模拟器与因果不变式测试设计 |
 | | [ADR-0003: Deterministic Kernel](./docs/adr/0003-deterministic-kernel.md) | 三种时间（因果 / 媒体 / 墙钟）、四正交区域、纯 `step()` 与单份 `KernelPorts` 执行的取舍与验收（含账本按 `{no, gen}` 结算） |
+| | [ADR-0004: Flattened Pipelines](./docs/adr/0004-flattened-pipelines.md) | 为什么把「一条泵里三个分支」摊平成 pure live / pure cascade 两条互斥管道 |
 | **实现与草稿** | [fsm-align-report.md](./docs/fsm-align-report.md) | 状态机对齐第 0–4 步推进记录与卡点 |
 | | [shared-conversation-log.md](./docs/design/shared-conversation-log.md) | 单一对话日志设计草稿（暂缓实现） |
 | **硬件适配** | [RAYNEO-X3-PRO.md](./docs/devices/RAYNEO-X3-PRO.md) | 雷鸟 X3 Pro 真机接入参考 |
