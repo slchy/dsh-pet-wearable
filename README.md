@@ -4,7 +4,7 @@
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.18.0-brightgreen.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/tests-1060%2B%20passing-success.svg)](#开发与验证)
+[![Tests](https://img.shields.io/badge/tests-1240%20passing-success.svg)](#开发与验证)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 **面向智能穿戴设备的云端全双工语音伴生 Agent（基于 `dsh` / DeepSeek Harness）**
@@ -23,7 +23,7 @@
 - **统一单泵与确定性内核**：`TurnRunner` 仅消费 `FastVoiceEngine.respond()` 事件流；相位、打断与结算唯一归口纯函数 [kernel.ts](./src/kernel.ts)（因果序号 `commitSeq` / `{no, gen}` + 媒体时间尺子），所有副作用经 `KernelRuntime.dispatchAndApply()` 唯一执行。
 - **全双工即时打断与话筒仲裁**：能量门 + TurnJudge 判停免唤醒切句；用户开口立刻下发 `audio.stop` 并抢占话筒（`user > reply > announce / pet > reflex`）。
 - **硬件无关线协议**：`src/devices/` 仅定义 6 个下行指令与 6 个上行事件，握手期按能力集动态降级，接入新设备（如[雷鸟 X3 Pro](./docs/devices/RAYNEO-X3-PRO.md)）不改核心状态机。
-- **零密钥本地闭环与虚拟时间仿真**：内置 `canned / silent / echo` 离线桩、`npm run sim` 纯虚拟时间模拟器、330 转移穷尽状态验证与 1060+ 单元测试。
+- **零密钥本地闭环与虚拟时间仿真**：内置 `canned / silent / echo` 离线桩、`npm run sim` 纯虚拟时间模拟器、330 转移穷尽状态验证与 1240 项运行时测试（`npm run test:all` 共 1267）。
 
 ---
 
@@ -133,7 +133,10 @@ VOICE_PIPELINE=cascade node src/main.ts --listen 8766 --stt qwen-realtime --tts 
 ## 开发与验证
 
 ```bash
-npm test                                          # 全量单元与集成测试（1060+ 用例）
+npm test                                          # 云端运行时测试（1240），与部署自检 100% 对齐
+npm run test:bench                                # bench/eval 与 bench/replay（23）
+npm run test:web                                  # packages/dsh-voice-web（4）
+npm run test:all                                  # 全仓：1240 根 + 23 bench + 4 web = 1267
 npm run typecheck                                 # TypeScript 严格检查
 npm run sim                                       # 40 场景虚拟时间仿真
 node --experimental-strip-types tests/fsm-verify.ts  # DialogFsm 穷尽状态验证（330 转移）
@@ -159,7 +162,7 @@ node scripts/probe-omni-inject-speak.mjs          # 真 DashScope 后台同嗓�
 │   ├── background-task-bus.ts · omni-shadow.ts          # 异步后台总线与实时音频车道
 │   ├── app/ · devices/ · pet/                           # 应用层话筒仲裁、v1/v2 协议、宠物脑与仿真
 ├── packages/dsh-voice-web/                              # 浏览器 Web 插件与前端 demo
-├── scripts/ · bench/ · tools/                           # 观测归因、回放探针、设备模拟器
+├── scripts/ · bench/ · tools/                           # 观测归因、回放探针、设备模拟器；bench/eval/ 为 55 轮离线 TTS 准确率与延迟护栏
 ├── docs/ · tests/                                       # 架构/QoS/ADR 文档与测试套件
 ```
 

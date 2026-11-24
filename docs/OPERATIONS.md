@@ -22,8 +22,11 @@ node src/main.ts --listen 8766 --stt qwen-realtime --tts cosyvoice --agent dsh
      └─ mcp/mcp-sessions.mjs     搜过去的对话
 ```
 
-这行是现网组合：`--stt qwen-realtime`（DashScope，端点由我们控，`VOICE_COMMIT_MS` /
-`VOICE_STT_COMMIT_MS` 才有意义）＋ `--tts cosyvoice`。换回 NLS 写 `--stt aliyun`；
+这行是现网组合：`--stt qwen-realtime`（DashScope）＋ `--tts cosyvoice`。
+`QWEN_ASR_TURN_DETECTION` 默认 `manual`：端点由我们控，`VOICE_COMMIT_MS` /
+`VOICE_STT_COMMIT_MS` / `VOICE_OPEN_QUIET_MS` 才有意义。设成 `vad` 时端点交给服务端，
+`src/voice-config.ts` 把 `commitMs` / `sttCommitMs` 收成 0，并且不传开轮静音门槛，
+免得客户端和服务器 VAD 各切一次。换回 NLS 写 `--stt aliyun`；
 `--tts` 留空会兜底成 `mimo`（不是静音）。
 
 `MEMORY.md` 放在 `--work-dir` 目录下，由 dsh 的 `agent-instructions` **每轮注入**
@@ -75,7 +78,7 @@ python scripts/deploy_cloud.py                             # 不带就回 full
 
 | 缺什么 | 错误 |
 |---|---|
-| `OMNI_API_KEY` 与 `DASHSCOPE_API_KEY` 都空（只含空白也算空）。有 `OMNI_API_KEY` 就用它，否则用 `DASHSCOPE_API_KEY` | `VOICE_PIPELINE=live 需要 OMNI_API_KEY 或 DASHSCOPE_API_KEY` |
+| `OMNI_API_KEY` 与 `DASHSCOPE_API_KEY` 都空（只含空白也算空）。`resolveOmniApiKey`（`src/voice-config.ts`）有 `OMNI_API_KEY` 就用它，否则用 `DASHSCOPE_API_KEY`。CLI、Web 插件、评测沙盒同一份 | `VOICE_PIPELINE=live 需要 OMNI_API_KEY 或 DASHSCOPE_API_KEY` |
 | 装配层传入的 STT 不是 `qwen-realtime` | `VOICE_PIPELINE=live 需要 --stt qwen-realtime（当前是 <名字>）` |
 
 两样都缺时先报 key。按旧变量**推断**出来的 live 走同一套失败条件。
@@ -145,7 +148,7 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 类名是 `VoiceConnection`（`src/voice-session.ts`），没有 `aliyun-session.ts` 这个文件。启动日志会明说：
 
 ```
-宠物环   开（主动开口）：心跳每 30000 ms，离场 300000 ms 后重戴会打招呼
+宠物环   开（主动开口）：心跳每 3000 ms，离场 300000 ms 后重戴会打招呼
 宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口
 ```
 
@@ -165,10 +168,10 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `PET_PROACTIVE` | 未设（关） | `1` = 装宠物环 |
-| `PET_TICK_MS` | `30000` | 心跳间隔 |
+| `PET_TICK_MS` | `3000` | 心跳间隔。`src/main.ts` 的缺省（`envNumber('PET_TICK_MS', 3_000)`）；调用方没传 `tickMs` 时 `AppSession` 自己用 `30000` |
 | `PET_GREET_AWAY_MS` | `300000` | 离场多久后重戴会打招呼 |
 | `PET_CHATTER_IDLE_MS` | `1200000` | 安静多久后可以主动搭话 |
-| `PET_LISTEN_MS` | 见 `DEFAULT_PROACTIVE` | 说完后开麦听回应多久 |
+| `PET_LISTEN_MS` | 见 `DEFAULT_PET_PARAMS.listenMs` | 说完后开麦听回应多久。常量在 `src/pet/brain/registry.ts`（现为 `8000`）。`src/main.ts` 用 `envNumber('PET_LISTEN_MS', DEFAULT_PET_PARAMS.listenMs)` 送进主动开口 |
 | `PET_MIC_OPEN_TIMEOUT_MS` | `1500` | 开麦到首帧上行的截止 |
 
 > 注意 `presence`（佩戴）不是所有设备都报。v1 基线没有佩戴源，`greet` 这条触发不了，
@@ -182,7 +185,9 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 |---|---|
 | `MIAI_TLS_KEY` / `MIAI_TLS_CERT` | 给了就走 TLS（另一条路径是明文 TCP，同一份代码）。**只给一个会启动即失败** —— 静默降级成明文会让人以为已经加密了 |
 | `MIAI_TOKENS` | 指向 `token` 或 `token:deviceId` 一行的文件；配了就要求首帧 `Hello` |
-| `--host` | 缺省 `127.0.0.1`；上公网由部署方显式给 `0.0.0.0`（**且必须配齐上面两项**） |
+| `QWEN_ASR_TURN_DETECTION` | `manual`（默认）或 `vad`。`vad` 时 `src/voice-config.ts` 把客户端 `commitMs` / `sttCommitMs` 收成 0，并且不传 `openQuietMs`，于是 `VOICE_COMMIT_MS` / `VOICE_STT_COMMIT_MS` / `VOICE_OPEN_QUIET_MS` 不再生效，避免和服务器 VAD 各切一次。服务端静音窗是 `QWEN_ASR_VAD_SILENCE_MS`（默认 `200`，下限 200） |
+| `OMNI_API_KEY` | omni 车道的 key。`resolveOmniApiKey`（`src/voice-config.ts`）优先用它，空则落到 `DASHSCOPE_API_KEY`（只含空白当没配）。CLI（`src/main.ts`）、Web 插件、评测沙盒（`bench/eval/server.ts` 经 `assemblePipelinePlan`）同一份 |
+| `--host` | 缺省 `127.0.0.1`；上公网由部署方显式给 `0.0.0.0`（**且必须配齐 `MIAI_TLS_*` 与 `MIAI_TOKENS`**） |
 
 自签证书：
 
@@ -345,8 +350,10 @@ DASHSCOPE_API_KEY=<key> node scripts/probe-omni-inject-speak.mjs
 标定口径：**放大前**的门限 = `VOICE_PEAK_DBFS − 20·log10(MIAI_MIC_GAIN)`。
 这个值才是「多大声算开口」，换增益时保持它不变。
 
-**代码默认值不是现网值**：`src/main.ts` 里是 `4 / −30`（放大前 −42.0 dBFS），web 插件的
-`packages/dsh-voice-web/src/driver.ts` 是 `1 / −40`；现网 `.env` 用的是下面这对
+**代码默认值不是现网值**：三端共用 `src/voice-config.ts`，默认上行 `4×`、门限 `−30` dBFS
+（放大前 −42.0 dBFS）。`src/main.ts` 与 `bench/eval/server.ts` 不再自写这份默认。
+web 插件 `packages/dsh-voice-web/src/driver.ts` 只把增益盖成 `1×`（浏览器已开 AGC），
+门限仍是这份 `−30`（放大前 −30.0 dBFS）。现网 `.env` 用的是下面这对
 `2 / −46`（放大前仍是 −52.0 dBFS）—— 别把源码默认值当成线上配置。
 
 2026-11-23 从 `4 / −40`（放大前 −52.0 dBFS）改成 `2 / −46`（放大前 −52.0 dBFS）：

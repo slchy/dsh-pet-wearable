@@ -248,3 +248,19 @@ done
 `events.jsonl` 里的时间线是唯一能复算的东西 —— 改动前后要能比快慢，所以仪表
 （`gate.close` / `asr.sentence` / `tts.first` / `turn.end`）缺了要记 `null`，
 **不拿 0 冒充**，否则历史基线会被静默伪造。
+
+## 部署边界与测试归属
+
+根目录 `tests/*.test.ts` **只能引用部署清单里的路径**。清单与 `scripts/deploy_cloud.py` 的 `ITEMS` 对齐：`src/`、`mcp/`、`tools/`、`tests/`、`turn_judge/`、`scripts/`，以及 `package.json`、`tsconfig.json`、`README.md`、`docs/TIME-KNOBS.md`。`tests/deploy-boundary.test.ts` 静态检查越界引用。`bench/` 与 `packages/` 不在清单里，写进根测试后服务器自检会模块找不到。
+
+测试按归属拆开：
+
+- 云端运行时：`tests/*.test.ts`，`npm test`（与部署自检同一批）
+- bench：`bench/eval/*.test.ts` 与 `bench/replay/*.test.ts`，`npm run test:bench`
+- web 包：`packages/dsh-voice-web/tests/*.test.ts`，`npm run test:web`
+
+本地一次验完跑 `npm run test:all`。
+
+## 三端运行配置唯一真相源
+
+CLI（`src/main.ts`）、Web 插件（`packages/dsh-voice-web/src/driver.ts`）、评测服务（`bench/eval/server.ts`）共用 `src/voice-config.ts`。运行时默认值只从 `buildVoiceRuntimeConfig`、`resolveOmniApiKey`、`DEFAULT_IMAGE_QUESTION` 取；三端差异只走 `overrides`。入口里再抄一套默认，改一处就会漂。

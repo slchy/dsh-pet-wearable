@@ -141,8 +141,10 @@ interface FastLaneAudioLane {
 }
 ```
 
-**车道层仍不含「要不要用」的判断。** `live` 前台不调用 `routeTurn()`：
-`LiveOrchestrator` 只问 `willServe()`，然后要么 `playLive`，要么 `fallbackDsh`。
+**车道层仍不含「要不要用」的判断。** `live` 前台不调用 `routeTurn()`。
+分支是纯函数 `decideLiveTurn()`（取消、识图、钟点、`live_with_bg_guard`、
+`live_direct`、`fallback_dsh`），不派单、不碰车道。`willServe()` 为真走封段认领；
+为假但 `canAnswerText()` 还能答就 `answerFromText()`；两条都没有才 `fallbackDsh`。
 `TurnRunner` 也不再先问 `willServeAudio()` 再决定开不开流式 TTS —— 出话只有
 `respond()` 一条泵。`cascade` 里 `routeTurn()` 的 `live` 档恒为 off，14 字 / key /
 历史深度只作用于那条文本窗。omni 吃的是整段音频，那些前提对它没有物理依据。
@@ -223,6 +225,12 @@ feed(voiced)  → muted = false，先补 ring 再追加
 
 `broken` 是终态。影子挂了就等于这次实验结束——少一个半夜自己重连、
 把账单和口径都搅乱的东西。落一条 `{skipped:'broken', why}` 事件，人看见了再决定。
+
+`stop()` 与 `break()` 只走 `teardown()`。它清掉在途 `resp` 和排队的 `pending`，
+再把状态收到 `broken`（已经是 `broken` 就直接返回）。`willServe()`、
+`canAnswerText()`、`canSpeakBackground()` 都先看状态：不是 `ready` 也不是 `busy`
+就为 false。建连回调只认当时那只 socket（`this.ws !== ws` 就丢掉）；
+`teardown` 把 `this.ws` 置空之后，旧连接的 open / message / close 不再改状态。
 
 ### 4.5 `restart()` 的四件事，顺序有讲究
 
@@ -422,23 +430,35 @@ onFrame(frame)      → assembler.addFrame(frame) → stt.feed(pcm, voiced)
 `run_in_background` / 子代理，都经 [`BackgroundTaskBus`](../src/background-task-bus.ts)
 回到同一条 omni 会话里说。`FastLlmClient` / `PrefetchSlot` 不在这条管道里。
 
-`respond()` 里前台按这个顺序做：
+`respond()` 按这个顺序做：
 
 1. `flushUnspoken()`。空窗还没到、用户已经开口时，把还没念的结论以
    `injectAnswer(..., 'unspoken')` 回注一次，免得下一轮 omni 被问「跑完没」时现编。
-2. 整句是「别查了」一类（`isCancelRequest`）并且总线上还有要汇报的任务：
-   `cancelAll`，丢掉在途 omni 音频，说「好，不查了。」`memory_silent` 默认留着。
-3. 带图：丢掉 omni 在途音频（图是 dsh 看的，omni 没看见）。车道还能交接
-   （`willServe()` 或 `canSpeakBackground()`）就把图异步派进总线（`source: 'image'`），
-   前台只说「我看看。」并带 `nonBlocking`。车道接不上才同步问 dsh，再用本层 TTS 念出来。
-4. `looksMemorable`：`dispatch({ source: 'memory_silent', silent: true })`。
-   成功和失败都不播报，也不挡住前台那一回合（§零 的 716–776 ms，委派垫话的
+2. 纯函数 `decideLiveTurn()` 定这一支，只走一条：取消 → 识图 → 钟点 →
+   `live_with_bg_guard` / `live_direct` → `fallback_dsh`。
+3. 不是取消、也不是识图，并且 `looksMemorable`：`dispatch({ source: 'memory_silent', silent: true })`。
+   成功和失败都不播报，也不挡住前台（§零 的 716–776 ms，委派垫话的
    `response.done` 约 700–960 ms，见 §10.1）。
-5. `isActionRequest` 且车道 `willServe()`：再派一条 `early_rule`（同一 `turnNo`）。
-6. 车道 `willServe()`：交给 `LiveVoiceEngine`。否则 `fallbackDsh`。
 
-`tool_call` 出在 `LiveVoiceEngine` 的 `delegate` 事件上。编排器按 `turnNo` 再
-`dispatch({ source: 'tool_call' })`，打上 `meta.nonBlocking`，垫话播完这一轮就结束。
+各支：
+
+- **取消**（`isCancelRequest` 且总线上还有要汇报的任务）：`cancelAll`，丢掉在途 omni 音频，
+  说「好，不查了。」已经在跑的 `memory_silent` 默认留着。
+- **识图**：丢掉 omni 在途音频（图是 dsh 看的，omni 没看见）。车道还能交接
+  （`willServe()` 或 `canSpeakBackground()`）就把图异步派进总线（`source: 'image'`），
+  前台只说「我看看。」并带 `nonBlocking`。车道接不上才同步问 dsh，再用本层 TTS 念出来。
+- **钟点**（`isClockTimeRequest`）：车道还能答就立刻 `early_rule`，前台只应一声「我查查。」
+  接不上才 `fallbackDsh`。这条不进 `live_with_bg_guard`，因为 Omni 会直接编时间。
+- **`live_with_bg_guard`**：要查外部或要动手，并且车道还能开口（`willServe()`，或至少
+  `answerFromText` 在场）。**进 Omni 之前不派单**。`finishLive()` 一见到 `delegate` 就立刻
+  `dispatch({ source: 'tool_call' })`，查询用 `rewrittenQuery` 再附上用户原话。
+  整段结束仍没有 `delegate`，才用原话补一笔 `early_rule`。中止，或 `dispose()`
+  已经置上 `disposed`，都不再派。工人因此不会拿着 ASR 原话先跑完，再和改写查询各答一次。
+- **`live_direct`**：同样进 Omni，但不挂这道后台守卫。封段认领和文本直答都没有，才
+  `fallbackDsh`（账本记 `dsh`）。
+
+`tool_call` 出在 `delegate` 事件上。封段认领和 `answerFromText` 都进同一条
+`finishLive()`。编排器打上 `meta.nonBlocking`，垫话播完这一轮就结束。
 omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免对着静音干等。
 
 总线的规矩：
@@ -446,7 +466,7 @@ omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免�
 | 规矩 | 行为 |
 |:---|:---|
 | 同一 `turnNo` | 要播报的任务去重，只执行一次。还在 `queued` 的 `early_rule` 会被后到的 `tool_call` 换成工具里的查询；已经 `running` 或 `completed` 的保持原查询，不再开第二次 |
-| 编排器时序 | `early_rule` 在进入 `LiveVoiceEngine` 之前入队，`tool_call` 要等 omni 的 `delegate`。工人晚一个微任务就开跑，所以后到的 `tool_call` 多半撞上已经在跑的那条：查询仍是用户原话，汇报的 `source` 仍是 `early_rule` |
+| 编排器时序 | `live_with_bg_guard` 不在进 Omni 之前派 `early_rule`。`tool_call` 在 `finishLive()` 当场派改写查询；整段没有 `delegate` 才补 `early_rule`。两条不会各跑一遍 |
 | 同一同步回合 | 若两条 `dispatch` 发生在同一次同步调用里、工人还没取队列，微任务会把它们合成一次 `execute`（先升级再跑） |
 | 工人 | 一次只跑一个 `execute`，避免单会话 dsh RPC 叠在一起 |
 | `memory_silent` | 不参与 `turnNo` 去重，不产生 `BackgroundTaskReport`。`cancelAll` 默认不停它 |
@@ -458,7 +478,8 @@ omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免�
 
 账本在编排器自己的 `ConversationLedger`：omni 答完（含垫话）记 `live`，同步兜底记 `dsh`。
 记下时 `truncated` 先按 false，内核结算经 `reconcileTurnOutcome({no, gen})` 改成真实结果。
-`lastLedgerLane()` 只在上一轮确是 omni 时回报 `live`。垫话轮记的是垫话本身；结论稍后由
+`lastLedgerLane()` 原样读账本上一轮：omni 记 `live`，`fallbackDsh` 记过 `dsh` 之后这里返回 `dsh`。
+还没答过、或只有 `pet`，是 `null`。垫话轮记的是垫话本身；结论稍后由
 `speakFromText` 进 omni 的服务端历史，或由逐字 TTS 用 `inject: 'spoken'` 补进去。
 
 `needsVerbatimRead()` 决定这份结论能不能交给全双工自己说。下面任一为真，报告带上
@@ -481,12 +502,16 @@ omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免�
 |:---|:---|
 | 报告带 `verbatim` | 不调用 `speakFromText`。`TurnRunner.speakCanned` 用 TTS 逐字念原文。念完且没被打断时，`noteFallbackAnnounceSpoken` 以 `injectAnswer(..., 'spoken')` 把原文注进 omni，不再出第二声 |
 | `canSpeakBackground()` 为假，或 `speakFromText` 返回 null | `'defer'`：条目排回队首，等下一个 800 ms 空窗。忙着发 `response.create` 会被服务端丢掉（§4.2） |
-| 可以开口 | `buildLiveReportPrompt`（[`persona.ts`](../src/persona.ts)）写成一条 user 文本。`OmniShadow.speakFromText` 连发 `conversation.item.create` + `response.create`，音频由 `TurnRunner.speakAudioAnswer` 下发。同一副嗓子，上下文自然接着 |
-| 开口前 0 字节，且不是被打断 | `'fallback'`：改走 TTS，并按 `'spoken'` 回注 |
+| 可以开口 | `buildLiveReportPrompt`（[`persona.ts`](../src/persona.ts)）写成一条 user 文本。`OmniShadow.speakFromText` 连发 `conversation.item.create` + `response.create`，音频由 `TurnRunner.speakAudioAnswer` 下发。同一副嗓子，上下文自然接着。`playAudio` 确认这一条是 `spoken` 之后才 `markInjected` |
+| 开口前 0 字节，且不是被打断 | `'fallback'`：还没 `markInjected`，改走 TTS，并按 `'spoken'` 回注。提前标记会让这次回注被吞掉 |
 | TTS 被打断 | 不按 `'spoken'` 回注 |
 
+`dispose()` 之后 `speakBackgroundReport` 直接 `'defer'`，在途的 `finishLive` 也不再补派。
+
 `canSpeakBackground()` 为真要同时满足：`ready`、没有在途回复、没有排队封段、
-`dirtyBytes === 0`，并且 `serve` 不是 off。
+`dirtyBytes === 0`，并且 `serve` 不是 off。`canAnswerText()` 同样只认 `ready`
+（`serve` 不是 off、没有在途回复、没有排队封段），但不看 `dirtyBytes`。
+`willServe()` 更宽：状态是 `ready` 或 `busy`，`serve` 不是 off，手里有活回复，或者 `pending` 里还排着一份。
 
 DashScope 上「dangling `tool_call`（不回 `function_call_output`）之后，
 `item.create`（`user`）+ `response.create` 还能不能出声、还记不记得」用
@@ -962,3 +987,18 @@ STT 是 `qwen-realtime`）。`OMNI_ANSWER=full` 在这条管道上既不发声�
 被新题顶掉时**不补播但回注记忆**、显式取消连已放手的轮一起取消。
 `tests/keepalive.test.ts`（14 条）：含 `dropPrefetch` / `reconcileTurnOutcome` /
 `lastLedgerLane` 等全量可选能力 Proxy 透传清单——防 §6.4 复发。
+
+离线 55 轮评测在 `bench/eval/`（`npm test` 的 glob 只收 `tests/*.test.ts`，
+这套用 `npm run test:bench`）：
+
+| 文件 | 做什么 |
+|:---|:---|
+| `manifest.json` | eval-v1，55 轮 |
+| `server.ts` | 隔离沙盒，生产装配，stub dsh |
+| `runner.ts` | 按 v2 `pcm16` 原速推流 |
+| `score.ts` | 准确率 + 延迟护栏。延迟只调用 `latency-report.ts` 的 `computeTurns()` / `summarize()`。`--compare` 对两份汇总 |
+| `score.test.ts` | 打分口径（同目录还有 `server-wiring.test.ts`） |
+
+Wave A+B 快照是 `bench/eval/baseline/20261124-live-v1-wave-ab.json`
+（`gitHead` `2ddf08b`）：S1 F1 **96.0%**、双答冲突 **0**；S2 忽略数字 ITN **100%**；
+S3-M1 **4/4**、S3-M2 **1/1**、S3-M3 **2/2**、S3-M4 **2/2**；S4 完整短句 **4/4**。

@@ -1,12 +1,13 @@
 # 状态机一览
 
-以**当前代码**为准（2026-11-23）。旧记录见 [ADR-0001](adr/0001-app-layer-and-pet.md)、
+以**当前代码**为准（2026-11-24）。旧记录见 [ADR-0001](adr/0001-app-layer-and-pet.md)、
 [ADR-0002](adr/0002-virtual-time-simulator.md)、[ADR-0003](adr/0003-deterministic-kernel.md)、
 [ADR-0004](adr/0004-flattened-pipelines.md)；
 与本文件冲突的地方已在各自文件里标注取代关系。
 
 这份文档回答四个问题：每台机器有哪些状态、什么事件推动它、转移条件是什么、
-**谁持有它、谁驱动它**。最后一节是一条对话从开口到播完的完整时序。
+**谁持有它、谁驱动它**。第 6 节是一条对话从开口到播完的完整时序。
+第 7–11 节是后来收成显式相位的几台机器，以及它们共同守的不变量。
 
 ## 0 唯一真相
 
@@ -16,19 +17,25 @@
 |---|---|---|
 | 话筒归谁 | `AppSession.floor`（`FloorArbiter.owner`） | `floor.busy` / `floor.owner`；宠物经 `PetWorld.floorBusy` 与 `floorTaken` 输入得知 |
 | 当前相位 / 轮次 / 代次 | `kernel.ts` 的 `dialog` 区域（`KernelRuntime.state.dialog`）；`DialogFsm` 只是它的**薄门面** | `DialogFsm.ticket()` 读 `runtime.state.dialog.ticket` → `{no, gen, baseCommitSeq?, startedAtMs?}`；上游取消、迟到回调一律拿票据比对（`isStale` / `isCurrent`）。内核意图的唯一执行路径是 `KernelRuntime.dispatchAndApply` + `DialogRuntime.attachPorts`（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` / `settleTurn`）；`SessionCore` 不另发插话的 `audio.stop` |
-| 播放进度 | `TurnRunner`（`playedSeen` + 设备 `played` 回执）；**口径**在内核 | 判"听到多少"只走 `kernel.ts` 的 `settleTurn`（媒体游标 = 字节/采样率），`DialogFsm` 只收 `audioDone(ticket)` 这一个结论 |
+| 播放进度 | 内核 `playback`（`sentMediaMs` / `playedAtMs`） | `devicePlayed` 写入 `playedAtMs`。`TurnRunner.playedSeen` 只打断「等到估算时长下限」的等待环，不算第二套 heard。结算仍只走 `settleTurn`；`DialogFsm` 只收 `audioDone(ticket)` |
 | 这一轮听到多少 / 少听没少听 / 该不该回注 | `kernel.ts`（`step()` 的 `settleTurn` 意图；`stale` 归 `dialog` 区域、`truncated` 归 `playback` 区域） | `TurnRunner` 只喂事实（`audioSent` / `devicePlayed` / `ticketInvalidated` / `turnEnded`），结算数字**不许自己再算一遍**；回注口气 `inject` 三态（`spoken` / `unspoken` / `none`）也**只在这里算一次**；历史档案对账用 `scripts/kernel-replay.ts`。**因果旧段拦截唯一归口在 `kernel.ts::isPreTurnCommit`**（`kernel.isCausallyStale` 与 `SessionCore` 都调它；`voice-session.ts` 不再保留 `fromPreTurnSegment` 副本） |
 | 这一轮先由谁答 | `turn-router.ts::routeTurn()`（纯函数，判据与引擎实现无关）；`live` 另由车道健康度与 omni 自己的 `tool_call` 决定 | `CascadeAgent` / `FrontedAgent` 问 `routeTurn()`。`TurnRunner` 不判，也不按 `reply.audio` 分叉：它只消费 `respond()` 的 `EngineEvent` |
 | 上一轮谁答的 / 少听没少听（路由与回注要读） | `FrontedAgent.ledger`（`ConversationLedger`，只记已结束的轮次） | `lastAnsweredLane()` 给 `routeTurn()` 的 `lastLane`；`pet` 轮不算"答过用户"。`KernelPorts.settleTurn` 把后验的 `truncated` 与 `endedAtMs` 按 `{no, gen}` 精确回写（`ConversationLedger.reconcileOutcome`）；重连时 `DialogRuntime` 用 `agent.lastLedgerLane()` 播种 `initialKernelState` 的 `lastLane`，两份账不漂 |
-| 判停中的文本 | `UtteranceAssembler`（`pending`） | 上层只在 `accept` 时拿到整句，拿不到半句 |
+| 判停中的文本 | `UtteranceAssembler`（`pendingText`） | 上层只在 `onUtterance` 拿到整句，拿不到半句 |
 | 快车道闸门 | `FrontedAgent.innerMode`（`pass` / `buffer` / `drop`） | dsh 的流式增量按闸门决定直通、缓冲还是丢弃 |
-| 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 只在还没出声时能说；答案的第一块一到就置 `cancelled` 并 `audio.stop`，不再有人读它。**出声期间它占着 `DialogFsm` 的 `speaking`**（`receiptStarted` / `receiptEnded`），所以那会儿用户开口算插话 |
+| 委派回执 | `TurnRunner.receipt`（+ `receiptPlaying` / `firstAudioSeen`） | 出声前锁存票据，`receiptStarted(ticket)` / `receiptEnded(ticket)` 由内核按 `{no, gen}` 核对。自然播完先在 `this.receipt === current` 时把引用清掉，再 `receiptEnded`。过期票是空操作 |
 | 宠物状态 | `PetSession.state`（`PetState`） | 纯函数 `brain.step` 产出；执行器无判断 |
 | 后台汇报什么时候开口 | `DialogRuntime.announceQueue` + 四道闸；Pure Live 的开口结果在 `speakAnnounce` | `queue.length > 0` → 宠物闸门 `floorFree` 不通过（`announcePending`），宠物自己不说话；`announce` 抢不动 `reply`。开口三态见 §5.7：`spoken` / `defer`（排回队首）/ `fallback`（逐字 TTS，再静默回注） |
 | 后台任务跑到哪 | `BackgroundTaskBus` 上每条任务的 `state` | `queued → running → completed \| failed \| cancelled`。同一 `turnNo` 上 `early_rule` 与 `tool_call` 去重，还在排队时 `tool_call` 升级查询；`memory_silent` 不进这张去重表、也不播报。插话不取消，显式取消才停，迟到结果不再汇报。见 §5.7 |
 | 这一轮的出话泵 | `TurnRunner` 持有的那一个 `FastVoiceEngine` | `run()` 只 `for await` `respond()`。`VOICE_PIPELINE=live\|cascade` 启动时二选一，会话内不换泵。见 §5.9 与 [ADR-0004](adr/0004-flattened-pipelines.md) |
 | omni 车道状态 | `VoiceConnection.omni`（`OmniShadow.state`：`idle`/`connecting`/`ready`/`busy`/`broken`） | `FrontedAgent.audioLane.willServe()` / `explain()`；宿主只经这两个入口读，不复制状态 |
 | omni 那一份音频归谁 | `OmniShadow.claimedResp`（认领时绑定） | `AgentAudioAnswer.chunks` / `transcript()` 的闭包；**不许事后去 `resp` 里找**（见 §5.6） |
+| 有声 / 连续静音 | `EnergyGate` 产出的 `AudioFrame`（`voiced` / `silenceMs` / `tsMs`） | 生产装配 `voiceDebounceFrames: 2`。`addFrame` 把这三字段原样交给 `SilenceTriggers`（`alreadyDebounced: true`），不再做第二套两帧去抖。见 §4 |
+| 句边界相位 | `UtteranceAssembler._phase` + `evalEpoch` | 上层只在 `onUtterance` 拿到整句。`disposed` 是唯一吸收态。见 §4 |
+| 开麦 | `VoiceConnection.micPhase` | 只经 `enterMic`。`closed` 之后不再出来。见 §8 |
+| 浏览器客户端 | `createVoiceClient` 里的 `ClientPhase` + `startGen` | 清理只走一次 `teardown()`。见 §10 |
+| DSH 主会话 | `DshSession.openSessionId` + `turnPhase` | 对不上主会话的事件只进 `TaskBoard`。进程代次是 `procGen`。见 §7 |
+| 后台总线的会话代 | `BackgroundTaskBus.sessionEpoch` | 重连后同号 `turnNo` 不互相挡住 |
 
 > **两个「封段」旋钮不是一回事**：`VOICE_COMMIT_MS`（20 ms）只让 **omni 车道**起跑
 > （`omni.seal()`），`VOICE_STT_COMMIT_MS`（150 ms）才请 **ASR** 封段解码
@@ -41,6 +48,33 @@
 > `userFinal()` 里直接 `claim('reply')` 永远失败，话筒会卡死在 `user`（改用
 > `handoff('user','reply')`）；②`AppSession.speaker` 曾是一份影子状态，与仲裁器重复；
 > ③`syncFloor()` 曾试图「同步」两者，但它只是恒等式，什么都没做。②③已删除。
+
+### 时钟与代次
+
+三把尺子不混用（[ADR-0003](adr/0003-deterministic-kernel.md)）：
+
+| 尺子 | 载体 | 用来判 |
+|---|---|---|
+| 因果 / 代次 | 下表这些序号 | 先后、过期、跨连接串台 |
+| 媒体时间 | `AudioFrame.tsMs`、字节 / 采样率 | 起止、静音累计、`heardMs`、`truncated` |
+| 墙钟 | 注入的 `clock.now()` / `clock.after` | 网络、RPC、握手、拍照、看门狗 |
+
+跨 `await`、定时器、socket 回调、子进程 stdout 的恢复点，第一行核对「出生代次还在，且没进吸收态」。对不上就返回。
+
+| 代次 | 持有者 | 挡住什么 |
+|---|---|---|
+| `procGen` | `DshSession` | 旧进程的 `close` / `error` / 2 s 强杀 |
+| `openSessionId` | `DshSession` | 子会话事件写进主轮 `assistantText` 或提前 `idle` |
+| `tailSwallow` | `DshSession` | 旧轮那条不带轮号的 `idle` / `turn/start` |
+| 票据 `{no, gen, baseCommitSeq?}` | 内核 `dialog.ticket` | 上一轮迟到回调；插话作废排队轮 |
+| `commitSeq` | 内核 `input` | 开轮前旧段（`isPreTurnCommit`） |
+| `evalEpoch` + `seq` | `UtteranceAssembler` | 挂起的 `evaluate` / `rearmFromSpeakingMore` |
+| `micEpoch` | `VoiceConnection` | 开麦宽限与等麦超时 |
+| `wsGen` | `QwenRealtimeAsr` / `AliyunAsr` / `OmniTts` | 旧 socket 的 open / message / close |
+| `startGen` | 浏览器 `VoiceClient` | `start()` 里还停在 `await` 的那一次 |
+| `sessionEpoch` | `BackgroundTaskBus` | 重连后的同号后台任务 |
+
+`OmniShadow` 这条连接不重连。吸收态是 `broken`，清理只走 `teardown()`，没有自己的 `wsGen`。
 
 ### 接线检查清单
 
@@ -88,10 +122,10 @@
 | | | | **`thinking` 是合法前驱**：用户在模型还在跑的时候又说了一句 → 新票据让旧票过期，旧轮的结果被 `isStale` 丢弃。**这就是「出声前吸收窗口」的实现方式**，真机上一半的句中停顿都走这条路。以前这里记成「⚠ 调度 bug」（注释写着「串行队列保证不会到这里」），是**错的** —— 按注释去「修」它，等于取消吸收窗口 |
 | `beginAwaitShot()` | `listening` | `awaiting_shot` | 不在 `listening` 时返回 `null` |
 | `abortAwaitShot()` | `awaiting_shot` | `listening` | 代次不变 |
-| **`receiptStarted()`** | `thinking` | `speaking` | 置 `receiptOnly`；不在 `thinking` 时返回 `false`（这一轮已被作废/已收尾，不该出声） |
-| **`receiptEnded()`** | `speaking`（且 `receiptOnly`） | `thinking` | 幂等；不动代次。回执被真音频顶掉后调用它是空操作 |
-| `audioStarted(t)` | `thinking` | `speaking` | 票据过期/不是当前轮则忽略；**清 `receiptOnly`**（真音频接管）。**触发点是首块音频要下发的那一刻**（`turn-runner` 的 `emit()` 里，紧挨着 `sendAudio`），不是回复文本到达时 |
-| `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 迟到票据按 `{no, gen}` 丢弃；`receiptOnly` 为真时**直接返回**（回执那段 `speaking` 不是本轮音频） |
+| **`receiptStarted(ticket?)`** | `thinking` | `speaking` | 置 `receiptOnly`。带了票据时内核 `acceptsReceiptTicket`：当前票非空，且 `causal.isStaleTicket` 为假（`no` 与 `gen` 一起比）。过期票、或不在 `thinking`，返回 `false`，这一轮不出声。`beginTurn` 开新轮时无条件把 `receiptOnly` 清成 `false` |
+| **`receiptEnded(ticket?)`** | `speaking` 且 `receiptOnly` | `thinking` | 过期票，或 `receiptOnly` 已经清掉：空操作，相位不动。回执被真音频顶掉后再调也是空操作 |
+| `audioStarted(t)` | `thinking` | `speaking` | 票据须 `{no, gen}` 都对上当前轮；**清 `receiptOnly`**（真音频接管）。**触发点是首块音频要下发的那一刻**（`turn-runner` 的 `emit()` 里，紧挨着 `sendAudio`），不是回复文本到达时 |
+| `audioDone(t)` | `thinking`、`speaking` | `endAfterSpeech ? ending : listening` | 本轮相位的收尾出口。票据对上才走，并清掉 `receiptOnly`。回执自己播完走 `receiptEnded`（回 `thinking`），不走这里。`turnEnded` **不改** `dialog.phase`，只结算 `playback` 与 `ledger` |
 | `requestEnd()` | `listening`、`awaiting_shot` | `ending` | 在 `speaking`/`thinking` 只置标志，让告别语播完 |
 | `bargeIn(why, commitSeq?)` | **仅** `speaking`（含回执那段） | `listening` | 先过因果屏障：带 `commitSeq` 时 `kernel.ts::isPreTurnCommit` 判「开轮前录的旧段」，是旧段就不算插话（相位不动、返回 `false`）。成立时 `gen += 1`（作废排队轮次）→ 清 `receiptOnly` → 内核声明四条意图：`stopDeviceAudio`、`invalidateTurn(ticket, 'bargeIn')`、`abortEngine('barge_in')`、`settleTurn`（当场按媒体游标结算这一轮），由 `KernelRuntime.dispatchAndApply()` 经 `KernelPorts` 各执行一次 |
 | `close()` | 任意 | `closed` | 宣告这一轮作废（内核发 `invalidateTurn(ticket, 'closed')`）→ 清票 |
@@ -121,9 +155,10 @@
    （`no + 1`，`gen` 不变；同一轮谱系内沿用上一张票的 `baseCommitSeq` / `startedAtMs`），
    顺手结算还留在播放区里的上一轮（有残留音频时才发 `settleTurn`）→ `thinking → thinking`
 3. 旧票不再是「当前轮」：`isCurrent(ticket)`（`no` 已前进）为假，旧轮的结果回来时
-   一个字都不下发。`isStale` 比的是 `gen`，插话那次才 +1，这里不动 ——
+   一个字都不下发。`DialogFsm.isStale` 只比 `gen`，插话那次才 +1，这里不动 ——
    **`beginTurn` 自己不发 `invalidateTurn`**（只有 `bargeIn` 与 `closed` 发），
-   所以它只让旧轮的输出作废，不去取消旧轮的上游
+   所以它只让旧轮的输出作废，不去取消旧轮的上游。下发侧用 `TurnRunner.isTurnDead`：
+   `isStale(ticket) || !isCurrent(ticket)`，`no` 或 `gen` 对不上都停
 4. 快车道也不会走 `commit` → **不写进对话历史**
 
 效果等价于「合并后重答」，但**实现是新轮取代旧轮**，不是把两段文本拼起来。
@@ -135,6 +170,29 @@
 
 **还没做的审计**（`fsm-trace`）：被取代的轮次（票 `no` 小于当前轮、且没有 `turn.end`）
 不得出现 `tts.first` 或下行音频。真机上「半句当整句答」如果还在发生，先查这里。
+
+### TurnRunner：回执、死票、旁白
+
+`speakReceipt` 出声前读 `fsm.ticket()`，`receiptStarted` 失败就一句都不发。
+`holdReceipt` 按音频时长占住 `speaking`，循环里看见 `cancelled` 或 `fsm.state === 'closed'` 就停。
+醒来之后：
+
+1. 仅当 `this.receipt === current` 时把它置成 `null`。悬空的旧回执不能清掉下一轮的引用，
+   也不能让几秒后的正式回答误判「回执还在念」再发一条 `audio.stop`。
+2. `receiptEnded(receiptTicket)`。票是出声时锁存的那张；内核按 `{no, gen}` 丢掉过期票。
+
+`run()` 的 `finally` 先 `cancelActiveReceipt()`，再 `audioDone`。这样晚醒的 `holdReceipt`
+只能拿旧票去 `receiptEnded`。
+
+`isTurnDead` 用在 `emit`、`respond` 循环和播完等待上。`speakCanned` 的合成循环与播完等待
+同样看见 `fsm.state === 'closed'` 就停，不再往已关的连接上送字节。
+
+### PhotoInbox
+
+**持有**：`DialogRuntime.photos`。`dispose()` 把 `disposed` 置上，取消在等的那一张
+（`cancelled`），并拆掉兜底定时器。之后 `request()` 直接返回 `cancelled`，不再武装新定时器。
+`DialogRuntime.dispose()` 会调到它；`enqueueTurn` 的串行链入口同时看 `disposed` 和
+`fsm.state === 'closed'`。
 
 ```mermaid
 stateDiagram-v2
@@ -262,21 +320,57 @@ stateDiagram-v2
 ## 4 UtteranceAssembler —— 判停
 
 **持有**：`voice-session` 的 `assembler`（`src/utterance-assembler.ts`）。
-**驱动**：ASR 中间结果 / 整句（`push`）、预测器（`turn-judge`）、定时器。
+**驱动**：ASR 定稿（`addSentence`）、声学帧（`addFrame`）、预测器（`turn-judge`）、定时器。
+相位只有 `setPhase` 能写；`disposed` 写进去之后 `setPhase` 直接返回。
 
 | 状态 | 含义 |
 |---|---|
-| `idle` | 没有待判文本 |
-| `pending` | 攒着一段文本，定时器在等（等预测器或等下文） |
-| `settled` | 已定稿：整句交给了上层，下一句重新从 `idle` 开始 |
+| `idle` | 没有待判文本。`flush()` 把整句交出去之后回到这里 |
+| `armed` | `addSentence` 已并入文本，静候窗定时器在走 |
+| `judging` | `evaluate(seq, evalEpoch)` 正在跑 |
+| `extending` | 静音闸 / 短碎片 / `p` 说没说完，再等一拍 |
+| `speaking_more` | 缓冲文本还在，又收到去抖后的有声帧。在途 `evaluate` 必须让位 |
+| `rearming` | 离开 `speaking_more` 之后，先等在途 ASR 解码，再决定要不要 `evaluate` |
+| `disposed` | 吸收态。`addFrame` / `addAudio` / `notePartial` / `addSentence` / `flush` 入口直接返回 |
+
+`seq` 在 `addSentence` / `flush` / `dispose` 加一，只跟文本边界走。
+`evalEpoch` 在 `handleVoiced` / `addSentence` / `flush` / `dispose` 加一：重新开口不改 `seq`，
+但必须作废已经挂在 `await` 上的那一趟。每次 `await` 之后走 `isStaleEval`：
+`disposed`、`speaking_more`、`idle`、`seq` 变了、`evalEpoch` 变了、或缓冲被清空，都退出。
+`rearming` 本身不算失效相位 —— 旧协程靠对不上锁存的 `evalEpoch` 让位。
 
 | 事件 | 条件 | 结果 |
 |---|---|---|
-| `push(text)` | 任意 | 追加到 `pending`，重置定时器 |
-| `notePartial(text)` | 任意 | 只更新 `lastPartialText`（不拼文本，中间结果会反复改写）。**静音满 `speculateMs`（100 ms）时**用它给快车道投机，见 §5 |
-| 定时器到期 → `evaluate()` | 预测器说「说完」且不满足「等下文」 | `accept`：整句交给上层 |
-| 同上 | 结尾像没说完（数字、井号、连词…）或刚收到中间结果 | `extend`：再等 `extendMs`（默认 200 ms），最多 `maxExtensions` 次 |
-| 同上 | 预测器不在 | `predictor-unavailable`：按固定时长兜底 |
+| `addSentence(text)` | 非 `disposed` | `seq++`、`evalEpoch++`，`extensions` / `waitedMs` / `unsureExtensions` 清零，相位 `armed`，到点 `evaluate(seq, epoch)` |
+| `notePartial(text)` | 非 `disposed` | 只更新 `lastPartialText`。**静音满 `speculateMs`（默认 100 ms；显式 `≤ 0` 关闭）时**拿它投机，见 §5 |
+| `addFrame` 有声 | 缓冲非空，且不是 `idle` / `disposed` | `evalEpoch++`，取消定时器，进入 `speaking_more`，武装断流看门狗 |
+| 静音到 `rearmSilenceMs`，或看门狗 | 仍在 `speaking_more` 且 `seq` 没变 | 先入 `rearming`，`waitPendingDecode`；解码带回新定稿或代次过期就返回，否则 `evaluate` |
+| `evaluate` 要再等 | 静音不够、短碎片、或 `p` 说没说完，且预算没满 | `extending`，定时器再到点重新 `evaluate`（同一 `seq` / `epoch`） |
+| `evaluate` 收下 | 闸都过了 | `flush()`：`seq++`、`evalEpoch++`，`onUtterance`，相位回 `idle` |
+| `dispose()` | 任意 | 直接写成 `disposed`，`evalEpoch++`，清定时器、缓冲和语义缓存 |
+
+`rearmSilenceMs` 取 `openQuietMs` 与 `sttCommitAfterMs` 的较大者；两个都没配时退回
+`quietMs` / `extendMs` / 100 ms 的较大者。看门狗比这个门槛再多 100 ms，并且不低于 350 ms。
+
+### 声学事实：能量门、上行管道、静音触发
+
+生产链路上「有没有声、静音多久」只从 `EnergyGate.process` 出来：
+
+| 字段 | 含义 |
+|---|---|
+| `voiced` | 连续 `voiceDebounceFrames` 块过门限才为真。生产在 `VoiceConnection` 里传 **2**。不够数的尖峰保持原来的 `silenceMs`，不归零 |
+| `silenceMs` | 自最后一块确认有声起的连续静音。有声块本身是 0 |
+| `tsMs` | 这一帧读一次注入时钟。`AudioFrame.tsMs` 与能量门用同一个时刻 |
+| `prerollFrames` | 开门时交出的预卷，每块已经标好 `voiced`。下游不再跑第二遍 `pcm16PeakDbfs` |
+
+`UplinkPipeline.end()` 把 `closed` 置上。之后 `push` 与 ffmpeg 的 `onPcm` 直接丢弃，
+断连尾包不再进门、不再触发 `onFrame` / `onSpeechClose`。
+
+`SilenceTriggers.noteFrame` 在 `alreadyDebounced === true` 且带了 `frontSilenceMs` 时
+（`addFrame` 就是这条），有声帧立刻推进 `lastVoicedAt`，四个阈值读 `frontSilenceMs`。
+`addAudio` 老路径不带这个标志，仍自己做两帧去抖，并用 `atMs - lastVoicedAt` 算静音。
+`commitAfterMs` / `sttCommitAfterMs` / `pauseDetectMs`：`undefined` 用各自默认，**显式 `≤ 0` 关闭**。
+`speculateMs` 缺省 100；显式 `≤ 0` 关闭。`assemblerSilenceFromGate` 把配置里的 `0` 原样传下去。
 
 **三个新增的门（2026-11-18 起，只在「端点由我们控」的 ASR 上生效）**：
 
@@ -291,8 +385,8 @@ stateDiagram-v2
 > `p=0.823 / 静音 137ms / 实等 63ms`。**这两次都靠 200 而不是 300 才只等了 4 / 63 ms**，
 > 删掉短档会让它们各多等 100 ms。触发率低是真的，「从不生效」不成立。
 
-配套的**静音去抖**：单帧（20 ms）有声不算重新开口，连续两帧才算 —— 这段录音里 20 ms 的
-「有声」有 14 处，多是塞音闭塞段，不去抖会让静音计时反复归零、开轮门槛永远不成立。
+两帧去抖的来历：那段录音里 20 ms 的「有声」有 14 处，多是塞音闭塞段。单帧就清零
+`silenceMs` 会让开轮门槛永远不成立。生产上这一刀在 `EnergyGate` 里做完。
 
 **QoS：`②` 的等待预算（2026-11-18）**
 
@@ -322,11 +416,24 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     [*] --> idle
-    idle --> pending : push(text)
-    pending --> pending : push(text) / 重置定时器
-    pending --> pending : evaluate() → extend（再等 200 ms）
-    pending --> settled : evaluate() → accept
-    settled --> idle : 下一句
+    idle --> armed : addSentence（seq++，evalEpoch++）
+    armed --> judging : 静候窗到点 evaluate
+    judging --> extending : 静音闸 / 短碎片 / p=more
+    extending --> judging : 延长到点 evaluate
+    armed --> speaking_more : 去抖后的有声帧（evalEpoch++）
+    judging --> speaking_more : await 期间又开口
+    extending --> speaking_more : 延长期间又开口
+    speaking_more --> rearming : 静音到门槛或看门狗
+    rearming --> armed : 解码期间又来 addSentence
+    rearming --> speaking_more : 解码期间又开口
+    rearming --> judging : 解码结束且代次仍有效
+    judging --> idle : flush / onUtterance
+    idle --> disposed : dispose
+    armed --> disposed : dispose
+    judging --> disposed : dispose
+    extending --> disposed : dispose
+    speaking_more --> disposed : dispose
+    rearming --> disposed : dispose
 ```
 
 ## 5 FrontedAgent 快车道
@@ -466,12 +573,12 @@ partial，段与段之间一个字都不吐（`071340` 轮 4 从 −764 ms 到 �
 
 **回执要占 `speaking`**：说不出声的话，用户听完回执再开口，`SessionCore` 会把它当成
 「同一句的下文」合并进去（`thinking` 状态下的语音默认是追问/补充），于是「不用了」
-顶不掉这一轮。所以出声前先 `fsm.receiptStarted()`（`thinking → speaking` + 置
-`receiptOnly`），那句话播完 `fsm.receiptEnded()`（`speaking → thinking`）。
-`receiptOnly` 只有一个作用：让 `audioDone()` 知道这段 `speaking` 不是本轮答案的音频，
-**不要**据此把轮次推进到 `listening`。真答案首块一到，`audioStarted()` 会清掉这个标志，
-此后就是正常的一轮。回执期间用户开口 → `bargeIn()` 照常生效（`gen += 1` 掐掉 dsh），
-这就是「回执可被打断」。
+顶不掉这一轮。所以出声前先 `fsm.receiptStarted(ticket)`（`thinking → speaking` + 置
+`receiptOnly`），那句话播完 `fsm.receiptEnded(ticket)`（`speaking → thinking`）。
+`receiptOnly` 标的是「这段 `speaking` 还只是回执」：真答案首块一到，`audioStarted()`
+清掉它并留在 `speaking`。回执自然结束走 `receiptEnded`，回到 `thinking` 继续等答案。
+过期票据两次调用都是空操作（§1）。回执期间用户开口 → `bargeIn()` 照常生效
+（`gen += 1` 掐掉 dsh），这就是「回执可被打断」。
 
 > 这两次转移**净变化为零**时 `notifyState` 会去重、不产生 `dialog.transition` 事件，
 > 但 `dialog.state` 事件里的 `why` 能区分（见 `docs/TOOLS.md` §12.1）。
@@ -499,7 +606,9 @@ Pure Live（`VOICE_PIPELINE=live`）过了这四道闸之后不直接合成：�
 第三条用 `lastUserSpeechAt`（连 partial 也算）是因为用户说话时 FSM 也是 `listening`
 （要等整句定稿才进 `thinking`），光看状态会在换气口插进去。第四条只看**整句**：
 开麦最长 1.5 s，而且用户已经在说时麦是立刻开的 —— 最该让路的时候反而最快开口；
-但一个语气词的 partial 不值得把汇报再推后一轮。
+但一个语气词的 partial 不值得把汇报再推后一轮。`awaitMicOpen` 回来之后
+`shouldSpeak` 再查一遍：`!disposed`、相位仍是 `listening`、并且
+`lastUserSentenceAt ≤ mark`。
 
 已经念到一半被打断：旁白期间 FSM 停在 `listening`，`bargeIn` 对它不成立，所以只有
 `dispatch` 里那一次 `interruptCanned()`（非旁听句子才触发）。没念完的部分切成残句，
@@ -553,17 +662,26 @@ stateDiagram-v2
 | `connecting` | socket 已发握手，等 `session.updated`（实测 ~1.3 s） |
 | `ready` | 可发 `commit`+`create` |
 | `busy` | 有一份 response 在生成（`resp !== null`） |
-| `broken` | **吸收态，不自动重连** |
+| `broken` | **吸收态，不自动重连**。`stop()` 与故障都经唯一的 `teardown()` |
 
 | 事件 | 从 | 到 | 条件 / 副作用 |
 |---|---|---|---|
-| `start()` | `idle` | `connecting` | 与设备握手**并行**，不占关键路径。握手超时 15 s → `broken` |
+| `start()` | `idle` | `connecting` | 与设备握手**并行**，不占关键路径。握手超时 15 s → `teardown` |
 | `session.updated` | `connecting` | `ready` | 握手完成即就绪，**没有「预热 seal」**（发假音频会白花钱 + 往第 0 轮塞脏历史） |
 | `seal()` | `ready` | `busy` | `commit` + `create` **连发**（pipe）。create 每推迟 1 ms 首块就晚 1 ms，决策预算只有 ~171 ms |
 | `seal()` | `busy` | `busy` | 先 `response.cancel()`，把这一份排进 `pending`（只留一份），`done` 之后补发 |
 | `response.done` | `busy` | `ready` | 同时 flush `pending`（→ `busy`）和排队中的回注 |
-| `response.done` / `error` / `close` | 任意 | `broken` | 落 `{skipped:'broken', why}`；`stop()` 也走这里 |
-| 一份 response 30 s 没 `done` | `busy` | `broken` | 看门狗，防挂死（**不是性能判据**） |
+| `stop()` / 断线 / 协议错 / 30 s 看门狗 | 非 `broken` | `broken` | `teardown(reason, emitSkipped)`。已是 `broken` 则直接返回。30 s 只防挂死，不是性能判据 |
+
+`teardown` 清掉定时器、socket、`resp`、`pending`、`claimReserved`、`claimedResp`、`held`，
+再 `wakeAudio` / `wakeLive`。`stop()` 不写档案；故障路径落 `{skipped:'broken', why}`。
+这条连接不重连，所以没有 `wsGen`；ASR / TTS 的 socket 代次在 §9。
+
+`willServe()`、`canAnswerText()`、`canSpeakBackground()` 的第一行都要求
+`state === 'ready' || state === 'busy'`。`broken` 三个都是 `false`，
+`LiveOrchestrator` 因此走 `fallback_dsh`（§5.7），账本记 `dsh`。
+`canAnswerText` 还要求此刻就是 `ready`、`resp` 与 `pending` 都空。
+`canSpeakBackground` 在这之上再要求 `dirtyBytes === 0`。
 
 ```mermaid
 stateDiagram-v2
@@ -574,8 +692,8 @@ stateDiagram-v2
     ready --> busy : seal()（commit + create 连发）
     busy --> busy : seal()（先 cancel，排队）
     busy --> ready : response.done（并 flush pending）
-    ready --> broken : error / close / stop()
-    busy --> broken : 超时 / 连续协议错误
+    ready --> broken : teardown（error / close / stop）
+    busy --> broken : teardown（超时 / 协议错）
     broken --> [*]
 ```
 
@@ -605,7 +723,8 @@ stateDiagram-v2
 
 两处容易写错：
 
-1. **`willServe()` 必须看得见 `pending`。** 撞 busy 之后「cancel 掉旧的 + 新的排队」，
+1. **`willServe()` 必须看得见 `pending`，并且先看相位。** `broken` 直接 false。
+   撞 busy 之后「cancel 掉旧的 + 新的排队」，
    而新的要等旧的 `done` 才建 —— 实测空窗 **92 ms**。只看 `resp` 会在这窗口里判 false，
    整轮退回级联，而 omni 那份 1 s 的回答生成完没人要（真机 2/38 中招）。
 2. **`claimedResp` 不能省。** `finish()` 一到就把 `resp` 置 null，而异步 generator 的
@@ -714,6 +833,41 @@ dsh 继续跑完；回来的答复交给 `setAnnouncer` —— 与「后台任�
 `memory_silent` 收进总线，dsh 自己的 `onAnnounce` 走
 `ingestExternalAnnouncement`；汇报经 `setTaskReporter` → `enqueueAnnounce` →
 `flushAnnounce`。`VOICE_PIPELINE=cascade` 不走这一节。
+`dispose()` 置 `disposed` 并停总线；之后 `respond` / `speakBackgroundReport` /
+`finishLive` 的恢复点都直接返回。
+
+### 前台决策 `decideLiveTurn`
+
+`respond()` 开头把这一轮收成一张纯函数表，再 `switch`。穷尽，没有落在表外的分支。
+
+| 事实（按这个顺序看） | 决策 | 做什么 |
+|---|---|---|
+| `isCancelRequest` 且 `hasActiveReportable()` | `cancel_bg` | `cancelAll('user_cancel')`，丢掉在途 omni，念取消句 |
+| 本轮带图，且 `willServe()` 或 `canSpeakBackground()` | `photo_delegate` | `discard()`，派 `image`，念拍照垫话 |
+| 带图但车道开不了口 | `fallback_dsh` | 同步 `inner.reply`，TTS 念出来，`remember(..., 'dsh')` |
+| 问钟点，且 `willServe()` 或 `canAnswerText()` | `clock_override` | 立刻 `discard()`，当场 `dispatchEarly`（`early_rule`），前台只念垫话 |
+| 问钟点但车道开不了口 | `fallback_dsh` | 同步 dsh，不经 omni |
+| `willServe()` 或有 `answerFromText`，且是动作 / 实时事实 | `live_with_bg_guard` | 先让 omni 开口。见下面的守卫 |
+| `willServe()` 或有 `answerFromText`，其余 | `live_direct` | `playLive`，没有可认领封段时改 `answerFromText` |
+| 车道两个入口都没有 | `fallback_dsh` | 同步 dsh。`remember` 把车道写成 `'dsh'`，`lastLedgerLane()` 原样读出来（`pet` 仍当成没答过） |
+
+`looksMemorable` 且决策不是 `cancel_bg` / `photo_delegate` 时，另派一条 `memory_silent`。
+它不进 `turnNo` 去重，也不播报。
+
+`live_with_bg_guard` **不在进 omni 之前派单**。工人晚一个微任务就会开跑，
+提前派的 `early_rule` 会拿着 ASR 原话跑完，后面的改写查询赶不上。
+
+| Omni 这一段里发生的事 | 派单 |
+|---|---|
+| 事件流里出现 `delegate`（带 `rewrittenQuery` 就用改写，并附上用户原话） | 当场 `dispatch({ source: 'tool_call' })` |
+| `done` 时还没见过 `delegate`，或流结束仍没有 `done` 且还没补过 | `dispatchEarly`：`source: 'early_rule'`，查询是原话 |
+| `signal.aborted` 或 `disposed` | 不再补派 |
+
+`live_direct` 里 omni 自己吐出 `delegate` 时，同一条 `finishLive` 也按 `tool_call` 派，
+只是没有「没调工具就补 `early_rule`」这一步。
+
+总线上「排队中的 `early_rule` 可被后到的 `tool_call` 升级」仍然有效
+（`clock_override` 就是进 omni 之前就派了 `early_rule`）。守卫轮自己不会在同一同步回合里先派粗查询。
 
 ### 每条后台任务
 
@@ -741,8 +895,10 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
-工人循环晚一个微任务才取队列，所以同一个同步回合里先到的 `early_rule` 和后到的
-`tool_call` 能合成**一次** `execute`。去重键是 `turnNo`，只对要播报的任务：
+工人循环晚一个微任务才取队列。去重键是 `turnNo`，只对要播报的任务。
+守卫轮不靠「同一回合里先粗后细」：`tool_call` 在 `delegate` 到达时才派，
+`early_rule` 只在整段结束仍没有 `delegate` 时补上（见上一节）。
+下面这张升级表留给确实会先入队 `early_rule` 的路径（例如 `clock_override`）：
 
 | 规则 | 行为 |
 |---|---|
@@ -782,9 +938,9 @@ omni 这边再加一道空闲闸，空闲的定义是 `canSpeakBackground()`，�
 
 | 结果 | 条件 | 然后 |
 |---|---|---|
-| `spoken` | `canSpeakBackground()` 为真，`speakFromText` 非 null，并且播过字节，或 0 字节但是被打断 | 这一条算念过。`speakFromText` 发出去的那条 user 旁注已经在会话里 |
-| `defer` | 车道没有空闲，或 `speakFromText` 返回 null | **排回队首**，本轮不算出过声。`finally` 再排一个 800 ms 重试 |
-| `fallback` | `verbatim`、车道没有 `speakFromText`、或开口后 0 字节且不是打断 | `runner.speakCanned` 念 `item.speech`。没被打断、且这条任务还没注入过时，`onFallbackAnnounceSpoken` → `injectAnswer(..., 'spoken')`：只往 omni 历史里写旁注，不再说第二遍 |
+| `spoken` | `canSpeakBackground()` 为真，`speakFromText` 非 null，并且播过字节，或 0 字节但是被打断 | `playAudio` 确认之后才 `markInjected(taskId)`。提前标记会让后面的 fallback 以为已经回注过 |
+| `defer` | 还没开口就 `disposed`、车道不空闲，或 `speakFromText` 返回 null；开口后 0 字节且已经 `disposed` 也走这里 | **排回队首**，不 `markInjected`。`finally` 再排一个 800 ms 重试 |
+| `fallback` | `verbatim`、车道没有 `speakFromText`、或开口后 0 字节且不是打断 | `runner.speakCanned` 念 `item.speech`。没被打断、且 `injectedTaskIds` 里还没有这条时，`noteFallbackAnnounceSpoken` → `injectAnswer(..., 'spoken')` 并记入已注入 |
 
 `verbatim === true` 时 `flushAnnounce` **不调用** `speakAnnounce`，直接走
 `speakCanned`，播完仍通知 `onFallbackAnnounceSpoken`。`speakBackgroundReport`
@@ -879,7 +1035,8 @@ node --experimental-strip-types scripts/fsm-trace-check.ts <档案目录 | event
    不回头问 ASR「你是不是还在解」。
 
 边界（**现状**，别搞混）：`step()` 按正交区域拆成 `stepInput` / `stepPlayback` /
-`stepDialog`，自己只做因果屏障、吸收态守门和按区域路由。相位真相在 `dialog` 区域，
+`stepDialog`，自己只做因果屏障、吸收态守门和按区域路由。只有 `stepDialog` 改 `dialog.phase`；
+`turnEnded` 落在 `stepPlayback`，已结算过的那一轮只原样重述。相位真相在 `dialog` 区域，
 `KernelRuntime` 持有**唯一一份** `KernelState`。`DialogRuntime` 用 `attachPorts()` 绑上
 生产 `KernelPorts`；`DialogFsm` 与 `TurnRunner` 都经 `dispatchAndApply()` 执行意图，
 四条（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` / `settleTurn`）**只跑一次**。
@@ -1020,7 +1177,7 @@ sequenceDiagram
 ### 分支 C：omni 直出（`OMNI_ANSWER=full` / `VOICE_PIPELINE=live`）
 
 omni **不等定稿**：封段在 `onCommit`（20 ms）先跑，早于 `onSttCommit`（150 ms）的 `stt.commit()`，用 `asr.commit.lane_seq` 配对。
-图里的 `willServeAudio` / `claim` 是这条车道的时序；调用点在 `LiveVoiceEngine`，`TurnRunner` 只收 `EngineEvent`。后台结论的开口见 §5.7。
+图里的 `willServeAudio` / `claim` 是这条车道的时序；调用点在 `LiveVoiceEngine`，`TurnRunner` 只收 `EngineEvent`。Pure Live 这一轮走哪条分支由 `decideLiveTurn` 决定（§5.7），不在 `TurnRunner` 里再分一次。后台结论的开口也见 §5.7。
 
 ```mermaid
 sequenceDiagram
@@ -1076,3 +1233,163 @@ sequenceDiagram
 | omni 在 `onCommit` 起跑，早于 `beginTurn()` | 推迟 241 ms 到定稿才 `create`，首块从 664 掉到 887，输给级联的 835 |
 | `willServeAudio()` 在流式 TTS 之前问 | 那一步会真开一个合成 task，而 omni 轮没文本可送，服务端拒空文本 → 整轮退化 |
 | `speech` 在 drain 之后才读 | 它是活 getter；被打断时当前值正好是「已播出去的部分」，审计与续话要的就是它 |
+
+## 7 DshSession —— 进程代次与主轮相位
+
+**持有**：`DshSession`（`src/session.ts`）。进程机和轮次机正交：`procGen` 管子进程，
+`turnPhase` 管主会话这一轮。
+
+### 轮次 `DshTurnPhase`
+
+| 状态 | 含义 |
+|---|---|
+| `idle` | 没有在等的主轮，也没有放手后还在跑的委派轮。`isBusy()` 为假 |
+| `prompting_rpc` | 正在等 `session/prompt` 的响应 |
+| `awaiting_idle` | prompt 已被接受，在等这条主会话的 `idle` |
+| `detached_running` | 调用方已经 `detachTurn`，dsh 那一轮还在跑 |
+
+`askSdk` 从写 `activeTicket` / `onIdle` / `turnPhase` **之前**进入 `try`。
+`finally` 清掉等待者和票据，相位落到 `detached ? detached_running : idle`。
+`session/prompt` 抛错不会把 `isBusy()` 锁死。
+
+`detachTurn(ticket)` / 取消侧的票据核对：`activeTicket === null`，或 `{no, gen}` 对不上，
+直接丢掉。放手轮的文本在 `detachedText`，和下一轮的 `assistantText` 分开。
+`turn/end` 对上 `detachedTurn` 时，若相位还是 `detached_running` 就回到 `idle`；
+新一轮已经在 `prompting_rpc` / `awaiting_idle` 时不动它。
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> prompting_rpc : askSdk 写入票据
+    prompting_rpc --> awaiting_idle : session/prompt 成功
+    prompting_rpc --> idle : RPC 抛错（finally）
+    awaiting_idle --> idle : 主会话 idle，且没有放手
+    awaiting_idle --> detached_running : detachTurn 之后 finally
+    detached_running --> idle : 本轮 turn/end，或显式取消
+```
+
+### `tailSwallow`
+
+`idle` 不带轮号。上一轮的尾巴用三态挡住，避免叫醒新一轮的 `onIdle`，
+也避免旧 `assistant/message` 写进新一轮：
+
+| 相位 | 何时进入 | 下一步 |
+|---|---|---|
+| `none` | 没有旧尾巴 | — |
+| `awaiting_old_turn_start` | `askSdk` 时自发轮还活着，而且旧 `turn/start` 还没到 | 吃掉那条 `turn/start`，改成 `awaiting_old_idle` |
+| `awaiting_old_idle` | 旧 `turn/start` 已过（含放手轮刚 `turn/end`） | 吃掉紧随的那条 `status=idle`，回到 `none`。其间若先来了新的 `turn/start`，说明旧 `idle` 不会来了，直接 `none`。两条吞噬相位见到 `idle` 都回到 `none` |
+
+`tailSwallow !== 'none'` 时，主轮的 `assistant/message` 不写入 `assistantText`。
+
+### `procGen` 与 `openSessionId`
+
+每次 `handshake` spawn 时 `procGen++`，`close` / `error` / `stop()` 的 2 s 强杀都抓住自己那一代。
+`myGen !== procGen` 就返回：不 reject 新进程的 pending，不写新的 `exitError`，也不 `kill` 新进程。
+
+`isMainSession` 要求事件上的 `sessionId` 非空且等于 `openSessionId`。
+`session.event` 先喂 `TaskBoard`，对不上主会话就返回：不写 `assistantText`，不推 `turn/start` / `turn/end`。
+`session.status` 同样先过这道门，子会话的 `idle` 不唤醒主轮。
+
+## 8 VoiceConnection —— 开麦 `MicPhase`
+
+**持有**：`VoiceConnection`（`src/voice-session.ts`）。唯一写入点是 `enterMic`。
+非法迁移打日志并保持原状。每次真正迁出一格，`micEpoch++`。宽限定时器和等麦超时抓住登记时的代次。
+
+| 状态 | 含义 |
+|---|---|
+| `idle` | 还没开始等设备推流 |
+| `watching` | `armCaptureWatch` 已武装，宽限期内看设备是不是已经在采集 |
+| `opening` | `listen.start` **已经发出去**，在等首帧 |
+| `open` | 看到了非空上行音频 |
+| `closed` | 吸收态。`onClose` 进入，等麦的人一律 `false` |
+
+`canEnterMic`：任意状态都可以进 `closed`；`closed` 不能再出去。
+`idle → watching | opening`，`watching → opening | open`，`opening → open | idle`，
+`open → opening`。宽限到期但不该唤醒时留在 `watching`，不另开一条回 `idle` 的边。
+
+`sendListenStart` 只负责调用 `sendCall`。`listen.start` 的字节真交出去之后，
+`noteListenSent` 才 `enterMic('opening')`。发送失败留在原相位。
+`listen.stop` 成功且当时是 `opening` 才回到 `idle`，并放开等麦的人。
+`closing`（`linkClosing`）或连接已关时，`listenStartBlocked` 拒绝再发 `listen.start`。
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> watching : armCaptureWatch
+    idle --> opening : listen.start 已发出
+    watching --> open : 首帧非空上行
+    watching --> opening : 宽限到期且应当唤醒，listen.start 已发出
+    opening --> open : 首帧非空上行
+    opening --> idle : listen.stop 已发出
+    open --> opening : 再次 listen.start 已发出
+    idle --> closed : onClose
+    watching --> closed : onClose
+    opening --> closed : onClose
+    open --> closed : onClose
+```
+
+## 9 ASR / TTS —— `wsGen`
+
+`QwenRealtimeAsr`、`AliyunAsr`、`OmniTts` 各自持有 `wsGen`。
+`connect` 时先 `++wsGen` 并记住 `myGen`；`open` / `message` / `close` / `error`
+以及 `await` 之后的第一行都核对 `myGen === wsGen`（再加「是不是这一条 socket」）。
+对不上就返回，必要时把那条旧 socket 关掉。
+
+`close()` 与 `drop()` 都再 `++wsGen`，让还挂在建连 `await` 上的那一次失效。
+Qwen 的 `drop` 与 `close` 共用 `resetSessionState`：清 `dirty`、`awaitingDecode`、
+`pendingVoice`、`holdActive`、`commitDeferred`、`commitWhenReady`、`discardLeft`、
+积压缓冲，并 `resolveDecode()`，`whenDecoded()` 不会一直挂着。
+未就绪时 Qwen 的 `backlog` 是 `{ pcm, voiced }`，`session.updated` 置就绪后按 FIFO 补发。
+Aliyun 的积压是裸 PCM；`TranscriptionStarted` 里先按到达顺序刷完，再把 `ready` 置上。
+
+`OmniShadow` 不在这张表里：它的吸收态是 `broken`，清理只走 `teardown()`（§5.6）。
+
+## 10 浏览器 VoiceClient —— `ClientPhase` + `startGen`
+
+**持有**：`packages/dsh-voice-web` 的 `createVoiceClient`。清理只有 `teardown(emitClose)`。
+
+| 状态 | 含义 |
+|---|---|
+| `idle` | 还没 `start` |
+| `starting` | 正在 `resume` / `getUserMedia`。这一次的 `startGen` 已加一 |
+| `connecting` | 媒体就绪，WebSocket 还没 `open` |
+| `open` | Hello 已发出，可以上下行 |
+| `closed` | 吸收态。`start()` 再调用直接抛错，要换一个实例 |
+
+`teardown` 在已经是 `closed` 时返回。否则：相位写成 `closed`，`startGen++`，
+停采集、停播放、摘掉 socket 监听并关闭，关掉 `AudioContext`。
+`emitClose === true` 时只发一次 `close`（页面自己的结束按钮传 `false`，避免和 `onclose` 套娃）。
+`FrameDecoder` 超长、`onerror`、`onclose` 都进这一个入口。
+
+`start()` 在每次 `await` 之后看 `phase === 'starting' && myGen === startGen`。
+对不上就停掉这次才拿到的麦和 context，然后返回。`closed` 之后 `send` 与下行帧都丢弃。
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> starting : start（startGen++）
+    starting --> connecting : 媒体就绪且代次未变
+    starting --> closed : close / 权限失败 → teardown
+    connecting --> open : ws.onopen，代次仍是这一次
+    connecting --> closed : onclose / onerror / close
+    open --> closed : onclose / onerror / 帧超长 / close
+```
+
+## 11 不变量
+
+这些是上面几台机器在当前代码里守着的边界。序号与重构验收单对齐。
+
+| 编号 | 代码里怎么守 |
+|---|---|
+| **INV-1** | `evaluate` / `rearmFromSpeakingMore` 每次 `await` 之后走 `isStaleEval`。期间有过 `onVoiced` 则 `evalEpoch` 已加一，旧协程退出，不 `flush` |
+| **INV-2** | 生产帧的 `voiced` / `silenceMs` 只来自 `EnergyGate`（`voiceDebounceFrames: 2`）。`addFrame` 把同一份交给 `SilenceTriggers`。`speculateMs` 与封段门槛显式 `≤ 0` 时关闭 |
+| **INV-3** | 只有 `stepDialog` 改 `dialog.phase`。`turnEnded` 只结算播放区与账本。`receiptEnded` 对过期票是空操作 |
+| **INV-4** | 内核 `isStaleTicket` / `ticketMatches` 同时比 `no` 与 `gen`。`TurnRunner.isTurnDead` 把 `DialogFsm.isStale`（只比 `gen`）和 `isCurrent`（只比 `no`）合在一起 |
+| **INV-5** | `UplinkPipeline.closed`、`UtteranceAssembler.disposed`、`MicPhase.closed`、`PhotoInbox.disposed`、`OmniShadow.broken`、`VoiceClient.closed`、`LiveOrchestrator.disposed` 进入后不再接新帧、新定时器或新一轮 |
+| **INV-6** | `OmniShadow` 离开 `ready`/`busy` 后，`willServe` / `canAnswerText` / `canSpeakBackground` 为假。下一轮 `decideLiveTurn` 落到 `fallback_dsh`，账本车道是 `dsh` |
+| **INV-7** | Qwen / Aliyun / OmniTts 的旧 socket 回调被 `wsGen` 挡住。Qwen `resetSessionState` 解开 `whenDecoded`，积压按 FIFO 补发并保留 `voiced` |
+| **INV-8** | 子会话事件过不了 `openSessionId`。旧 `procGen` 的退出不碰新进程。`askSdk` 的 `finally` 把相位归回 `idle` 或 `detached_running`。过期票据的 `detachTurn` 是空操作。`tailSwallow` 吃掉旧轮那条不带轮号的 `idle` |
+| **INV-9** | `live_with_bg_guard` 在 `delegate` 到达时派 `tool_call(rewrittenQuery)`；整段没有 `delegate` 才补 `early_rule`。`markInjected` 只在 `playAudio` 确认说出有效音频或被打断之后 |
+| **INV-10** | 话筒只写在 `AppSession.floor`。宠物经 `acquireFloor` / `releaseFloor` 看到同一份。`DialogRuntime.dispose` 取消旁白并 `photos.dispose`；`onClose` 先把开麦收成 `closed` |
+| **INV-11** | 生产上行只在 `VoiceConnection` 构造管道时传入 `voiceDebounceFrames: 2`。能量门自己的缺省仍是 1，给不走这条装配的调用方。`assemblerSilenceFromGate` 把配置里的 `0` 原样传下去 |
+| **INV-12** | `appendToken` 只把 `ENOENT` 当成空表，其它读失败原样抛出。帧超长、连接错误、主动关闭都进 `VoiceClient.teardown` 一次 |

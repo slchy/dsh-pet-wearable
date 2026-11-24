@@ -58,7 +58,8 @@
 | **状态机还有没有走不到 / 走错的边** | `node tests/fsm-verify.ts` | 36 配置 / 330 转移的穷尽探索；INV1–INV10 + P1–P5 的反例序列（退出码 0/1） |
 | `dsh` 内部那几秒花在哪 | `scripts/dsh-timeline.ts <会话目录>` | Miai 档案与 dsh session log 同轴 |
 | 「开跑→首块」是模型的锅还是 TTS 的锅 | `bench/tau2/reply_breakdown.py` | `dsh_ms` vs `tts_first_ms` |
-| 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比 |
+| 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比。比对器单测是 `bench/replay/baseline.test.ts`，进 `npm run test:bench`，不进 `npm test` |
+| **live 管道离线 55 轮准不准、护栏有没有破** | `bench/eval/`：`node bench/eval/score.ts --compare <基线> <候选>` | S1–S4 与首字延迟。快照 `bench/eval/baseline/20261124-live-v1-wave-ab.json`。单测 `npm run test:bench`；连同 `npm test` 与 web 用 `npm run test:all` |
 | 不接眼镜、全自动跑几条话术 | `bench/e2e/run.py`（手机当喇叭+话筒） | 说完→首音 / 通过与否 |
 | 判停侧车为什么不敢收 | **档案里的 `judge.decide`**（线上就有，最省事）；要离线复算才用 `bench/latency/probe-turnjudge-silence.py` | 每次决定的 `p` + 等待；② 的成因 |
 | 换个判停阈值/延长次数会怎样 | `bench/latency/probe-turnjudge-silence.py --curve START:END:STEP` | p 随尾部静音怎么变 |
@@ -106,6 +107,7 @@ gate.close ──①──▶ asr.sentence ──②──▶ turn.start ──�
 - ③ `turnToAudio` 开跑 → 首块音频。**含 `dsh` 模型首字**，不是纯 TTS
 - ④ `playbackMs` 播放，不算延迟
 - `firstWordMs = ①+②+③` = **闭嘴→出声** = 项目 p50/p90 指的那个数，预算 `FIRST_WORD_BUDGET_MS = 1200`
+- `bench/eval/score.ts` 的延迟护栏调用同一对 `computeTurns()` / `summarize()`，不另写分位
 
 P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6 个样本上能差 40 ms。
 所以别在别处重写一遍统计（`summarize()` 是唯一实现）。
@@ -219,7 +221,9 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 **L3 回放基线** —— `python bench/replay/run.py --archive <向量> --baseline <json>`
 
-基线在 `bench/replay/baseline/`，文件名只用时间戳。
+基线在 `bench/replay/baseline/`，文件名只用时间戳。比对器单测是
+`bench/replay/baseline.test.ts`（`npm run test:bench`）。基线文件本身要跑服务器，
+不进 `npm test`（那份 glob 只收 `tests/*.test.ts`）。
 
 **比的是回放 vs 回放，不是回放 vs 真机。** 同一份向量：回放 ③ = 648，真机当时 543
 —— 回放**更慢**。差的 ~300 ms 在 TTS `setup`（回放 348 常数、真机 54 常数）：回放
@@ -247,7 +251,12 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | 脚本 | 作用 |
 |---|---|
 | `bench/replay/run.py` | 把某场真机会话的上行音频原速重放，逐轮对比。`--list` 列可回放的场次，`--archive <名字>` 指定 |
+| `bench/replay/baseline.test.ts` | L3 比对器会不会漏判 / 误判。进 `npm run test:bench`，不进 `npm test` |
 | `bench/replay/client.mjs` | 线协议客户端，自报 `pcm16` 直接送解码后 PCM（回放没有 mSBC 可编） |
+| `bench/eval/server.ts` | 隔离沙盒：生产装配 + stub dsh，不碰生产端口、生产 MEMORY、生产档案 |
+| `bench/eval/runner.ts` | 按 `manifest.json` 原速推 eval-v1 的 55 轮 PCM，写出 `run-artifact.json` |
+| `bench/eval/score.ts` | 离线准确率 + 延迟护栏。`node bench/eval/score.ts --compare <基线> <候选>`。延迟复用 `latency-report.ts` |
+| `bench/eval/score.test.ts` | 打分口径。与 `bench/replay/baseline.test.ts` 一起由 `npm run test:bench` 跑；三套一起是 `npm run test:all` |
 | `bench/e2e/run.py` | 真机全自动：**不接眼镜**，手机当喇叭和话筒 |
 | `bench/e2e/synth.mjs` | 在服务器上用线上同一条 TTS 合成「用户会说的话」 |
 | `bench/e2e/mictap/build.py` | 打 MicTap APK（手机录 PCM 用；`app_process` 那条路会被 audioserver 静音） |
@@ -452,8 +461,10 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/env-dump.py` | 见 §7 |
 | `tests/fsm-verify.ts` | `DialogFsm` 穷尽状态空间验证：36 配置 / 330 转移 + INV1–INV10 + P1–P5。**不在 `npm test`**（那份 glob 只收 `tests/*.test.ts`），改状态机后单跑 |
 
-`npm run` 入口只有七个：`start` / `pair` / `sim` / `typecheck` / `test` / `mutate` / `install-profile`
-（`prepublishOnly` 是生命周期钩子，不算入口）。
+`npm run` 入口：`start` / `pair` / `sim` / `typecheck` / `test` / `test:bench` / `test:web` / `test:all` / `mutate` / `install-profile`
+（`prepublishOnly` 是生命周期钩子，不算入口）。`npm test` 只跑 `tests/*.test.ts`。
+`bench/replay/baseline.test.ts` 与 `bench/eval/*.test.ts` 在 `npm run test:bench`；
+连根测试、bench、web 用 `npm run test:all`。
 其余一律直接 `node <路径>`。`.ts` / `.mts` 在 Node ≥ 22.18 上直接跑（类型擦除已默认开，
 本机 v24）；老版本要加 `--experimental-strip-types`，几个 .ts 脚本的头部注释里带着它，
 加上也无害。
@@ -473,6 +484,8 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 > 采集时只有**一条**管道（级联：ASR → 文本 → TTS）。两条互斥管道（`VOICE_PIPELINE=live|cascade`）
 > 是 2026-11-23 之后的事，所以这一节的数字**只对 `cascade` 有意义**，别拿它去衡量 `live`。
+> live 的离线 55 轮护栏在 `bench/eval/baseline/20261124-live-v1-wave-ab.json`，
+> 数字见 [OMNI-LANE.md](./OMNI-LANE.md) §十三。
 
 > 这里是**两场 12 轮**的样本；README「真机基准实测」用的是**另一份 13 轮同向量**
 > （`…_46019`），数字不同属正常，别把两套混着引用。

@@ -4,7 +4,7 @@
 > 数据流、错误模型与扩展点。接线细节与部署见 [README.md](../README.md)；
 > 本文只讲**实现怎么摆**。
 >
-> **对账基准**：`src/` 当前代码 + `npm test` 全绿。
+> **对账基准**：`src/` 当前代码 + `npm test`（部署运行时，见 §8）全绿。
 > **注意**：这棵树早年放在 `cloud/src`、编排类叫 `aliyun-session`；现在路径是 `src/`，
 > 编排类是 `VoiceConnection`（`src/voice-session.ts`）。文中已按现行名字改写，
 > 见到旧名按这个对应关系读。文档与代码冲突时以代码为准。
@@ -100,13 +100,14 @@ live 的空窗汇报不进 respond()：
 | 边界 | 规则 | 为什么 |
 |---|---|---|
 | `providers.ts` | **只放接口**，不 import 任何具体实现 | 换 STT / TTS / Agent 不改编排代码 |
-| `pipeline-mode.ts` · `session-core.ts` · `dialog-fsm.ts` · `kernel.ts` · `kernel-runtime.ts` · `causal.ts` · `turn-router.ts` · `emotion.ts` · `hq-intent.ts` · `wake-word.ts` · `backchannel.ts` | 纯函数 / 纯状态机 / 纯类型，**不碰 socket、定时器、子进程** | 最容易出错的判断（插话算不算数、听到多少、这句要不要成轮、这一轮交给谁、这一会话走哪条主管道）用单测钉住，不必起连接；`kernel.ts` 还要求无 `await`（同一串事件在任何机器上 reduce 出同一结果）。`pipeline-mode.ts` 不读 `process.env` |
+| `voice-config.ts` · `pipeline-mode.ts` · `session-core.ts` · `dialog-fsm.ts` · `kernel.ts` · `kernel-runtime.ts` · `causal.ts` · `turn-router.ts` · `emotion.ts` · `hq-intent.ts` · `wake-word.ts` · `backchannel.ts` | 纯函数 / 纯状态机 / 纯类型，**不碰 socket、定时器、子进程** | 最容易出错的判断（插话算不算数、听到多少、这句要不要成轮、这一轮交给谁、这一会话走哪条主管道）用单测钉住，不必起连接；`kernel.ts` 还要求无 `await`（同一串事件在任何机器上 reduce 出同一结果）。`pipeline-mode.ts` 与 `voice-config.ts` 都不读 `process.env` |
 | `transport.ts` · `frame.ts` | 不认识任何业务语义 | 改心跳不该动对话代码 |
 | `pcm.ts` · `util.ts` | 无依赖的纯函数 | 谁都能引，不产生环 |
 
 `voice-session.ts` 是唯一"什么都摸"的地方：它持有连接、定时器、子进程和工具口，
 但**不做判断** —— 相位与结算在 `kernel.ts`，效果由 `session-core.ts` 判，
-它只把各层的结论翻译成动作。
+它只把各层的结论翻译成动作。开麦相位 `MicPhase` 只经 `enterMic` 迁移（见 §4.4）。
+生产把能量门的 `voiceDebounceFrames` 设为 2。
 
 ---
 
@@ -127,8 +128,8 @@ live 的空窗汇报不进 respond()：
 | 文件 | 职责 | 关键点 |
 |---|---|---|
 | `uplink-pipeline.ts` | 上行解码：`msbc`（子进程 `ffmpeg`）或设备自报的 `pcm16` → 放大 → 能量门 → 有声段交 STT；另有**原始 PCM 旁路**与**电平表** | `onRawPcm` 给的是**放大前**的字节（档案要能重算增益） |
-| `energy-gate.ts` | 「这块音频要不要推给 STT」的状态机 + 预卷缓冲 | 没声音就**不建 STT 连接**：ASR 网关对"没听到有效语音"的连接 10 s 就判空闲超时 |
-| `silence-triggers.ts` | 同一次静音喂四路**期限差一个数量级**的消费者：投机 100 ms / 判停预跑 200 ms / omni 车道封段 20 ms / ASR 封段 150 ms | 四者各有自己的 `firedAt`，不是一个布尔「静音了没有」；闸只比时刻（`lastVoicedAt`），不持状态 |
+| `energy-gate.ts` | 「这块音频要不要推给 STT」的状态机 + 预卷缓冲。`silenceMs` 是封段 / 投机 / 判停共用的那一份静音累计；预卷以 `PrerollFrame`（`pcm` + 门内标好的 `voiced`）交出，下游不再自己跑 `pcm16PeakDbfs` | 生产（`voice-session.ts`）传 `voiceDebounceFrames: 2`，与静音触发器的两帧去抖对齐：单帧尖峰不把 `silenceMs` 打回 0，也不因此重开一段。缺省仍是 1（老单测）。没声音就**不建 STT 连接**：ASR 网关对"没听到有效语音"的连接 10 s 就判空闲超时 |
+| `silence-triggers.ts` | 同一次静音喂四路**期限差一个数量级**的消费者：投机 100 ms / 判停预跑 200 ms / omni 车道封段 20 ms / ASR 封段 150 ms（后两路是客户端封段的默认；`QWEN_ASR_TURN_DETECTION=vad` 时为 0，见 `voice-config.ts`） | 四者各有自己的 `firedAt`，不是一个布尔「静音了没有」；闸只比时刻（`lastVoicedAt`），不持状态 |
 | `utterance-assembler.ts` | 句子 → 一轮话语：按 TurnJudge 概率或固定窗口判停；判停请求**与静默窗重叠**提前发出 | ASR 的句号是**句子**边界，不是**轮次**边界；问号结尾不等于说完了。提前算的那份结果带两条有效性条件（还是同一句、算完之后没再收到中间结果），不成立就现算一遍 —— 拿过期结果定稿就是抢话 |
 | `barge-voicing.ts` | 声学插话闸：定稿后无新有声帧时拦住同一截缓冲的重复解码幻觉 | 同步校验时钟同源（`CLOCK_MISMATCH_MS`） |
 | `turn-judge.ts` | 常驻 Python 侧车的客户端：`[u32 len][int16 PCM]` 问、`[f64 概率]` 答 | 进程常驻、模型只加载一次；不可用时退回固定窗口 |
@@ -185,12 +186,12 @@ live 的空窗汇报不进 respond()：
 | 文件 | 职责 | 约束 |
 |---|---|---|
 | `aliyun-asr.ts` | 阿里云 NLS 实时识别客户端（WebSocket） | 消息 id / task id 必须是 32 位纯十六进制；连接由能量门按需拉起 |
-| `qwen-realtime-asr.ts` | DashScope realtime 识别客户端（**端点由我们控**） | `turn_detection: null` 时服务端不判句，由宿主在静音到点时发 `input_audio_buffer.commit`；`silence_duration_ms` 地板是 200 ms（回执接受更小值但不生效）；协议**没有** `clear`，打断只能 commit 后丢结果；空缓冲 commit 会被拒，必须有脏标记。显式 `MIAI_STT=qwen-realtime` 才启用；留空走旧链路（`legacy-pipeline`） |
+| `qwen-realtime-asr.ts` | DashScope realtime 识别客户端。默认 `manual`：端点由我们控。`QWEN_ASR_TURN_DETECTION=vad` 改由服务端 VAD 判句，客户端封段旋钮见 `voice-config.ts` | `turn_detection: null` 时服务端不判句，由宿主在静音到点时发 `input_audio_buffer.commit`；`silence_duration_ms` 地板是 200 ms（回执接受更小值但不生效）；协议**没有** `clear`，打断只能 commit 后丢结果；空缓冲 commit 会被拒，必须有脏标记。显式 `--stt qwen-realtime`（或 `MIAI_STT`）才启用；留空走旧链路（`legacy-pipeline`） |
 | `mimo.ts` | MiMo 的 ASR 与 TTS（SSE 流式） | 上行 16 kHz、下行 **24 kHz**；TTS 是"聊天式"：风格进 `user`、正文进 `assistant`。`--tts` 留空时的默认实现 |
 | `cosyvoice.ts` | 阿里云 CosyVoice 流式合成（DashScope WebSocket，一条连接复用跑多个 task） | 默认情绪模式 `prosody`（`DEFAULT_COSYVOICE_EMOTION_MODE`）；系统音色 + v3-flash 首包 ~350 ms。`instruction` 只给复刻/设计音色吃，首包多 ~90 ms，系统音色配它会 428 |
 | `omni-tts.ts` | 把 omni 当**朗读机**：文本 → PCM16，走一条专用 realtime 连接 | 逐字忠实度实测 100%，但语速 4.0–4.4 字/秒、首块 629–781 ms、按输出 token 计费；只在显式 `--tts omni` 时用 |
-| `agent.ts` | `VoiceAgent`：拼本轮输入 → 模型 → 剥情绪标签 → 清洗成可朗读文本 → 播报出口 | **人设提示词不在这里**，在 `mcp/profile.cordis.yml` 的 `personaPrefix`，由 dsh 当系统提示词注入（见 AGENTS.md）。清洗是必须的：TTS 会把 markdown 原样念出来。`cleanForSpeech` 还负责两类**看不见**的脏东西：零宽字符及其 HTML 实体（`&#8203;` 字面送进去会被念成符号）、以及两个中日韩字符之间的空格（那不是停顿标记，只会让合成器塞一个假停顿；英文 / 数字 / 代码段两侧的空格有语义，不动） |
-| `session.ts` | `DshSession`：把文本交给 agent 进程（NDJSON），续会话、取 usage、接住**自发轮次** | 单轮等待上限 180 s；超出必须抛错**并说出来**，不许静默 |
+| `agent.ts` | `VoiceAgent`：拼本轮输入 → 模型 → 剥情绪标签 → 清洗成可朗读文本 → 播报出口。`cleanForSpeech` 的实现在 `emotion.ts`，这里 `export { cleanForSpeech }` 再导出，兼容旧导入 | **人设提示词不在这里**，在 `mcp/profile.cordis.yml` 的 `personaPrefix`，由 dsh 当系统提示词注入（见 AGENTS.md）。清洗是必须的：TTS 会把 markdown 原样念出来。`cosyvoice.ts` 直接从 `emotion.ts` 取 `cleanForSpeech`，不再反向依赖 `agent.ts`。清洗还去掉两类**看不见**的脏东西：零宽字符及其 HTML 实体（`&#8203;` 字面送进去会被念成符号）、以及两个中日韩字符之间的空格（那不是停顿标记，只会让合成器塞一个假停顿；英文 / 数字 / 代码段两侧的空格有语义，不动） |
+| `session.ts` | `DshSession`：把文本交给 agent 进程（NDJSON），续会话、取 usage、接住**自发轮次**。主轮相位是 `DshTurnPhase`（`idle` / `prompting_rpc` / `awaiting_idle` / `detached_running`），`isBusy()` 只看它。`procGen` 给每次 spawn 加一代，旧进程晚到的退出不能碰新进程。`openSessionId` 记住本进程已经打开的会话，同一个 id 只 `resume` 一次。`tailSwallow`（`none` / `awaiting_old_turn_start` / `awaiting_old_idle`）吞上一轮没有轮号的 `idle` 尾巴 | 单轮等待上限 60 s（`DEFAULT_TIMEOUT_MS`）；超出必须抛错**并说出来**，不许静默 |
 
 ### 2.5 决策层（纯逻辑）
 
@@ -203,9 +204,10 @@ live 的空窗汇报不进 respond()：
 | `turn-router.ts` | 路由：`routeTurn(text, ctx)` 判这一轮**先由谁答**（`live` / `cascade` / `dsh`）。判据与引擎实现无关 | `routeTurn` / `Lane` / `isCancelRequest` |
 | `conversation-ledger.ts` | 对话账本：只记**已经结束**的轮次（谁答的、少听没少听），路由的话题粘性与回注都读它。结算由 `KernelPorts.settleTurn` 把后验的 `truncated` 与 `endedAtMs` 按**精确的** `{no, gen}` 票据回写（`reconcileOutcome`）；`DialogRuntime` 建连时用 `agent.lastLedgerLane()` 播种 `initialKernelState` 的 `lastLane` —— 重连也不丢「上一轮谁答的」 | `ConversationLedger` / `LedgerTurn` |
 | `session-core.ts` | 事件 → 效果：收听 / 识图 / 自助结束 / 挂断都在这里判。插话的 `audio.stop` / `invalidateTurn` / `abortEngine` **不再由这里发** —— 内核在 `bargeIn` 上声明、经 `KernelPorts` 执行唯一一份；`commitSeq` 从这里一路传进 `kernel.ts::isPreTurnCommit`（定稿与中间结果共用同一个谓词） | `SessionCore` / `CoreEvent` / `CoreEffect` |
-| `emotion.ts` | 情绪标签 → 规范化 key → TTS 风格串 | `EMOTION_LABELS` 是单一事实来源 |
+| `emotion.ts` | 情绪标签 → 规范化 key → TTS 风格串。`cleanForSpeech` 定义在这里，打断早先 `cosyvoice → agent` 的反向依赖；`agent.ts` 再导出同名，旧导入不用改 | `EMOTION_LABELS`（标签的单一事实来源）/ `parseEmotion` / `asEmotion` / `cleanForSpeech` |
 | `engine-contract.ts` | 四层类型契约。`FastVoiceEngine.respond()` 是 `TurnRunner` 的唯一出话泵；`live` 与 `cascade` 只在这个接口后面不同 | `AudioFrame` / `AsrSyncState` / `TurnInput` / `TurnOutcome` / `outcomeOf` / `FastVoiceEngine` / `EngineEvent` |
-| `pipeline-mode.ts` | 启动期主管道选择。纯函数：不读 `process.env`、不做 IO。装配层把环境收成 `ResolvePipelineInput` 再进来；`resolveVoicePipelineFromEnv` 只看调用方传入的 `env` | `VoicePipelineMode`（`'live' \| 'cascade'`）/ `PipelinePlan` / `resolveVoicePipeline` / `resolveVoicePipelineFromEnv`。显式 `VOICE_PIPELINE` 优先，别的字符串直接抛错。没写时：`OMNI_SHADOW=1` 且 `OMNI_ANSWER` 不是 `off` 推断为 `live`，否则 `cascade`。`live` 且 `strict !== false`：omni key（`OMNI_API_KEY ?? DASHSCOPE_API_KEY`）为空就抛错；传了 `sttName` 且不是 `qwen-realtime` 也抛错。`live` 计划里 `useOmniPlayback` 为 true、`useCascadeFastLane` 为 false、`cascadeKey` 为空；若快车道 key 还在且没被 `FAST_LANE=0` 关掉，`notes` 记一行「不加载文本级联」。`cascade` 计划里 `useOmniPlayback` 为 false；显式 cascade 且影子开着、answer 不是 `off` 时，`notes` 记一行「忽略 `OMNI_ANSWER`，不接管发声」。`useOmniProbeOnly`：影子开、answer 为 `off`、omni key 非空、STT 未指定或是 `qwen-realtime`。`useCascadeFastLane`：`FAST_LANE` 不是 `0` 且快车道 key（`FAST_LANE_API_KEY ?? DEEPSEEK_API_KEY`）非空 |
+| `voice-config.ts` | CLI、Web 插件、评测沙盒共用的语音运行时配置。纯函数：只读传入的 `env`，不碰 `process.env` | `buildVoiceRuntimeConfig` / `resolveOmniApiKey` / `DEFAULT_IMAGE_QUESTION`。三个入口是 `src/main.ts`、`packages/dsh-voice-web/src/driver.ts`（同步副本 `./voice/voice-config.ts`）、`bench/eval/server.ts`。`qwen-realtime` 且 `QWEN_ASR_TURN_DETECTION` 不是 `vad` 时才由客户端封段；设成 `vad`，或 STT 不是 `qwen-realtime`，就把 `commitMs` / `sttCommitMs` 收成 0，并且不传 `openQuietMs` / `openQuietShortMs`（`VOICE_COMMIT_MS` / `VOICE_STT_COMMIT_MS` / `VOICE_OPEN_QUIET_MS` 不再生效），避免客户端再 `commit()` 和服务器 VAD 各切一次。`resolveOmniApiKey`：`OMNI_API_KEY` 优先，否则 `DASHSCOPE_API_KEY`，只含空白当没配 |
+| `pipeline-mode.ts` | 启动期主管道选择。纯函数：不读 `process.env`、不做 IO。装配层把环境收成 `ResolvePipelineInput` 再进来；`resolveVoicePipelineFromEnv` 只看调用方传入的 `env` | `VoicePipelineMode`（`'live' \| 'cascade'`）/ `PipelinePlan` / `resolveVoicePipeline` / `resolveVoicePipelineFromEnv`。显式 `VOICE_PIPELINE` 优先，别的字符串直接抛错。没写时：`OMNI_SHADOW=1` 且 `OMNI_ANSWER` 不是 `off` 推断为 `live`，否则 `cascade`。`live` 且 `strict !== false`：omni key（`resolveOmniApiKey`：`OMNI_API_KEY`，否则 `DASHSCOPE_API_KEY`）为空就抛错；传了 `sttName` 且不是 `qwen-realtime` 也抛错。`live` 计划里 `useOmniPlayback` 为 true、`useCascadeFastLane` 为 false、`cascadeKey` 为空；若快车道 key 还在且没被 `FAST_LANE=0` 关掉，`notes` 记一行「不加载文本级联」。`cascade` 计划里 `useOmniPlayback` 为 false；显式 cascade 且影子开着、answer 不是 `off` 时，`notes` 记一行「忽略 `OMNI_ANSWER`，不接管发声」。`useOmniProbeOnly`：影子开、answer 为 `off`、omni key 非空、STT 未指定或是 `qwen-realtime`。`useCascadeFastLane`：`FAST_LANE` 不是 `0` 且快车道 key（`FAST_LANE_API_KEY ?? DEEPSEEK_API_KEY`）非空 |
 | `persona.ts` | 代码层短人设唯一导出源，与 `mcp/profile.cordis.yml` 的 `personaPrefix` 分工。omni 用 `OMNI_SHORT_INSTRUCTIONS`；级联快车道用 `FAST_LANE_PERSONA_HEADER`；Pure Live 的后台注记与空窗提示用 `LIVE_BACKEND_TASK_DIRECTIVE` / `buildLiveReportPrompt` | `PERSONA_NAME` / `OMNI_SHORT_INSTRUCTIONS` / `FAST_LANE_PERSONA_HEADER` / `LIVE_BACKEND_TASK_DIRECTIVE` / `buildLiveReportPrompt` |
 | `providers.ts` | `SttProvider` / `TtsProvider` / `AgentProvider` 三个契约 + 测试替身 | `cannedStt` / `silentTts` / `echoAgent` |
 
@@ -237,6 +239,7 @@ drop            丢弃这句话（纯噪声）
 | `engines/live-voice-engine.ts` | Live 引擎：把 `FastLaneAudioLane`（生产是 `OmniShadow`）适配成 `FastVoiceEngine`。车道能服务时，`LiveOrchestrator.playLive` 把这一轮交给它的 `respond()` | 转发上行帧、把 `claim()` 的活流包成 `EngineEvent`、按内核放弃在途投机。`claim()` 拿到的是活流，等下一块必须和中止信号赛跑。取消确认、识图短回执、断线兜底不走这一层，由编排层自己合成。`mode` 为 `'live'` |
 | `engines/cascade-voice-engine.ts` | 端口版级联引擎。`ask` 的增量一出来就送 `synthesizeStream`（首包与模型生成重叠）；流式失败、或一个音频块都没有但清洗后的 `speech` 非空时，退回整段 `synthesize` | 只依赖四个端口（问 / 合成 / 转发上行 / 报告放弃投机），不 import 具体 agent。与 `CascadeAgent.toEngine()` 同一份 `FastVoiceEngine` 契约。`mode` 为 `'cascade'` |
 | `engines/agent-engine-adapter.ts` | 调用方没注入引擎时，把现有 `AgentProvider` + `TtsProvider` 收成一条 `FastVoiceEngine` 事件流。`TurnRunner` 在构造函数里包这一层 | `mode` 固定 `'cascade'`（「问 agent 再出音频」的泵）；某一轮实际走了 omni 直出时，路径写在 `meta.path` 上。带图不问 `willServeAudio`、omni 轮事先不开流式 TTS、流式失败退回整段、多步增量用 `spokenFromStream` 对账、omni 转交 dsh 时垫话留住，都收在 `respond()` 里 |
+| `engines/stream-utils.ts` | 流式引擎的公共件。Live / Cascade / 适配器以前各抄一份队列、中止门和「念出去的全文」 | `EventQueue`（文本和音频同一条到达顺序）/ `createAbortGate`（已中止立刻兑现且不挂监听；调用方在 `finally` 里 `cancel()` 摘掉监听）/ `spokenFromStream`（按全部增量剥情绪标签再 `cleanForSpeech`；多步时不能只拿最后一步的 `reply.speech`） |
 | `pipelines/live-orchestrator.ts` | `VOICE_PIPELINE=live` 的唯一前台。热路径是 `toEngine()`（`mode: 'live'`）：omni 一副嗓子；`reply()` 留给保活和无音频调用方 | 工具调用、识图、早规则、静默记忆进 `BackgroundTaskBus`；dsh 自己的 `run_in_background` / 子代理经 `ingestExternalAnnouncement` 进同一条总线。空窗 `speakBackgroundReport`：`verbatim` 返回 `'fallback'`；车道缺失或没有 `speakFromText` 也是 `'fallback'`；`canSpeakBackground()` 为假或 `speakFromText` 返回 null 则 `'defer'`；开口后 0 字节且不是被打断，同样 `'fallback'`。能说则把 `buildLiveReportPrompt` 交给 `speakFromText`，音频由调用方的 `playAudio`（生产是 `TurnRunner.speakAudioAnswer`）播出。用户先开口、空窗还没到时，`flushUnspoken` 按 `'unspoken'` 回注，每个任务只注一次。omni 接不上（没车道，或 `willServe()` 为假）时才同步问 dsh，再用本层 TTS 把那句说出来。插话只停前台这一句，不取消已经答应的后台任务；显式「别查了」才 `cancelAll` |
 | `background-task-bus.ts` | Pure Live 的后台任务总线。`dispatch` 收本轮交给 dsh 的查询，`ingestExternalAnnouncement` 收 dsh 自己跑完的播报，两条路都收成 `BackgroundTaskReport`，由唯一前台决定什么时候说 | 来源：`tool_call` / `early_rule` / `image` / `memory_silent` / `dsh_background`。工人循环一次只跑一个 `runner.execute`；循环晚一个微任务才取队列，同一同步回合里先到的 `early_rule` 和后到的 `tool_call` 合成一次调用。状态只许 `queued → running \| cancelled`、`running → completed \| failed \| cancelled`。终态之后 runner 才回来的结果丢掉。`memory_silent` 与 `silent: true` 不播报；`cancelAll` 默认也不动它们。队列上限默认 16（只数还在排队的）。同一 `turnNo` 的要播报任务去重，排队中的 `tool_call` 可以升级查询。端口、订单号、代码路径、`[VERBATIM]`、超长正文走 `verbatim`（`summary` 截到 160 个码点，全文在 `verbatim`）。`dispose` 停掉还往这条连接上送的汇报并 abort 信号，不调用 `cancelRunning`：在途 dsh 可以自己跑完，结果留给离线补播 |
 | `pipelines/cascade-agent.ts` | `VOICE_PIPELINE=cascade` 的唯一 agent。热路径是 `toEngine(tts)`：`reply()` 的文本增量直接送 `tts.synthesizeStream`，流式失败再退回整段 `synthesize`；没有 `synthesizeStream` 时用 `SentencePump` 逐句合成 | `FastLlmClient`（对冲、两段超时、`[[DELEGATE]]` 早退）+ `PrefetchSlot`（定稿前预跑与中间结果投机）+ dsh 投机（快模型与 dsh 同时起跑，快车道赢了就按 `cancelMode` 取消在途那一轮）。`routeTurn` 的 `live` 恒为 `'off'`，类上没有 `attachAudioLane` / `willServeAudio` / `speakFromText` 这一组方法。短闲聊走快模型，其余交给内层 dsh。`AbortSignal` 立刻停流并 `cancelTurn` + `dropPrefetch('barge_in')` |
@@ -384,6 +387,10 @@ closed ──峰值越门──▶ open（推流 + 预卷补发 + hold 计时）
 门限作用在**放大后**的波形上（`--gain` 与门限是同一个坐标系）。这条曾经踩过坑：
 早期按放大前的电平算门限，增益开得越大、门限被同步抬高，小声说话照样推不开。
 
+生产传 `voiceDebounceFrames: 2`：连续两块过门限才算有声，单帧尖峰不把 `silenceMs` 打回 0。
+开门时的预卷是 `PrerollFrame`（同一条门限标好 `voiced`），下游直接喂，不再按能量重算。
+`silenceMs` 是封段、投机、判停共用的那一份静音累计。
+
 ### 4.3 拍照（`PhotoInbox`）
 
 ```text
@@ -406,6 +413,14 @@ request({id, intent, needsUser}) ── capture ──▶ WAIT ◀── deliver
 `hq_image` 公告之后那一帧归 `detail`；在途的 `glance` 认领第一帧，**认领即结束**（一趟只回一帧）；
 等快门期间相机顺手回的低清图不属于任何请求（收件箱吃掉）；取消 `detail` 后迟到的那一帧
 归已作废的 id（同样吃掉，不回落成识图轮），这个残留会一直留到那一帧到达或设备报 `hq_failed`。
+
+### 4.4 开麦相位（`MicPhase`，`voice-session.ts`）
+
+一条连接的开麦相位是 `idle` → `watching`（宽限期内看设备是不是已经在采集）或
+`opening`（`listen.start` 已经发出，等首帧）→ `open`（看到有效上行）→ `closed`。
+只许 `VoiceConnection.enterMic` 迁移；`closed` 是吸收态。`listen.start` 只有字节
+真的交出去才进 `opening`，发送失败不会把相位留在「正在开」。`listen.stop` 成功且
+还在等首帧时，从 `opening` 回到 `idle`。
 
 ---
 
@@ -472,7 +487,7 @@ request({id, intent, needsUser}) ── capture ──▶ WAIT ◀── deliver
 | 层 | 选型 |
 |---|---|
 | 主管道 | `live`：`LiveOrchestrator` + `OmniShadow` 一副嗓子，dsh 经 `BackgroundTaskBus` 异步。`cascade`：`CascadeAgent`（`FastLlmClient` + `PrefetchSlot` + dsh 投机 + CosyVoice 流式），`routeTurn` 的 `live` 恒为 `'off'` |
-| STT | `qwen-realtime`（端点由我们控，`turn_detection: null`）或 `aliyun`（现网 NLS）。`live` 要求 `--stt qwen-realtime` |
+| STT | `qwen-realtime`（默认端点由我们控，`turn_detection: null`；`QWEN_ASR_TURN_DETECTION=vad` 改由服务端判句，客户端封段旋钮见 `voice-config.ts`）或 `aliyun`（NLS）。`live` 要求 `--stt qwen-realtime` |
 | TTS | `cosyvoice`（流式，系统音色）。`cascade` 的正文走它。`live` 的前台不走它；短回执、`verbatim` 回落、omni 断线兜底才用。`--tts omni` 是把 omni 当朗读机，只在显式指定时用 |
 | 慢车道 | `dsh`（`DshSession`，headless 或 `--dsh-sdk`）。`live` 里异步、不占前台；`cascade` 里与快模型同时起跑，快车道赢了就取消在途那一轮 |
 
@@ -556,8 +571,8 @@ fork 之后**旧会话还在磁盘上**（`~/.dsh/sessions/<workspace>/<id>`，�
 | 级别 | 例子 | 处理 |
 |---|---|---|
 | 连接级 | 鉴权失败、空闲 45 s、单帧超 32 MB | 发控制串后断开；不影响其它连接 |
-| 回合级 | agent 一轮超过 180 s、清洗后可朗读内容为空 | 抛错并由编排层**说出来**（"我这轮没跑完"），不许静默 |
-| 能力级 | 拍照失败（`PhotoFailReason` 12 个值）、STT 无结果 | 变成一句人话或一次明确的工具错误码 |
+| 回合级 | agent 一轮超过 60 s、清洗后可朗读内容为空 | 抛错并由编排层**说出来**（"我这轮没跑完"），不许静默 |
+| 能力级 | 拍照失败（`CaptureErrorCode` 五个值：`unsupported` / `busy` / `timeout` / `cancelled` / `failed`）、STT 无结果 | 变成一句人话或一次明确的工具错误码 |
 | 实现级 | TTS HTTP 非 2xx、SSE 断流、`ffmpeg` 退出 | 记日志；该段能力本轮失效，连接继续 |
 
 三条硬规则：
@@ -595,7 +610,9 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
 两段超时、空闲上限、鉴权 token 表）。主管道是 `VOICE_PIPELINE=live|cascade`
 （`src/pipeline-mode.ts`，见 §1 与 §2.5）。没写这个变量时，按 `OMNI_SHADOW` 与
 `OMNI_ANSWER` 推断。`FAST_LANE=0` 只关掉级联文本模型；`live` 计划里文本快车道本来就不加载。
-默认值只有一处，集中在 `main.ts` 与各模块导出的常量。
+增益、门限、判停、端点、超时和识图提问的默认值只有一处：`src/voice-config.ts` 的
+`buildVoiceRuntimeConfig`（`src/main.ts`、Web 插件、`bench/eval/server.ts` 共用）。
+`QWEN_ASR_TURN_DETECTION=vad` 时客户端 `commitMs` / `sttCommitMs` 为 0，开轮静音门槛不传。
 
 ### 7.2 控制口（HTTP，仅本机）
 
@@ -622,7 +639,8 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
 
 | 层 | 手段 |
 |---|---|
-| 纯逻辑（决策、判停、情绪、补播队列、档案） | `node --test tests/*.test.ts`，不起连接、不需要凭据 |
+| 部署运行时（`npm test`） | `node --test tests/*.test.ts`。`tests/deploy-boundary.test.ts` 守边界：这些测试只能引用部署清单里的路径（`src`、`mcp`、`tools`、`tests`、`turn_judge`、`scripts`，以及 `package.json` / `tsconfig.json` / `README.md` / `docs/TIME-KNOBS.md`）。`bench/` 与 `packages/` 不在清单里 |
+| 全量（`npm run test:all`） | `npm test`，再加 `npm run test:bench`（`bench/eval/*.test.ts`、`bench/replay/*.test.ts`）和 `npm run test:web` |
 | 端到端（无真机） | `tools/fake-phone.ts`：假手机，可发 mSBC、收下行、按剧本触发高清照三条分支 |
 | 类型安全 | `tsc --noEmit` + **strip-only 语法检查**：Node 的类型擦除不支持参数属性这类写法，`tsc` 查不出，必须静态挑一遍 |
 | 启动自检 | 无参数跑 `node src/main.ts` 应当打印用法并以 2 退出 —— 用它当"整张依赖图能加载"的冒烟 |

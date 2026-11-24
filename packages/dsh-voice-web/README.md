@@ -52,7 +52,10 @@
 npm install                # 本包是独立包（仓根没有 workspaces），依赖要在本目录装
 npm run build              # 同步语音栈 + 编译 lib/ + 打包页面
 npm run typecheck          # 不产出文件，只验类型
+npm test                   # sync:voice，再 node --test tests/*.test.ts（4 项：桥、帧对齐、driver 装配）
 ```
+
+`prepublishOnly` 跑 `typecheck && test`。
 
 `npx tsc --noEmit` 单跑不等于 typecheck：`npm run typecheck` 会先 `sync:voice`，
 副本没同步时缺模块的报错（`Cannot find module './voice/turn-judge.ts'`）才是真的。
@@ -105,10 +108,12 @@ dsh --profile voice
 | **用户手势** | `AudioContext.resume()` 与 `getUserMedia` 都要在点击的调用栈里，否则 iOS Safari 上采集静默不出数据 |
 | **权限** | 嵌 iframe 时页面要带 `Permissions-Policy: microphone=(self)` |
 | **戴耳机** | 这条链路不做回声消除，外放会被自己的声音触发。见下文「回声」 |
+| **客户端生命周期** | `createVoiceClient` 用显式 `ClientPhase` 与 `startGen`，收口只走一次 `teardown()`。并发 `close` 不会把还在 `await` 上的麦克风漏开 |
+| **桥的绑定与路径** | `bridge.ts` 复用 `checkBindSafety`：非本机没有 TLS 就拒绝启动，并且要配 `origins`。畸形百分号编码（如 `GET /%`）返回 HTTP 400 |
 
 ## 回声：要求戴耳机，不做回声消除
 
-整个语音栈**假定声学回声不存在**（见 `src/devices/primitives.ts`：真机眼镜在端侧做 AEC，插件不再重复做），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（两处默认都是 **−30 dBFS**，见 `packages/dsh-voice-web/src/driver.ts` 与仓根 `src/main.ts`）。
+整个语音栈**假定声学回声不存在**（见 `src/devices/primitives.ts`：真机眼镜在端侧做 AEC，插件不再重复做），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（默认 **−30 dBFS**）。`driver.ts` 与仓根 `src/main.ts` 都经 `buildVoiceRuntimeConfig` 读同一份 `voice/voice-config.ts`（本包同步在 `src/voice/voice-config.ts`，仓根是 `src/voice-config.ts`）。浏览器只显式覆盖 `micGain: 1`、`controlPort: 0`。
 
 **门限与上行增益必须成对看**：门限按**放大后**的电平算。独立进程默认 `MIAI_MIC_GAIN=4`（眼镜 mic 电平低），web 插件默认 **1×** —— 浏览器侧 `getUserMedia` 已经开了 `autoGainControl`，再乘 4 会顶到削波。改其中一个就得回头量另一个。
 
