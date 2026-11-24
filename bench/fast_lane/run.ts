@@ -15,7 +15,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 
-import { FrontedAgent, isFastCandidate } from '../../src/fronted-agent.ts';
+import { CascadeAgent, isFastCandidate } from '../../src/pipelines/cascade-agent.ts';
 import type { AgentProvider } from '../../src/providers.ts';
 
 interface Case {
@@ -91,7 +91,7 @@ async function runCase(
 ): Promise<Row> {
   const inner = fakeInner();
   const lines: string[] = [];
-  const agent = new FrontedAgent({
+  const agent = new CascadeAgent({
     inner: inner.agent,
     apiKey: options.apiKey,
     model: options.model,
@@ -100,6 +100,8 @@ async function runCase(
     timeoutMs: options.timeoutMs,
     totalMs: options.totalMs,
     speculate: options.speculate,
+    // 类默认已是 true，和旧 FrontedAgent 一样。写明是因为本 harness 靠 [[DELEGATE]] 判委派。
+    delegateEnabled: true,
     log: (line) => { lines.push(line); },
   });
 

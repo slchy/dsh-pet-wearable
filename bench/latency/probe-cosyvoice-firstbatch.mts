@@ -11,12 +11,14 @@
  *
  * 预热一次，避免把冷 TLS 算进来。
  *
- * 跑法：node scripts/probe-cosyvoice-firstbatch.mts
+ * 跑法：node bench/latency/probe-cosyvoice-firstbatch.mts
  */
-const REPO = new URL('../../', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
-for (const line of (await import('node:fs')).readFileSync(REPO + '.env', 'utf8').split(/\r?\n/)) {
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+for (const line of readFileSync(resolve(import.meta.dirname, '..', '..', '.env'), 'utf8').split(/\r?\n/)) {
   const m = /^([A-Z_]+)=(.*)$/.exec(line.trim());
-  if (m !== null && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+  if (m !== null && m[1] !== undefined && m[2] !== undefined && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
 }
 
 const { cosyVoiceTts } = await import(new URL('../../src/cosyvoice.ts', import.meta.url).href);

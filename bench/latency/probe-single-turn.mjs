@@ -9,7 +9,7 @@
  * 为什么要自己起：本地没有 turn_judge 侧车，判停会退回固定窗口（600 ms），
  * 所以 ② 只作参考；① 和 ③ 的口径与服务端一致，可用于定位。
  *
- * 跑法：node scripts/probe-single-turn.mjs [--repeats 3]
+ * 跑法：node bench/latency/probe-single-turn.mjs [--repeats 3] [--pipeline cascade|live]
  */
 import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
@@ -26,6 +26,23 @@ for (const line of readFileSync(join(REPO, '.env'), 'utf8').split(/\r?\n/)) {
 }
 
 const REPEATS = Number(process.argv[process.argv.indexOf('--repeats') + 1] ?? 3) || 3;
+
+function argvValue(flag) {
+  const i = process.argv.indexOf(flag);
+  if (i < 0) return undefined;
+  return process.argv[i + 1];
+}
+
+const pipelineSpecified = process.argv.includes('--pipeline');
+const pipelineArg = argvValue('--pipeline');
+const pipeline = pipelineSpecified ? pipelineArg : 'cascade';
+if (pipeline !== 'cascade' && pipeline !== 'live') {
+  console.error(`--pipeline 只允许 cascade 或 live（收到 ${pipeline === undefined ? '(缺值)' : pipeline}）`);
+  process.exit(1);
+}
+/** live 必须走 qwen-realtime；cascade 保持原来的阿里云 NLS */
+const stt = pipeline === 'live' ? 'qwen-realtime' : 'aliyun';
+
 const PORT = 8771;
 const ARCHIVE = join(REPO, '.probe-archive');
 
@@ -60,7 +77,7 @@ mkdirSync(ARCHIVE, { recursive: true });
 
 const server = spawn(process.execPath, [
   'src/main.ts', '--listen', String(PORT), '--host', '127.0.0.1',
-  '--stt', 'aliyun', '--tts', 'cosyvoice', '--agent', 'dsh', '--dsh-sdk',
+  '--stt', stt, '--tts', 'cosyvoice', '--agent', 'dsh', '--dsh-sdk',
   '--work-dir', REPO,
 ], {
   env: {
@@ -69,7 +86,10 @@ const server = spawn(process.execPath, [
     MIAI_ARCHIVE_DIR: ARCHIVE,
     MIAI_ARCHIVE_KEEP: '50',
     COSYVOICE_TRACE: '1',
-    
+    VOICE_PIPELINE: pipeline,
+    // .env 若配成 Pure Live，显式 cascade 仍可能被 OMNI_SHADOW / OMNI_ANSWER 带偏
+    ...(pipeline === 'cascade' ? { OMNI_SHADOW: '', OMNI_ANSWER: 'off' } : {}),
+
     // Windows 上 npm 的 .ps1/.cmd 垫片不是可执行映像，必须指到 .cmd。
     // 路径因人而异，不写死：没设 DSH_BIN 就按 PATH 找（npm 全局 bin 通常在 PATH 里）。
     DSH_BIN: process.env['DSH_BIN'] ?? 'dsh.cmd',

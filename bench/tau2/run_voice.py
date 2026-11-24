@@ -84,6 +84,7 @@ def bench_env(
     patch: Path,
     bridge_port: int,
     session_file: Path,
+    pipeline: str = "cascade",
 ) -> dict[str, str]:
     """本次 bench 专用的子进程环境。
 
@@ -97,10 +98,17 @@ def bench_env(
       只留最近 `keepSessions`（默认 20）个 —— **bench 每跑一场就挤掉一份真实档案**
       （2026-11-17 实测：21 个目录里 13 个是 bench/回放，真实设备只剩 8 份）
     - `MEMORY_FILE`：不隔离，快车道会读到生产的 `MEMORY.md`，同一题跑两次结果不一样
+    - `VOICE_PIPELINE`：不钉死就会继承 `$DSH_DIR/.env`。生产常写
+      `VOICE_PIPELINE=live`，或者只写 `OMNI_SHADOW=1` + `OMNI_ANSWER=full`
+      （没写管道时会推断成 live）。tau2 默认 `--stt aliyun`，live 配 aliyun
+      在 `src/main.ts` 里直接退出，bench 一场都起不来。这里显式写成传入的
+      `pipeline`（默认 `cascade`）。`cascade` 时同时把 `OMNI_SHADOW=""`、
+      `OMNI_ANSWER=off`，免得 .env 里的 live 播放漏进来；只有调用方故意设
+      `TAU2_KEEP_OMNI_PROBE=1` 才保留原来的 `OMNI_*`（cascade 上的只读探针）。
 
-    将来把这个框架单独发布时，这一组就是「产物不许落到别人生产目录」的最小要求。
+    将来把这个框架单独发布时，这一组就是「产物不许落到别人生产目录、管道不许继承别人的 .env」的最小要求。
     """
-    return {
+    env = {
         **os.environ,
         "DSH_PATCH": str(patch),
         "TAU2_BRIDGE_URL": f"http://127.0.0.1:{bridge_port}",
@@ -108,11 +116,28 @@ def bench_env(
         "MIAI_ANNOUNCE_FILE": "",
         "MIAI_ARCHIVE_DIR": str(work_dir / "archive"),
         "MEMORY_FILE": str(work_dir / "fastlane-memory.md"),
+        "VOICE_PIPELINE": pipeline,
     }
+    # cascade 的默认是「别把生产的 omni 播放带进来」。只读探针要调用方显式留下。
+    if pipeline == "cascade" and os.environ.get("TAU2_KEEP_OMNI_PROBE") != "1":
+        env["OMNI_SHADOW"] = ""
+        env["OMNI_ANSWER"] = "off"
+    return env
 
 
-def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str, sentence_silence_ms: int = 200) -> "subprocess.Popen[str]":
+def spawn_dsh(
+    work_dir: Path,
+    port: int,
+    bridge_port: int,
+    stt: str,
+    tts: str,
+    sentence_silence_ms: int = 200,
+    pipeline: str = "cascade",
+) -> "subprocess.Popen[str]":
     """拉起一个**只服务本次 bench** 的 dsh（不动生产那个 63993）。"""
+    if pipeline == "live" and stt != "qwen-realtime":
+        raise RuntimeError("--pipeline live 需要 --stt qwen-realtime")
+
     import socket as _socket
     import subprocess
     import time
@@ -129,8 +154,13 @@ def spawn_dsh(work_dir: Path, port: int, bridge_port: int, stt: str, tts: str, s
     # 放在 work_dir **旁边**而不是里面：沙箱允许 agent 写 work_dir 内的一切（见 session.ts）。
     session_file = work_dir.parent / f"{work_dir.name}.session.json"
     session_file.unlink(missing_ok=True)
-    log.info("bench 隔离：会话 %s / 档案 %s / 记忆 %s", session_file, work_dir / "archive", work_dir / "fastlane-memory.md")
-    env = bench_env(work_dir, patch=patch, bridge_port=bridge_port, session_file=session_file)
+    log.info(
+        "bench 隔离：管道 %s / 会话 %s / 档案 %s / 记忆 %s",
+        pipeline, session_file, work_dir / "archive", work_dir / "fastlane-memory.md",
+    )
+    env = bench_env(
+        work_dir, patch=patch, bridge_port=bridge_port, session_file=session_file, pipeline=pipeline,
+    )
     log_path = Path("/tmp/dsh-bench.log")
     log_file = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(  # noqa: S603 —— 参数是我们自己拼的，无 shell
@@ -249,9 +279,18 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=150.0, help="整场墙钟上限（秒），到点就收尾判分")
     ap.add_argument("--sentence-silence", type=int, default=200, help="阿里云 max_sentence_silence（200-2000），默认与生产一致")
     ap.add_argument("--stt", default="aliyun")
+    ap.add_argument(
+        "--pipeline",
+        choices=["cascade", "live"],
+        default=os.environ.get("TAU2_PIPELINE", "cascade"),
+        help="语音主管道（默认 TAU2_PIPELINE，否则 cascade）。live 必须配 --stt qwen-realtime",
+    )
     ap.add_argument("--tts", default="cosyvoice")
     ap.add_argument("--work-dir", default=None, help="dsh 工作目录（默认 /tmp/tau2-bench-work）")
     args = ap.parse_args()
+    if args.pipeline == "live" and args.stt != "qwen-realtime":
+        print("--pipeline live 需要 --stt qwen-realtime", file=sys.stderr)
+        return 2
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # tau2 的 tick 日志走 loguru，一跑就是几千行；我们只看自己的日志
@@ -321,7 +360,9 @@ def main() -> int:
     dsh_proc = None
     if args.spawn_dsh:
         # 必须先有桥再有 dsh：dsh 的 MCP 在启动时就要拉工具表（failOnStartupError）
-        dsh_proc = spawn_dsh(work_dir, args.dsh_port, args.bridge_port, args.stt, args.tts, args.sentence_silence)
+        dsh_proc = spawn_dsh(
+            work_dir, args.dsh_port, args.bridge_port, args.stt, args.tts, args.sentence_silence, args.pipeline,
+        )
 
     log.info("开始：domain=%s task=%s tick=%dms 顾客=%s", args.domain, task.id, args.tick_ms, args.language)
     try:

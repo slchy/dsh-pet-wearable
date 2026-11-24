@@ -117,7 +117,7 @@ function awaitsReply(speech: string): boolean {
 }
 
 /** 只挡形态：空、超长、阿拉伯数字。语义委派交给模型的 `[[DELEGATE]]`。 */
-function isFastCandidate(text: string, maxChars = 14): boolean {
+export function isFastCandidate(text: string, maxChars = 14): boolean {
   const core = text.replace(/[\s。.,，!！?？、~～…\-—]/g, '');
   if (core.length === 0 || core.length > maxChars) return false;
   return !/[0-9０-９]/.test(core);
