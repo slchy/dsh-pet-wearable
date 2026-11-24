@@ -458,6 +458,13 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 本机 v24）；老版本要加 `--experimental-strip-types`，几个 .ts 脚本的头部注释里带着它，
 加上也无害。
 
+**跑测试用 Node ≥ 24**（服务器 2026-11-24 已从 22.21.1 升到 24.22.3，两边同为 24 大版本）。
+22 的 test runner 会把「唯一待办是一个 `.unref()` 定时器」判成 `cancelledByParent`
+（`Promise resolution is still pending but the event loop has already resolved`）——
+`tests/omni-shadow.test.ts` 的「后台汇报途中断线、stop 或 response 超时」就是这么红的，
+升到 24 后自然转绿。这是 runner 的判定，不是代码问题，只在跑测试时出现，常驻进程不受影响
+（`unref()` 对常驻服务本来就是正确写法）。
+
 ---
 
 ## 12. 标定值（跑对了应该看到什么）

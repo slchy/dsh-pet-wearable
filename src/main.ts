@@ -978,7 +978,7 @@ async function main(): Promise<void> {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
     console.error('  --host <addr>   监听地址（默认 127.0.0.1）。非本机地址必须同时配');
     console.error('                  MIAI_TOKENS 与 MIAI_TLS_KEY/MIAI_TLS_CERT，否则拒绝启动');
-    console.error('  可替换件: --stt aliyun|qwen-realtime|noop|canned|<path>  --tts cosyvoice|mimo|silent|<path>');
+    console.error('  可替换件: --stt aliyun|qwen-realtime|noop|canned|<path>  --tts cosyvoice|omni|mimo|silent|<path>');
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
     console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);
     console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');

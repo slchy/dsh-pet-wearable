@@ -96,6 +96,23 @@ python scripts/deploy_cloud.py                             # 不带就回 full
 
 `OMNI_SHADOW` 未设 = 不建连、零成本。回滚见 [OMNI-LANE.md](./OMNI-LANE.md) §12.3。
 
+### 嗓子（TTS）不是管道的判据
+
+`VOICE_PIPELINE` 只管「谁对用户出声」，**不校验 `--tts` 与它是否自洽**。两条管道对
+`--tts` / `MIAI_TTS` 的用法也不一样：
+
+| 管道 | `--tts` 的角色 |
+|:--|:--|
+| `live` | **不是主嗓子**。主嗓子是 omni 直出；`--tts` 只用于短回执（`live-orchestrator` 的 `receiptOnly`）、识图应声、取消确认与断线兜底。生产上配 `--tts omni` 是为了让回执与 omni 同音色 |
+| `cascade` | **就是主嗓子**。逐句 `tts.synthesizeStream`，流式失败退回整段 `synthesize` |
+
+所以 `VOICE_PIPELINE=cascade` + `MIAI_TTS=omni` 是**合法但没定义过**的组合：omni 朗读
+连接是「攒完再念」（逐句要付一次 ~630 ms 握手），而 cascade 换嗓子的本意通常是压低首包。
+启动期既不校验也不告警 —— **换管道时记得一起看 `--tts`**。
+
+顺带：延迟数字必须标嗓子。历史上的「TTS 首包 330–400 ms」是 CosyVoice 测的；omni 朗读
+连接是另一个量级（首块 630–780 ms），两者不能横比（口径见 [QOS.md](./QOS.md) §1.0）。
+
 ## 鉴权与 TLS
 
 **先看判据**：非本机地址必须同时具备 token 与 TLS，否则不监听（退出码 2）。
