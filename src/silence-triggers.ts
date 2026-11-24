@@ -67,8 +67,10 @@ export interface SilenceTriggerHost {
   predictionPending(): boolean;
   /** 静音到点：为「下一句」预跑判停（`seq + 1` 由宿主负责） */
   startUpcomingPrediction(): void;
-  /** 又来声音了：在跑的预跑作废（那份音频里没有他后半句） */
-  dropPrediction(): void;
+  /** 又来声音了（去抖后的真实语音帧）：作废在跑的预跑，并通知状态机迁入 speaking_more */
+  onVoiced(atMs: number): void;
+  /** 静音帧到达（携带距上次有声帧的连续静音时长）：供 speaking_more 在静音恢复后重新武装 */
+  onSilence?(atMs: number, silenceMs: number): void;
 }
 
 export class SilenceTriggers {
@@ -132,8 +134,8 @@ export class SilenceTriggers {
         return;
       }
       this.lastVoicedAt = atMs;
-      // 音频比快照长了：预跑的那份判停不再代表「用户说完没有」
-      this.host.dropPrediction();
+      // 音频比快照长了：通知宿主作废在跑预跑、并在已有缓冲句时迁入 speaking_more
+      this.host.onVoiced(atMs);
       return;
     }
     this.voicedRun = 0;
@@ -144,6 +146,9 @@ export class SilenceTriggers {
     this.maybePrefirePrediction(atMs);
     this.maybeCommit(atMs);
     this.maybeSttCommit(atMs);
+    if (this.lastVoicedAt !== NEVER) {
+      this.host.onSilence?.(atMs, atMs - this.lastVoicedAt);
+    }
   }
 
   /** 一句新定稿：投机的次数配额与去重按句重置（下一段语音可以再投机两次） */

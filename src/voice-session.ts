@@ -248,6 +248,17 @@ export interface VoiceSessionOptions {
     readonly serve?: 'off' | 'full';
     /** 测试注入 realtime 套接字；生产不传，行为与以前一致 */
     readonly socketFactory?: RealtimeSocketFactory;
+    /**
+     * 长期记忆摘要。字符串原样用；函数在**这条连接**构造影子时调用一次，
+     * 取当时的 MEMORY.md。空白不传。
+     */
+    readonly memoryContext?: string | (() => string);
+    /** 当前日期。原样交给影子，由它在 `session.update` 时调用一次。 */
+    readonly clockContext?: () => string;
+    /** ASR 热词。空白不传。 */
+    readonly asrCorpusText?: string;
+    /** ASR 语言。空白不传。 */
+    readonly asrLanguage?: string;
   };
   /** 显式管道模式（'live' | 'cascade'）。未设时兼容旧推断。 */
   readonly pipelineMode?: VoicePipelineMode;
@@ -469,8 +480,8 @@ export async function runVoiceServer(options: VoiceSessionOptions): Promise<numb
       authenticate: options.authenticate,
       idleTimeoutMs: options.idleTimeoutMs,
       singleConnection: options.serve !== true,
-      ...(options.onListening === undefined ? {} : { onListening: options.onListening }),
       log: (line) => { console.log(line); },
+      ...(options.onListening === undefined ? {} : { onListening: options.onListening }),
       onConnection: (conn) => { handshake(conn, options, service); },
     });
   } finally {
@@ -538,6 +549,43 @@ function handshake(conn: Connection, options: VoiceSessionOptions, service: Voic
   if (options.authenticate === undefined) {
     timer = setTimeout(() => { decide(null); }, HANDSHAKE_WAIT_MS);
   }
+}
+
+/**
+ * 把宿主给的静态上下文收成 `OmniShadow` 认的形状。
+ *
+ * 记忆可以是函数：每条连接构造影子时调用一次，取当时的 MEMORY.md 摘要。
+ * 日期函数不在这里调用，影子自己在 `session.update` 里调用一次。
+ * 空白字段不传，避免空块写进提示词或 ASR 配置。
+ */
+function omniStaticContext(
+  shadow: NonNullable<VoiceSessionOptions['omniShadow']>,
+): {
+  readonly memoryContext?: string;
+  readonly clockContext?: () => string;
+  readonly asrCorpusText?: string;
+  readonly asrLanguage?: string;
+} {
+  const rawMemory = shadow.memoryContext === undefined
+    ? undefined
+    : (typeof shadow.memoryContext === 'function' ? shadow.memoryContext() : shadow.memoryContext);
+  const memory = textIfPresent(rawMemory);
+  const corpus = textIfPresent(shadow.asrCorpusText);
+  const language = textIfPresent(shadow.asrLanguage);
+  return {
+    ...(memory === undefined ? {} : { memoryContext: memory }),
+    ...(shadow.clockContext === undefined ? {} : { clockContext: shadow.clockContext }),
+    ...(corpus === undefined ? {} : { asrCorpusText: corpus }),
+    ...(language === undefined ? {} : { asrLanguage: language }),
+  };
+}
+
+/** 空白不当事实。有内容则原样返回，不改写。 */
+function textIfPresent(text: string | undefined): string | undefined {
+  if (text === undefined || text.trim() === '') {
+    return undefined;
+  }
+  return text;
 }
 
 /**
@@ -776,6 +824,7 @@ export class VoiceConnection {
         ? {}
         : { socketFactory: options.omniShadow.socketFactory }),
       serve: options.omniShadow.serve ?? 'off',
+      ...omniStaticContext(options.omniShadow),
       // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
       emit: (data) => { this.archive?.event(EVENTS.omniShadow, data); },
       log: (line) => { console.log(line); },

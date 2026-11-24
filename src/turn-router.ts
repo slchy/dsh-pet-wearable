@@ -41,9 +41,60 @@ export type Lane = 'live' | 'cascade' | 'dsh';
 const ACTION_CUES =
   /(记一下|记下来|提醒我|定个|订一下|预约|开个|打开|关掉|关闭|删除|删掉|清掉|发个|发一条|查一下|搜一下|查查|搜搜|读一下|念一下)/u;
 
+/**
+ * 叙述/评论里也会出现「关掉」「打开」。
+ * 真机「电影里主角把门关掉那段真紧张」被 `关掉` 错派 dsh。
+ * 这些记号在、且没有对助手的请求前缀时，动作表让开。
+ */
+const NARRATIVE_CONTEXT =
+  /(电影里|小说里|书里|故事里|剧情|主角|那段|那一幕|演的)/u;
+
+/** 对着助手下令。有它，句子里夹着「电影里 / 那段」仍是真请求 */
+const ASSISTANT_REQUEST =
+  /(帮我|给我|请|替我|把我|把刚才)/u;
+
 /** 这句是不是「有副作用」的动作请求。路由与早规则竞速共用这一份动词表 */
 export function isActionRequest(text: string): boolean {
+  if (NARRATIVE_CONTEXT.test(text) && !ASSISTANT_REQUEST.test(text)) {
+    return false;
+  }
   return ACTION_CUES.test(text);
+}
+
+/**
+ * 问的是此刻钟点，或今天的日期/星期。
+ *
+ * 不进 `routeTurn`（车道规则不变）。Omni 实测「现在几点了」编成「晚上八点半」、
+ * 「今天是几月几号星期几」编成「2026年7月25日」——调用方据此在开口前派出去。
+ * 「是」可有可无。陈述（「三点开会」「今天心情不错」「现在停下来想想」）不认。
+ */
+const CLOCK_TIME_CUES =
+  /(?:现在(?:是)?几点|几点了|几点钟|现在(?:是)?什么时间|今天(?:是)?几月几号|今天(?:是)?几号|今天(?:是)?星期几|今天(?:是)?周几|今天(?:是)?礼拜几|现在(?:是)?几号)/u;
+
+/** 这句是不是在问当前钟点，或今天的日期/星期 */
+export function isClockTimeRequest(text: string): boolean {
+  return CLOCK_TIME_CUES.test(text);
+}
+
+/**
+ * 没有动作动词、但答案会过期、只能查外部的问句：钟点/日期、天气、行情、路况。
+ * 同样不进 `routeTurn`。常识（沸点）和闲聊（心情、加班、作品）不进这里。
+ */
+const REALTIME_WEATHER =
+  /(?:今天|明天|后天|现在|外面).{0,6}(?:天气|下雨|下雪|气温|温度|空气质量)|天气怎么样|下不下雨|会下雨吗/u;
+
+const REALTIME_MARKET =
+  /(?:股价|股票|汇率|比分|金价|油价).{0,4}(?:多少|怎么样|涨|跌)|今天.{0,6}(?:股价|汇率|比分)/u;
+
+const REALTIME_TRAFFIC =
+  /堵不堵|堵车吗|路况|开过去要多久|开车去.{1,10}(?:堵|多久)/u;
+
+/** 这句是不是必须查实时外部信息（含钟点/日期） */
+export function isRealtimeFactRequest(text: string): boolean {
+  return isClockTimeRequest(text)
+    || REALTIME_WEATHER.test(text)
+    || REALTIME_MARKET.test(text)
+    || REALTIME_TRAFFIC.test(text);
 }
 
 /**

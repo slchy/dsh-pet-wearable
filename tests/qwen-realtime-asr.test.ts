@@ -9,13 +9,23 @@ import { test } from 'node:test';
 
 import {
   QwenRealtimeAsr,
+  mergeCorpusText,
   qwenRealtimeStt,
   type RealtimeSocket,
 } from '../src/qwen-realtime-asr.ts';
 
 interface Sent {
   type: string;
-  session?: { turn_detection?: unknown };
+  session?: {
+    modalities?: string[];
+    input_audio_format?: string;
+    turn_detection?: unknown;
+    input_audio_transcription?: {
+      model?: string;
+      language?: string;
+      corpus?: { text?: string };
+    };
+  };
   audio?: string;
 }
 
@@ -552,4 +562,167 @@ test('qwenRealtimeStt 把 commitSeq 透传给宿主（这是唯一的号源）',
   session.commit?.();
   assert.equal(session.commitSeq?.(), 1);
   assert.equal(session.commit?.(), undefined, 'commit 仍然不返回值（老调用点不受影响）');
+});
+
+// ------------------------------------------------------- 静态 corpus / language
+//
+// 缺省时一个字段都不能多：旧断言和线上对照都认这份报文。
+// 给了热词或语言才带 `input_audio_transcription`，热路径不再多一次往返。
+
+const MANUAL_SESSION_UPDATE = {
+  type: 'session.update',
+  session: {
+    modalities: ['text'],
+    input_audio_format: 'pcm',
+    turn_detection: null,
+  },
+};
+
+async function sessionUpdateOf(opts: {
+  model?: string;
+  corpusText?: string;
+  language?: string;
+  turnDetection?: 'manual' | 'vad';
+  vadSilenceMs?: number;
+} = {}): Promise<Sent> {
+  const socket = new FakeSocket();
+  const asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    onSentence: () => {},
+    socketFactory: () => asSocket(socket),
+    ...opts,
+  });
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  const update = socket.sent.find((s) => s.type === 'session.update');
+  assert.ok(update, '要先发 session.update');
+  return update;
+}
+
+test('不传 corpusText / language 时 session.update 保持原报文', async () => {
+  const { socket } = await ready();
+  const update = socket.sent.find((s) => s.type === 'session.update');
+  assert.deepEqual(update, MANUAL_SESSION_UPDATE);
+});
+
+test('corpusText 和 language 只有空白时也不改报文', async () => {
+  assert.deepEqual(
+    await sessionUpdateOf({ corpusText: ' \n\t', language: '  ' }),
+    MANUAL_SESSION_UPDATE,
+  );
+});
+
+test('传 corpusText + language 时 session.update 精确带上 input_audio_transcription', async () => {
+  assert.deepEqual(
+    await sessionUpdateOf({
+      model: 'custom-asr',
+      corpusText: '  莱姆 《其主之声》  ',
+      language: '\nzh\n',
+    }),
+    {
+      type: 'session.update',
+      session: {
+        modalities: ['text'],
+        input_audio_format: 'pcm',
+        turn_detection: null,
+        input_audio_transcription: {
+          model: 'custom-asr',
+          language: 'zh',
+          corpus: { text: '莱姆 《其主之声》' },
+        },
+      },
+    },
+  );
+});
+
+test('只给一边时，另一边的键不出现', async () => {
+  assert.deepEqual(
+    (await sessionUpdateOf({ language: '  en  ', corpusText: ' \n' })).session?.input_audio_transcription,
+    { model: 'qwen3-asr-flash-realtime', language: 'en' },
+  );
+  assert.deepEqual(
+    (await sessionUpdateOf({
+      corpusText: '  莱姆\n眼镜  ',
+      language: '   ',
+    })).session?.input_audio_transcription,
+    { model: 'qwen3-asr-flash-realtime', corpus: { text: '莱姆\n眼镜' } },
+  );
+});
+
+test('热词和语言叠在原来的 session 上，不换掉 turn_detection', async () => {
+  assert.deepEqual(
+    await sessionUpdateOf({
+      turnDetection: 'vad',
+      vadSilenceMs: 320,
+      corpusText: '眼镜',
+      language: 'zh',
+    }),
+    {
+      type: 'session.update',
+      session: {
+        modalities: ['text'],
+        input_audio_format: 'pcm',
+        turn_detection: { type: 'server_vad', silence_duration_ms: 320 },
+        input_audio_transcription: {
+          model: 'qwen3-asr-flash-realtime',
+          language: 'zh',
+          corpus: { text: '眼镜' },
+        },
+      },
+    },
+  );
+});
+
+test('qwenRealtimeStt 把 corpusText 和 language 透传到 session.update', async () => {
+  const socket = new FakeSocket();
+  const stt = qwenRealtimeStt({
+    apiKey: 'k',
+    model: 'custom-asr',
+    corpusText: '  眼镜  ',
+    language: ' zh ',
+    socketFactory: () => asSocket(socket),
+  });
+  stt.open({ onSentence: () => {} }).feed(Buffer.alloc(320), true);
+  socket.open();
+  await new Promise((r) => { setImmediate(r); });
+  const update = socket.sent.find((s) => s.type === 'session.update');
+  assert.deepEqual(update?.session?.input_audio_transcription, {
+    model: 'custom-asr',
+    language: 'zh',
+    corpus: { text: '眼镜' },
+  });
+});
+
+test('mergeCorpusText 去注释、去空串、按空白切分并去重', () => {
+  assert.equal(mergeCorpusText(['', '  ', '# 只有注释\n\n#another']), '');
+  // 注释行里的「眼镜不要」不能漏进热词；同一词跨段只留第一次
+  assert.equal(
+    mergeCorpusText([
+      '# 眼镜不要\n眼镜  眼镜',
+      '莱姆\r\n眼镜\n  其主之声  ',
+      '#tail',
+    ]),
+    '眼镜 莱姆 其主之声',
+  );
+  assert.equal(mergeCorpusText(['b a b', 'a c']), 'b a c');
+});
+
+test('mergeCorpusText 截断停在 maxChars 边界', () => {
+  const full = 'abcd efgh';
+  assert.equal(full.length, 9);
+  assert.equal(mergeCorpusText([full], 9), full, '刚好等于上限，整串保留');
+  assert.equal(mergeCorpusText([full], 100), full, '上限更宽，不截');
+  assert.equal(mergeCorpusText([full], 8), 'abcd efg', '超一个字就切到正好上限');
+  assert.equal(mergeCorpusText([full], 8).length, 8);
+  assert.equal(mergeCorpusText([full], 5), 'abcd', '截断点落在分隔空格上时去掉末尾空格');
+  assert.equal(mergeCorpusText([full], 4), 'abcd');
+  assert.equal(mergeCorpusText([full], 3), 'abc');
+  assert.equal(mergeCorpusText([full], 0), '');
+  assert.equal(mergeCorpusText(['ab ab cd'], 4), 'ab c', '先去重再截，不能把重复词算进预算');
+
+  const capped = mergeCorpusText(['词'.repeat(900)]);
+  assert.equal(capped, '词'.repeat(800), '缺省上限 800，截满且不多一个字');
+  assert.equal(mergeCorpusText(['词'.repeat(800)]), '词'.repeat(800));
+  assert.equal(mergeCorpusText(['词'.repeat(799)]).length, 799);
 });

@@ -22,6 +22,9 @@ import {
   assemblePipelinePlan,
   assembleStreamingAgent,
   createAuditSlot,
+  formatCurrentDateContext,
+  loadStaticAsrCorpus,
+  resolveAsrLanguage,
   shouldCreateFrontedAgent,
   type AssembleStreamingAgentDeps,
   type AuditSink,
@@ -309,6 +312,10 @@ function streamingFrom(
     readonly dsh?: ReturnType<typeof scriptedDsh>;
     readonly log?: (line: string) => void;
     readonly onReply?: () => void;
+    readonly memorySummary?: () => string;
+    readonly clockContext?: () => string;
+    readonly asrCorpusText?: string;
+    readonly asrLanguage?: string;
   },
 ): {
   readonly dsh: ReturnType<typeof scriptedDsh>;
@@ -332,6 +339,10 @@ function streamingFrom(
     speculate: false,
     announceStore: hooks?.announceStore ?? null,
     log: hooks?.log ?? ((line) => { lines.push(line); }),
+    ...(hooks?.memorySummary === undefined ? {} : { memorySummary: hooks.memorySummary }),
+    ...(hooks?.clockContext === undefined ? {} : { clockContext: hooks.clockContext }),
+    ...(hooks?.asrCorpusText === undefined ? {} : { asrCorpusText: hooks.asrCorpusText }),
+    ...(hooks?.asrLanguage === undefined ? {} : { asrLanguage: hooks.asrLanguage }),
   };
   return { dsh, activity, assembled: assembleStreamingAgent(deps), lines };
 }
@@ -551,4 +562,178 @@ test('assembleStreamingAgent：live 的非法 OMNI_ANSWER 抛错，不退出进�
     }),
     /OMNI_ANSWER=sideways 不合法（off\|full；clip 已并入 full）/u,
   );
+});
+
+// ---------------------------------------------------------------- 静态热词 / 日期 / 记忆摘要
+
+test('resolveAsrLanguage：默认中文，auto/off/空串不写语言', async () => {
+  assert.equal(resolveAsrLanguage({}), 'zh');
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: undefined }), 'zh');
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'auto' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'off' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: '' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: '   ' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: ' auto ' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: ' off ' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: '  en  ' }), 'en');
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'yue' }), 'yue');
+
+  await withEnv({ QWEN_ASR_LANGUAGE: 'en' }, async () => {
+    assert.equal(resolveAsrLanguage(), 'en');
+  });
+  await withEnv({ QWEN_ASR_LANGUAGE: '' }, async () => {
+    assert.equal(resolveAsrLanguage(), undefined);
+  });
+});
+
+test('loadStaticAsrCorpus：热词文件与记忆提示合并，QWEN_ASR_CORPUS=0 关掉', () => {
+  assert.equal(loadStaticAsrCorpus('花生过敏', { QWEN_ASR_CORPUS: '0' }), '');
+  assert.equal(loadStaticAsrCorpus('', { QWEN_ASR_CORPUS: '0' }), '');
+
+  const corpus = loadStaticAsrCorpus('# 注释\n花生过敏\n\n眼镜', {});
+  assert.ok(corpus.startsWith('审计 '), `热词文件应当排在记忆前面：${corpus.slice(0, 40)}`);
+  assert.ok(corpus.includes('智能体'));
+  assert.ok(corpus.includes('花生过敏'));
+  assert.equal(corpus.split(' ').filter((word) => word === '眼镜').length, 1, '热词与记忆里的同一个词只留一次');
+  assert.equal(corpus.includes('# 注释') || corpus.split(' ').includes('注释'), false);
+  assert.ok(corpus.length <= 800);
+
+  const many = Array.from({ length: 300 }, (_, i) => `mw${i}`).join(' ');
+  const capped = loadStaticAsrCorpus(many, {});
+  assert.ok(capped.length <= 800);
+  assert.equal(capped, capped.trimEnd());
+  assert.equal(capped.endsWith(' '), false);
+  assert.ok(capped.includes('审计'));
+  assert.ok(capped.includes('mw0'));
+  assert.equal(capped.includes('mw299'), false);
+});
+
+test('formatCurrentDateContext：北京时间的日期和星期，不含钟点', () => {
+  assert.equal(
+    formatCurrentDateContext(new Date('2026-11-24T04:00:00Z')),
+    '当前日期：2026年11月24日 星期二（北京时间）',
+  );
+  assert.equal(
+    formatCurrentDateContext(new Date('2026-11-23T16:00:00Z')),
+    '当前日期：2026年11月24日 星期二（北京时间）',
+  );
+  assert.equal(
+    formatCurrentDateContext(new Date('2026-11-24T15:45:00Z')),
+    '当前日期：2026年11月24日 星期二（北京时间）',
+  );
+  assert.equal(
+    formatCurrentDateContext(new Date('2026-11-24T16:30:00Z')),
+    '当前日期：2026年11月25日 星期三（北京时间）',
+  );
+  assert.equal(
+    formatCurrentDateContext(new Date('2026-01-01T00:00:00+08:00')),
+    '当前日期：2026年1月1日 星期四（北京时间）',
+  );
+  const live = formatCurrentDateContext();
+  assert.match(live, /^当前日期：\d+年\d+月\d+日 星期[一二三四五六日]（北京时间）$/u);
+  assert.equal(/\d{1,2}:\d{2}/u.test(live), false);
+});
+
+test('main() 把静态热词、语言和记忆摘要接到 STT 与流式装配', () => {
+  const source = readFileSync(MAIN_TS, 'utf8');
+  assert.match(source, /memoryFile\.hotwordHints\(\)/u);
+  assert.match(source, /loadStaticAsrCorpus\(memoryHints,\s*process\.env\)/u);
+  assert.match(source, /resolveAsrLanguage\(process\.env\)/u);
+  assert.match(source, /memorySummary:\s*\(\)\s*=>\s*memoryFile\.summary\(\)/u);
+  assert.match(source, /asrCorpusText:\s*corpusText/u);
+  assert.match(source, /asrLanguage:\s*language/u);
+  assert.match(source, /corpusText,\s*language,/u);
+});
+
+test('assembleStreamingAgent：live 透传 memoryContext / clockContext / 热词 / 语言', () => {
+  let reads = 0;
+  const memorySummary = (): string => {
+    reads += 1;
+    return `第${reads}次`;
+  };
+  const clockContext = (): string => '当前日期：2026年11月24日 星期二（北京时间）';
+  const { assembled } = streamingFrom({
+    VOICE_PIPELINE: 'live',
+    DASHSCOPE_API_KEY: 'sk-omni',
+  }, {
+    memorySummary,
+    clockContext,
+    asrCorpusText: '眼镜 全双工',
+    asrLanguage: 'zh',
+    log: () => {},
+  });
+  try {
+    assert.equal(assembled.mode, 'live');
+    assert.equal(assembled.omniShadow?.serve, 'full');
+    assert.equal(assembled.omniShadow?.memoryContext, memorySummary);
+    assert.equal(assembled.omniShadow?.clockContext, clockContext);
+    assert.equal(assembled.omniShadow?.asrCorpusText, '眼镜 全双工');
+    assert.equal(assembled.omniShadow?.asrLanguage, 'zh');
+    assert.equal(reads, 0, '装配时不能先把记忆摘要算死');
+    const readMemory = assembled.omniShadow?.memoryContext;
+    assert.equal(typeof readMemory, 'function');
+    if (typeof readMemory === 'function') {
+      assert.equal(readMemory(), '第1次');
+      assert.equal(readMemory(), '第2次');
+    }
+  } finally {
+    assembled.dispose();
+  }
+
+  const emptyCorpus = streamingFrom({
+    VOICE_PIPELINE: 'live',
+    DASHSCOPE_API_KEY: 'sk-omni',
+  }, {
+    memorySummary,
+    asrCorpusText: '',
+    log: () => {},
+  });
+  try {
+    assert.equal(emptyCorpus.assembled.omniShadow?.asrCorpusText, '');
+    assert.equal(emptyCorpus.assembled.omniShadow?.asrLanguage, undefined);
+    assert.equal(emptyCorpus.assembled.omniShadow?.clockContext?.(), formatCurrentDateContext());
+  } finally {
+    emptyCorpus.assembled.dispose();
+  }
+
+  const defaults = streamingFrom({
+    VOICE_PIPELINE: 'live',
+    DASHSCOPE_API_KEY: 'sk-omni',
+  }, { log: () => {} });
+  try {
+    assert.equal(defaults.assembled.omniShadow?.memoryContext, undefined);
+    assert.equal(defaults.assembled.omniShadow?.asrCorpusText, undefined);
+    assert.equal(defaults.assembled.omniShadow?.asrLanguage, undefined);
+    assert.equal(typeof defaults.assembled.omniShadow?.clockContext, 'function');
+    assert.equal(defaults.assembled.omniShadow?.clockContext?.(), formatCurrentDateContext());
+  } finally {
+    defaults.assembled.dispose();
+  }
+});
+
+test('assembleStreamingAgent：cascade 只读探针同样带上静态上下文', () => {
+  const memorySummary = (): string => '- 记一条';
+  const clockContext = (): string => '当前日期：2026年11月24日 星期二（北京时间）';
+  const { assembled } = streamingFrom({
+    VOICE_PIPELINE: 'cascade',
+    OMNI_SHADOW: '1',
+    OMNI_ANSWER: 'off',
+    DASHSCOPE_API_KEY: 'sk-omni',
+    FAST_LANE_API_KEY: 'sk-fast',
+  }, {
+    memorySummary,
+    clockContext,
+    asrCorpusText: '眼镜',
+    asrLanguage: 'zh',
+    log: () => {},
+  });
+  try {
+    assert.equal(assembled.omniShadow?.serve, 'off');
+    assert.equal(assembled.omniShadow?.memoryContext, memorySummary);
+    assert.equal(assembled.omniShadow?.clockContext, clockContext);
+    assert.equal(assembled.omniShadow?.asrCorpusText, '眼镜');
+    assert.equal(assembled.omniShadow?.asrLanguage, 'zh');
+  } finally {
+    assembled.dispose();
+  }
 });

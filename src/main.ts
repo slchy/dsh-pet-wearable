@@ -20,7 +20,7 @@ import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
 import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
-import { qwenRealtimeStt } from './qwen-realtime-asr.ts';
+import { mergeCorpusText, qwenRealtimeStt } from './qwen-realtime-asr.ts';
 import { cosyVoiceTts, DEFAULT_COSYVOICE_EMOTION_MODE } from './cosyvoice.ts';
 import { omniTts } from './omni-tts.ts';
 import { mimoTts } from './mimo.ts';
@@ -86,7 +86,7 @@ export async function buildStt(
   spec: string,
   creds: {
     akId: string; akSecret: string; appkey: string; region: string;
-    maxSentenceSilenceMs: number; vocabularyId?: string;
+    maxSentenceSilenceMs: number; vocabularyId?: string; corpusText?: string; language?: string;
   },
 ): Promise<SttProvider> {
   if (spec === 'noop') return noopStt();
@@ -102,14 +102,14 @@ export async function buildStt(
     // 端点由谁判：默认我们控（`turn_detection: null`，静音窗见 `VOICE_COMMIT_MS`）；
     // `QWEN_ASR_TURN_DETECTION=vad` 交给服务端（`speech_stopped → 定稿` 139–204 ms，
     // 比手动 commit 的 261 ms 快，但拿走了封段权，`VOICE_COMMIT_MS` 等旋钮全部失效）
-    const turnDetection = process.env['QWEN_ASR_TURN_DETECTION'] === 'vad' ? 'vad' : 'manual';
+    const turnDetection = process.env['QWEN_ASR_TURN_DETECTION'] === 'vad' ? 'vad' : 'manual'; const { corpusText, language } = creds;
     return qwenRealtimeStt(
       {
         apiKey,
         ...(process.env['QWEN_ASR_URL'] ? { url: process.env['QWEN_ASR_URL'] } : {}),
         ...(process.env['QWEN_ASR_MODEL'] ? { model: process.env['QWEN_ASR_MODEL'] } : {}),
         turnDetection,
-        vadSilenceMs: envNumber('QWEN_ASR_VAD_SILENCE_MS', 200),
+        vadSilenceMs: envNumber('QWEN_ASR_VAD_SILENCE_MS', 200), ...(corpusText ? { corpusText } : {}), ...(language ? { language } : {}),
       },
       (line) => { console.log(`  [asr] ${line}`); },
     );
@@ -728,7 +728,7 @@ function memoryLines(memory: (text: string) => string): (text: string) => readon
 function streamingOmniShadow(
   plan: PipelinePlan,
   env: Record<string, string | undefined>,
-  log: (line: string) => void,
+  log: (line: string) => void, ctx: OmniStaticInput = {},
 ): NonNullable<VoiceSessionOptions['omniShadow']> | undefined {
   const model = env['OMNI_SHADOW_MODEL'];
   const modelOpt = model === undefined ? {} : { model };
@@ -741,7 +741,7 @@ function streamingOmniShadow(
     if (requested === 'clip') {
       log('管道      OMNI_ANSWER=clip 已取消，纯 live 按 full 出声');
     }
-    const omniShadow = { apiKey, serve: 'full' as const, ...modelOpt };
+    const omniShadow = { apiKey, serve: 'full' as const, ...modelOpt, ...omniStaticContext(ctx) };
     log(
       `影子    omni 前台开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
       + `**会出声** serve=${omniShadow.serve}）\n`,
@@ -749,7 +749,7 @@ function streamingOmniShadow(
     return omniShadow;
   }
   if (plan.useOmniProbeOnly) {
-    const omniShadow = { apiKey, serve: 'off' as const, ...modelOpt };
+    const omniShadow = { apiKey, serve: 'off' as const, ...modelOpt, ...omniStaticContext(ctx) };
     log(
       `影子    omni 只读探针（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`,
     );
@@ -770,7 +770,7 @@ export interface AssembleStreamingAgentDeps {
   readonly audit: (name: string, data: Record<string, unknown>) => void;
   readonly speculate: boolean;
   readonly announceStore?: AnnounceStore | null;
-  readonly log?: (line: string) => void;
+  readonly log?: (line: string) => void; readonly memorySummary?: () => string; readonly clockContext?: () => string; readonly asrCorpusText?: string; readonly asrLanguage?: string;
 }
 
 /** `VOICE_PIPELINE=live | cascade` 装配完、可以直接交给 `runVoiceServer` 的那一套。 */
@@ -802,7 +802,7 @@ export function assembleStreamingAgent(input: AssembleStreamingAgentDeps): Assem
   if (plan.mode === 'live') {
     // pure-live-assembly：只要直播编排。文本级联不装。
     // 非法 OMNI_ANSWER 在造编排器之前抛出，免得退出时留下一条没人 dispose 的总线。
-    const omniShadow = streamingOmniShadow(plan, env, log);
+    const omniShadow = streamingOmniShadow(plan, env, log, { memorySummary: input.memorySummary, clockContext: input.clockContext, asrCorpusText: input.asrCorpusText, asrLanguage: input.asrLanguage });
     const orch = new LiveOrchestrator({
       inner: dshAgent,
       tts,
@@ -862,7 +862,7 @@ export function assembleStreamingAgent(input: AssembleStreamingAgentDeps): Assem
     agent = trackActivity(dshAgent, activity);
     engine = undefined;
   }
-  const omniShadow = streamingOmniShadow(plan, env, log);
+  const omniShadow = streamingOmniShadow(plan, env, log, { memorySummary: input.memorySummary, clockContext: input.clockContext, asrCorpusText: input.asrCorpusText, asrLanguage: input.asrLanguage });
   return {
     mode: plan.mode,
     agent,
@@ -949,9 +949,9 @@ async function main(): Promise<void> {
     readonly activity: ActivityState;
     readonly memory: (text: string) => string;
     readonly taskStatus: () => string;
-    readonly speculate: boolean;
+    readonly speculate: boolean; readonly memorySummary?: () => string; readonly asrCorpusText?: string; readonly asrLanguage?: string;
   } | null = null;
-  let disposeStreaming: () => void = () => {};
+  let disposeStreaming: () => void = () => {}; let corpusText: string | undefined; let language: string | undefined;
 
   // `--listen 0` 仍然点名了这条装配。非法 `VOICE_PIPELINE` 必须在用法横幅之前失败，
   // 否则 `node src/main.ts --agent dsh --stt qwen-realtime --listen 0` 只会打印用法。
@@ -1041,7 +1041,7 @@ async function main(): Promise<void> {
     const fastKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
     const fastOff = process.env['FAST_LANE'] === '0';
     const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md');
-    const memoryFile = new MemoryFile(memoryPath);
+    const memoryFile = new MemoryFile(memoryPath); const memoryHints = memoryFile.hotwordHints(); corpusText = loadStaticAsrCorpus(memoryHints, process.env); language = resolveAsrLanguage(process.env);
     const activity = newActivityState(Date.now());
     const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
     /**
@@ -1098,7 +1098,7 @@ async function main(): Promise<void> {
       // 直播编排要一整段；级联在 assembleStreamingAgent 里再拆回逐条。
       memory: (text) => memoryFile.relevant(text).join('\n'),
       taskStatus: () => session.taskStatus(),
-      speculate,
+      speculate, memorySummary: () => memoryFile.summary(), asrCorpusText: corpusText, asrLanguage: language,
     });
     if (pipelinePlan !== null && pipelinePlan.mode === 'live') {
       console.log('快车道    关（纯 live：不加载文本级联快车道）');
@@ -1218,7 +1218,7 @@ async function main(): Promise<void> {
       audit: (name, data) => { auditSlot.emit(name, data); },
       speculate: pending.speculate,
       announceStore,
-      log,
+      log, memorySummary: pending.memorySummary, asrCorpusText: pending.asrCorpusText, asrLanguage: pending.asrLanguage,
     });
   };
 
@@ -1299,7 +1299,7 @@ async function main(): Promise<void> {
       appkey,
       region,
       maxSentenceSilenceMs: sentenceSilenceMs,
-      ...(vocabularyId ? { vocabularyId } : {}),
+      ...(vocabularyId ? { vocabularyId } : {}), corpusText, language,
     });
     const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
@@ -1562,7 +1562,7 @@ async function main(): Promise<void> {
       ...(turnJudgeClient === null ? {} : { turnJudgeClient }),
       ...(semantic === null
         ? {}
-        : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 300) }),
+        : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 400) }),
       gate: {
         thresholdDbfs: peakDbfs,
         holdMs: envNumber('VOICE_HOLD_MS', 2000),
@@ -1717,4 +1717,86 @@ function normalizeFileUrl(url: string): string {
 // 退出码 2 结束，那是 `docs/CLOUD-ARCHITECTURE.md` §8 的启动自检。
 if (isMainModule()) {
   void main();
+}
+
+/**
+ * 静态热词、识别语言、日期。`main()` 和 `bench/eval/server.ts` 共用。
+ *
+ * 放在文件末尾：插到 `envNumber(...)` 前面会改行号，`docs/TIME-KNOBS.md` 会对不上。
+ */
+interface OmniStaticInput {
+  readonly memorySummary?: () => string;
+  readonly clockContext?: () => string;
+  readonly asrCorpusText?: string;
+  readonly asrLanguage?: string;
+}
+
+/**
+ * ASR 语言。默认中文。
+ *
+ * `auto` / `off` / 空串（含只含空白）表示不写 `language` 字段，让服务端自己判。
+ * 其它非空值 trim 后原样返回。
+ */
+export function resolveAsrLanguage(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  const raw = env['QWEN_ASR_LANGUAGE'];
+  if (raw === undefined) return 'zh';
+  const trimmed = raw.trim();
+  if (trimmed === '' || trimmed === 'auto' || trimmed === 'off') return undefined;
+  return trimmed;
+}
+
+/**
+ * 仓根 `docs/hotwords.txt` 与记忆热词收成一条静态 corpus。
+ *
+ * `QWEN_ASR_CORPUS=0` 关掉。文件读不到就当没有热词，不抛。
+ */
+export function loadStaticAsrCorpus(
+  memoryHints = '',
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (env['QWEN_ASR_CORPUS'] === '0') return '';
+  let hotwordsText = '';
+  try {
+    hotwordsText = readFileSync(new URL('../docs/hotwords.txt', import.meta.url), 'utf8');
+  } catch {
+    hotwordsText = '';
+  }
+  return mergeCorpusText([hotwordsText, memoryHints], 800);
+}
+
+/**
+ * 建连时写进提示词的日期。只有年月日和星期，没有钟点：
+ * 长连接不会因为「现在几点」过几小时就过期。
+ *
+ * `Intl.DateTimeFormat#format` 会把「日」和「星期」粘在一起，这里按字段重拼，
+ * 中间留一个空格。
+ */
+export function formatCurrentDateContext(now: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    weekday: 'long',
+  }).formatToParts(now);
+  const value = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((part) => part.type === type)?.value ?? '';
+  return `当前日期：${value('year')}年${value('month')}月${value('day')}日 ${value('weekday')}（北京时间）`;
+}
+
+/** 影子上的静态上下文。记忆摘要留成函数，每条新连接再读一次。 */
+function omniStaticContext(ctx: OmniStaticInput): {
+  readonly memoryContext?: () => string;
+  readonly clockContext: () => string;
+  readonly asrCorpusText?: string;
+  readonly asrLanguage?: string;
+} {
+  return {
+    ...(ctx.memorySummary === undefined ? {} : { memoryContext: ctx.memorySummary }),
+    clockContext: ctx.clockContext ?? (() => formatCurrentDateContext()),
+    ...(ctx.asrCorpusText === undefined ? {} : { asrCorpusText: ctx.asrCorpusText }),
+    ...(ctx.asrLanguage === undefined ? {} : { asrLanguage: ctx.asrLanguage }),
+  };
 }

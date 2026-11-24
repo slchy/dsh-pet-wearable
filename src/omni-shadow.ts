@@ -37,6 +37,18 @@
  * 其它时刻返回 null，调用方等下一个空窗 —— 忙着发 create 会被服务端拒掉
  * 且那一次永久丢失（上面第 2 条）。这份回复的读端只认自己那一份，
  * 用户中途开口也不会把下一段的音频抢走。
+ *
+ * <h2>建连时的静态事实（热路径 0 ms）</h2>
+ *
+ * 长期记忆、当前日期、ASR 热词只在 `session.update` 里追加一次。
+ * `instructions` 里只放纯静态事实，**不放任何「要不要调工具」的暗示**
+ * （那条纪律在工具描述里，见 §十）。不传这些字段时，报文与原来逐字一致。
+ *
+ * <h2>拆句没有封段时的文本直答</h2>
+ *
+ * ASR 把一句拆开、后半句没走到 `seal()` 时，`willServe()` 是 false，
+ * 但连接仍是 `ready`。`answerFromText()` 用同一条会话把已经听写出来的
+ * 文本答出去（`origin: 'user'`），避免健康的 omni 被误降级成另一副嗓子。
  */
 import WebSocket from 'ws';
 
@@ -81,6 +93,13 @@ const DEFAULT_RING_MILLISECONDS = 150;
 
 /** 回注进 omni 上下文的文本上限（字）。委派轮的答案动辄几百字，整段塞进去只是烧 token */
 const MAX_INJECT_CHARS = 200;
+/**
+ * 建连时写进 `instructions` 的长期记忆上限（字）。
+ *
+ * 只截这一次：热路径不再读盘。上限就是 600，截断不加省略号，
+ * 否则会多出一个字。
+ */
+const MAX_STATIC_MEMORY_CHARS = 600;
 /** 回注排队上限。委派轮本来就是低频事件，多了说明哪里不对 */
 const MAX_PENDING_INJECTS = 4;
 /** 「没人认领的回复」最多记几份再一次性清。多了说明上游一直没出整句 */
@@ -90,6 +109,17 @@ const MAX_HELD_BYTES = BYTES_PER_MILLISECOND * 8000;
 /** 按**字符**截断（中文一个字一个 token 量级，`String.length` 对代理对也不至于切坏） */
 function clipText(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/**
+ * 静态事实：空白当没有。超长按字符截断，**不加省略号**（上限不能再多一个字）。
+ */
+function boundedFact(text: string | undefined, maxChars: number): string {
+  const trimmed = text?.trim() ?? '';
+  if (trimmed === '') {
+    return '';
+  }
+  return trimmed.length <= maxChars ? trimmed : trimmed.slice(0, maxChars);
 }
 
 /**
@@ -193,6 +223,27 @@ export interface OmniShadowOptions {
   readonly model?: string;
   readonly url?: string;
   readonly instructions?: string;
+  /**
+   * `MEMORY.md` 里挑出来的事实。建连时追加一次；空白当没传；超过 600 字截断。
+   *
+   * 只是事实，不是「要不要调工具」的暗示。不传时 `instructions` 与原来逐字一致。
+   */
+  readonly memoryContext?: string;
+  /**
+   * 建连时调用**一次**，返回当前日期事实，例如
+   * `当前日期：2026年11月24日 星期二（北京时间）`。空白当没传。
+   */
+  readonly clockContext?: () => string;
+  /**
+   * ASR 热词。非空时放进 `input_audio_transcription.corpus.text`。
+   * 不传或空串时该字段不出现。
+   */
+  readonly asrCorpusText?: string;
+  /**
+   * ASR 语言。非空时放进 `input_audio_transcription.language`。
+   * 不传或空串时该字段不出现。
+   */
+  readonly asrLanguage?: string;
   /** 一份 seal 的结果 → 会话档案（`omni.shadow`） */
   readonly emit: (data: Record<string, unknown>) => void;
   readonly log?: (line: string) => void;
@@ -238,10 +289,11 @@ type ResponseOrigin = 'user' | 'announce';
 interface PendingResponse {
   readonly meta: SealMeta;
   /**
-   * `user`：`seal()` 开出来的。`announce`：`speakFromText` 开出来的。
+   * `user`：`seal()` 或 `answerFromText()` 开出来的。`announce`：`speakFromText` 开出来的。
    *
    * 用户 `claim()` 不许把 announce 交出去；announce 的读端也不许顺着 `next`
-   * 去拿用户下一段的音频。
+   * 去拿用户下一段的音频。文本直答虽然也是 `user`，但一建出来就是 `claimed`，
+   * 读端只绑自己那一份，不会把下一次封段的音频抢走。
    */
   readonly origin: ResponseOrigin;
   /** commit+create 真正发出去的时刻（撞 busy 时晚于 anchor） */
@@ -311,7 +363,7 @@ interface PendingResponse {
   claimed: boolean;
 }
 
-/** 一份还没开张的回复。`sendSeal` / `speakFromText` 共用，避免哪边漏字段。 */
+/** 一份还没开张的回复。`sendSeal` / `speakFromText` / `answerFromText` 共用，避免哪边漏字段。 */
 function blankPending(meta: SealMeta, origin: ResponseOrigin, sentAt: number): PendingResponse {
   return {
     meta,
@@ -880,8 +932,10 @@ export class OmniShadow {
     }
     if (!resp.cancelled && !resp.closed) {
       resp.audio.length = 0;
-      this.wakeAudio(resp);
+      // 先标取消再叫醒。反过来的话，读端被叫醒时 `cancelled` 还是 false，
+      // 会重新挂上 waiter，一直等到 `response.done` 才退出。
       this.cancelCurrent(resp);
+      this.wakeAudio(resp);
     }
   }
 
@@ -900,6 +954,22 @@ export class OmniShadow {
       && this.resp === null
       && this.pending === null
       && this.dirtyBytes === 0;
+  }
+
+  /**
+   * 现在能不能用已经听写出来的文本，在这条健康连接上直接答。纯读、不改账。
+   *
+   * 跟 {@link canSpeakBackground} 的差别：不看 `dirtyBytes`。拆句没封段时
+   * 缓冲里可能还有残留，但 ASR 文本已经在手里，不该因此退回另一副嗓子。
+   * 未传 `serve` 与 `'off'` 一样，只测不发声。
+   */
+  canAnswerText(): boolean {
+    if ((this.opts.serve ?? 'off') === 'off') {
+      return false;
+    }
+    return this.state === 'ready'
+      && this.resp === null
+      && this.pending === null;
   }
 
   /**
@@ -976,6 +1046,91 @@ export class OmniShadow {
         }
       })(),
     };
+  }
+
+  /**
+   * 拆句没封段、但连接健康时，用听写文本在**这条**会话里直接答。
+   *
+   * 协议形状与 {@link speakFromText} 相同：先清孤儿和排队回注，再
+   * `conversation.item.create`（`role: 'user'`）+ `response.create`。
+   * 差别是 `origin` 必须是 `'user'` —— 这是用户这一轮，不是后台汇报。
+   * 一发出去就标成已认领，`claim()` 拿不走，读端也不跟着下一段走。
+   *
+   * `canAnswerText()` 为假，或 `userText` 去掉空白后是空的，返回 null，一个帧都不发。
+   */
+  answerFromText(userText: string): AgentAudioAnswer | null {
+    if (!this.canAnswerText() || userText.trim() === '') {
+      return null;
+    }
+    // 还是 ready：先把积压的孤儿回复和回注刷出去，再占用这条会话。
+    this.flushOrphans();
+    this.flushInjects();
+    const sentAt = this.now();
+    const resp = blankPending({
+      seq: 0,
+      silenceMs: 0,
+      anchor: sentAt,
+      bytes: 0,
+      flushedMs: 0,
+    }, 'user', sentAt);
+    resp.claimed = true;
+    this.resp = resp;
+    this.claimedResp = resp;
+    this.state = 'busy';
+    this.log('[omni] 文本直答');
+    this.send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: userText }],
+      },
+    });
+    this.send({
+      type: 'response.create',
+      response: { modalities: ['audio', 'text'] },
+    });
+    this.armResponseTimeout();
+    const target = resp;
+    const answer: AgentAudioAnswer & { interrupt(): void } = {
+      sampleRate: DOWNSTREAM_RATE,
+      transcript: () => target.text,
+      delegateReason: () => target.delegate,
+      delegateText: () => target.delegateRequest,
+      interrupt: () => {
+        if (target.cancelled || target.closed) {
+          if (this.claimedResp === target) {
+            this.claimedResp = null;
+          }
+          return;
+        }
+        target.audio.length = 0;
+        this.cancelCurrent(target);
+        if (this.claimedResp === target) {
+          this.claimedResp = null;
+        }
+        this.wakeAudio(target);
+      },
+      chunks: (async function* iterate() {
+        for (;;) {
+          if (target.audio.length > 0) {
+            const chunk = target.audio.shift();
+            if (chunk !== undefined) {
+              yield chunk;
+            }
+            continue;
+          }
+          // 停在自己这份上。下一次封段是另一句，读了就把人家的音频抢走。
+          if (target.cancelled || target.closed) {
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            target.audioWaiters.push(resolve);
+          });
+        }
+      })(),
+    };
+    return answer;
   }
 
   /**
@@ -1282,8 +1437,30 @@ export class OmniShadow {
     }
   }
 
+  /**
+   * 建连提示词。基础人设保持原样；日期和长期记忆只在非空时各追加一块事实。
+   *
+   * `clockContext` 在这里调用一次（`sendSessionUpdate` 只在握手时跑）。
+   * 不传、或返回空白时，结果与 `instructions ?? DEFAULT_INSTRUCTIONS` 逐字相同。
+   */
+  private composeInstructions(): string {
+    const base = this.opts.instructions ?? DEFAULT_INSTRUCTIONS;
+    const clock = this.opts.clockContext?.().trim() ?? '';
+    const memory = boundedFact(this.opts.memoryContext, MAX_STATIC_MEMORY_CHARS);
+    let instructions = base;
+    if (clock !== '') {
+      instructions += `\n\n【当前日期参考】\n${clock}`;
+    }
+    if (memory !== '') {
+      instructions += `\n\n【关于哥的已知长期记忆（仅供如实回答，不要主动复述）】\n${memory}`;
+    }
+    return instructions;
+  }
+
   private sendSessionUpdate(): void {
     const serve = (this.opts.serve ?? 'off') !== 'off';
+    const lang = this.opts.asrLanguage;
+    const corpus = this.opts.asrCorpusText;
     this.send({
       type: 'session.update',
       session: {
@@ -1292,7 +1469,8 @@ export class OmniShadow {
         // 「如果决定调用工具，直接调用，不要先说任何过渡语」之后，闲聊会 3/3
         // 被判成工具调用（零音频）；去掉它、只留 `DELEGATE_TOOL.description`，
         // 同一批闲聊 150 轮 `0/150` 误触发。决定权在工具描述，不在提示词。
-        instructions: this.opts.instructions ?? DEFAULT_INSTRUCTIONS,
+        // 下面追加的日期 / 长期记忆是纯静态事实，同样不许写成工具暗示。
+        instructions: this.composeInstructions(),
         // 手动端点：我们已经在封段那一刻决定「这句说完了」，服务端 VAD 既多余又更慢
         turn_detection: null,
         audio: {
@@ -1308,8 +1486,13 @@ export class OmniShadow {
           },
           output: { format: { type: 'pcm', sample_rate: DOWNSTREAM_RATE } },
         },
-        // 没有它就没有 `input_audio_transcription.completed`，`final_ms` 整列缺失
-        input_audio_transcription: { model: 'qwen3-asr-flash-realtime' },
+        // 没有它就没有 `input_audio_transcription.completed`，`final_ms` 整列缺失。
+        // 语言和热词都不传（或空串）时，这个对象只剩 `model`，与原来逐字一致。
+        input_audio_transcription: {
+          model: 'qwen3-asr-flash-realtime',
+          ...(lang ? { language: lang } : {}),
+          ...(corpus ? { corpus: { text: corpus } } : {}),
+        },
         // 只有真的要它答时才挂工具：挂在 `session.update` 里会抬高每轮 `in_text_tok`
         // 基线（实测 150 轮首块没变慢，但那是有 0 次调用的前提下）
         ...(serve ? { tools: [DELEGATE_TOOL], tool_choice: 'auto' } : {}),

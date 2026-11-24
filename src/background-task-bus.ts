@@ -24,6 +24,13 @@ const LONG_DIGITS = /\d{5,}/;
 const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
 /** 订单号一类：1–4 个大写字母接至少 4 位数字，例如 `W8665881`、`AB1234`。 */
 const ORDER_ID = /[A-Z]{1,4}\d{4,}/;
+/**
+ * 显式端口：`端口 8766`、`端口:8080`、`port=80`、`:8766`。
+ * 不把 `2026年` 或 `晚上8点15分` 当成端口（冒号后至少 4 位，才避开钟点）。
+ */
+const EXPLICIT_PORT = /(?:端口|port)\s*[:：=]?\s*\d{2,5}\b|:\d{4,5}\b/iu;
+/** semver：`v2.3.1`、`2.3.1`、`1.0.0-beta.1`。 */
+const SEMVER = /\bv?\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/u;
 const CODE_EXT = 'ts|tsx|js|jsx|mjs|cjs|py|yml|yaml|json|toml|md|go|rs|sh|java|kt|swift|css|html|vue|c|cpp|h';
 /** 至少含一个 `/` 或 `\` 的代码路径。单独的 `main.ts` 不算。 */
 const CODE_PATH = new RegExp(
@@ -33,8 +40,8 @@ const CODE_PATH = new RegExp(
 /**
  * 后台结果里有没有必须逐字念的字面量。
  *
- * 普通短句（天气、闹钟）返回 false，交给全双工自己说。
- * 端口、订单号、路径、显式 `[VERBATIM]`、超长正文返回 true，走逐字朗读。
+ * 普通短句（天气、闹钟、年份、钟点）返回 false，交给全双工自己说。
+ * 端口、版本号、订单号、路径、显式 `[VERBATIM]`、超长正文返回 true，走逐字朗读。
  */
 export function needsVerbatimRead(text: string): boolean {
   if (VERBATIM_TAG.test(text)) return true;
@@ -42,6 +49,8 @@ export function needsVerbatimRead(text: string): boolean {
   if (IPV4.test(text)) return true;
   if (CODE_PATH.test(text)) return true;
   if (ORDER_ID.test(text)) return true;
+  if (EXPLICIT_PORT.test(text)) return true;
+  if (SEMVER.test(text)) return true;
   const trimmed = text.trim();
   // 码元数 ≤ 180 时码点数只可能更少，不必把字符串展开。
   if (trimmed.length <= 180) return false;
@@ -121,6 +130,8 @@ export interface BackgroundTaskBusOptions {
 interface TaskRecord {
   readonly taskId: string;
   readonly turnNo?: number;
+  /** 创建时的 `sessionEpoch`。上一代的轮次不能挡住重连后的同号轮。 */
+  readonly epoch: number;
   query: string;
   readonly source: BackgroundTaskSource;
   image?: AgentImage;
@@ -205,8 +216,13 @@ export class BackgroundTaskBus {
   private running: TaskRecord | null = null;
   private readonly reportable: TaskRecord[] = [];
   private readonly silentQueue: TaskRecord[] = [];
-  /** 要播报的任务按 turnNo 留到 completed，失败和取消会摘掉，同一轮才能再派。 */
+  /**
+   * 要播报的任务按 turnNo 留到 completed，失败和取消会摘掉，同一会话里才能再派。
+   * 进程级总线跨重连还在，轮次却从 1 重新编号；`resetSession()` 必须把这里清掉。
+   */
   private readonly byTurn = new Map<number, TaskRecord>();
+  /** 每次 `resetSession()` 加一。去重只认当前这一代。 */
+  private sessionEpoch = 0;
 
   constructor(options: BackgroundTaskBusOptions) {
     this.runner = options.runner;
@@ -296,6 +312,17 @@ export class BackgroundTaskBus {
   }
 
   /**
+   * 设备重连、对话轮次从 1 重新编号时调用。可重复调用。
+   *
+   * 已完成的 `turnNo` 若一直留在 `byTurn`，新会话的第 1–N 轮会被当成重复任务丢掉。
+   * 只清索引并推进代际：在跑的和还在排队的继续跑，不取消，也不释放总线。
+   */
+  resetSession(): void {
+    this.byTurn.clear();
+    this.sessionEpoch += 1;
+  }
+
+  /**
    * 连接断开时调用。幂等。
    *
    * 只停「还往这条连接上送汇报」。在途的 dsh 轮次不在这里 `cancelRunning`：
@@ -330,6 +357,7 @@ export class BackgroundTaskBus {
       image: req.image,
       note: req.note,
       silent: isSilentRequest(req),
+      epoch: this.sessionEpoch,
       state: 'queued',
       controller: null,
     };
@@ -350,6 +378,10 @@ export class BackgroundTaskBus {
     if (isSilentRequest(req) || req.turnNo === undefined) return undefined;
     const found = this.byTurn.get(req.turnNo);
     if (found === undefined) return undefined;
+    if (found.epoch !== this.sessionEpoch) {
+      this.byTurn.delete(req.turnNo);
+      return undefined;
+    }
     if (found.state === 'queued' || found.state === 'running' || found.state === 'completed') {
       return found;
     }

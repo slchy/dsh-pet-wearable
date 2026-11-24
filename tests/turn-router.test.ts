@@ -5,6 +5,8 @@ import { test } from 'node:test';
 import {
   isActionRequest,
   isCancelRequest,
+  isClockTimeRequest,
+  isRealtimeFactRequest,
   looksLikeAnswer,
   looksLikeFollowUp,
   looksMemorable,
@@ -83,6 +85,133 @@ test('两条快车道都不可用 → dsh（出声优先于速度）', () => {
     lane: 'dsh',
     why: 'no-fast-lane',
   });
+});
+
+test('叙述句里的动作动词不误判成命令', () => {
+  // 真机：含「关掉」但是在讲电影，不该派 dsh。
+  for (const text of [
+    '电影里主角把门关掉那段真紧张。',
+    '小说里他把门关掉了',
+    '书里写他关掉了灯',
+    '故事里主角把城门关掉',
+    '这段剧情是他把门关掉',
+    '那一幕他把灯关掉了',
+    '演的就是把门关掉',
+  ]) {
+    assert.equal(isActionRequest(text), false, `「${text}」是叙述`);
+  }
+  // 同一批叙述词，一旦对着助手下令，仍是动作。
+  for (const text of [
+    '帮我把电影里那盏灯关掉',
+    '给我把那段删掉',
+    '请关掉那段提醒',
+    '替我把故事里的闹钟关掉',
+    '把我那段录音删掉',
+    '把刚才电影里定的闹钟关掉',
+  ]) {
+    assert.equal(isActionRequest(text), true, `「${text}」是在下令`);
+  }
+});
+
+test('真实指令仍命中动作表，叙述句不再因关掉进 dsh', () => {
+  for (const text of [
+    '帮我打开客厅的灯',
+    '把刚才定的七点闹钟关掉',
+    '关掉提醒',
+    '删掉这条',
+    '记一下这个单号',
+    '查一下天气',
+  ]) {
+    assert.equal(isActionRequest(text), true, `「${text}」应当算动作`);
+    assert.equal(routeTurn(text, base).why, 'action', `「${text}」仍走 action`);
+  }
+  assert.equal(routeTurn('电影里主角把门关掉那段真紧张。', base).lane, 'live');
+});
+
+test('isClockTimeRequest 只认此刻钟点与今天日期', () => {
+  for (const text of [
+    '现在几点',
+    '现在几点了？',
+    '几点了',
+    '几点钟',
+    '现在什么时间',
+    '现在是什么时间',
+    '今天几月几号',
+    '今天是几月几号星期几？',
+    '今天几月几号星期几',
+    '今天几号',
+    '今天是几号',
+    '今天星期几',
+    '今天是星期几',
+    '今天周几',
+    '今天礼拜几',
+    '现在几号',
+    '现在是几点了',
+  ]) {
+    assert.equal(isClockTimeRequest(text), true, `「${text}」是钟点/日期`);
+    assert.equal(isRealtimeFactRequest(text), true, `「${text}」也是实时事实`);
+  }
+  for (const text of [
+    '我明天下午三点开会',
+    '今天心情不错',
+    '我觉得今天心情还不错。',
+    '现在停下来想想',
+    '记一下我明天下午三点要开会。',
+    '你看过星球大战没',
+  ]) {
+    assert.equal(isClockTimeRequest(text), false, `「${text}」不是在问钟点`);
+  }
+});
+
+test('isRealtimeFactRequest 只认会过期的外部事实', () => {
+  for (const text of [
+    '明天北京天气怎么样？',
+    '今天天气怎么样',
+    '外面现在在下雨吗？',
+    '后天会下雪吗',
+    '现在空气质量怎么样',
+    '外面温度多少',
+    '天气怎么样',
+    '下不下雨',
+    '会下雨吗',
+    '英伟达今天股价多少？',
+    '股价多少',
+    '股票怎么样',
+    '汇率涨了吗',
+    '比分多少',
+    '金价跌了没',
+    '油价多少',
+    '今天的汇率',
+    '今天比分',
+    '从这里开车去双流机场堵不堵？',
+    '堵车吗',
+    '路况怎么样',
+    '开过去要多久',
+    '开车去公司要多久',
+  ]) {
+    assert.equal(isRealtimeFactRequest(text), true, `「${text}」要查实时`);
+  }
+  for (const text of [
+    '水在标准大气压下多少度沸腾',
+    '水在标准大气压下多少度沸腾？',
+    '他还写过哪些作品',
+    '他还写过哪些作品？',
+    '你看过星球大战没',
+    '你看过星球大战没？',
+    '今天心情不错',
+    '我觉得今天心情还不错。',
+    '我今天加班好累啊',
+    '我今天加班好累啊。',
+    '我明天下午三点开会',
+    '现在停下来想想',
+    '你好呀，今天过得怎么样？',
+    '电影里主角把门关掉那段真紧张。',
+    '眼镜现在还剩多少电？',
+    '记一下我明天下午三点要开会。',
+  ]) {
+    assert.equal(isRealtimeFactRequest(text), false, `「${text}」不是实时事实`);
+    assert.equal(isClockTimeRequest(text), false, `「${text}」也不是钟点`);
+  }
 });
 
 test('显式取消：只认短句，别把正常说话当成中断指令', () => {

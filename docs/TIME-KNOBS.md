@@ -24,7 +24,7 @@
 | `TURN_JUDGE_WAIT_BUDGET_MS` | 200 | wall | `src/main.ts:1549` | 同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算 | — |
 | `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 1200 | wall | `src/main.ts:1553` | 模型段（只对数字/字母/「然后」这类句尾生效） | TURN_JUDGE_MAX_OPEN_SILENCE_MS |
 | `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | 650 | audio | `src/main.ts:1559` | 无（它自己是上限） | — |
-| `SEMANTIC_END_TAG_BUDGET_MS` | 300) } | wall | `src/main.ts:1565` | 静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行 | — |
+| `SEMANTIC_END_TAG_BUDGET_MS` | 400) } | wall | `src/main.ts:1565` | 静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行 | — |
 | `VOICE_HOLD_MS` | 2000 | wall | `src/main.ts:1568` | 无（它决定 `gate.close` 何时落，① 的起点；配大了 ① 会被算小） | — |
 | `VOICE_PREROLL_MS` | 800 | audio | `src/main.ts:1569` | 无（它是滑窗长度，不加延迟） | — |
 | `VOICE_PAUSE_DETECT_MS` | 200 | wall | `src/main.ts:1571` | ASR 解出句之前（提前起跑，不额外等） | — |
@@ -90,7 +90,7 @@
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:140` | 无关首声（不在停嘴→出声路径上） | — |
 | `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:151` | 无关首声（不在停嘴→出声路径上） | — |
 | `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:169` | 判停侧车输入预处理（不额外等） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:487` | 无关首声（不在停嘴→出声路径上） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:498` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 四、还没标注的
 

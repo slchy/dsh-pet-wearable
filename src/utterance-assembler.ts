@@ -17,9 +17,10 @@
  * 所以一律先等 {@link UtteranceAssemblerOptions.quietMs}，再交给
  * {@link UtteranceAssemblerOptions.predict}（TurnJudge）看**音频本身**。
  * 它说没说完就再等一段：`p < threshold` 这一类最多
- * {@link UtteranceAssemblerOptions.maxUnsureExtensions} 次，其余三种文本判据合计
+ * {@link UtteranceAssemblerOptions.maxUnsureExtensions} 次，其余文本判据合计
  * 最多 {@link UtteranceAssemblerOptions.maxExtensions} 次，然后强制收下，
- * 避免模型不确定时永远不定稿。
+ * 避免模型不确定时永远不定稿。语义明确 MORE、且 unsure 已把等待预算吃光、
+ * 拍数还没越过上限时，再给一次（仍受 `maxOpenSilenceMs` 约束）。
  *
  * <h2>与静候窗重叠</h2>
  *
@@ -50,8 +51,9 @@ export interface UtteranceAssemblerOptions {
    *
    * 声学判停（`TurnJudge`）看的是音频，它能判断「这像不像句尾」，判断不了「这句话
    * 说完了没有」—— 真机上 `p=0.985` 判对句尾、判错语义的场景一抓一把。文本这一层
-   * 只补这一个洞：`'more'` 就再等一拍（吃既有的拍数/预算，不开后门），`'end'` 或
-   * 超时都照常开轮。
+   * 只补这一个洞：`'more'` 就再等一拍。拍数超过 `maxExtensions` 不再等；
+   * 预算被 unsure 吃光、但拍数还没越过上限时，这一次仍然给（静音天花板照旧挡）。
+   * `'end'`、`null` 或超时都照常开轮。
    *
    * 判定在 `addSentence` 时就发出去，与静候窗重叠，所以正常情况下**不额外加延迟**。
    */
@@ -353,11 +355,15 @@ const TRAILING_PUNCT = /[\s。．.，,、!！?？~～…\-—:：;；"'“”‘
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
 
 /**
- * 声学判据到了这个置信度就不等语义判停了。
+ * 声学判据到了这个置信度，**完整句**就不等语义判停了。
  *
- * 语义判停的意义在「声学拿不准」（p 落在 0.3–0.80 那条带），p 已经 0.83–0.98
+ * 语义判停的意义在「声学拿不准」（p 落在 0.3–0.80 那条带）。p 已经 0.83–0.98
  * 时再等 256–324 ms 纯属白搭 —— 真机 `20261123-051448` 与 `-053719` 两场
  * 语义一次没拦住 MORE，而 p=0.834 那轮白等了 273 ms。
+ *
+ * `looksUnfinished` 的半句不走这条捷径：eval-v1 S4「实在不甘心的话。」p=0.977、
+ * 「如果明天下午不下雨的话。」p=0.873，语义都回了 MORE，跳过等待就把半句开了轮。
+ * 那种情况仍等已经在飞的那趟，上限是 `semanticBudgetMs`。
  */
 const SEMANTIC_SKIP_P = 0.80;
 
@@ -398,6 +404,23 @@ export function looksUnfinished(text: string): boolean {
   return core.length > 0 && UNFINISHED_TAIL.test(core);
 }
 
+/**
+ * 判停组装器的显式有限状态（单点真相源）。
+ *
+ * 两条硬不变量：
+ * 1. `disposed` 是吸收态，进入后任何事件都不许迁出或发射 `onUtterance`。
+ * 2. 一旦在缓冲文本非空期间收到去抖后的真实新语音，必迁入 `speaking_more` 并取消
+ *    当前到期定时器；任何在途异步恢复点见到 `speaking_more`（或 `seq` 变更）都必须
+ *    放弃提交，绝不在用户说话中途截断。
+ */
+export type AssemblerPhase =
+  | 'idle'
+  | 'armed'
+  | 'judging'
+  | 'extending'
+  | 'speaking_more'
+  | 'disposed';
+
 export class UtteranceAssembler {
   private readonly options: UtteranceAssemblerOptions;
   private readonly now: () => number;
@@ -405,6 +428,11 @@ export class UtteranceAssembler {
   private recentBytes = 0;
   private pendingText = '';
   private pendingTimer: NodeJS.Timeout | null = null;
+  private _phase: AssemblerPhase = 'idle';
+  /** `speaking_more` 的断流兜底定时器（彻底停帧时保证活性，不吞话） */
+  private speakingWatchdog: NodeJS.Timeout | null = null;
+  /** 最近一次 `addSentence` 或 `speaking_more` 退出时锁存的 `lastVoicedAtMs` */
+  private sentenceVoicedAt = Number.NEGATIVE_INFINITY;
   /**
    * 当前这一句的代号。`addSentence` / `flush` / `dispose` 都 +1。
    *
@@ -517,8 +545,14 @@ export class UtteranceAssembler {
       hasPredictor: () => this.options.predict !== undefined,
       predictionPending: () => this.prediction !== null,
       startUpcomingPrediction: () => { this.startPrediction(this.seq + 1, true); },
-      dropPrediction: () => { this.prediction = null; },
+      onVoiced: (atMs) => { this.handleVoiced(atMs); },
+      onSilence: (atMs, silenceMs) => { this.handleSilence(atMs, silenceMs); },
     });
+  }
+
+  /** 当前显式有限状态（供测试与诊断直接观测状态转移） */
+  get phase(): AssemblerPhase {
+    return this._phase;
   }
 
   get pending(): string {
@@ -656,6 +690,12 @@ export class UtteranceAssembler {
       : this.pendingText;
     this.pendingText = tail ? tail + text : text;
     this.cancelTimer();
+    this.cancelSpeakingWatchdog();
+    // 新一截定稿到达：锁存此刻的有声水位线，且把这一截的静音/unsure 预算从零起算
+    // （避免前一段的等待耗尽预算后，把后一段的静音闸门一起关掉）。
+    this.sentenceVoicedAt = this.silence.lastVoicedAtMs;
+    this.waitedMs = 0;
+    this.unsureExtensions = 0;
     // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿。
     // **例外**是预跑（`silence-triggers.ts` 的 `maybePrefirePrediction`）：那份快照
     // 本来就是给这一句的（seq 已经对上），留着才能把「出句→开轮」那一段省掉。
@@ -685,6 +725,7 @@ export class UtteranceAssembler {
     const delay = this.options.predict
       ? this.options.quietMs
       : this.options.fallbackWindowMs;
+    this.setPhase('armed');
     this.schedulePrediction(seq, delay);
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, delay);
   }
@@ -762,13 +803,16 @@ export class UtteranceAssembler {
     }
     this.cancelTimer();
     this.cancelPredictTimer();
+    this.cancelSpeakingWatchdog();
     this.seq += 1;
     this.prediction = null;
     this.extensions = 0;
     this.unsureExtensions = 0;
     this.waitedMs = 0;
+    this.sentenceVoicedAt = Number.NEGATIVE_INFINITY;
     const text = this.pendingText.trim();
     this.pendingText = '';
+    this.setPhase('idle');
     if (!text) {
       return;
     }
@@ -780,11 +824,14 @@ export class UtteranceAssembler {
 
   dispose(): void {
     this.disposed = true;
+    this._phase = 'disposed';
     this.cancelTimer();
     this.cancelPredictTimer();
+    this.cancelSpeakingWatchdog();
     this.seq += 1;
     this.prediction = null;
     this.pendingText = '';
+    this.sentenceVoicedAt = Number.NEGATIVE_INFINITY;
     this.recentChunks.length = 0;
     this.recentBytes = 0;
     // 语义判停的两个缓存不准跟到连接之后：它们是「最近几句」的窗口，
@@ -793,12 +840,116 @@ export class UtteranceAssembler {
     this.semanticSettled.clear();
   }
 
+  /** 唯一状态迁移入口：`disposed` 是吸收态，任何路径都不可覆盖。 */
+  private setPhase(next: AssemblerPhase): void {
+    if (this._phase === 'disposed') {
+      return;
+    }
+    this._phase = next;
+  }
+
+  /**
+   * 异步恢复点统一守卫（每次 `await` 之后与 `flush()` 之前必检）：
+   * 连接已释放、用户又开口进入 `speaking_more`、状态已回 `idle`、或新定稿推进了 `seq`，
+   * 当前协程都必须立刻退出，绝不拿旧判定覆盖新状态。
+   */
+  private isStaleEval(seq: number): boolean {
+    return this.disposed
+      || this._phase === 'disposed'
+      || this._phase === 'speaking_more'
+      || this._phase === 'idle'
+      || seq !== this.seq
+      || !this.pendingText.trim();
+  }
+
+  /**
+   * 退出 `speaking_more` 所需的连续静音门槛（音频时钟）：至少盖过 `sttCommitAfterMs`
+   * 与 `openQuietMs`，确保 ASR 已触发封段解码，随后由 `waitPendingDecode` 接住。
+   */
+  private rearmSilenceMs(): number {
+    const open = this.options.openQuietMs ?? 0;
+    const stt = this.options.sttCommitAfterMs ?? 0;
+    if (open > 0 || stt > 0) {
+      return Math.max(open, stt);
+    }
+    return Math.max(this.options.quietMs, this.options.extendMs, 100);
+  }
+
+  /**
+   * 收到去抖后的真实新语音帧（连续 ≥2 帧有声）。
+   *
+   * 物理不变量：缓冲文本非空期间一旦收到新语音，必须取消在途定时器并迁入
+   * `speaking_more` —— 预算耗尽只能限制「安静时多等几拍」，绝不能在说话中途截断。
+   */
+  private handleVoiced(atMs: number): void {
+    this.prediction = null;
+    if (this._phase === 'disposed' || this._phase === 'idle' || !this.pendingText.trim()) {
+      return;
+    }
+    if (atMs <= this.sentenceVoicedAt && this._phase !== 'speaking_more') {
+      return;
+    }
+    this.cancelTimer();
+    this.cancelPredictTimer();
+    this.setPhase('speaking_more');
+    this.armSpeakingWatchdog(this.seq);
+  }
+
+  /** 静音帧推进：仅在 `speaking_more` 达到连续静音门槛后退出，防止清嗓子/空解码卡死。 */
+  private handleSilence(_atMs: number, silenceMs: number): void {
+    if (this._phase !== 'speaking_more') {
+      return;
+    }
+    if (silenceMs >= this.rearmSilenceMs()) {
+      void this.rearmFromSpeakingMore(this.seq);
+    }
+  }
+
+  /** `speaking_more` 断流兜底定时器：持续说话期间每 20 ms 刷新，彻底停帧时保证活性。 */
+  private armSpeakingWatchdog(seq: number): void {
+    this.cancelSpeakingWatchdog();
+    const waitMs = Math.max(this.rearmSilenceMs() + 100, this.options.extendMs + 100, 350);
+    this.speakingWatchdog = setTimeout(() => {
+      this.speakingWatchdog = null;
+      if (this._phase === 'speaking_more' && seq === this.seq) {
+        void this.rearmFromSpeakingMore(seq);
+      }
+    }, waitMs);
+  }
+
+  private cancelSpeakingWatchdog(): void {
+    if (this.speakingWatchdog) {
+      clearTimeout(this.speakingWatchdog);
+      this.speakingWatchdog = null;
+    }
+  }
+
+  /**
+   * 从 `speaking_more` 恢复到正常判停：先等 ASR 在途解码（避免浪费一趟 TurnJudge
+   * 并冲掉给下一句预跑的快照）；若解码带回新定稿，`seq` 变更直接让位；否则照常
+   * 重新进入 `evaluate(seq)` 收口。
+   */
+  private async rearmFromSpeakingMore(seq: number): Promise<void> {
+    if (this._phase !== 'speaking_more' || seq !== this.seq || this.disposed) {
+      return;
+    }
+    this.cancelSpeakingWatchdog();
+    this.sentenceVoicedAt = this.silence.lastVoicedAtMs;
+    this.setPhase('judging');
+    const yielded = await this.waitPendingDecode(seq);
+    if (yielded || this.isStaleEval(seq)) {
+      return;
+    }
+    await this.evaluate(seq);
+  }
+
   /** 判定当前这一轮是否定稿。 */
   private async evaluate(seq: number): Promise<void> {
     this.pendingTimer = null;
-    if (this.disposed || seq !== this.seq || !this.pendingText.trim()) {
+    if (this.isStaleEval(seq)) {
       return;
     }
+    this.setPhase('judging');
 
     const predict = this.options.predict;
     if (!predict) {
@@ -812,8 +963,8 @@ export class UtteranceAssembler {
     const probability = await this.takeProbability(seq, predict);
     const shown = probability < 0 ? '故障' : probability.toFixed(3);
 
-    // 等待期间用户又说了新的一句：那一轮已经重新排好，这里什么都不做
-    if (this.disposed || seq !== this.seq) {
+    // 等待期间用户又说了新的一句、或新语音迁入了 `speaking_more`：立刻让位
+    if (this.isStaleEval(seq)) {
       return;
     }
 
@@ -879,6 +1030,7 @@ export class UtteranceAssembler {
           p: probability, waitMs: wait, action: 'extend', why: 'silence',
           silenceMs: Math.round(quietNow),
         });
+        this.setPhase('extending');
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
         return;
       }
@@ -936,6 +1088,7 @@ export class UtteranceAssembler {
           `  判停    ${shown} → 太短且紧跟前一轮，再等 ${wait} ms`,
         );
         this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'short' });
+        this.setPhase('extending');
         this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
         return;
       }
@@ -962,6 +1115,7 @@ export class UtteranceAssembler {
     this.reportJudge({
       p: probability, waitMs: this.options.extendMs, action: 'extend', why: 'unsure', threshold,
     });
+    this.setPhase('extending');
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, this.options.extendMs);
   }
 
@@ -1035,13 +1189,106 @@ export class UtteranceAssembler {
   }
 
   /**
+   * 明确的语义 MORE 还能不能占这一拍。
+   *
+   * 调用方已经确认判定是 `'more'`（不是 `'end'` / `null` / `'timeout'`），
+   * 而且这段文字还没因语义延长过。静音天花板由调用方先挡掉。
+   *
+   * - `extensions > maxExtensions`：不许。已经越过拍数上限。
+   * - `extensions < maxExtensions` 且预算还没用完：可以（原行为）。
+   * - 否则（拍数刚用满，或 `overBudget()`）：只有 unsure 自己的等待已经盖住
+   *   **当前**预算，并且 `extensions <= maxExtensions`，才放行这一次。
+   *   当前预算是 {@link waitBudget}：普通句是 `waitBudgetMs`，序列句是
+   *   `waitBudgetSequenceMs`。静音闸门 / 短碎片把预算吃光的，不豁免。
+   *   `maxExtensions: 0` 时 unsure 一拍都不会发生，因此仍然立刻放行。
+   */
+  private semanticMoreAllowed(): boolean {
+    const limit = this.maxExtensionsNow();
+    if (this.extensions > limit) {
+      return false;
+    }
+    if (this.extensions < limit && !this.overBudget()) {
+      return true;
+    }
+    return this.extensions <= limit && this.unsureAteBudget();
+  }
+
+  /**
+   * unsure 分支累计的等待是否已经盖住当前预算。
+   *
+   * unsure 每拍加的就是 `extendMs`（见 `evaluate`）。这里不看 `waitedMs`：
+   * 静音闸门和短碎片也往里加，那些不算「预算被 unsure 吃掉」。
+   */
+  private unsureAteBudget(): boolean {
+    const budget = this.waitBudget();
+    if (budget <= 0 || this.unsureExtensions <= 0) {
+      return false;
+    }
+    return this.unsureExtensions * this.options.extendMs >= budget;
+  }
+
+  /**
+   * 静音上限：普通/完整句严格受 `maxOpenSilenceMs` 约束（0 额外延迟）；
+   * 仅当语义判停**明确确认** `'more'` 且宿主显式配置了更大的序列预算
+   * (`waitBudgetSequenceMs > maxOpenSilenceMs`) 时，采用序列预算作为天花板，
+   * 避免 `commit(150) + decode(230) + semantic(300) ≈ 680 ms` 把 `more` 压成死代码。
+   */
+  private silenceCapFor(semanticMore: boolean): number {
+    const base = this.options.maxOpenSilenceMs ?? 0;
+    if (base <= 0) {
+      return 0;
+    }
+    if (semanticMore) {
+      const sequenceBudget = this.options.waitBudgetSequenceMs ?? 0;
+      if (sequenceBudget > base) {
+        return sequenceBudget;
+      }
+    }
+    return base;
+  }
+
+  /**
+   * 语义 MORE 这一拍等多少。
+   *
+   * - 没给 `maxOpenSilenceMs`：`min(extendMs, shortFragmentWaitMs ?? 400)`；
+   * - 给了 `maxOpenSilenceMs` 但未配更大的 `waitBudgetSequenceMs`：
+   *   `min(shortFragmentWaitMs ?? 400, max(1, min(max(extendMs, 350), cap - quietNow)))`；
+   * - 显式配了更大的 `waitBudgetSequenceMs`（如 1200 > 650）：允许单拍等最多 550 ms
+   *   （仍严格受 `cap - quietNow` 夹住），足以接住 700–900 ms 的句中思考停顿，
+   *   且对完整句零额外延迟。调用方保证 `quietNow < cap`。
+   */
+  private semanticMoreWait(openSilenceCap: number, quietNow: number): number {
+    const fragmentCap = this.options.shortFragmentWaitMs ?? 400;
+    const baseCap = this.options.maxOpenSilenceMs ?? 0;
+    const sequenceBudget = this.options.waitBudgetSequenceMs ?? 0;
+    if (openSilenceCap > 0) {
+      const room = openSilenceCap - quietNow;
+      if (baseCap > 0 && sequenceBudget > baseCap) {
+        const want = Math.max(this.options.extendMs, 550);
+        return Math.max(1, Math.min(want, room));
+      }
+      // 350：见上面的说明。不要抽成 `*_MS` 常量 —— 扫描器会把它登记成新旋钮。
+      const want = Math.max(this.options.extendMs, 350);
+      return Math.min(fragmentCap, Math.max(1, Math.min(want, room)));
+    }
+    return Math.min(this.options.extendMs, fragmentCap);
+  }
+
+  /**
    * 「要不要开轮」的最后一道文本闸：语义判停说还有下文时再等一拍。
    *
-   * 三条硬边界：
+   * 硬边界：
    * - **只延长一次**（同一段文字）。多次延长等于把判停交给另一层，收益全是延迟。
-   * - 吃的是**既有的**拍数与总预算（`maxExtensionsNow()` / `overBudget()`），不新开账。
+   * - 拍数越过 `maxExtensions` 就放行。拍数刚用满或 `overBudget()` 时，只有
+   *   「unsure 吃光当前预算且 `extensions <= maxExtensions`」才再给这一次
+   *   （见 {@link semanticMoreAllowed}）。`end` / `null` / `timeout` 没有豁免。
+   * - **静音天花板谁都不许绕过**：`maxOpenSilenceMs > 0` 且已静音到顶，立刻放行。
+   *   `evaluate` 开头那道闸量的是进来之前；这里再量一次，是因为等语义回话的
+   *   那几百毫秒里静音还在涨。
    * - 等判停本身有上限（`semanticBudgetMs`）；等不到按「说完了」放行 —— 判停这层
    *   出问题绝不能把用户的话吞掉。
+   * - p ≥ {@link SEMANTIC_SKIP_P} 的完整句不等还没回来的语义（0 ms）。
+   *   `looksUnfinished` 的半句要等已经在飞的那趟。
    *
    * @returns 是否放行（`true` = 可以 `flush()`）
    */
@@ -1065,19 +1312,21 @@ export class UtteranceAssembler {
     } else if (this.hasPrefixEnd(text)) {
       // 定稿只是中间结果的收尾（多一两个标点）：前面那趟已经说「说完了」，别再问
       verdict = 'end';
-    } else if (probability >= SEMANTIC_SKIP_P) {
+    } else if (probability >= SEMANTIC_SKIP_P && !looksUnfinished(text)) {
       // 声学判据已经很有把握，**不再等**语义：真机 `20261123-051448` 里 p 到
       // 0.88–0.98 的几轮还各等了 256–324 ms，而全场语义一次没拦住 MORE —— 纯成本。
       // 只挡住「等」；说话期间已经发出去的那趟请求照旧（它与 ASR 并行，不要钱），
       // 所以上面那两条「已经回来的判定」仍然优先。
+      // 半句（`looksUnfinished`：的话 / 因为 / 如果 …）不走这里，改等已经在飞的
+      // 那趟，上限仍是 `semanticBudgetMs`。完整句维持 0 ms 放行。
       verdict = 'end';
     } else {
       verdict = await this.awaitSemantics(text);
     }
-    if (this.disposed || seq !== this.seq) {
-      // 等待期间又来了新的一句：那一轮已经重新排好，放行交给它（`flush` 自带
-      // 空文本保护，不会把新的一句误封出去）
-      return true;
+    if (this.isStaleEval(seq)) {
+      // 等待期间来了新句（`seq` 已变）或用户重新开口（`speaking_more`）：
+      // 必须返回 `false` 放弃本次提交，绝不能落进 `flushOrWait` 把新缓冲句提前冲掉。
+      return false;
     }
     if (verdict !== 'more') {
       if (verdict === 'timeout') {
@@ -1089,11 +1338,21 @@ export class UtteranceAssembler {
     if (this.semanticExtended === text) {
       return true;
     }
-    if (this.extensions >= this.maxExtensionsNow() || this.overBudget()) {
+    // 静音天花板：仅对明确 `more` 启用 `silenceCapFor(true)`；等语义的那一程不在
+    // `evaluate` 开头那道闸的量程里，所以这里用此刻的静音再判一次。
+    const openSilenceCap = this.silenceCapFor(true);
+    const quietNow = openSilenceCap > 0 ? this.now() - this.silence.lastVoicedAtMs : 0;
+    if (openSilenceCap > 0 && quietNow >= openSilenceCap) {
+      this.options.log(
+        `  判停    语义=还有下文，但静音 ${Math.round(quietNow)} ms ≥ 上限 ${openSilenceCap}，放行`,
+      );
+      return true;
+    }
+    if (!this.semanticMoreAllowed()) {
       this.options.log('  判停    语义=还有下文，但拍数/预算已经用完，放行');
       return true;
     }
-    const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);
+    const wait = this.semanticMoreWait(openSilenceCap, quietNow);
     this.semanticExtended = text;
     this.extensions += 1;
     this.waitedMs += wait;
@@ -1102,6 +1361,7 @@ export class UtteranceAssembler {
     );
     this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'meaning' });
     this.cancelTimer();
+    this.setPhase('extending');
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq); }, wait);
     return false;
   }
@@ -1123,21 +1383,14 @@ export class UtteranceAssembler {
   }
 
   /**
-   * 收下这一轮 —— 先等 ASR 手上那段解完（如果有的话）。
+   * 等待 ASR 手上在途解码结束（最多 `decodeWaitMs`）。
    *
-   * 不等会怎样：判停那一拍（静音 200–300 ms）常常早于解码（`commit→定稿` 261 ms），
-   * 于是拿**半句话**开轮；后半句解回来时状态机已经在播回执，它被当成插话，
-   * 一轮正确的回答就这么被自己掐掉（真机 `20261123-053719` 第 2 轮
-   * `audio_s=0.00 barge_in=1`，dsh 那份答案完全正确）。
-   *
-   * 等回来之后**不自己收**：那段定稿如果进了组装器，`seq` 已经变了 —— 新那拍
-   * 会拿拼齐的整句重新判定，这里直接放手。等超预算照常收（判停这层绝不能吞话）。
+   * @returns `true` 表示等待期间来了新句子（`seq` 已变）或状态已迁离/释放，调用方应直接让位。
    */
-  private async flushOrWait(seq: number): Promise<void> {
+  private async waitPendingDecode(seq: number): Promise<boolean> {
     const waiting = this.options.awaitDecode?.() ?? null;
     if (waiting === null) {
-      this.flush();
-      return;
+      return false;
     }
     const budget = this.options.decodeWaitMs ?? 240;
     const startedAt = this.now();
@@ -1151,17 +1404,35 @@ export class UtteranceAssembler {
       }
     });
     if (this.disposed) {
-      return;
+      return true;
     }
     const waited = this.now() - startedAt;
     this.waitedMs += waited;
-    if (seq !== this.seq) {
-      // 等回来了，而且那段定稿已经进过组装器（`seq` 变了）→ 新那拍会重新判定
-      this.options.log(`  判停    等解码 ${Math.round(waited)} ms，同一句又长了 → 重新判`);
-      return;
+    if (this.isStaleEval(seq)) {
+      if (seq !== this.seq) {
+        this.options.log(`  判停    等解码 ${Math.round(waited)} ms，同一句又长了 → 重新判`);
+      }
+      return true;
     }
     if (!decoded) {
       this.options.log(`  判停    等解码超 ${budget} ms，不再等（按当前文本收下）`);
+    }
+    return false;
+  }
+
+  /**
+   * 收下这一轮 —— 先等 ASR 手上那段解完（如果有的话）。
+   *
+   * 入口与等待结束都走 `isStaleEval(seq)` 守卫：绝不把后到新句或用户正在说话
+   * (`speaking_more`) 的缓冲句提前冲掉。
+   */
+  private async flushOrWait(seq: number): Promise<void> {
+    if (this.isStaleEval(seq)) {
+      return;
+    }
+    const yielded = await this.waitPendingDecode(seq);
+    if (yielded || this.isStaleEval(seq)) {
+      return;
     }
     this.flush();
   }

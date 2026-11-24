@@ -52,6 +52,19 @@ export interface QwenRealtimeAsrOptions {
   url?: string;
   model?: string;
   /**
+   * 静态热词，写入 `input_audio_transcription.corpus.text`。
+   *
+   * 缺省、或 trim 之后为空，则不增加这个字段（两个提示都空时连
+   * `input_audio_transcription` 都不出现）——旧的 `session.update` 必须保持原样。
+   * 实测这条偏置能把「显克微奇《奇主之声》」拉回「莱姆《其主之声》」，热路径不再多一次往返。
+   */
+  readonly corpusText?: string;
+  /**
+   * 识别语言，写入 `input_audio_transcription.language`。
+   * 同样：缺省或 trim 后为空就不写。
+   */
+  readonly language?: string;
+  /**
    * 端点（句尾）归谁判：
    *
    * - `manual`（默认）：`turn_detection: null`，我们发 `input_audio_buffer.commit`
@@ -288,6 +301,16 @@ export class QwenRealtimeAsr {
    */
   private startSession(): void {
     const vad = this.opts.turnDetection === 'vad';
+    const corpus = this.opts.corpusText?.trim() ?? '';
+    const lang = this.opts.language?.trim() ?? '';
+    // 两个都空就别加键。多写一个空的 input_audio_transcription 也会让旧报文对不上。
+    const transcription = (corpus !== '' || lang !== '')
+      ? {
+          model: this.opts.model ?? DEFAULT_MODEL,
+          ...(lang !== '' ? { language: lang } : {}),
+          ...(corpus !== '' ? { corpus: { text: corpus } } : {}),
+        }
+      : undefined;
     this.sendRaw({
       type: 'session.update',
       session: {
@@ -296,6 +319,7 @@ export class QwenRealtimeAsr {
         turn_detection: vad
           ? { type: 'server_vad', silence_duration_ms: this.opts.vadSilenceMs ?? 200 }
           : null,
+        ...(transcription ? { input_audio_transcription: transcription } : {}),
       },
     });
   }
@@ -597,6 +621,34 @@ export class QwenRealtimeAsr {
       this.opts.onError?.(new QwenRealtimeAsrError(`服务端错误: ${msg}`));
     }
   }
+}
+
+/**
+ * 多段热词文本收成一条给 `corpus.text` 的静态串。
+ *
+ * 先按行丢掉空行和 `#` 开头的注释，再按空白切词、去重，按第一次出现的顺序用单个空格拼上。
+ * 拼完超过 `maxChars` 就按字符截到这个上限（不加省略号，多一个字就超了）；
+ * 截断点正好落在分隔空格上时去掉末尾空格，不把半个分隔符送出去。
+ * 纯函数，不做文件 I/O。
+ */
+export function mergeCorpusText(parts: readonly string[], maxChars = 800): string {
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const part of parts) {
+    for (const rawLine of part.split(/\r\n|\n|\r/)) {
+      const line = rawLine.trim();
+      if (line === '' || line.startsWith('#')) continue;
+      for (const token of line.split(/\s+/)) {
+        if (token === '' || seen.has(token)) continue;
+        seen.add(token);
+        tokens.push(token);
+      }
+    }
+  }
+  const joined = tokens.join(' ');
+  if (maxChars <= 0 || joined === '') return '';
+  if (joined.length <= maxChars) return joined;
+  return joined.slice(0, maxChars).trimEnd();
 }
 
 /** 把 DashScope realtime 包成 {@link SttProvider}。 */

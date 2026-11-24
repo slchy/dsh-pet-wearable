@@ -1311,6 +1311,285 @@ test('定稿判了 MORE → 再等一拍，仍不重问', async () => {
   assert.equal(asked.length, 1, '同一段文字只问一趟');
 });
 
+// ---------------------------------------------------------------- 语义判停：半句要等、预算豁免、静音天花板
+//
+// 契约（eval-v1 S4，不要再放宽）：
+// 1. p ≥ 0.80 且 `looksUnfinished` 为假：不等还没回来的语义，0 额外延迟。
+//    判定已经在手上（settled / 前缀）时仍按原样用，不把这条捷径提前。
+// 2. p ≥ 0.80 且 `looksUnfinished`：等已经在飞的 semanticEndpoint，上限 semanticBudgetMs。
+//    end / null / timeout → 放行；明确 more → 再等一拍。
+// 3. 这一拍在没设 maxOpenSilenceMs 时仍是 min(extendMs, shortFragmentWaitMs ?? 400)。
+//    设了天花板时是 max(1, min(max(extendMs, 350), cap - quietNow))，再被
+//    shortFragmentWaitMs（默认 400）夹住。quietNow ≥ cap 立刻放行，不许绕过。
+// 4. unsure 吃光当前预算（waitBudget()）且 extensions ≤ maxExtensions 时，
+//    明确 more 仍给这一次。extensions 已经越过上限，或预算是静音闸门 / 短碎片
+//    吃掉的，不豁免。maxExtensions 为 0（unsure 一拍都不会发生）仍然立刻放行。
+
+test('半句即使 p≥0.80 也要等在飞的语义；MORE 再等一拍', async () => {
+  let release: (verdict: 'more') => void = () => {};
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 40,
+    maxExtensions: 2,
+    predict: async () => 0.977,
+    semanticEndpoint: () => new Promise<'more'>((resolve) => { release = resolve; }),
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+  try {
+    assembler.addSentence('实在不甘心的话。');
+    await delay(30);
+    assert.equal(utterances.length, 0, '以「的话」结尾不能因 p 高就跳过语义');
+    release('more');
+    await delay(15);
+    assert.equal(utterances.length, 0, '明确 MORE 要再等一拍');
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 1);
+    await delay(70);
+    assert.equal(utterances.length, 1, '等完这一拍必须收下');
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 1, '同一段只延长一次');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('半句等高 p 的语义 END 时放行，不再多等一拍', async () => {
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    predict: async () => 0.873,
+    semanticEndpoint: async () => {
+      await delay(80);
+      return 'end';
+    },
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+  try {
+    assembler.addSentence('如果明天下午不下雨的话。');
+    await delay(30);
+    assert.equal(utterances.length, 0, '半句要等在飞的语义，不能先开轮');
+    await delay(120);
+    assert.equal(utterances.length, 1, 'END 回来后照常收下');
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 0, 'END 不占语义延长');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('半句等语义超时按说完了放行，不卡住开轮', async () => {
+  const { assembler, utterances } = makeAssembler({
+    predict: async () => 0.95,
+    semanticEndpoint: () => new Promise<'end' | 'more' | null>(() => {}),
+    semanticBudgetMs: 30,
+  });
+  try {
+    const startedAt = Date.now();
+    assembler.addSentence('因为');
+    await delay(80);
+    assert.equal(utterances.length, 1, '超时必须放行');
+    assert.ok(Date.now() - startedAt < 250, '超时按 semanticBudgetMs 走');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('完整句 p≥0.80 时不等还在飞的语义，0 额外延迟', async () => {
+  let resolved = false;
+  let late: ReturnType<typeof setTimeout> | undefined;
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    predict: async () => 0.977,
+    semanticBudgetMs: 400,
+    semanticEndpoint: () => new Promise<'more'>((resolve) => {
+      late = setTimeout(() => { resolved = true; resolve('more'); }, 400);
+    }),
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+  try {
+    const startedAt = Date.now();
+    assembler.addSentence('今天天气真不错。');
+    await delay(40);
+    const elapsed = Date.now() - startedAt;
+    assert.equal(utterances.length, 1, '完整句该直接收下');
+    assert.equal(resolved, false, '不该等语义那一趟回来');
+    assert.ok(elapsed < 250, `不该付出语义往返，实际 ${elapsed} ms`);
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 0);
+  } finally {
+    if (late !== undefined) clearTimeout(late);
+    assembler.dispose();
+  }
+});
+
+test('unsure 吃光 waitBudget 后，明确 MORE 仍给一次（拍数刚用满也行）', async () => {
+  const facts: Array<{ why?: string; waitedMs?: number }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 40,
+    maxExtensions: 1,
+    maxUnsureExtensions: 1,
+    waitBudgetMs: 40,
+    predict: async () => 0.022,
+    semanticEndpoint: async () => 'more',
+    onJudge: (fact) => { facts.push({ why: fact.why, waitedMs: fact.waitedMs }); },
+  });
+  try {
+    assembler.addSentence('我觉得这件事吧。');
+    await delay(160);
+    assert.equal(utterances.length, 1, '延长这一次之后必须收下');
+    assert.equal(facts.filter((f) => f.why === 'unsure').length, 1, 'unsure 先吃掉那 40 ms');
+    const meaning = facts.filter((f) => f.why === 'meaning');
+    assert.equal(meaning.length, 1, '预算被 unsure 吃光时 MORE 仍要再等');
+    assert.ok((meaning[0]?.waitedMs ?? 0) > 40, '这一拍落在预算用完之后');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('maxExtensions 为 0 时 MORE 不能靠预算豁免再等', async () => {
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    maxExtensions: 0,
+    waitBudgetMs: 40,
+    extendMs: 40,
+    predict: async () => 0.022,
+    semanticEndpoint: async () => 'more',
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+  try {
+    assembler.addSentence('我觉得这件事吧。');
+    await delay(30);
+    assert.equal(utterances.length, 1, '拍数是 0 时 unsure 不会发生，MORE 立刻放行');
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 0);
+    assert.equal(facts.filter((f) => f.why === 'unsure').length, 0);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('预算被静音闸门吃光时，语义 MORE 不豁免', async () => {
+  let clock = 1_000;
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 400,
+    extendMs: 40,
+    maxExtensions: 4,
+    waitBudgetMs: 40,
+    now: () => clock,
+    predict: async () => 0.9,
+    semanticEndpoint: async () => 'more',
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+  try {
+    clock = 1_000;
+    assembler.addAudio(voiced());
+    clock = 1_020;
+    assembler.addAudio(voiced());
+    clock = 1_040;
+    assembler.addSentence('把灯关掉。');
+    await delay(120);
+    assert.equal(utterances.length, 1, '静音闸门吃光预算后必须放行');
+    assert.equal(facts.filter((f) => f.why === 'silence').length, 1);
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 0, '不是 unsure 吃掉的预算，不豁免');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('没设静音天花板时，MORE 这一拍仍是 min(extendMs, shortFragment)，不抬到 350', async () => {
+  const facts: Array<{ why?: string; waitMs: number }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 200,
+    maxExtensions: 2,
+    shortFragmentWaitMs: 400,
+    predict: async () => 0.5,
+    semanticEndpoint: async () => 'more',
+    onJudge: (fact) => { facts.push({ why: fact.why, waitMs: fact.waitMs }); },
+  });
+  try {
+    assembler.addSentence('你帮我讲讲那本书里。');
+    await delay(30);
+    assert.equal(utterances.length, 0);
+    const meaning = facts.filter((f) => f.why === 'meaning');
+    assert.equal(meaning.length, 1);
+    assert.equal(meaning[0]?.waitMs, 200, '没给天花板时不改用 350');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('设了静音天花板时，MORE 这一拍取 max(extendMs, 350) 并夹在剩余额度与碎片上限里', async () => {
+  const run = async (
+    quietMs: number,
+    shortFragmentWaitMs: number | undefined,
+    extendMs: number,
+  ): Promise<number | undefined> => {
+    let clock = 5_000;
+    const facts: Array<{ why?: string; waitMs: number }> = [];
+    const { assembler } = makeAssembler({
+      extendMs,
+      maxExtensions: 3,
+      maxOpenSilenceMs: 650,
+      ...(shortFragmentWaitMs === undefined ? {} : { shortFragmentWaitMs }),
+      silenceDb: -40,
+      now: () => clock,
+      predict: async () => 0.5,
+      semanticEndpoint: async () => 'more',
+      onJudge: (fact) => { facts.push({ why: fact.why, waitMs: fact.waitMs }); },
+    });
+    try {
+      assembler.addAudio(voiced());
+      clock = 5_020;
+      assembler.addAudio(voiced());
+      clock = 5_020 + quietMs;
+      assembler.addSentence('你帮我讲讲那本书里。');
+      await delay(30);
+      return facts.find((f) => f.why === 'meaning')?.waitMs;
+    } finally {
+      assembler.dispose();
+    }
+  };
+
+  assert.equal(await run(100, 400, 200), 350, '剩余额度够时用 max(extendMs, 350)');
+  assert.equal(await run(400, 400, 200), 250, '不超过 cap - quietNow（650-400）');
+  assert.equal(await run(100, 100, 200), 100, '再被 shortFragmentWaitMs 夹住');
+  assert.equal(await run(0, undefined, 500), 400, 'extendMs 大于 350 时仍不超碎片默认 400');
+});
+
+test('等语义期间静音到顶，明确 MORE 也不再延长', async () => {
+  let clock = 5_000;
+  let release: (verdict: 'more') => void = () => {};
+  let markPredict: () => void = () => {};
+  const predictEntered = new Promise<void>((resolve) => { markPredict = resolve; });
+  const facts: Array<{ why?: string }> = [];
+  const { assembler, utterances } = makeAssembler({
+    extendMs: 200,
+    maxExtensions: 3,
+    maxOpenSilenceMs: 300,
+    silenceDb: -40,
+    now: () => clock,
+    predict: async () => {
+      markPredict();
+      return 0.95;
+    },
+    semanticEndpoint: () => new Promise<'more'>((resolve) => { release = resolve; }),
+    onJudge: (fact) => { facts.push({ why: fact.why }); },
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock = 5_020;
+    assembler.addAudio(voiced());
+    clock = 5_120; // 静音 100 ms，低于上限 300
+    assembler.addSentence('实在不甘心的话。');
+    await predictEntered;
+    await delay(0); // 让 evaluate 通过开头的天花板检查，停在等语义
+    assert.equal(utterances.length, 0, '还在等语义，不该先开轮');
+    clock = 5_020 + 400; // 等的过程中静音越过上限
+    release('more');
+    await delay(30);
+    assert.equal(utterances.length, 1, '到顶必须放行');
+    assert.equal(facts.filter((f) => f.why === 'meaning').length, 0, '到顶后不许再延一拍');
+  } finally {
+    assembler.dispose();
+  }
+});
+
 // ------------------------------------------------ 声学前端统一入口（AudioFrame）
 //
 // 能量门已经算过 `voiced`，组装器不该再按能量算一遍：同一段音频在门与判停两处
@@ -1469,4 +1748,375 @@ test('语义判停缓存只留最近 8 条：陈旧的前缀判定不许复用�
   } finally {
     assembler.dispose();
   }
+});
+
+// ------------------------------------------------ 有限状态与物理不变量（FSM 收口）
+//
+// 守三条硬不变量：
+// 1. 预算耗尽（`overBudget`）只限制「安静时多等几拍」，绝不能盖过「人此刻正在说话」：
+//    缓冲句非空期间收到去抖后的真实新语音，必迁入 `speaking_more` 并取消在途定时器。
+// 2. 任何异步恢复点（`takeProbability` / `awaitSemantics` / `awaitDecode`）醒来见到
+//    `speaking_more` 或 `seq` 变更都必须让位，绝不拿旧判定冲掉新句或截断说话。
+// 3. 活性保证：清嗓子/空解码在静音达标后退出 `speaking_more` 并先等在途解码再收口；
+//    彻底停帧也有兜底定时器；`disposed` 为吸收态。
+
+test('FSM 不变量 1a（s1_act_01/s2_asr_04 复现）：静音闸耗光预算后用户仍在说话，绝不中途截断', async () => {
+  let clock = 1_000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 300,
+    extendMs: 40,
+    waitBudgetMs: 40,
+    maxExtensions: 4,
+    now: () => clock,
+    predict: async () => 0.92,
+  });
+  try {
+    // 前半句停嘴后 10 ms 收到定稿（用户其实已开口说后半句）
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 10;
+    assembler.addSentence('记一下。');
+    await delay(5);
+    assert.equal(assembler.phase, 'extending', '静音不够，进入 extending 且吃光 40 ms 预算');
+    assert.equal(utterances.length, 0);
+
+    // 预算虽已耗光，但用户正在持续发声：必须迁入 speaking_more，绝不放行「记一下。」
+    for (let i = 0; i < 6; i += 1) {
+      clock += 20;
+      assembler.addAudio(voiced());
+    }
+    assert.equal(assembler.phase, 'speaking_more');
+    await delay(80); // 远超原来的 40 ms 延长定时器
+    assert.equal(utterances.length, 0, '用户正在说话期间绝对不能提交旧缓冲句');
+
+    // 后半句停嘴、定稿并段
+    for (let i = 0; i < 16; i += 1) {
+      clock += 20;
+      assembler.addAudio(silent(20));
+    }
+    assembler.addSentence('我明天下午三点要开会。');
+    await delay(30);
+    assert.deepEqual(utterances.map((u) => u.text), ['记一下。我明天下午三点要开会。']);
+    assert.equal(assembler.phase, 'idle');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 不变量 1b（s4_p_300 复现）：semantic=more 续等期间用户重新开口，取消旧定时器并并句', async () => {
+  let clock = 2_000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 300,
+    extendMs: 40,
+    waitBudgetMs: 40,
+    maxExtensions: 2,
+    maxUnsureExtensions: 1,
+    now: () => clock,
+    predict: async () => 0.02,
+    semanticEndpoint: async () => 'more',
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 340; // 静音已过 openQuiet，先走 unsure 吃光预算，再走 semantic=more
+    assembler.addSentence('我觉得这件事吧。');
+    await delay(60);
+    assert.equal(assembler.phase, 'extending', 'semantic=more 应进入 extending');
+    assert.equal(utterances.length, 0);
+
+    // 续等期间用户开口说后半句
+    for (let i = 0; i < 4; i += 1) {
+      clock += 20;
+      assembler.addAudio(voiced());
+    }
+    assert.equal(assembler.phase, 'speaking_more');
+    await delay(80);
+    assert.equal(utterances.length, 0, '续等定时器已被取消，不许把前半句误提交');
+
+    for (let i = 0; i < 18; i += 1) {
+      clock += 20;
+      assembler.addAudio(silent(20));
+    }
+    assembler.addSentence('最后还是得靠自己。');
+    await delay(100);
+    assert.deepEqual(utterances.map((u) => u.text), ['我觉得这件事吧。最后还是得靠自己。']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 不变量 1c（s4_p_500 复现）：awaitSemantics 期间用户重新开口，即使超时/END 也不许提交', async () => {
+  let clock = 3_000;
+  let release: (verdict: 'end' | 'more' | null) => void = () => {};
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 200,
+    extendMs: 40,
+    maxExtensions: 2,
+    now: () => clock,
+    predict: async () => 0.97,
+    semanticBudgetMs: 200,
+    semanticEndpoint: () => new Promise<'end' | 'more' | null>((r) => { release = r; }),
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 350;
+    assembler.addSentence('实在不甘心的话。');
+    await delay(10);
+    assert.equal(assembler.phase, 'judging', '半句正在等语义判停');
+
+    // 在等语义期间用户开始说后半句
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.phase, 'speaking_more');
+
+    // 即使语义此刻回 END（或超时），也不能把前半句冲出去
+    release('end');
+    await delay(30);
+    assert.equal(utterances.length, 0, 'speaking_more 下迟到的语义回执必须让位');
+
+    for (let i = 0; i < 12; i += 1) {
+      clock += 20;
+      assembler.addAudio(silent(20));
+    }
+    assembler.addSentence('可以再试一次。');
+    await delay(30);
+    assert.deepEqual(utterances.map((u) => u.text), ['实在不甘心的话可以再试一次。']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 并发守卫：awaitSemantics 期间新 addSentence 到达，旧协程返回不得误冲新句', async () => {
+  let releaseFirst: (verdict: 'end') => void = () => {};
+  let call = 0;
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 80,
+    predict: async () => 0.5,
+    semanticEndpoint: () => {
+      call += 1;
+      if (call === 1) {
+        return new Promise<'end'>((r) => { releaseFirst = r; });
+      }
+      return new Promise<'end'>(() => {}); // 第二句故意挂住，用来验证旧协程不会提前冲掉它
+    },
+    semanticBudgetMs: 200,
+  });
+  try {
+    assembler.addSentence('前半句');
+    await delay(95); // 第一句进入 awaitSemantics
+    assert.equal(assembler.phase, 'judging');
+
+    // 第二句到达，seq 递增，并重新进入 80 ms quietMs
+    assembler.addSentence('后半句');
+    assert.equal(assembler.phase, 'armed');
+
+    // 第一句的语义此时返回：旧协程必须放弃，绝不能把「前半句后半句」在 quietMs 内冲掉
+    releaseFirst('end');
+    await delay(20);
+    assert.equal(utterances.length, 0, '旧协程见到 seq 变更必须返回 false，不能误调 flush()');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 活性 1：speaking_more 后只是清嗓子无新定稿，静音达标后自动收口不吞话', async () => {
+  let clock = 4_000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 120,
+    extendMs: 20,
+    maxExtensions: 2,
+    now: () => clock,
+    predict: async () => 0.99,
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 40;
+    assembler.addSentence('把灯关掉。');
+    await delay(5);
+
+    // 清嗓子触发 speaking_more，但 ASR 没有吐新定稿
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.phase, 'speaking_more');
+
+    // 连续静音达标（≥ 120 ms）后退出 speaking_more 并正常收下原句
+    for (let i = 0; i < 7; i += 1) {
+      clock += 20;
+      assembler.addAudio(silent(20));
+    }
+    await delay(30);
+    assert.deepEqual(utterances.map((u) => u.text), ['把灯关掉。']);
+    assert.equal(assembler.phase, 'idle');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 活性 2：speaking_more 退出前先等 awaitDecode，等来新定稿时不浪费旧 predict', async () => {
+  let clock = 5_000;
+  let releaseDecode: () => void = () => {};
+  let decoding = false;
+  let predictCalls = 0;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 120,
+    sttCommitAfterMs: 80,
+    extendMs: 20,
+    maxExtensions: 2,
+    decodeWaitMs: 200,
+    now: () => clock,
+    predict: async () => {
+      predictCalls += 1;
+      return 0.99;
+    },
+    awaitDecode: () => (decoding ? new Promise<void>((r) => { releaseDecode = r; }) : null),
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 40;
+    assembler.addSentence('请检查订单号');
+    await delay(5);
+    const beforeCalls = predictCalls;
+
+    // 说话进入 speaking_more
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.phase, 'speaking_more');
+
+    // 停嘴后 ASR 正在解码后半句
+    decoding = true;
+    for (let i = 0; i < 7; i += 1) {
+      clock += 20;
+      assembler.addAudio(silent(20));
+    }
+    await delay(10);
+    assert.equal(predictCalls, beforeCalls, '退出 speaking_more 应先等解码，不要先白跑旧句的 predict');
+    assert.equal(utterances.length, 0);
+
+    // 解码完成并送入后半句
+    decoding = false;
+    assembler.addSentence('W8665881');
+    releaseDecode();
+    await delay(30);
+    assert.deepEqual(utterances.map((u) => u.text), ['请检查订单号W8665881']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 活性 3：speaking_more 后彻底断流停帧，兜底定时器保证不死锁', async () => {
+  let clock = 6_000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 100,
+    extendMs: 20,
+    maxExtensions: 2,
+    now: () => clock,
+    predict: async () => 0.99,
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addSentence('今天天气不错。');
+    await delay(5);
+
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.phase, 'speaking_more');
+
+    // 模拟设备断流/能量门关闭：之后再无任何帧，把时钟拨过 openQuiet 后等兜底唤醒
+    clock += 200;
+    await delay(420);
+    assert.deepEqual(utterances.map((u) => u.text), ['今天天气不错。']);
+    assert.equal(assembler.phase, 'idle');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 语义 MORE 与序列上限（s4_p_700/s4_p_900）：配了序列预算时接住 900 ms 停顿，完整句零开销', async () => {
+  let clock = 7_000;
+  const facts: Array<{ why?: string; waitMs: number }> = [];
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    openQuietMs: 300,
+    openQuietShortMs: 200,
+    extendMs: 200,
+    maxExtensions: 3,
+    waitBudgetMs: 200,
+    waitBudgetSequenceMs: 1_200,
+    maxOpenSilenceMs: 650,
+    now: () => clock,
+    predict: async () => 0.92,
+    semanticEndpoint: async (text) => (text.includes('公园') ? 'end' : 'more'),
+    onJudge: (f) => { facts.push({ why: f.why, waitMs: f.waitMs }); },
+  });
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 640; // 定稿+语义返回后静音已到 640 ms（距普通 650 上限仅剩 10 ms）
+    assembler.addSentence('如果明天下午不下雨的话。');
+    await delay(20);
+    assert.equal(utterances.length, 0, '明确 MORE 在 1200 ms 序列上限内应给足续等窗口');
+    const meaning = facts.find((f) => f.why === 'meaning');
+    assert.ok(meaning !== undefined && meaning.waitMs >= 500, `期望给足 ≥500 ms 续等，实际 ${meaning?.waitMs}`);
+
+    // 900 ms 停顿后用户继续说后半句
+    clock += 260;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.phase, 'speaking_more');
+
+    clock += 350;
+    assembler.addSentence('我们就去公园走一圈。');
+    await delay(20);
+    assert.deepEqual(utterances.map((u) => u.text), ['如果明天下午不下雨的话我们就去公园走一圈。']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('FSM 吸收态：dispose 之后任何输入均不可离开 disposed 或再发射定稿', async () => {
+  let clock = 8_000;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    now: () => clock,
+  });
+  assembler.addSentence('半句话');
+  assembler.dispose();
+  assert.equal(assembler.phase, 'disposed');
+
+  clock += 20;
+  assembler.addAudio(voiced());
+  clock += 20;
+  assembler.addAudio(voiced());
+  assembler.addSentence('后续');
+  assembler.flush();
+  await delay(50);
+  assert.equal(assembler.phase, 'disposed');
+  assert.equal(utterances.length, 0);
 });

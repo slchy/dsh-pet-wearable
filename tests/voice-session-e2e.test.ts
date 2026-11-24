@@ -500,12 +500,18 @@ function wireLive(
   tts: TtsProvider,
   stt: SttProvider,
   factory: RealtimeSocketFactory,
+  shadow?: Partial<NonNullable<VoiceSessionOptions['omniShadow']>>,
 ): VoiceSessionOptions {
   const live = new LiveOrchestrator({ inner: dsh, tts, log: () => {} });
   return sessionOptions(live, stt, tts, {
     pipelineMode: 'live',
     engine: live.toEngine(),
-    omniShadow: { apiKey: 'test-key', serve: 'full', socketFactory: factory },
+    omniShadow: {
+      apiKey: 'test-key',
+      serve: 'full',
+      socketFactory: factory,
+      ...shadow,
+    },
     speakAnnounce: (item, play) => live.speakBackgroundReport(item, play),
     cancelAnnounce: () => { live.cancelBackgroundSpeech(); },
     onFallbackAnnounceSpoken: (item, interrupted) => {
@@ -521,6 +527,140 @@ function wireLive(
 function readyOmni(socket: FakeSocket): void {
   socket.open();
   socket.message({ type: 'session.updated' });
+}
+
+interface Serving {
+  readonly done: Promise<number>;
+  readonly voicePort: number;
+  readonly controlPort: number;
+  stop(): Promise<number>;
+}
+
+/**
+ * `serve` 常驻：第一条 TCP 断开后监听还在，才能用同一份 LiveOrchestrator 接第二条。
+ * 停机只走 `onListening` 交出来的 `stop`。
+ */
+async function bootServing(options: VoiceSessionOptions): Promise<Serving> {
+  const spy = installPortSpy();
+  // 闭包里赋值的 `let` 在 catch 里会被收成 `never`，所以停机入口放在对象上。
+  const stopper: { stop: (() => void) | null } = { stop: null };
+  const done = runVoiceServer({
+    ...options,
+    serve: true,
+    onListening: (info) => {
+      stopper.stop = info.stop;
+      options.onListening?.(info);
+    },
+  });
+  const halt = (): void => {
+    stopper.stop?.();
+  };
+  try {
+    await waitFor('监听端口', () => spy.ports.control !== 0 && spy.ports.voice !== 0, 2_000);
+    const voicePort = spy.ports.voice;
+    const controlPort = spy.ports.control;
+    return {
+      done,
+      voicePort,
+      controlPort,
+      async stop() {
+        halt();
+        const code = await Promise.race([
+          done,
+          delay(2_000).then(() => -1),
+        ]);
+        if (code === -1) {
+          throw new Error('runVoiceServer 没有退出');
+        }
+        return code;
+      },
+    };
+  } catch (error) {
+    halt();
+    await Promise.race([done.then(() => undefined), delay(1_500)]);
+    throw error;
+  } finally {
+    spy.restore();
+  }
+}
+
+async function openClient(port: number): Promise<V2Client> {
+  const client = await V2Client.connect(port);
+  client.sendHello();
+  await waitFor('Welcome', () => client.welcome, 1_000);
+  return client;
+}
+
+/** 旧连接的 `onClose` 跑完才会把控制口摘成 503。 */
+async function waitNoDevice(port: number): Promise<void> {
+  const deadline = Date.now() + 1_500;
+  while (Date.now() <= deadline) {
+    const caps = await httpText(port, 'GET', '/capabilities');
+    if (caps.status === 503) {
+      return;
+    }
+    await delay(10);
+  }
+  throw new Error('超时：旧连接还占着控制口');
+}
+
+interface SessionUpdate {
+  readonly type: string;
+  readonly session?: {
+    readonly instructions?: string;
+    readonly input_audio_transcription?: {
+      readonly model?: string;
+      readonly language?: string;
+      readonly corpus?: { readonly text?: string };
+    };
+  };
+}
+
+function sessionUpdateOf(socket: FakeSocket): SessionUpdate {
+  const found = socket.sent.find((msg) => msg.type === 'session.update');
+  if (found === undefined) {
+    throw new Error('没有 session.update');
+  }
+  return found as SessionUpdate;
+}
+
+/**
+ * 一句要查外部信息的话：垫音走假 WS，dsh 的结论再从同一条 WS 念出来。
+ * `response.create` 按进入本函数时的计数再加两笔（用户轮 + 汇报）。
+ */
+async function liveDelegatedTurn(
+  stt: ScriptedStt,
+  socket: FakeSocket,
+  client: V2Client,
+  text: string,
+  lead: Buffer,
+  report: Buffer,
+  speech: string,
+): Promise<void> {
+  client.sendPcm(SILENCE);
+  const creates = socket.count('response.create');
+  const user = fulfillUserTurn(socket, client, lead, () => {
+    socket.message({
+      type: 'response.function_call_arguments.done',
+      arguments: JSON.stringify({ request: text, reason: '需要外部信息' }),
+    });
+  });
+  const background = (async () => {
+    await waitFor(
+      `${text} 后台 response.create`,
+      () => socket.count('response.create') >= creates + 2,
+      2_500,
+    );
+    await waitFor(`${text} 汇报提示`, () => socket.textIncludes(speech), 1_000);
+    socket.message({ type: 'response.audio_transcript.delta', delta: speech });
+    socket.message({ type: 'response.audio.delta', delta: report.toString('base64') });
+    await waitFor(`${text} 汇报 PCM`, () => client.hasBytes(report), 1_500);
+    socket.message({ type: 'response.done', response: { status: 'completed' } });
+  })();
+  await userSays(stt, client, text);
+  await user;
+  client.sendPlayed();
+  await background;
 }
 
 /** 等真封段发出 response.create，再回音频；TCP 上看到字节之后才 response.done。 */
@@ -761,6 +901,137 @@ describe('VoiceConnection 本地回环', { concurrency: false }, () => {
       assert.equal(session.client.audioBytes(), heard);
       assert.equal(session.client.countOp('listen.start'), 0);
     } finally {
+      await session.stop();
+    }
+  });
+
+  test('Live：session.update 带上日期、长期记忆和 ASR 热词', async () => {
+    const stt = new ScriptedStt();
+    const ttsTexts: string[] = [];
+    const dsh = makeDsh(async () => ({ text: '不该出现', speech: '不该出现' }));
+    const dateLine = '当前日期：2026年11月24日 星期二（北京时间）';
+    let memoryReads = 0;
+    let clockReads = 0;
+    const box: { socket: FakeSocket | null } = { socket: null };
+    const session = await boot(wireLive(
+      dsh.agent,
+      makeTts(ttsTexts, false),
+      stt,
+      () => {
+        const created = new FakeSocket();
+        box.socket = created;
+        return created;
+      },
+      {
+        memoryContext: () => {
+          memoryReads += 1;
+          return '对花生过敏';
+        },
+        clockContext: () => {
+          clockReads += 1;
+          return dateLine;
+        },
+        asrCorpusText: '眼镜',
+        asrLanguage: 'zh',
+      },
+    ));
+    try {
+      const socket = box.socket;
+      if (socket === null) {
+        throw new Error('omni socket 没建出来');
+      }
+      assert.equal(memoryReads, 1, '记忆函数在构造影子时调用一次');
+      assert.equal(clockReads, 0, '日期函数要留给 session.update');
+      readyOmni(socket);
+      assert.equal(memoryReads, 1);
+      assert.equal(clockReads, 1);
+      const update = sessionUpdateOf(socket);
+      const instructions = update.session?.instructions ?? '';
+      assert.ok(instructions.includes('【当前日期参考】'), instructions);
+      assert.ok(instructions.includes(dateLine), instructions);
+      assert.ok(instructions.includes('【关于哥的已知长期记忆（仅供如实回答，不要主动复述）】'), instructions);
+      assert.ok(instructions.includes('对花生过敏'), instructions);
+      assert.deepEqual(update.session?.input_audio_transcription, {
+        model: 'qwen3-asr-flash-realtime',
+        language: 'zh',
+        corpus: { text: '眼镜' },
+      });
+      assert.deepEqual(ttsTexts, []);
+      assert.equal(dsh.calls.length, 0);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  test('Live：重连后 turn=1 的委派不被上一条连接的 byTurn 吞掉', async () => {
+    const stt = new ScriptedStt();
+    const ttsTexts: string[] = [];
+    const dsh = makeDsh(async (text) => {
+      await delay(40);
+      if (text.includes('股价')) {
+        return { text: '股价是一百', speech: '股价是一百' };
+      }
+      return { text: '外面在下雨', speech: '外面在下雨' };
+    });
+    const sockets: FakeSocket[] = [];
+    const session = await bootServing(wireLive(
+      dsh.agent,
+      makeTts(ttsTexts, false),
+      stt,
+      () => {
+        const created = new FakeSocket();
+        sockets.push(created);
+        return created;
+      },
+    ));
+    let second: V2Client | null = null;
+    try {
+      const first = await openClient(session.voicePort);
+      const socket1 = sockets[0];
+      if (socket1 === undefined) {
+        throw new Error('omni socket 没建出来');
+      }
+      readyOmni(socket1);
+      await liveDelegatedTurn(
+        stt,
+        socket1,
+        first,
+        '今天天气怎么样',
+        Buffer.alloc(960, 0x33),
+        Buffer.alloc(960, 0x22),
+        '外面在下雨',
+      );
+      const afterFirst = dsh.calls.length;
+      assert.ok(afterFirst >= 1);
+      assert.ok(dsh.calls.some((call) => call.text.includes('今天天气怎么样')));
+
+      first.socket.destroy();
+      await waitFor('第一条断开', () => first.closed, 1_000);
+      await waitNoDevice(session.controlPort);
+
+      second = await openClient(session.voicePort);
+      assert.equal(sockets.length, 2, '重连要新建一条 omni 连接');
+      const socket2 = sockets[1];
+      if (socket2 === undefined) {
+        throw new Error('重连后 omni socket 没建出来');
+      }
+      readyOmni(socket2);
+      await liveDelegatedTurn(
+        stt,
+        socket2,
+        second,
+        '今天股价多少',
+        Buffer.alloc(960, 0x55),
+        Buffer.alloc(960, 0x66),
+        '股价是一百',
+      );
+      const secondCalls = dsh.calls.slice(afterFirst);
+      assert.ok(secondCalls.length >= 1, '第二条连接的 turn=1 必须再叫一次 dsh');
+      assert.ok(secondCalls.some((call) => call.text.includes('今天股价多少')));
+      assert.ok(second.hasBytes(Buffer.alloc(960, 0x66)));
+      assert.deepEqual(ttsTexts, []);
+    } finally {
+      second?.socket.destroy();
       await session.stop();
     }
   });

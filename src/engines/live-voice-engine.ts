@@ -14,16 +14,26 @@
  * （`OmniShadow` 的读端会挂在 `waitLive()` 上，最长 5 s）。
  */
 import type { AudioFrame, EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
-import type { FastLaneAudioLane, InjectKind } from '../providers.ts';
+import type { AgentAudioAnswer, FastLaneAudioLane, InjectKind } from '../providers.ts';
 
 /**
  * Live 需要的车道：`providers.ts` 那条 + 上行音频入口。
  *
  * `feed` 是可选的：`OmniShadow` 天然满足；测试里的假车道可以只实现 `claim()`，
  * 内核照样能把一轮跑完（只是没有音频可识别）。
+ *
+ * `canAnswerText` / `answerFromText` 也是可选的：这一轮没有封段（`willServe()`
+ * 为假）但连接还健康时，编排器用它们按用户文本直答，而不是误降级去同步问 dsh。
  */
 export interface LiveAudioLane extends FastLaneAudioLane {
   feed?(pcm: Buffer, voiced?: boolean): void;
+  /** 连接还在、手里没有在途回复，可以按文本开口。 */
+  canAnswerText?(): boolean;
+  /**
+   * 同一条会话按用户文本直接答。`null` = 此刻真的答不了（断线或正忙）。
+   * 返回的活流与 `claim()` 同一形状：`chunks` / `transcript` / `delegateReason` / `delegateText`。
+   */
+  answerFromText?(userText: string): AgentAudioAnswer | null;
 }
 
 /**
@@ -59,6 +69,61 @@ function abortGate(signal: AbortSignal): AbortGate {
   };
 }
 
+/**
+ * 把一份已经拿到的 {@link AgentAudioAnswer} 收成和 `claim()` 成功后相同的事件流。
+ *
+ * `respond()` 走封段认领；编排器在没有封段时走 `answerFromText()`。两条都不能各写
+ * 一套「音频 / 转写增量 / tool_call」，否则文本兜底会漏掉 `delegate` 或中止竞速。
+ */
+export async function* streamLiveAnswer(
+  answer: AgentAudioAnswer,
+  signal: AbortSignal,
+): AsyncGenerator<EngineEvent> {
+  yield { type: 'meta', path: 'omni' };
+
+  const gate = abortGate(signal);
+  let said = 0;
+  const chunks = answer.chunks[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const step = chunks.next();
+      const winner = await Promise.race([step, gate.when]);
+      if (winner === null) {
+        // 中止：不再等下一块，也不再产事件 —— 这一轮的声音到此为止。
+        // 放弃 `step` 时要接住它后续的拒绝，否则会变成未处理的 rejection；
+        // `return()` 不 await：读端可能正挂在 `waitLive()` 上。
+        void Promise.resolve(step).catch(() => {});
+        void Promise.resolve(chunks.return?.()).catch(() => {});
+        return;
+      }
+      if (winner.done === true) {
+        break;
+      }
+      yield { type: 'audio', pcm: winner.value, sampleRate: answer.sampleRate };
+      // 转写是**活的**：随音频流增长。增长了多少就补多少文本增量。
+      const text = answer.transcript();
+      if (text.length > said) {
+        const delta = text.slice(said);
+        said = text.length;
+        yield { type: 'text', delta };
+      }
+    }
+  } finally {
+    gate.cancel();
+  }
+
+  if (signal.aborted) {
+    return;
+  }
+  // omni 自己决定转 dsh（`tool_call`）：音频可能已经说过一句垫话，照常播完了
+  const reason = answer.delegateReason?.() ?? null;
+  if (reason !== null) {
+    yield { type: 'delegate', reason, rewrittenQuery: answer.delegateText?.() ?? null };
+  }
+  const finalText = answer.transcript();
+  yield { type: 'done', fullText: finalText, speech: finalText };
+}
+
 export class LiveVoiceEngine implements FastVoiceEngine {
   readonly mode = 'live' as const;
 
@@ -89,49 +154,7 @@ export class LiveVoiceEngine implements FastVoiceEngine {
       return;
     }
     // 认领成功才报路径：内核不用再看引擎类型，就知道这轮是 omni 直出
-    yield { type: 'meta', path: 'omni' };
-
-    const gate = abortGate(signal);
-    let said = 0;
-    const chunks = answer.chunks[Symbol.asyncIterator]();
-    try {
-      for (;;) {
-        const step = chunks.next();
-        const winner = await Promise.race([step, gate.when]);
-        if (winner === null) {
-          // 中止：不再等下一块，也不再产事件 —— 这一轮的声音到此为止。
-          // 放弃 `step` 时要接住它后续的拒绝，否则会变成未处理的 rejection；
-          // `return()` 不 await：读端可能正挂在 `waitLive()` 上。
-          void Promise.resolve(step).catch(() => {});
-          void Promise.resolve(chunks.return?.()).catch(() => {});
-          return;
-        }
-        if (winner.done === true) {
-          break;
-        }
-        yield { type: 'audio', pcm: winner.value, sampleRate: answer.sampleRate };
-        // 转写是**活的**：随音频流增长。增长了多少就补多少文本增量。
-        const text = answer.transcript();
-        if (text.length > said) {
-          const delta = text.slice(said);
-          said = text.length;
-          yield { type: 'text', delta };
-        }
-      }
-    } finally {
-      gate.cancel();
-    }
-
-    if (signal.aborted) {
-      return;
-    }
-    // omni 自己决定转 dsh（`tool_call`）：音频可能已经说过一句垫话，照常播完了
-    const reason = answer.delegateReason?.() ?? null;
-    if (reason !== null) {
-      yield { type: 'delegate', reason, rewrittenQuery: answer.delegateText?.() ?? null };
-    }
-    const finalText = answer.transcript();
-    yield { type: 'done', fullText: finalText, speech: finalText };
+    yield* streamLiveAnswer(answer, signal);
   }
 
   abortSpeculation(reason: 'delegated' | 'superseded' | 'barge_in'): void {

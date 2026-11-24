@@ -433,8 +433,11 @@ test('needsVerbatimRead 只在必须逐字念的时候为真', () => {
   assert.equal(needsVerbatimRead('明天北京晴，12到22度'), false);
   assert.equal(needsVerbatimRead('已经帮你把闹钟定在明天早上七点了'), false);
   assert.equal(needsVerbatimRead('今年是2024年'), false);
-  assert.equal(needsVerbatimRead('端口8080'), false);
   assert.equal(needsVerbatimRead('main.ts'), false);
+  assert.equal(needsVerbatimRead('明天 10 到 22 度'), false);
+  assert.equal(needsVerbatimRead('2026年11月'), false);
+  assert.equal(needsVerbatimRead('晚上8点15分'), false);
+  assert.equal(needsVerbatimRead('晚上8:15'), false);
   assert.equal(needsVerbatimRead('甲'.repeat(180)), false);
   assert.equal(needsVerbatimRead(`  ${'甲'.repeat(180)}  `), false);
 
@@ -442,6 +445,14 @@ test('needsVerbatimRead 只在必须逐字念的时候为真', () => {
   assert.equal(needsVerbatimRead('【VERBATIM】念这个'), true);
   assert.equal(needsVerbatimRead('[开心][VERBATIM]你好'), true);
   assert.equal(needsVerbatimRead('端口 63993'), true);
+  assert.equal(needsVerbatimRead('端口8080'), true);
+  assert.equal(needsVerbatimRead('端口 8766'), true);
+  assert.equal(needsVerbatimRead('端口:8766'), true);
+  assert.equal(needsVerbatimRead('port=8080'), true);
+  assert.equal(needsVerbatimRead(':8766'), true);
+  assert.equal(needsVerbatimRead('v2.3.1'), true);
+  assert.equal(needsVerbatimRead('v2.3.1-beta.1'), true);
+  assert.equal(needsVerbatimRead('服务跑在端口 8766，当前版本 v2.3.1。'), true);
   assert.equal(needsVerbatimRead('单号 W8665881'), true);
   assert.equal(needsVerbatimRead('单号AB1234'), true);
   assert.equal(needsVerbatimRead('改在 src/main.ts'), true);
@@ -719,4 +730,183 @@ test('队列超过上限就丢，去重不算新任务', async () => {
   await flush();
   assert.equal(next.state(), 'completed');
   assert.equal(bus.activeCount(), 0);
+});
+
+test('resetSession 后重连的 turnNo 不再被旧会话吞掉，同会话去重仍在', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+
+  const old = bus.dispatch({ query: '旧会话', source: 'tool_call', turnNo: 1 });
+  await flush();
+  must(held.pending[0], 'old slot').resolve({ text: '旧答案' });
+  await flush();
+  assert.equal(old.state(), 'completed');
+
+  const dup = bus.dispatch({ query: '同一会话', source: 'early_rule', turnNo: 1 });
+  assert.equal(dup.deduplicated, true);
+  assert.equal(dup.taskId, old.taskId);
+  assert.equal(dup.state(), 'completed');
+  assert.equal(held.calls.length, 1);
+
+  bus.resetSession();
+  bus.resetSession();
+
+  const early = bus.dispatch({
+    query: '重连原话',
+    source: 'early_rule',
+    turnNo: 1,
+    note: '旧注',
+  });
+  const tool = bus.dispatch({
+    query: '重连后的完整问题',
+    source: 'tool_call',
+    turnNo: 1,
+    note: '新注',
+  });
+  assert.equal(early.deduplicated, false);
+  assert.equal(early.state(), 'queued');
+  assert.notEqual(early.taskId, old.taskId);
+  assert.equal(tool.deduplicated, true);
+  assert.equal(tool.taskId, early.taskId);
+  assert.equal(tool.source, 'early_rule');
+  assert.equal(bus.activeCount(), 1);
+
+  const early2 = bus.dispatch({
+    query: '第二轮原话',
+    source: 'early_rule',
+    turnNo: 2,
+    note: '保留',
+  });
+  const tool2 = bus.dispatch({ query: '第二轮完整问题', source: 'tool_call', turnNo: 2 });
+  assert.equal(tool2.deduplicated, true);
+  assert.equal(tool2.taskId, early2.taskId);
+
+  await flush();
+  assert.equal(held.calls.length, 2);
+  const first = must(held.calls[1], 'reconnect execute');
+  assert.equal(first.taskId, early.taskId);
+  assert.equal(first.query, '重连后的完整问题');
+  assert.equal(first.note, '新注');
+  assert.equal(early.state(), 'running');
+  assert.equal(early2.state(), 'queued');
+
+  must(held.pending[1], 'reconnect slot').resolve({ text: '新答案' });
+  await flush();
+  assert.equal(early.state(), 'completed');
+  assert.equal(tool.state(), 'completed');
+  const second = must(held.calls[2], 'turn 2 execute');
+  assert.equal(second.query, '第二轮完整问题');
+  assert.equal(second.note, '保留');
+
+  const blocked = bus.dispatch({ query: '新会话里不该再跑', source: 'tool_call', turnNo: 1 });
+  assert.equal(blocked.deduplicated, true);
+  assert.equal(blocked.taskId, early.taskId);
+  assert.equal(blocked.state(), 'completed');
+  assert.equal(held.calls.length, 3);
+
+  must(held.pending[2], 'turn 2 slot').resolve({ text: '第二轮答案' });
+  await flush();
+  assert.equal(early2.state(), 'completed');
+  assert.equal(must(reports[1], 'new report').summary, '新答案');
+  assert.equal(must(reports[1], 'new report').query, '重连后的完整问题');
+  assert.equal(must(reports[2], 'turn 2 report').summary, '第二轮答案');
+  assert.equal(old.state(), 'completed');
+});
+
+test('resetSession 不取消在跑和排队的任务，也不释放总线', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+
+  const running = bus.dispatch({ query: '还在跑', source: 'tool_call', turnNo: 1 });
+  await flush();
+  const queued = bus.dispatch({ query: '还在排队', source: 'early_rule', turnNo: 2 });
+  assert.equal(running.state(), 'running');
+  assert.equal(queued.state(), 'queued');
+
+  bus.resetSession();
+  assert.equal(running.state(), 'running');
+  assert.equal(queued.state(), 'queued');
+  assert.equal(must(held.calls[0], 'running call').signal.aborted, false);
+  assert.equal(held.cancels.length, 0);
+
+  const again = bus.dispatch({ query: '重连第一轮', source: 'early_rule', turnNo: 1 });
+  const turn2 = bus.dispatch({ query: '新的第二轮', source: 'tool_call', turnNo: 2 });
+  assert.equal(again.deduplicated, false);
+  assert.equal(again.state(), 'queued');
+  assert.notEqual(again.taskId, running.taskId);
+  assert.equal(turn2.deduplicated, false);
+  assert.notEqual(turn2.taskId, queued.taskId);
+
+  must(held.pending[0], 'running slot').resolve({ text: '旧的跑完了' });
+  await flush();
+  assert.equal(running.state(), 'completed');
+  assert.equal(must(reports[0], 'running report').summary, '旧的跑完了');
+  assert.equal(must(held.calls[1], 'queued call').query, '还在排队');
+  assert.equal(queued.state(), 'running');
+
+  must(held.pending[1], 'queued slot').resolve({ text: '排队的也说' });
+  await flush();
+  assert.equal(queued.state(), 'completed');
+  assert.equal(must(held.calls[2], 'reconnect call').query, '重连第一轮');
+  assert.equal(again.state(), 'running');
+
+  must(held.pending[2], 'again slot').resolve({ text: '新的第一轮' });
+  await flush();
+  assert.equal(again.state(), 'completed');
+  assert.equal(turn2.state(), 'running');
+  assert.equal(must(held.calls[3], 'turn 2 call').query, '新的第二轮');
+  must(held.pending[3], 'turn 2 slot').resolve({ text: '新的第二轮说完' });
+  await flush();
+  assert.equal(turn2.state(), 'completed');
+  assert.equal(bus.activeCount(), 0);
+  assert.deepEqual(reports.map((report) => report.summary), [
+    '旧的跑完了',
+    '排队的也说',
+    '新的第一轮',
+    '新的第二轮说完',
+  ]);
+});
+
+test('四位端口和版本号走逐字，天气年份钟点不走', async () => {
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: {
+      async execute(req) {
+        return { text: req.query };
+      },
+    },
+    onReport: (report) => { reports.push(report); },
+  });
+  const cases: ReadonlyArray<{ query: string; verbatim?: string }> = [
+    { query: '端口 8766', verbatim: '端口 8766' },
+    { query: 'v2.3.1', verbatim: 'v2.3.1' },
+    {
+      query: '服务跑在端口 8766，当前版本 v2.3.1。',
+      verbatim: '服务跑在端口 8766，当前版本 v2.3.1。',
+    },
+    { query: '明天 10 到 22 度' },
+    { query: '2026年11月' },
+    { query: '晚上8点15分' },
+  ];
+  for (const item of cases) {
+    bus.dispatch({ query: item.query, source: 'tool_call' });
+  }
+  await flush();
+  assert.equal(reports.length, cases.length);
+  for (let i = 0; i < cases.length; i += 1) {
+    const item = must(cases[i], `case ${i}`);
+    const report = must(reports[i], `report ${i}`);
+    assert.equal(needsVerbatimRead(item.query), item.verbatim !== undefined);
+    assert.equal(report.query, item.query);
+    assert.equal(report.summary, item.query);
+    assert.equal(report.verbatim, item.verbatim);
+  }
 });

@@ -6,13 +6,14 @@
  * 会话里说出来。
  *
  * 不走文本快车道，不做投机预跑，也不把后台任务退回另一副嗓子。
- * 整段会话只有在 omni 接不上（没车道，或 `willServe()` 为假）时才同步问 dsh，
+ * 整段会话只有在 omni 接不上（没车道，`willServe()` 为假，且
+ * `answerFromText()` 也拿不到答案）时才同步问 dsh，
  * 再用本层的 TTS 把那句说出来 —— 那是断线兜底，不是第二条人格。
  */
 import { BackgroundTaskBus } from '../background-task-bus.ts';
-import { ConversationLedger } from '../conversation-ledger.ts';
+import { ConversationLedger, type LedgerTurn } from '../conversation-ledger.ts';
 import type { AudioFrame, EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
-import { LiveVoiceEngine, type LiveAudioLane } from '../engines/live-voice-engine.ts';
+import { LiveVoiceEngine, streamLiveAnswer, type LiveAudioLane } from '../engines/live-voice-engine.ts';
 import type { TurnTicket } from '../kernel.ts';
 import { LIVE_BACKEND_TASK_DIRECTIVE, buildLiveReportPrompt } from '../persona.ts';
 import type {
@@ -25,7 +26,13 @@ import type {
   TtsProvider,
   TurnContext,
 } from '../providers.ts';
-import { isActionRequest, isCancelRequest, looksMemorable } from '../turn-router.ts';
+import {
+  isActionRequest,
+  isCancelRequest,
+  isClockTimeRequest,
+  isRealtimeFactRequest,
+  looksMemorable,
+} from '../turn-router.ts';
 
 /** 用户明说取消时的短确认。只在真有要汇报的后台任务时说。 */
 const CANCEL_LINE = '好，不查了。';
@@ -190,10 +197,19 @@ export class LiveOrchestrator implements AgentProvider {
   /**
    * 按连接挂车道。`expected` 是调用方以为还挂着的那条：对不上就什么都不做，
    * 旧连接迟到的 `onClose` 不能把新连接的车道摘掉。
+   *
+   * 换上另一条非空车道时清掉上一条连接的后台去重。设备重连后轮次从 1 重新
+   * 编号，旧的 `turn=1,2,3` 若还留在总线上，新连接的委派会被当成重复任务吞掉。
    */
   attachAudioLane(lane: FastLaneAudioLane | null, expected?: FastLaneAudioLane | null): void {
     if (expected !== undefined && this.audioLane !== expected) return;
-    this.audioLane = lane as LiveAudioLane | null;
+    const next = lane as LiveAudioLane | null;
+    const replaced = next !== null && next !== this.audioLane;
+    this.audioLane = next;
+    if (!replaced) return;
+    this.bus.resetSession();
+    this.pendingReports.clear();
+    this.injectedTaskIds.clear();
   }
 
   /** 纯健康事实，不做路由。宿主用来决定要不要预开一条用不上的合成。 */
@@ -371,8 +387,31 @@ export class LiveOrchestrator implements AgentProvider {
     const parts: string[] = [directive];
     const memory = this.readMemory(query);
     if (memory !== '') parts.push(memory);
+    // 前台 0 ms：账本已在这一进程里，拼进后台注记只为让 dsh 看懂「它」。
+    const recent = this.recentDialogNote();
+    if (recent !== '') parts.push(recent);
     if (note !== undefined && note.trim() !== '') parts.push(note);
     return parts.join('\n\n');
+  }
+
+  /** 最近四轮有内容的前台对话。空轮跳过；被打断的那句在米馍行末尾标明。 */
+  private recentDialogNote(): string {
+    const lines: string[] = [];
+    for (const turn of this.ledger.recent(4)) {
+      this.appendDialogTurn(lines, turn);
+    }
+    if (lines.length === 0) return '';
+    return `【最近前台对话（仅供理解代词与指代，不要重复回答）】\n${lines.join('\n')}`;
+  }
+
+  private appendDialogTurn(lines: string[], turn: LedgerTurn): void {
+    const user = turn.userText.trim();
+    const assistant = turn.assistantText.trim();
+    if (user === '' && assistant === '') return;
+    if (user !== '') lines.push(`用户：${user}`);
+    if (assistant !== '' || turn.truncated) {
+      lines.push(`米馍：${assistant}${turn.truncated ? '（被打断）' : ''}`);
+    }
   }
 
   private readMemory(query: string): string {
@@ -477,19 +516,44 @@ export class LiveOrchestrator implements AgentProvider {
     yield { type: 'done', fullText: reply.text, speech: reply.speech };
   }
 
-  private async *playLive(turn: TurnInput, signal: AbortSignal): AsyncGenerator<EngineEvent> {
+  private async *playLive(
+    turn: TurnInput,
+    signal: AbortSignal,
+    fallbackRealtime = false,
+  ): AsyncGenerator<EngineEvent> {
     const lane = this.audioLane;
     if (lane === null) return;
     const live = new LiveVoiceEngine(lane);
+    yield* this.finishLive(turn, signal, live.respond(turn, signal), fallbackRealtime);
+  }
+
+  /** `answerFromText()` 已经拿到活流：事件与 `tool_call` 处理和封段认领同一条。 */
+  private async *playTextAnswer(
+    turn: TurnInput,
+    signal: AbortSignal,
+    answer: AgentAudioAnswer,
+    fallbackRealtime = false,
+  ): AsyncGenerator<EngineEvent> {
+    yield* this.finishLive(turn, signal, streamLiveAnswer(answer, signal), fallbackRealtime);
+  }
+
+  private async *finishLive(
+    turn: TurnInput,
+    signal: AbortSignal,
+    source: AsyncIterable<EngineEvent>,
+    fallbackRealtime = false,
+  ): AsyncGenerator<EngineEvent> {
     let audioBytes = 0;
     let spokeReceipt = false;
-    for await (const ev of live.respond(turn, signal)) {
+    let sawDelegate = false;
+    for await (const ev of source) {
       if (ev.type === 'audio') {
         audioBytes += ev.pcm.byteLength;
         yield ev;
         continue;
       }
       if (ev.type === 'delegate') {
+        sawDelegate = true;
         const query = ev.rewrittenQuery
           ? `${ev.rewrittenQuery}\n用户原话：「${turn.text}」`
           : turn.text;
@@ -509,6 +573,9 @@ export class LiveOrchestrator implements AgentProvider {
         continue;
       }
       if (ev.type === 'done') {
+        if (fallbackRealtime && !sawDelegate && !signal.aborted) {
+          this.dispatchEarly(turn);
+        }
         const said = ev.speech ?? ev.fullText;
         this.remember(turn, said !== '' ? said : (spokeReceipt ? DELEGATE_LINE : ''), 'live');
         yield ev;
@@ -516,6 +583,22 @@ export class LiveOrchestrator implements AgentProvider {
       }
       yield ev;
     }
+  }
+
+  /** 车道现在还能让 omni 开口：封段可认领，或者健康到能按文本答。 */
+  private laneCanAnswer(): boolean {
+    const lane = this.audioLane;
+    if (lane === null) return false;
+    return lane.willServe() || lane.canAnswerText?.() === true;
+  }
+
+  private dispatchEarly(turn: TurnInput): void {
+    this.bus.dispatch({
+      turnNo: turn.no,
+      source: 'early_rule',
+      query: turn.text,
+      note: turn.note,
+    });
   }
 
   private async *respond(turn: TurnInput, signal: AbortSignal): AsyncGenerator<EngineEvent> {
@@ -556,18 +639,49 @@ export class LiveOrchestrator implements AgentProvider {
       this.bus.dispatch({ source: 'memory_silent', silent: true, query: turn.text });
     }
 
-    if (isActionRequest(turn.text) && this.audioLane?.willServe() === true) {
-      this.bus.dispatch({
-        turnNo: turn.no,
-        source: 'early_rule',
-        query: turn.text,
-        note: turn.note,
-      });
+    // 钟点 Omni 会直接编。车道还能开口就丢掉在途音频，后台查，前台只应一声。
+    if (isClockTimeRequest(turn.text)) {
+      if (this.laneCanAnswer()) {
+        this.audioLane?.discard?.();
+        this.dispatchEarly(turn);
+        this.writeLog('  直播    钟点问题交给后台，前台只应一声');
+        yield* this.speakFixed(turn, signal, DELEGATE_LINE, {
+          type: 'meta',
+          path: 'omni',
+          delegate: 'task',
+          nonBlocking: true,
+        });
+        return;
+      }
+      this.writeLog('  直播    问时间时 omni 不可用，同步交给 dsh');
+      yield* this.fallbackDsh(turn, signal, { type: 'meta', path: 'dsh' });
+      return;
+    }
+
+    // 动作动词提前派单（与 Omni 的 tool_call 按 turnNo 去重）；
+    // 无动词的实时事实（天气/股价/路况）优先让 Omni 自己的 tool_call 带出改写查询，
+    // 若它没调工具再在 finishLive 末尾兜底补派，不抢掉 rewrittenQuery。
+    const actionReq = isActionRequest(turn.text);
+    const realtimeFallback = !actionReq && isRealtimeFactRequest(turn.text);
+    if (actionReq && this.audioLane?.willServe() === true) {
+      this.dispatchEarly(turn);
     }
 
     if (this.audioLane !== null && this.audioLane.willServe()) {
-      yield* this.playLive(turn, signal);
+      yield* this.playLive(turn, signal, realtimeFallback);
       return;
+    }
+
+    // 没封段不等于断线。健康的文本直答优先；只有它明确返回 null 才同步问 dsh。
+    if (this.audioLane !== null && !this.audioLane.willServe()) {
+      if (signal.aborted) return;
+      const answered = this.audioLane.answerFromText?.(turn.text) ?? null;
+      if (answered !== null) {
+        if (actionReq) this.dispatchEarly(turn);
+        this.writeLog('  直播    没有封段，改按文本让 omni 答');
+        yield* this.playTextAnswer(turn, signal, answered, realtimeFallback);
+        return;
+      }
     }
 
     yield* this.fallbackDsh(turn, signal, { type: 'meta', path: 'dsh' });

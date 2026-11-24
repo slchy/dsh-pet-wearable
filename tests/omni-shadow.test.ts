@@ -9,11 +9,15 @@
  * - **忙时不许发 `response.create`**（服务端会拒且那一次 create 永久丢失）
  * - **`delete` 不能当场发**（item id 在 `response.done` 里，那会儿通常连 created 都没到）
  * - **后台汇报只在完全空闲时开**，读端只绑自己那一份，不许跟到用户的下一段
+ * - **不传静态记忆 / 日期 / 热词时 `session.update` 与基线逐字一致**；传了只追加事实
+ * - **健康 ready 上 `answerFromText` 用 user 源直答**，空文本和忙时一个帧都不发
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { OmniShadow } from '../src/omni-shadow.ts';
+import { OmniShadow, type OmniShadowOptions } from '../src/omni-shadow.ts';
+import { OMNI_SHORT_INSTRUCTIONS } from '../src/persona.ts';
+import type { AgentAudioAnswer } from '../src/providers.ts';
 import type { RealtimeSocket } from '../src/qwen-realtime-asr.ts';
 
 interface Sent {
@@ -25,6 +29,12 @@ interface Sent {
   session?: {
     instructions?: string;
     tools?: Array<{ name?: string; description?: string }>;
+    tool_choice?: string;
+    input_audio_transcription?: {
+      model?: string;
+      language?: string;
+      corpus?: { text?: string };
+    };
   };
 }
 
@@ -76,12 +86,16 @@ class FakeSocket {
 const MS = 32;
 const SILENCE = Buffer.alloc(MS * 100);
 
-function make(serve: 'off' | 'full' = 'off') {
+function make(
+  serve: 'off' | 'full' = 'off',
+  extra: Partial<Omit<OmniShadowOptions, 'apiKey' | 'emit' | 'socketFactory' | 'now' | 'serve'>> = {},
+) {
   const socket = new FakeSocket();
   const events: Array<Record<string, unknown>> = [];
   let clock = 0;
   const shadow = new OmniShadow({
     apiKey: 'k',
+    ...extra,
     serve,
     now: () => clock,
     emit: (data) => { events.push(data); },
@@ -1342,4 +1356,390 @@ test('后台汇报途中断线、stop 或 response 超时：生成器结束，�
   assert.equal(shadow.currentState, 'broken');
   assert.equal(events.some((event) => event['audio_ms'] !== undefined), false);
   assert.equal(events.some((event) => event['skipped'] === 'broken'), true);
+});
+
+test('不传静态记忆、日期、热词时 session.update 与基线逐字一致', () => {
+  const baseline = make('full');
+  baseline.ready();
+  let clocks = 0;
+  const empty = make('full', {
+    memoryContext: ' \n\t',
+    clockContext: () => {
+      clocks += 1;
+      return ' \n';
+    },
+    asrCorpusText: '',
+    asrLanguage: '',
+  });
+  empty.ready();
+  assert.equal(clocks, 1, '空白日期也只在建连时调用一次');
+  assert.equal(JSON.stringify(empty.socket.sent[0]), JSON.stringify(baseline.socket.sent[0]));
+  assert.equal(baseline.socket.sent[0]?.session?.instructions, OMNI_SHORT_INSTRUCTIONS);
+  assert.deepEqual(baseline.socket.sent[0]?.session?.input_audio_transcription, {
+    model: 'qwen3-asr-flash-realtime',
+  });
+
+  const custom = make('off', { instructions: 'BASE' });
+  const customEmpty = make('off', {
+    instructions: 'BASE',
+    memoryContext: '',
+    clockContext: () => '',
+    asrLanguage: '',
+    asrCorpusText: '',
+  });
+  custom.ready();
+  customEmpty.ready();
+  assert.equal(JSON.stringify(customEmpty.socket.sent[0]), JSON.stringify(custom.socket.sent[0]));
+  assert.equal(custom.socket.sent[0]?.session?.instructions, 'BASE');
+  assert.equal(custom.socket.sent[0]?.session?.tools, undefined);
+});
+
+test('建连只追加静态事实和 ASR 热词，热路径不再调用时钟', () => {
+  let clocks = 0;
+  const h = make('full', {
+    clockContext: () => {
+      clocks += 1;
+      return '当前日期：2026年11月24日 星期二（北京时间）';
+    },
+    memoryContext: '  对花生过敏  ',
+    asrLanguage: 'zh',
+    asrCorpusText: '眼镜',
+  });
+  assert.equal(clocks, 0, '握手之前不调用');
+  h.shadow.start();
+  assert.equal(clocks, 0);
+  h.socket.open();
+  assert.equal(clocks, 1);
+  h.socket.message({ type: 'session.updated' });
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  assert.equal(clocks, 1, '封段不再读日期');
+
+  const session = h.socket.sent[0]?.session;
+  assert.equal(
+    session?.instructions,
+    `${OMNI_SHORT_INSTRUCTIONS}\n\n【当前日期参考】\n`
+      + '当前日期：2026年11月24日 星期二（北京时间）\n\n'
+      + '【关于哥的已知长期记忆（仅供如实回答，不要主动复述）】\n对花生过敏',
+  );
+  assert.equal(session?.instructions?.includes('调用工具'), false);
+  assert.equal(session?.instructions?.includes('要不要调'), false);
+  assert.deepEqual(session?.input_audio_transcription, {
+    model: 'qwen3-asr-flash-realtime',
+    language: 'zh',
+    corpus: { text: '眼镜' },
+  });
+  assert.equal(session?.tools?.[0]?.name, 'delegate_to_assistant');
+  assert.equal(session?.tool_choice, 'auto');
+});
+
+test('长期记忆超过 600 字截断；缺的事实块和空热词都不写', () => {
+  const memoryOnly = make('off', { memoryContext: `头${'记'.repeat(600)}` });
+  memoryOnly.ready();
+  const memoryText = memoryOnly.socket.sent[0]?.session?.instructions ?? '';
+  const marker = '\n\n【关于哥的已知长期记忆（仅供如实回答，不要主动复述）】\n';
+  assert.equal(memoryText.startsWith(OMNI_SHORT_INSTRUCTIONS), true);
+  assert.equal(memoryText.includes('【当前日期参考】'), false);
+  const fact = memoryText.slice(OMNI_SHORT_INSTRUCTIONS.length + marker.length);
+  assert.equal(fact, `头${'记'.repeat(599)}`);
+  assert.equal(fact.length, 600);
+  assert.equal(memoryText.length, OMNI_SHORT_INSTRUCTIONS.length + marker.length + 600);
+
+  const clockOnly = make('off', {
+    instructions: 'BASE',
+    clockContext: () => '当前日期：2026年11月24日 星期二（北京时间）',
+    memoryContext: '',
+  });
+  clockOnly.ready();
+  assert.equal(
+    clockOnly.socket.sent[0]?.session?.instructions,
+    'BASE\n\n【当前日期参考】\n当前日期：2026年11月24日 星期二（北京时间）',
+  );
+  assert.deepEqual(clockOnly.socket.sent[0]?.session?.input_audio_transcription, {
+    model: 'qwen3-asr-flash-realtime',
+  });
+
+  const langOnly = make('off', { asrLanguage: 'zh' });
+  langOnly.ready();
+  assert.deepEqual(langOnly.socket.sent[0]?.session?.input_audio_transcription, {
+    model: 'qwen3-asr-flash-realtime',
+    language: 'zh',
+  });
+
+  const corpusOnly = make('off', { asrCorpusText: '眼镜' });
+  corpusOnly.ready();
+  assert.deepEqual(corpusOnly.socket.sent[0]?.session?.input_audio_transcription, {
+    model: 'qwen3-asr-flash-realtime',
+    corpus: { text: '眼镜' },
+  });
+});
+
+test('canAnswerText 只在车道开着且 ready、没有在途回复时为真', () => {
+  const off = make('off');
+  off.ready();
+  assert.equal(off.shadow.canAnswerText(), false);
+
+  const idle = make('full');
+  assert.equal(idle.shadow.currentState, 'idle');
+  assert.equal(idle.shadow.canAnswerText(), false);
+
+  const connecting = make('full');
+  connecting.shadow.start();
+  connecting.socket.open();
+  assert.equal(connecting.shadow.currentState, 'connecting');
+  assert.equal(connecting.shadow.canAnswerText(), false);
+
+  const ready = make('full');
+  ready.ready();
+  assert.equal(ready.shadow.canAnswerText(), true);
+  ready.shadow.feed(Buffer.alloc(MS * 20), true);
+  assert.equal(ready.shadow.canSpeakBackground(), false);
+  assert.equal(ready.shadow.canAnswerText(), true, '残留音频不挡文本直答');
+
+  const busy = make('full');
+  busy.ready();
+  busy.shadow.restart([Buffer.alloc(MS * 40)]);
+  busy.shadow.seal(1, 10);
+  assert.equal(busy.shadow.currentState, 'busy');
+  assert.equal(busy.shadow.canAnswerText(), false);
+  busy.socket.message({ type: 'response.created' });
+  busy.shadow.feed(Buffer.alloc(MS * 40), true);
+  busy.shadow.seal(2, 10);
+  assert.equal(busy.shadow.explain().pending, true);
+  assert.equal(busy.shadow.canAnswerText(), false, '有排队封段');
+
+  const broken = make('full');
+  broken.ready();
+  broken.socket.close();
+  assert.equal(broken.shadow.currentState, 'broken');
+  assert.equal(broken.shadow.canAnswerText(), false);
+});
+
+test('answerFromText：先刷回注，再以 user 源开答，claim 和后台取消都拿不走', () => {
+  const h = make('full');
+  h.shadow.start();
+  h.socket.open();
+  h.shadow.injectAnswer('灯关了吗', '已经关掉了。');
+  assert.equal(h.socket.count('conversation.item.create'), 0);
+  h.socket.message({ type: 'session.updated' });
+  assert.equal(h.shadow.canAnswerText(), true);
+  assert.equal(h.shadow.willServe(), false, '没有封段时 willServe 仍是 false');
+
+  const mark = h.socket.sent.length;
+  const answer = h.shadow.answerFromText('  今天星期几  ');
+  assert.ok(answer);
+  const frames = h.socket.sent.slice(mark);
+  assert.deepEqual(frames.map((frame) => frame.type), [
+    'conversation.item.create',
+    'conversation.item.create',
+    'response.create',
+  ]);
+  assert.match(frames[0]?.item?.content?.[0]?.text ?? '', /已经关掉了/);
+  assert.equal(frames[1]?.item?.role, 'user');
+  assert.equal(frames[1]?.item?.content?.[0]?.type, 'input_text');
+  assert.equal(frames[1]?.item?.content?.[0]?.text, '  今天星期几  ');
+  assert.deepEqual(frames[2]?.response, { modalities: ['audio', 'text'] });
+  assert.equal(h.shadow.currentState, 'busy');
+  assert.equal(h.shadow.canAnswerText(), false);
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.claim(), null, '已认领的文本直答不能再被 claim 拿走');
+  const cancels = h.socket.count('response.cancel');
+  h.shadow.cancelBackgroundSpeech();
+  assert.equal(h.socket.count('response.cancel'), cancels, 'user 源不许被后台取消误伤');
+  assert.equal(h.shadow.currentState, 'busy');
+});
+
+test('answerFromText：空文本、车道关掉、忙着时返回 null，一帧都不发', () => {
+  const ready = make('full');
+  ready.ready();
+  const sent = ready.socket.sent.length;
+  assert.equal(ready.shadow.answerFromText(''), null);
+  assert.equal(ready.shadow.answerFromText(' \n\t'), null);
+  assert.equal(ready.socket.sent.length, sent);
+  assert.equal(ready.shadow.currentState, 'ready');
+  assert.equal(ready.shadow.canAnswerText(), true);
+
+  const off = make('off');
+  off.ready();
+  const offSent = off.socket.sent.length;
+  assert.equal(off.shadow.answerFromText('你好'), null);
+  assert.equal(off.socket.sent.length, offSent);
+  assert.equal(off.socket.count('response.create'), 0);
+
+  const busy = make('full');
+  busy.ready();
+  busy.shadow.restart([Buffer.alloc(MS * 40)]);
+  busy.shadow.seal(1, 10);
+  busy.shadow.injectAnswer('灯关了吗', '已经关掉了。');
+  assert.equal(busy.socket.count('conversation.item.create'), 0, '忙时回注只排队');
+  const busySent = busy.socket.sent.length;
+  assert.equal(busy.shadow.answerFromText('今天星期几'), null);
+  assert.equal(busy.socket.sent.length, busySent, '拒绝时不许把排队的回注提前发出去');
+  assert.equal(busy.socket.count('response.create'), 1);
+});
+
+test('answerFromText 先删没人听过的孤儿回复，再开答', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'orphan_user', role: 'user' } });
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'orphan_asst', role: 'assistant' }] },
+  });
+  assert.equal(h.socket.count('conversation.item.delete'), 0);
+  assert.equal(h.events.length, 1);
+
+  const mark = h.socket.sent.length;
+  const answer = h.shadow.answerFromText('今天星期几');
+  assert.ok(answer);
+  const frames = h.socket.sent.slice(mark);
+  assert.deepEqual(frames.map((frame) => frame.type), [
+    'conversation.item.delete',
+    'conversation.item.delete',
+    'conversation.item.create',
+    'response.create',
+  ]);
+  assert.deepEqual(
+    frames.slice(0, 2).map((frame) => frame.item_id),
+    ['orphan_asst', 'orphan_user'],
+  );
+  assert.equal(frames[2]?.item?.content?.[0]?.text, '今天星期几');
+  assert.equal(h.events.length, 1, '开答本身先不记 seal，等 response.done');
+});
+
+test('answerFromText：转写、委派和音频都在这份上，interrupt 不等 done', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.feed(Buffer.alloc(MS * 20), true);
+  assert.equal(h.shadow.canAnswerText(), true);
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 0);
+  const answer = h.shadow.answerFromText('今天吃什么') as AgentAudioAnswer & { interrupt(): void };
+  assert.equal(typeof answer.interrupt, 'function');
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 0, '文本直答不 commit 残留音频');
+  assert.equal(h.socket.count('response.create'), 1);
+
+  assert.equal(answer.transcript(), '');
+  assert.equal(answer.delegateReason?.(), null);
+  assert.equal(answer.delegateText?.(), null);
+  h.at(40);
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '别' });
+  h.socket.message({ type: 'response.text.delta', delta: '吃花生' });
+  assert.equal(answer.transcript(), '别吃花生');
+  h.socket.message({
+    type: 'response.function_call_arguments.done',
+    arguments: '{"request":"查不含花生的菜","reason":"要查记忆"}',
+  });
+  assert.equal(answer.delegateReason?.(), 'delegate');
+  assert.equal(answer.delegateText?.(), '查不含花生的菜');
+
+  const got: Buffer[] = [];
+  let resolvePulled: (() => void) | undefined;
+  const pulled = new Promise<void>((resolve) => {
+    resolvePulled = resolve;
+  });
+  const drain = (async () => {
+    for await (const chunk of answer.chunks) {
+      got.push(chunk);
+      resolvePulled?.();
+    }
+  })();
+  h.at(80);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  await pulled;
+  assert.equal(got.length, 1);
+  assert.equal(got[0]?.length, 480);
+  h.shadow.interrupt();
+  assert.equal(await finishSoon(drain), 'done', '打断必须马上结束读端，不能等 response.done');
+  assert.equal(h.socket.count('response.cancel'), 0, 'created 之前发会被服务端拒');
+
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1, 'created 到了才补发');
+  h.at(120);
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'cancelled',
+      output: [
+        { id: 'txt_user', role: 'user' },
+        { id: 'txt_asst', role: 'assistant' },
+      ],
+    },
+  });
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '认领过的回复打断后不删');
+  assert.equal(h.shadow.currentState, 'ready');
+  assert.equal(h.shadow.canAnswerText(), true);
+  assert.equal(answer.transcript(), '别吃花生');
+  assert.equal(h.events.length, 1);
+  assert.equal(h.events[0]?.['seq'], 0);
+  assert.equal(h.events[0]?.['cancelled'], true);
+  assert.equal(h.events[0]?.['warmup'], true);
+});
+
+test('answerFromText 读端自己的 interrupt 也立刻停，并且不追下一段封段', { timeout: 2000 }, async () => {
+  const stopped = make('full');
+  stopped.ready();
+  const early = stopped.shadow.answerFromText('你好') as AgentAudioAnswer & { interrupt(): void };
+  const earlyGot: Buffer[] = [];
+  const earlyDrain = (async () => {
+    for await (const chunk of early.chunks) {
+      earlyGot.push(chunk);
+    }
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  early.interrupt();
+  assert.equal(await finishSoon(earlyDrain), 'done');
+  assert.equal(earlyGot.length, 0);
+  stopped.socket.message({ type: 'response.created' });
+  assert.equal(stopped.socket.count('response.cancel'), 1);
+
+  const h = make('full');
+  h.ready();
+  const answer = h.shadow.answerFromText('今天星期几');
+  assert.ok(answer);
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  h.shadow.feed(Buffer.alloc(MS * 80), true);
+  h.shadow.seal(4, 10);
+  assert.equal(h.socket.count('response.create'), 1, '文本直答还没 done，不能再发 create');
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1);
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'cancelled', output: [{ id: 'txt_asst', role: 'assistant' }] },
+  });
+  assert.equal(await finishSoon(drain), 'done');
+  assert.equal(h.socket.count('response.create'), 2, '排队的封段在 done 之后发出');
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(960).toString('base64') });
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(got.length, 0, '文本直答不能把下一段封段的音频读走');
+});
+
+test('interrupt 立刻结束认领流，不等 response.done', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  const answer = h.shadow.claim();
+  assert.ok(answer);
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  h.shadow.interrupt();
+  assert.equal(await finishSoon(drain), 'done');
+  assert.equal(got.length, 0);
+  assert.equal(h.socket.count('response.cancel'), 0);
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1);
 });
