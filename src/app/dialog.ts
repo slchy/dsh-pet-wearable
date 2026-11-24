@@ -32,6 +32,7 @@ import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
 import {
   announceInterruptionNote, interruptionNote, remainingSpeech, TTS_CHARS_PER_SEC,
 } from '../interrupted-tail.ts';
+import type { FastVoiceEngine } from '../engine-contract.ts';
 import { EVENTS } from '../events.ts';
 import type { AgentProvider, DelegateReason, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
@@ -147,6 +148,20 @@ export function composeTurnNote(deviceNote?: string, tailNote?: string): string 
   return parts.length === 0 ? undefined : parts.join('；');
 }
 
+/** 一条后台播报。字符串入队仍合法，字段形态留给 Pure Live 同嗓子汇报。 */
+export interface AnnounceItem {
+  readonly speech: string;
+  readonly emotion?: string;
+  /** 后台任务标识（Pure Live 模式用于防重复回注与上下文关联） */
+  readonly taskId?: string;
+  /** 触发任务的用户原问（供前台汇报对齐指代） */
+  readonly query?: string;
+  /** 为真时必须走逐字朗读路径（如精确数字/端口/长报告），不交给对话态 Omni 自由转述 */
+  readonly verbatim?: boolean;
+  /** 后台任务需要用户确认的问题 */
+  readonly needsConfirm?: string;
+}
+
 export interface DialogOptions {
   /** 时钟端口：超时与等待全走它 */
   readonly clock: Clock;
@@ -192,6 +207,20 @@ export interface DialogOptions {
    */
   readonly env: DialogEnv;
   readonly log: (line: string) => void;
+  /** 可选：热路径语音引擎（Pure Live / Pure Cascade 由装配层显式注入；缺省时由 TurnRunner 包装 agent+tts） */
+  readonly engine?: FastVoiceEngine;
+  /**
+   * 可选：自定义后台播报播放口（Pure Live 模式下用 Omni `speakFromText()` 同嗓子汇报）。
+   *
+   * - `'spoken'`：已通过实时前台播出并入历史
+   * - `'defer'`：实时前台此刻正忙 / 有用户缓冲，排回队首顺延重试
+   * - `'fallback'`：要求逐字朗读或前台不可用，退回 `runner.speakCanned()`
+   */
+  readonly speakAnnounce?: (item: AnnounceItem) => Promise<'spoken' | 'defer' | 'fallback'>;
+  /** 可选：插话或双击清空播报时，同步掐断正在播的自定义后台汇报（例如 Omni `cancelBackgroundSpeech()`） */
+  readonly cancelAnnounce?: () => void;
+  /** 可选：当某条播报走回落 TTS（`verbatim` 或 `'fallback'`）播完/被打断后通知上层（用于静默回注 Omni 历史） */
+  readonly onFallbackAnnounceSpoken?: (item: AnnounceItem, interrupted: boolean) => void;
 }
 
 export class DialogRuntime {
@@ -221,7 +250,7 @@ export class DialogRuntime {
   /** 串行队列里还没跑完的任务数 */
   private queued = 0;
 
-  private readonly announceQueue: Array<{ speech: string; emotion?: string }> = [];
+  private readonly announceQueue: AnnounceItem[] = [];
   private announcing = false;
   private disposed = false;
   /** 用户最后一次开口（中间结果也算）的时刻，用来判断「他是不是还在说」。 */
@@ -289,6 +318,7 @@ export class DialogRuntime {
       clock: options.clock,
       agent: options.agent,
       tts: options.tts,
+      ...(options.engine === undefined ? {} : { engine: options.engine }),
       downlink: options.downlink,
       fsm: this.core.fsm,
       playbackTailMs: options.playbackTailMs,
@@ -327,6 +357,13 @@ export class DialogRuntime {
         this.runner.invalidateTurn(ticket, reason ?? 'bargeIn');
       },
       abortEngine: (reason) => {
+        // 引擎在场时只走 `abortSpeculation`：cascade 内部已经 `dropPrefetch`，
+        // live 内部已经 `abortLane`。再打到 agent 上就是同一次中止执行两遍。
+        // 引擎缺席（模拟器 / 旧测试）才落到裸 agent，理由字符串与既有装配一致。
+        if (options.engine !== undefined) {
+          options.engine.abortSpeculation(reason);
+          return;
+        }
         options.agent.dropPrefetch?.(`内核中止(${reason})`);
       },
       settleTurn: (turn) => {
@@ -426,6 +463,7 @@ export class DialogRuntime {
    */
   private interruptCanned(): void {
     this.runner.cancelCanned();
+    this.options.cancelAnnounce?.();
     const residue = this.runner.takeCannedResidue();
     if (residue === null) {
       return;
@@ -475,6 +513,7 @@ export class DialogRuntime {
         case 'call':
           if (effect.call.op === 'capture.cancel') {
             this.runner.cancelCanned();
+            this.options.cancelAnnounce?.();
             this.photos.cancel('用户改主意或收尾');
           } else {
             env.call(effect.call);
@@ -607,8 +646,11 @@ export class DialogRuntime {
    * 这条**不属于任何一轮**（`speakCanned` 的旁白通道），所以不占轮次票据、不改状态机。
    * 用户正在说话或正在播报时排队，等回到 `listening` 再放出来 —— 抢话比晚两秒更烦人。
    */
-  enqueueAnnounce(speech: string, emotion?: string): void {
-    this.announceQueue.push({ speech, emotion });
+  enqueueAnnounce(speechOrItem: string | AnnounceItem, emotion?: string): void {
+    const item: AnnounceItem = typeof speechOrItem === 'string'
+      ? { speech: speechOrItem, ...(emotion === undefined ? {} : { emotion }) }
+      : speechOrItem;
+    this.announceQueue.push(item);
     // 有货就要让宠物知道：它在「让位」闸门里等着这条
     this.options.env.onAnnounce?.(true, false);
     void this.flushAnnounce();
@@ -618,6 +660,7 @@ export class DialogRuntime {
   clearAnnounce(): void {
     this.announceQueue.length = 0;
     this.runner.cancelCanned();
+    this.options.cancelAnnounce?.();
     // 双击是明确的「别念了」：残句连"要不要补"都不该再问，直接作废
     this.runner.takeCannedResidue();
     this.announceTail = null;
@@ -651,13 +694,31 @@ export class DialogRuntime {
         if (item === undefined) {
           break;
         }
-        // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动
-        const speak = (text: string): Promise<void> => this.runner.speakCanned(text, item.emotion);
+        // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动。
+        // `deferred` 由 `speak` 在 `'defer'` 时置位；两条开麦分支共用后面的结算。
+        let deferred = false;
+        const speak = async (text: string): Promise<void> => {
+          if (item.verbatim !== true && this.options.speakAnnounce !== undefined) {
+            const outcome = await this.options.speakAnnounce(item);
+            if (outcome === 'spoken') {
+              return;
+            }
+            if (outcome === 'defer') {
+              deferred = true;
+              return;
+            }
+            // 'fallback' → 落到下面走 runner.speakCanned
+          }
+          await this.runner.speakCanned(text, item.emotion);
+          const interrupted = this.core.phase !== 'listening'
+            || this.options.clock.now() - this.lastUserSpeechAt < ANNOUNCE_QUIET_MS;
+          this.options.onFallbackAnnounceSpoken?.(item, interrupted);
+        };
         // 开麦这一段是异步的（最长 1.5 s），期间的整句记录用来判断要不要让路
         const mark = this.options.clock.now();
+        let spoke = true;
         if (mic === undefined) {
           await speak(item.speech);
-          spokeAny = true;
         } else {
           // 设备能开麦就先开：播报一开口就能被插话（ADR-0001 §6）。超时照播。
           const result = await speakAnnouncement(item.speech, {
@@ -671,14 +732,22 @@ export class DialogRuntime {
             shouldSpeak: () => this.lastUserSentenceAt <= mark,
             speak,
           });
-          if (!result.spoke) {
-            // 排回**队首**：这条只是被推迟，不是被丢掉
-            this.announceQueue.unshift(item);
-            this.options.log('  播报    开麦期间用户说了一句 → 排回队首，等安静');
-            break;
-          }
-          spokeAny = true;
+          spoke = result.spoke;
         }
+        if (deferred) {
+          // 排回**队首**：前台正忙，这条只是被推迟。不要记成出过声，
+          // `finally` 看到队列非空会自己排 `ANNOUNCE_QUIET_MS` 后再试。
+          this.announceQueue.unshift(item);
+          this.options.log('  播报    前台车道正忙 → 排回队首，等空窗重试');
+          break;
+        }
+        if (mic !== undefined && !spoke) {
+          // 排回**队首**：这条只是被推迟，不是被丢掉
+          this.announceQueue.unshift(item);
+          this.options.log('  播报    开麦期间用户说了一句 → 排回队首，等安静');
+          break;
+        }
+        spokeAny = true;
         // 播报期间用户说话了：这条已经被 `cancelCanned` 掐断，剩下的留到下一轮结束
         if (
           this.core.phase !== 'listening'

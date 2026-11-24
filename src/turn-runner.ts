@@ -23,15 +23,14 @@
  * 没挂端口的裸跑（单测 / 离线推演）仍要能跑完一轮：那种情况下 `turnEnded` 的
  * 结算意图由本类用一个一次性本地端口解释，**不另算一套口径**。
  *
- * <h2>Item C 边界：三分支泵仍在，换引擎是刻意的下一阶段</h2>
+ * <h2>出话只有一条泵</h2>
  *
- * 本类目前仍维护 `omni` / `stream` / `pump` 三条 `AgentProvider` 分支。这不是
- * 漏接线，是**刻意分期**：那三条上挂着 `FrontedAgent` 的双轨投机、流式 TTS 的
- * 异常回落，以及逐轮延迟埋点（`tts.first` / `turn.end` 的 `dsh_ms` / `audio_s`）。
- * `FastVoiceEngine` 的两份实现（`src/engines/*`）与工厂
- * （`FrontedAgent.toLiveEngine` / `toCascadeEngine`）**都已落地并通过契约测试**
- * （`tests/fast-voice-engine.test.ts`）—— 换泵的条件齐了，但把泵切过去要同时搬走
- * 上面那三件事，所以留到下一阶段；现在动它会静默丢掉这些能力。
+ * `run()` 只消费 {@link FastVoiceEngine.respond}。`omni` / `stream` / `pump`
+ * 以及 omni 转交 dsh 的垫话、流式失败退回整段，都在 `src/engines/`
+ * （生产的 `live` / `cascade` 管道直接注入引擎；只给了 `{ agent, tts }` 的
+ * 旧装配则包一层 {@link AgentEngineAdapter}）。逐轮延迟埋点
+ * （`tts.first` / `turn.end` 的 `dsh_ms` / `audio_s`）仍在本类：引擎只报事实，
+ * 记账与结算不进引擎。
  */
 import { DialogFsm } from './dialog-fsm.ts';
 import type { Clock } from './app/clock.ts';
@@ -46,11 +45,9 @@ import type { TurnTicket } from './dialog-fsm.ts';
 import type { DeviceCall } from './devices/primitives.ts';
 import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { remainingSpeech } from './interrupted-tail.ts';
-import { SentencePump } from './sentence-pump.ts';
-import { TokenQueue } from './token-queue.ts';
-import { cleanForSpeech } from './agent.ts';
-import { parseEmotion } from './emotion.ts';
-import type { AgentProvider, AgentReplyView, DelegateReason, TtsProvider } from './providers.ts';
+import type { FastVoiceEngine, TurnInput } from './engine-contract.ts';
+import { AgentEngineAdapter } from './engines/index.ts';
+import type { AgentAudioAnswer, AgentProvider, DelegateReason, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
 
 /**
@@ -70,13 +67,16 @@ const PLAYBACK_POLL_MS = 100;
 const PLAYED_GRACE_MS = 3_000;
 
 /**
- * 流式那条路**实际念出去的全文**：增量按到达顺序拼起来，再剥情绪标签、按 TTS 口径清洗。
+ * 会话层的图片附件（base64）收成引擎契约的字节快照。
  *
- * 单独提出来是因为它有两条调用点（正常回答 / omni 转交 dsh 之后），而它决定了
- * 打断续话从哪个字接着念 —— 两处各写一遍迟早漂。
+ * 适配器再编回 base64 交给 `agent.reply`。在这里转一次，`run()` 就不用知道
+ * 供应商要的是哪一种形状。
  */
-function spokenFromStream(raw: string): string {
-  return cleanForSpeech(parseEmotion(raw).rest);
+function turnImage(image: ImageAttachment): { readonly bytes: Buffer; readonly mime: string } {
+  return {
+    bytes: Buffer.from(image.data, 'base64'),
+    mime: image.mimeType,
+  };
 }
 
 export interface TurnRunnerOptions {
@@ -85,6 +85,14 @@ export interface TurnRunnerOptions {
   readonly agent: AgentProvider;
   /** TTS provider：采样率与合成都在里面，宿主不再各配一份 */
   readonly tts: TtsProvider;
+  /**
+   * 快车道引擎。给了就直接用（生产的 `live` / `cascade` 管道）。
+   *
+   * 没给（模拟器 / 旧测试只传 `{ agent, tts }`）时，本类用
+   * {@link AgentEngineAdapter} 把同一对 agent + TTS 收成同一条 `respond()`，
+   * 因此 `run()` 里只有一条泵。
+   */
+  readonly engine?: FastVoiceEngine;
   readonly downlink: DownlinkSink;
   readonly fsm: DialogFsm;
   /** 预估播放时长之外再多等的余量 */
@@ -171,6 +179,8 @@ export interface TurnResult {
 export class TurnRunner {
   private readonly options: TurnRunnerOptions;
   private readonly log: (line: string) => void;
+  /** 这一轮出话的唯一引擎。构造时定下来，`run()` 不再按供应商分支 */
+  private readonly engine: FastVoiceEngine;
   /** 旁白与本轮回答共用一条下行音频，必须串行，否则两段 PCM 会交织在一起 */
   private speechChain: Promise<void> = Promise.resolve();
   /**
@@ -187,6 +197,8 @@ export class TurnRunner {
     /** 首块音频下发的时刻；`-1` = 还没出过声 */
     firstChunkAt: number;
     cancelled: boolean;
+    /** 缺省用 TTS 采样率。实时音频流（`speakAudioAnswer`）可以不同 */
+    sampleRate?: number;
   } | null = null;
   /** 被打断的旁白还没念完的那一段，等下一轮结束再补播。一次性。 */
   private cannedResidue: { text: string; emotion?: string } | null = null;
@@ -194,6 +206,16 @@ export class TurnRunner {
   constructor(options: TurnRunnerOptions) {
     this.options = options;
     this.log = options.log;
+    this.engine = options.engine ?? new AgentEngineAdapter({
+      agent: options.agent,
+      tts: options.tts,
+      ...(options.onLiveAvailable === undefined
+        ? {}
+        : { onLiveAvailable: options.onLiveAvailable }),
+      speechChain: () => this.speechChain,
+      clock: () => this.options.clock.now(),
+      log: (line) => { this.log(line); },
+    });
   }
 
   /** 等 ms：走 Clock，虚拟时钟下就是推进虚拟时间。 */
@@ -296,12 +318,13 @@ export class TurnRunner {
    * `invalidateTurn` 从内核的 `invalidateTurn` 意图进来（插话 / 连接结束），也可能从
    * 裸跑时的 `fsm.onInvalidate` 进来 —— 两条路都必须按**整张票据**比对：迟到的
    * 取消不能杀掉下一轮（`no` 不同），同一轮也不能被取消两次（`invalidated`）。
-   * `markStale` 是「这一轮已经没必要再等」的信号（放掉还在 `await` 的 dsh 答复）。
+   * `turnAbort` 是「这一轮已经没必要再等」的信号：引擎的 `respond()` 看到
+   * `AbortSignal` 就停，委派轮不用再空等 dsh 的软取消。
    */
   private activeTurn: {
     readonly ticket: TurnTicket;
     invalidated: boolean;
-    readonly markStale: () => void;
+    readonly turnAbort: AbortController;
   } | null = null;
   /**
    * 最近一次由 `KernelPorts.settleTurn` 送来的结算。
@@ -352,6 +375,86 @@ export class TurnRunner {
     };
     const next = this.speechChain.then(run, run);
     this.speechChain = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * 播放一段外部已生成的实时音频流（Pure Live 模式下 Omni 后台汇报用）。
+   *
+   * 与 `speakCanned` 共用同一个 `this.canned` 取消令牌、`cannedResidue` 残句记录与
+   * `speechChain` 串行链 —— 插话或双击调用 `cancelCanned()` 时，两条播报路径享受
+   * 完全一致的即时掐断、`audio.stop` 下发与半句续话记录。
+   */
+  speakAudioAnswer(answer: AgentAudioAnswer): Promise<{
+    readonly spokenBytes: number;
+    readonly interrupted: boolean;
+    readonly transcript: string;
+  }> {
+    // 新的一条播报取代上一条：残留作废，否则补播会把已经盖掉的半句又说一遍
+    this.cannedResidue = null;
+    const token = {
+      text: '',
+      sentBytes: 0,
+      firstChunkAt: -1,
+      cancelled: false,
+      sampleRate: answer.sampleRate,
+    };
+    this.canned = token;
+    const run = async (): Promise<{
+      readonly spokenBytes: number;
+      readonly interrupted: boolean;
+      readonly transcript: string;
+    }> => {
+      let spokenBytes = 0;
+      let firstAudioAt = -1;
+      try {
+        for await (const chunk of answer.chunks) {
+          if (token.cancelled || this.options.fsm.state === 'closed') {
+            break;
+          }
+          if (firstAudioAt < 0) {
+            firstAudioAt = this.options.clock.now();
+            token.firstChunkAt = firstAudioAt;
+          }
+          spokenBytes += chunk.length;
+          token.sentBytes = spokenBytes;
+          token.text = answer.transcript();
+          this.options.onDownlinkChunk?.(chunk);
+          this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
+        }
+        if (!token.cancelled && spokenBytes > 0 && firstAudioAt >= 0) {
+          const until = firstAudioAt
+            + pcm16DurationMs(spokenBytes, answer.sampleRate)
+            + this.options.playbackTailMs;
+          while (
+            this.options.clock.now() < until
+            && !token.cancelled
+            && this.options.fsm.state !== 'closed'
+          ) {
+            await this.wait(PLAYBACK_POLL_MS);
+          }
+        }
+        if (token.cancelled && spokenBytes > 0) {
+          const audioSeconds = pcm16DurationMs(spokenBytes, answer.sampleRate) / 1000;
+          const playedSeconds = firstAudioAt >= 0
+            ? Math.min(audioSeconds, (this.options.clock.now() - firstAudioAt) / 1000)
+            : 0;
+          const rest = remainingSpeech(answer.transcript(), playedSeconds);
+          this.cannedResidue = rest === '' ? null : { text: rest };
+        }
+        return {
+          spokenBytes,
+          interrupted: token.cancelled,
+          transcript: answer.transcript(),
+        };
+      } finally {
+        if (this.canned === token) {
+          this.canned = null;
+        }
+      }
+    };
+    const next = this.speechChain.then(run, run);
+    this.speechChain = next.then(() => undefined, () => undefined);
     return next;
   }
 
@@ -462,7 +565,10 @@ export class TurnRunner {
       return;
     }
     current.cancelled = true;
-    const sentMs = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate);
+    const sentMs = pcm16DurationMs(
+      current.sentBytes,
+      current.sampleRate ?? this.options.tts.sampleRate,
+    );
     const elapsedMs = current.firstChunkAt < 0
       ? 0
       : this.options.clock.now() - current.firstChunkAt;
@@ -513,9 +619,9 @@ export class TurnRunner {
       return;
     }
     active.invalidated = true;
+    // 先掐引擎：`respond()` 卡在 dsh 上时，不 abort 就还要等软取消那几秒
+    active.turnAbort.abort(reason);
     this.log(`  取消    ${reason === 'bargeIn' ? '插话' : '连接结束'} → 取消在途请求（第 ${ticket.no} 轮）`);
-    // 先放掉还在等的 await（委派轮的软取消要几秒才回，串行链不能跟着卡）
-    active.markStale();
     // 回执也要停：`audio.stop` 只清掉设备已经收到的缓冲，合成循环还在往下发，
     // 不掐掉就会在用户说话时接着播（试过：用户一开口「我看看」又从头上响一遍）。
     if (this.receipt !== null && !this.receipt.cancelled) {
@@ -590,16 +696,14 @@ export class TurnRunner {
      * 这段时间 `DialogRuntime` 的串行链还卡着，**下一轮开不了**（回放里
      * `出句→开轮` 从源 187 ms 涨到 1304 ms）。答案回来也没人要了。
      */
-    const STALE = Symbol('stale');
-    let markStale: (() => void) | null = null;
-    const staleSignal = new Promise<typeof STALE>((resolve) => {
-      markStale = () => { resolve(STALE); };
-    });
+    // 这一轮的中止信号。`invalidateTurn` 同步 abort：委派轮等 dsh 的软取消要几秒
+    // （真机 2026-11-23 第 5 轮 2.5 s），不掐掉的话串行链卡着，下一轮开不了。
+    const turnAbort = new AbortController();
     // 端口侧的作废对象：`invalidateTurn` 只认这一张票，`finally` 里清掉。
     this.activeTurn = {
       ticket,
       invalidated: false,
-      markStale: () => { markStale?.(); },
+      turnAbort,
     };
 
     // **上游取消的入口**。生产（`DialogRuntime` 绑了端口）走内核那条：
@@ -633,6 +737,13 @@ export class TurnRunner {
      * 当成"omni 答过这一轮"，否则账本里会出现一条它其实没答完的记录。
      */
     let delegated = false;
+    /**
+     * 引擎已经在后台把这一轮派出去了（`meta.nonBlocking`）。
+     *
+     * 垫话播完就收轮，不阻塞等结果。这种垫话不是 omni 答完的一轮，不能
+     * `noteServedTurn`，否则账本以为 live 已经答过。
+     */
+    let nonBlockingDelegate = false;
 
     try {
       const agentStartedAt = this.options.clock.now();
@@ -682,267 +793,83 @@ export class TurnRunner {
         downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       };
 
-      // 优先走「边生成边合成」：文本一到就 continue-task，首包与生成重叠。
-      // 没有流式通道时才退回 SentencePump（按句切，等价于整段）。
-      const streamTts = this.options.tts.synthesizeStream?.bind(this.options.tts);
-      /**
-       * 这一轮会不会走 omni 直出。
-       *
-       * 必须在**起跑流式 TTS 之前**问：那一步会真的开一个合成 task，而 omni 轮
-       * 没有任何文本可送 —— 服务端会拒空文本，整轮退化成兜底（比不走 omni 还慢）。
-       *
-       * **带图轮次一定走 dsh**，连问都不问：omni 吃的是音频流，没有图片通道。
-       * 问一次会得到 `true`（路由只看健康度），于是流式 TTS 被关掉、dsh 的答案
-       * 只能整段合成 —— 带图那一轮白白慢好几秒。
-       */
-      const omniTurn = image === undefined && agent.willServeAudio?.(text) === true;
-      // 这条只在装配坏了时出声：`trackActivity()` 之类的包装层漏转发可选能力时，
-      // 表现是「omni 一次都不接管」而不报错（2026-11-23 线上踩过一整晚）
-      if (typeof agent.willServeAudio !== 'function') {
-        this.log('  车道    ✗ agent 上没有 `willServeAudio`（装配层把可选能力吞了）');
+      let streamedText = '';
+      let agentMarked = false;
+      const markAgent = (): void => {
+        if (agentMarked) {
+          return;
+        }
+        agentMarked = true;
+        agentLatencyMs = this.options.clock.now() - agentStartedAt;
+      };
+      const turnInput: TurnInput = {
+        text,
+        no: ticket.no,
+        baseCommitSeq: ticket.baseCommitSeq ?? 0,
+        startedAtMs: ticket.startedAtMs ?? agentStartedAt,
+        hasImage: image !== undefined,
+        ...(image === undefined ? {} : { image: turnImage(image) }),
+        ...(note === undefined ? {} : { note }),
+        ticket,
+      };
+      for await (const ev of this.engine.respond(turnInput, turnAbort.signal)) {
+        if (fsm.isStale(ticket)) {
+          break;
+        }
+        switch (ev.type) {
+          case 'meta':
+            if (ev.path !== undefined) {
+              replyPath = ev.path;
+              this.noteLane(replyPath);
+            }
+            if (ev.delegate !== undefined) {
+              delegateReason = ev.delegate as DelegateReason;
+            }
+            if (ev.firstTokenMs !== undefined) {
+              this.options.onEvent?.(EVENTS.llmFirst, { ms: ev.firstTokenMs });
+            }
+            if (ev.firstSynthAtMs !== undefined && firstSynthAt === 0) {
+              firstSynthAt = ev.firstSynthAtMs;
+              // 音频往往先于这条 meta。首块当时还不知道起点，这里按同一对时刻
+              // 把记在 `turn.end` 上的 `tts_first_ms` 补上。`tts.first` 事件本身
+              // 已经在首块发出（延迟复算用的是事件时间戳，不是这个字段）。
+              if (firstChunkSeen && firstAudioAtMs >= 0) {
+                const delta = firstAudioAtMs - firstSynthAt;
+                firstChunkAtMs = delta > 0 ? delta : 0;
+              }
+            }
+            if (ev.nonBlocking === true) {
+              nonBlockingDelegate = true;
+            }
+            break;
+          case 'audio':
+            markAgent();
+            if (ev.sampleRate !== undefined) {
+              audioRate = ev.sampleRate;
+            }
+            emit(ev.pcm);
+            break;
+          case 'text':
+            streamedText += ev.delta;
+            speech = streamedText;
+            break;
+          case 'delegate':
+            delegated = true;
+            delegateReason = ev.reason as DelegateReason;
+            break;
+          case 'done':
+            markAgent();
+            speech = ev.speech ?? ev.fullText;
+            break;
+        }
       }
-      const queue = omniTurn || streamTts === undefined || this.options.onLiveAvailable === undefined
-        ? null
-        : new TokenQueue();
-      const pump = queue === null
-        ? new SentencePump({
-            synthesize: (sentence, emotion) => this.options.tts.synthesize(sentence, emotion),
-            clean: cleanForSpeech,
-            resolveEmotion: (raw) => parseEmotion(raw).emotion,
-            gate: this.speechChain,
-            isStale: () => fsm.isStale(ticket),
-            log: (line) => { this.log(line); },
-            onFirstSentence: () => { firstSynthAt = this.options.clock.now(); },
-            onChunk: emit,
-          })
-        : null;
-
-      let streaming: Promise<void> | null = null;
-      /** 流式这条路收到的全部增量（未清洗）。多步时包含每一步的话，见 `TurnResult.speech` */
-      let streamedRaw = '';
-      if (queue !== null && streamTts !== undefined) {
-        this.log('  流式    分支=stream（边生成边合成）');
-        this.options.onLiveAvailable?.((delta) => {
-          streamedRaw += delta;
-          // `tts_first_ms` 的起点是「有文本可送」，不是任务开跑：run-task 在本轮一开始
-          // 就发了，从那儿算会把模型生成整段记到 TTS 头上（实测 3614 = dsh 2970 + 644），
-          // 和整段合成那条路的口径（送文本 → 首块）就比不了了。
-          if (firstSynthAt === 0) firstSynthAt = this.options.clock.now();
-          queue.push(delta);
-        });
-        streaming = (async () => {
-          await this.speechChain;
-          // 情绪标签在开头，但流式任务开跑时 reply 还没回来 —— 这里只能先按默认语气；
-          // 实测这一路是 calm（见 bench 日志 情绪=calm），暂不为了个别情绪牺牲首包。
-          for await (const chunk of streamTts(queue, undefined)) {
-            if (fsm.isStale(ticket)) return;
-            emit(chunk);
-          }
-        })();
-        // 先挂一个空的 catch：`agent.reply` 抛错时下面的 `await streaming` 走不到，
-        // 而这条流多半也会跟着失败（没文本 → 服务端拒空任务）。没人接的 rejection
-        // 在 Node 里是进程级错误，一轮失败会变成整个 harness 退出。
-        // 这只是标记「有人管」，下面 `await streaming` 照样能拿到错误去走兜底。
-        streaming.catch(() => undefined);
-      } else {
-        this.log('  流式    分支=pump（逐句/整段）');
-        this.options.onLiveAvailable?.((delta) => { pump?.push(delta); });
+      if (!agentMarked) {
+        markAgent();
       }
-
-      let reply;
-      try {
-        reply = await agent.reply(text, image, note, { ticket });
-      } finally {
-        this.options.onLiveAvailable?.(null);
-        queue?.close();
-      }
-      agentLatencyMs = this.options.clock.now() - agentStartedAt;
-      replyPath = reply.path;
-      delegateReason = reply.delegate;
-      this.noteLane(replyPath);
-      if (reply.firstTokenMs !== undefined) {
-        // 模型开口的时刻。和 TTS 首块分开记，才看得出"等生成"占了多少
-        this.options.onEvent?.(EVENTS.llmFirst, { ms: reply.firstTokenMs });
-      }
-      speech = reply.speech;
       this.log(
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `
-        + JSON.stringify(reply.text.slice(0, 120)),
+        + JSON.stringify(speech.slice(0, 120)),
       );
-
-      // 补齐没念的部分（没走流式时这一句就是整段合成），并等所有分片落地
-      if (reply.audio !== undefined) {
-        // omni 直出：音频边到边播，**不走 TTS**。
-        this.log('  流式    分支=omni（音频直出）');
-        audioRate = reply.audio.sampleRate;
-        for await (const chunk of reply.audio.chunks) {
-          if (fsm.isStale(ticket)) {
-            break;
-          }
-          emit(chunk);
-        }
-        // drain 之后 `speech` 才是完整的（它是活的 getter）
-        speech = reply.speech;
-        const why = reply.audio.delegateReason?.() ?? null;
-        if (why !== null && fsm.isStale(ticket)) {
-          // 已经作废了就别再叫 dsh：真机 2026-11-23 第 5 轮，插话与 omni 的
-          // `response.done` 落在同一毫秒，这一轮还是去问了 dsh，白等 2.5 s 之后
-          // 一个字都没合成 —— 期间状态机一直挂在 `thinking`，下一轮已经开跑了。
-          this.log('  omni    想转交 dsh，但本轮已作废 → 不问了');
-        } else if (why !== null) {
-          // omni 自己发了 `tool_call`：转交 dsh。
-          //
-          // **omni 在转交前说的那句就是回执**，不是要掐掉的废话 —— 留着它，dsh 的
-          // 答案接在后面。绝不掐断重说：`audio.stop` 只清得掉设备**还没播**的缓冲，
-          // 已经听到的追不回来，掐断之后 dsh 从头再讲一遍就是同一段内容听两遍
-          // （真机 2026-11-23 15:2x 第 8/9 轮：omni 先念 2.2 s / 3.4 s，掐断之后
-          //   dsh 又从头说了 13.52 s / 10.40 s，中间还静了 4.25 s）。
-          //
-          // "回执要短"是**提示词纪律**（`omni-shadow.ts` 的 `DEFAULT_INSTRUCTIONS`），
-          // 不在这里用阈值判：判了就得二选一，"掐断重说"和"干脆不转交"两种都难看。
-          const spokenMs = pcm16DurationMs(audioBytes, audioRate);
-          this.log(
-            audioBytes > 0
-              ? `  omni    说了 ${(spokenMs / 1000).toFixed(1)} s 回执 → 转交 dsh，答案接在后面`
-                + (spokenMs > 3_000 ? '（偏长：提示词没管住，见 `omni-shadow.ts` 的指令）' : '')
-              : '  omni    决定转交 dsh（它没出声，回执由 dsh 那边说）',
-          );
-          // 正文用 omni 的转述（它直接听音频，专名比 ASR 准），ASR 原话只作附注 ——
-          // 数字、路径、设备名这些"照抄"的东西靠原话兜底。
-          const omniText = reply.audio.delegateText?.() ?? null;
-          const leadIn = speech;
-          const bytesBeforeDelegate = audioBytes;
-          delegated = true;
-          // 转交之后 dsh 的增量要**接着**往 TTS 送。第一次 `reply` 的 sink 已经在
-          // 它的 finally 里摘掉了，不重挂的话这条流没人接 —— 只能等 `reply` 整段回来
-          // 再 `pump.drain()`，而慢车道的答案是 5–20 s，用户先听一段静音。
-          let delegateQueue: TokenQueue | null = null;
-          /** dsh 那条流收到的全部增量（未清洗），转写口径与主路径一致 */
-          let delegateStreamedRaw = '';
-          let delegateStreaming: Promise<void> | null = null;
-          if (streamTts !== undefined && this.options.onLiveAvailable !== undefined) {
-            const delegateTokenQueue = new TokenQueue();
-            delegateQueue = delegateTokenQueue;
-            this.options.onLiveAvailable((delta) => {
-              delegateStreamedRaw += delta;
-              // 口径同主路径：起点是「有文本可送」，不是合成任务开跑
-              if (firstSynthAt === 0) firstSynthAt = this.options.clock.now();
-              delegateTokenQueue.push(delta);
-            });
-            delegateStreaming = (async () => {
-              await this.speechChain;
-              for await (const chunk of streamTts(delegateTokenQueue, undefined)) {
-                if (fsm.isStale(ticket)) return;
-                emit(chunk);
-              }
-            })();
-            // 先挂一个空的 catch：作废时我们会提前返回，这条流跟着失败也没人接，
-            // 而没人接的 rejection 是进程级错误。
-            delegateStreaming.catch(() => undefined);
-          }
-          const pending = agent.reply(
-            omniText === null ? text : `${omniText}\n用户原话：「${text}」`,
-            image, note, {
-              ticket,
-              forceDelegate: why,
-              // omni 已经说过回执 → 别再叠一句内核的「我查查」（两句回执）；
-              // 同时这让这一轮在被打断时**放手而不是取消**：回执等于承诺了答案，
-              // dsh 的活儿要跑完，答案回来走 `onDetachedAnswer` 回注记忆。
-              receiptSpoken: speech.trim() !== '',
-            },
-          );
-          // 可能不等它了：留一个 catch，别让迟到的那次失败变成进程级错误
-          pending.catch(() => undefined);
-          let raced: AgentReplyView | typeof STALE;
-          try {
-            raced = await Promise.race([pending, staleSignal]);
-          } finally {
-            // dsh 的增量到此为止（作废时也一样）：不摘的话下一轮的增量还会进这条队列
-            this.options.onLiveAvailable?.(null);
-            delegateQueue?.close();
-          }
-          if (raced === STALE) {
-            // 已经作废：不再等 dsh 的取消往返（真机 2.5–3.2 s），否则串行链卡着，
-            // 用户下一句要排队。作废那一刻走的是**放手**（不取消），dsh 跑完之后
-            // 答案由 `session` 的 `onDetachedAnswer` 回注记忆，不会白跑。
-            this.log('  omni    转交后本轮被作废 → 不再等 dsh，答案回来会回注记忆');
-          } else {
-            reply = raced;
-            replyPath = reply.path;
-            delegateReason = reply.delegate;
-            speech = reply.speech;
-            this.noteLane(replyPath);
-            if (delegateStreaming !== null) {
-              try {
-                await delegateStreaming;
-                const spoken = spokenFromStream(delegateStreamedRaw);
-                if (spoken !== '' && spoken !== speech) {
-                  this.log(
-                    `  流式    转交后实际念了 ${[...spoken].length} 字`
-                    + `（最后一步只有 ${[...speech].length} 字）`,
-                  );
-                  speech = spoken;
-                }
-                // 流式一条音频都没吐出来（dsh 没挂流式通道 / 增量全是空串）：
-                // 不能就这么哑着走完一轮，退回整段合成。
-                if (audioBytes === bytesBeforeDelegate && !fsm.isStale(ticket)) {
-                  this.log('  流式    ✗ 转交后没有增量到达，退回整段合成');
-                  firstSynthAt = this.options.clock.now();
-                  for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
-                    if (fsm.isStale(ticket)) break;
-                    emit(chunk);
-                  }
-                }
-              } catch (error) {
-                // 这条路挂了（最常见：一个字都没收到，服务端会拒空文本）。
-                // 退回整段合成，宁可慢也不能哑。
-                this.log(`  流式    ✗ ${(error as Error).message}，退回整段合成`);
-                firstSynthAt = this.options.clock.now();
-                for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
-                  if (fsm.isStale(ticket)) break;
-                  emit(chunk);
-                }
-              }
-            } else {
-              await pump?.drain(reply.speech);
-            }
-            if (fsm.isStale(ticket) && audioBytes === bytesBeforeDelegate) {
-              // dsh 答了，但一个字都没合成出去（这条在到达前就被作废了）。
-              // `said` 记的必须是**念出去的**文本，不能是这段没念的答案 ——
-              // 否则档案里看着"它答了罗马史"，实际播出去的只有 omni 那半句垫话。
-              this.log(`  omni    dsh 的答案没来得及合成 → said 仍是垫话`);
-              speech = leadIn;
-            }
-          }
-        }
-      } else if (streaming !== null) {
-        try {
-          await streaming;
-          // 流式成功：念出去的是**全部增量**，不只是最后一步。用它做 `speech`，
-          // 打断续话才对得上已播时长。按全部增量算而不是按「已送批」算：被打断时
-          // 没来得及送的那截也是"没说完"的一部分，漏了它续话会少一段。
-          const spoken = spokenFromStream(streamedRaw);
-          if (spoken !== '' && spoken !== speech) {
-            this.log(
-              `  流式    实际念了 ${[...spoken].length} 字`
-              + `（最后一步只有 ${[...speech].length} 字）`,
-            );
-            speech = spoken;
-          }
-        } catch (error) {
-          // 流式这条路挂了（最常见：这条路一个字都没收到，服务端会拒空文本）。
-          // 退回整段合成，宁可慢也不能哑。
-          this.log(`  流式    ✗ ${(error as Error).message}，退回整段合成`);
-          // 兜底这次才是真正的「送文本」时刻，口径同整段合成
-          firstSynthAt = this.options.clock.now();
-          for await (const chunk of this.options.tts.synthesize(reply.speech, reply.emotion)) {
-            if (fsm.isStale(ticket)) break;
-            emit(chunk);
-          }
-        }
-      } else {
-        await pump?.drain(reply.speech);
-      }
 
       interrupted = interrupted || fsm.isStale(ticket);
       const audioSeconds = pcm16DurationMs(audioBytes, audioRate) / 1000;
@@ -1064,7 +991,7 @@ export class TurnRunner {
       //
       // `truncated` 用结算出来的那个值，**不能省**：账本里它决定回注与粘性判断，
       // 缺了就永远以为用户听全了（P1-4 的接线点）。
-      if (replyPath === 'omni' && !delegated) {
+      if (replyPath === 'omni' && !delegated && !nonBlockingDelegate) {
         agent.noteServedTurn?.(text, speech, truncated);
       }
 

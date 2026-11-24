@@ -10,7 +10,14 @@ import { test } from 'node:test';
 
 import type { Cancel, Clock } from '../src/app/clock.ts';
 import { DialogFsm } from '../src/dialog-fsm.ts';
-import type { AgentProvider, AgentReplyView, DelegateReason, TtsProvider } from '../src/providers.ts';
+import { CascadeVoiceEngine, LiveVoiceEngine } from '../src/engines/index.ts';
+import type {
+  AgentAudioAnswer,
+  AgentProvider,
+  AgentReplyView,
+  DelegateReason,
+  TtsProvider,
+} from '../src/providers.ts';
 import type { ImageAttachment } from '../src/session.ts';
 import { TurnRunner, type TurnResult } from '../src/turn-runner.ts';
 
@@ -579,4 +586,201 @@ test('带图的轮次不走 omni：流式 TTS 照常开', async () => {
   assert.deepEqual(r.streamed, ['[平静]我看了，', '是只猫。'], '流式 TTS 要照常收增量');
   assert.deepEqual(r.whole, [], '没走 omni 就不该退化成整段合成');
   assert.equal(r.payloads.find((p) => p.name === 'turn.end')?.data['path'], 'dsh');
+});
+
+// ---------------------------------------------------------------- 单泵
+
+/** 注入引擎时不该再走 `agent.reply`。走到了就说明 `run()` 还留着旧分支。 */
+function unusedAgent(): AgentProvider & { readonly calls: number } {
+  const state = { calls: 0 };
+  return {
+    name: 'unused',
+    get calls(): number { return state.calls; },
+    reply: async () => {
+      state.calls += 1;
+      throw new Error('engine 路径不应调用 agent.reply');
+    },
+  };
+}
+
+const stubTts: TtsProvider = {
+  name: 'fake',
+  sampleRate: 24_000,
+  async* synthesize() { yield LOUD; },
+};
+
+test('注入 LiveVoiceEngine：单泵出声、tts.first、turn.end path=omni、内核结算', async () => {
+  let said = '';
+  const engine = new LiveVoiceEngine({
+    willServe: () => true,
+    claim: () => ({
+      sampleRate: 24_000,
+      transcript: () => said,
+      chunks: (async function* generate() {
+        said = '在呢。';
+        yield LOUD;
+      })(),
+    }),
+    discard: () => {},
+  });
+  const events: string[] = [];
+  const payloads: Array<{ name: string; data: Record<string, unknown> }> = [];
+  const fsm = new DialogFsm(() => {}, { now: () => clock.now() });
+  const agent = unusedAgent();
+  const runner = new TurnRunner({
+    clock,
+    agent,
+    tts: stubTts,
+    downlink: { sendAudio: () => {}, sendControl: () => {} },
+    fsm,
+    playbackTailMs: 0,
+    engine,
+    onEvent: (name, data) => {
+      events.push(name);
+      payloads.push({ name, data: data ?? {} });
+    },
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+
+  const result = await runner.run('你好');
+  const end = payloads.find((p) => p.name === 'turn.end');
+  const ledger = fsm.runtime.state.ledger;
+
+  assert.ok(result);
+  assert.equal(agent.calls, 0, '注入了引擎就不该再调 agent.reply');
+  assert.ok(events.includes('tts.first'), '首块仪表不能缺');
+  assert.equal(end?.data['path'], 'omni');
+  assert.equal(result.speech, '在呢。');
+  assert.ok(result.audioBytes > 0);
+  assert.equal(ledger.lastSettled?.ticket.no, 1, `实际：${JSON.stringify(ledger)}`);
+  assert.equal(ledger.lastSettled?.ticket.gen, 0);
+  assert.equal(ledger.lastLane, 'live', 'omni 在内核里叫 live');
+  assert.equal(ledger.lastSettled?.inject, 'spoken', '听全了要按「他听到了」结算');
+});
+
+test('注入 CascadeVoiceEngine：插话通过 AbortSignal 取消在途请求', async () => {
+  let sawAbort = false;
+  const engine = new CascadeVoiceEngine({
+    isReady: () => true,
+    clock: () => clock.now(),
+    ask: async (_turn, emit, signal) => {
+      emit('慢车道答复。');
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 5_000);
+        const finish = (): void => {
+          sawAbort = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        if (signal.aborted) {
+          finish();
+          return;
+        }
+        signal.addEventListener('abort', finish, { once: true });
+      });
+      return { text: '慢车道答复。', speech: '慢车道答复。', path: 'dsh' };
+    },
+    tts: {
+      name: 'fake',
+      sampleRate: 24_000,
+      async* synthesize() { yield LOUD; },
+      async* synthesizeStream(chunks) {
+        for await (const chunk of chunks) {
+          void chunk;
+          yield LOUD;
+        }
+      },
+    },
+  });
+  const fsm = new DialogFsm(() => {}, { now: () => clock.now() });
+  const runner = new TurnRunner({
+    clock,
+    agent: unusedAgent(),
+    tts: stubTts,
+    downlink: { sendAudio: () => {}, sendControl: () => {} },
+    fsm,
+    playbackTailMs: 0,
+    engine,
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+
+  const running = runner.run('你好');
+  for (let i = 0; i < 50 && fsm.state !== 'speaking'; i += 1) {
+    await sleep(10);
+  }
+  assert.equal(fsm.state, 'speaking', '要先出声，插话才成立');
+  const bargedAt = Date.now();
+  assert.equal(fsm.bargeIn('插话'), true);
+  const result = await running;
+
+  assert.ok(result);
+  assert.equal(result.interrupted, true);
+  assert.equal(sawAbort, true, 'AbortSignal 必须送到引擎，否则 dsh 还要空等几秒');
+  assert.ok(
+    Date.now() - bargedAt < 1_000,
+    `作废后还等了 ${Date.now() - bargedAt} ms`,
+  );
+});
+
+test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻停并留下残句', async () => {
+  const sent: Buffer[] = [];
+  const fsm = new DialogFsm(() => {}, { now: () => clock.now() });
+  const runner = new TurnRunner({
+    clock,
+    agent: unusedAgent(),
+    tts: stubTts,
+    downlink: {
+      sendAudio: (pcm) => { sent.push(pcm); },
+      sendControl: () => {},
+    },
+    fsm,
+    playbackTailMs: 0,
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+  const full = '一二三四五六七八九十';
+  let said = '';
+  const answer: AgentAudioAnswer = {
+    sampleRate: 24_000,
+    transcript: () => said,
+    chunks: (async function* generate() {
+      for (const ch of full) {
+        said += ch;
+        // 100 ms 音频。十块一共 1 s，播放等待足够在中途掐断。
+        yield Buffer.alloc(4_800, 1);
+        await sleep(15);
+      }
+    })(),
+  };
+
+  const pending = runner.speakAudioAnswer(answer);
+  for (let i = 0; i < 80 && sent.length < [...full].length; i += 1) {
+    await sleep(10);
+  }
+  assert.equal(sent.length, [...full].length, '流要先下发完，后面才是播放等待');
+  // 还在等播完：这时候掐断。若没有播放等待，promise 已经结束，interrupted 会是 false。
+  await sleep(40);
+  const before = sent.length;
+  const cancelledAt = Date.now();
+  runner.cancelCanned();
+  const result = await pending;
+
+  assert.equal(result.interrupted, true);
+  assert.equal(result.spokenBytes, before * 4_800);
+  assert.equal(result.transcript, full);
+  assert.equal(sent.length, before, '掐断之后不能再往下发');
+  assert.ok(
+    Date.now() - cancelledAt < 400,
+    `掐断后还等了 ${Date.now() - cancelledAt} ms（不该把剩下的播放等完）`,
+  );
+  const residue = runner.takeCannedResidue();
+  assert.ok(residue, '没念完的部分要留在 takeCannedResidue');
+  assert.ok(residue.text.length > 0);
+  assert.ok(
+    full.includes(residue.text.replace(/\s+/g, '')),
+    `残句应当是原文的一段，实际「${residue.text}」`,
+  );
+  assert.equal(runner.takeCannedResidue(), null, '取一次就没了');
 });
