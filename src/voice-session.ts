@@ -138,6 +138,35 @@ const INITIAL_LISTEN_MS = 60_000;
 const CAPTURE_GRACE_MS = 1_500;
 
 /**
+ * 连接就绪时该不该主动唤醒设备（发 `listen.start`）。
+ *
+ * 三条判据，从「最本质」到「最保守」：
+ *
+ * 1. **设备正在推流** → 不用唤醒（重连场景多半是这样）
+ * 2. **明确未佩戴**（`wearing === false`）→ 不唤醒。设备不戴就不可能开麦，
+ *    发出去只是白占 {@link INITIAL_LISTEN_MS} 的麦克风。真机 2026-11-22 19:19:43：
+ *    未佩戴 + `listen.start{maxMs:60000}`，整段零音频帧、零 `OpenDevice`、
+ *    模型一句话没说 —— 用户看到的就是「莫名其妙被拉起，却没人说话」。
+ * 3. `wearing === null`（设备不报 / 还没报）→ **放行**。
+ *    这里与 ADR-0001 的 `worn` 闸门方向**相反**：那边保守是「不主动开口」，
+ *    这边保守必须是「开」—— 漏开的代价（用户长按没反应）比多开一次大。
+ *
+ * @param hasAudio 宽限期内是否收到过上行音频
+ * @param wearing 设备上报的佩戴状态；`null` = 不知道
+ */
+export function shouldWakeOnReady(input: {
+  readonly hasAudio: boolean;
+  readonly wearing: boolean | null;
+  readonly closed: boolean;
+  readonly micPending: boolean;
+}): boolean {
+  if (input.closed || input.micPending || input.hasAudio) {
+    return false;
+  }
+  return input.wearing !== false;
+}
+
+/**
  * 送给判停器的「最近音频」上限（秒）。
  *
  * 判停器要听到整句话的尾巴才能判「说完了」，8 s 足够覆盖常见的一句话，
@@ -1012,13 +1041,22 @@ class VoiceConnection {
    * 为什么不干脆"重连就跳过"：设备侧的 Aivs 会话可能已经自毁（真机 `会话状态 3`
    * 后采集停止），那种情况下不唤醒就是「未响应」。
    *
-   * 判据只能是设备有没有在推流 —— 等 {@link CAPTURE_GRACE_MS} 看有没有帧。
+   * 判据只能是设备有没有在推流 —— 等 {@link CAPTURE_GRACE_MS} 看有没有帧；
+   * 到期要不要开麦交给 {@link shouldWakeOnReady}（它还看佩戴）。
    */
   private armCaptureWatch(resumed: boolean): void {
     const why = resumed ? '自动重连' : '连接就绪';
     this.captureWatch = setTimeout(() => {
       this.captureWatch = null;
-      if (this.conn.isClosed || this.micPending) {
+      if (!shouldWakeOnReady({
+        hasAudio: false, // 收到帧时 watch 已被 onFrame 取消，走到这里就是没帧
+        wearing: this.wearing,
+        closed: this.conn.isClosed,
+        micPending: this.micPending,
+      })) {
+        if (this.wearing === false) {
+          console.log(`  开麦    ${why}且 ${CAPTURE_GRACE_MS} ms 无上行音频，但设备未佩戴 → 不唤醒`);
+        }
         return;
       }
       console.log(`  开麦    ${why}但 ${CAPTURE_GRACE_MS} ms 内没有上行音频 → 请设备推流（§42）`);

@@ -84,8 +84,8 @@
 | `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:118` | ASR 出句之前 | — |
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:127` | 无关首声（不在停嘴→出声路径上） | — |
 | `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:138` | 无关首声（不在停嘴→出声路径上） | — |
-| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:156` | 判停侧车输入预处理（不额外等） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:366` | 无关首声（不在停嘴→出声路径上） | — |
+| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:185` | 判停侧车输入预处理（不额外等） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:395` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 四、还没标注的
 
