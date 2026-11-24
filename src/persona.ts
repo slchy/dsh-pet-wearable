@@ -84,3 +84,39 @@ export const FAST_LANE_PERSONA_HEADER: readonly string[] = [
   '每句回复**最开头**写一个情绪标签，从这六个里选：[开心] [得意] [惊讶] [平静] [担心] [委屈]。',
   '标签只给语音合成用，不会被念出来；正文里不要再出现方括号。',
 ];
+
+/**
+ * Pure Live 下随后台任务交给 dsh 的注记。
+ *
+ * 这条链路里 dsh 是 {@link PERSONA_NAME} 的无头执行与记忆后端，不直接对用户出声。
+ * 前台只有 omni 一副嗓子，所以这里只要简洁的事实结论：不寒暄、不垫话、不写情绪标签。
+ * 必须逐字念出的数字、端口、标识、代码保持原样并且尽量短，交给前台朗读。
+ */
+export const LIVE_BACKEND_TASK_DIRECTIVE =
+  `你是${PERSONA_NAME}的无头执行与记忆后端，不直接对用户说话。`
+  + '直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。'
+  + '若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。';
+
+/**
+ * 交给 `OmniShadow.speakFromText` 的 `role: 'user'` 提示。
+ *
+ * 让 omni 以 {@link PERSONA_NAME} 的身份，用一两句口语把后台结论告诉「哥」。
+ * 会话里已经有短人设，这里不再重复那段 instructions，也不许它再调工具。
+ */
+export function buildLiveReportPrompt(input: {
+  readonly query: string;
+  readonly summary: string;
+  readonly needsConfirm?: string;
+}): string {
+  const lines = [
+    `用一两句口语，以${PERSONA_NAME}的身份直接告诉哥下面这件事的结果。`,
+    '不要调用任何工具，也不要把这段提示再念一遍。',
+    `哥要办的事：${input.query}`,
+    `结果：${input.summary}`,
+  ];
+  const confirm = input.needsConfirm?.trim() ?? '';
+  if (confirm !== '') {
+    lines.push(`还要问哥一句：${confirm}`);
+  }
+  return lines.join('\n');
+}

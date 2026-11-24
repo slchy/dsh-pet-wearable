@@ -259,6 +259,9 @@ test('trackActivity 透传**全部**可选能力（漏一个就是静默降级�
     'detachTurn',
     'dshBusy',
     'taskStatus',
+    // Pure Live 后台任务：漏了 → 完成汇报没人接、用户说「算了」也取消不掉，而且不报错。
+    'setTaskReporter',
+    'cancelBackgroundTasks',
     'prefetch',
     'speculatePartial',
     'attachAudioLane',

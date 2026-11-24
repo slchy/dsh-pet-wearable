@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
+  isActionRequest,
   isCancelRequest,
   looksLikeAnswer,
   looksLikeFollowUp,
@@ -47,6 +48,15 @@ test('粘性只认短追问：带专名/书名的长句照常给 Live', () => {
 test('上一轮是 Live 时不触发粘性', () => {
   const ctx: RouteContext = { ...base, lastLane: 'live' };
   assert.equal(routeTurn('你讲讲梗概。', ctx).lane, 'live');
+});
+
+test('isActionRequest 与 routeTurn 共用同一份动作动词表', () => {
+  for (const text of ['帮我查一下天气', '定个明天八点的闹钟', '记一下这个单号']) {
+    assert.equal(isActionRequest(text), true, `「${text}」应当算动作`);
+  }
+  for (const text of ['你今天怎么样', '你看过星球大战没']) {
+    assert.equal(isActionRequest(text), false, `「${text}」不是动作请求`);
+  }
 });
 
 test('只会说的两条车道接不了「有副作用」的动作 → 直接给 dsh', () => {

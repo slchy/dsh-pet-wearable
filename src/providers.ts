@@ -152,6 +152,21 @@ export interface FastLaneAudioLane {
    * @param kind 这句话有没有真的念给用户听（见 {@link InjectKind}）
    */
   injectAnswer?(userText: string, said: string, kind?: InjectKind): void;
+  /**
+   * 当前是否处于可安全发起后台汇报的状态：
+   * 必须同时满足 `ready`、无在途回复、无排队封段、无脏音频缓冲。
+   */
+  canSpeakBackground?(): boolean;
+  /**
+   * 在安全空窗期往同一条实时会话写入后台结论并触发音频回复（同一副嗓子 + 自然进上下文）。
+   * 返回 `null` 表示此刻不可发（忙 / 有用户音频 / 已断线），调用方应顺延重试。
+   */
+  speakFromText?(
+    promptText: string,
+    meta?: { readonly taskId?: string; readonly query?: string },
+  ): AgentAudioAnswer | null;
+  /** 只掐掉正在播的后台汇报回复（`origin === 'announce'`），绝不误掐用户自己的回复。 */
+  cancelBackgroundSpeech?(): void;
 }
 
 /**
@@ -212,6 +227,34 @@ export interface AgentReplyView {
    * 没有它，「这一轮为什么走 dsh」在日志里和「本地闸挡住」长得一模一样。
    */
   readonly delegate?: DelegateReason;
+}
+
+export type BackgroundTaskSource =
+  | 'tool_call'
+  | 'early_rule'
+  | 'image'
+  | 'memory_silent'
+  | 'dsh_background';
+
+/**
+ * 后台执行器（dsh）完成后回流给唯一前台的标准化结果。
+ *
+ * 无论是短工具调用、识图、还是 dsh 内部 `run_in_background` / `subagent` 跑完，
+ * 都归一成这一个形状再交给播报空窗（FloorArbiter）统一调度。
+ */
+export interface BackgroundTaskReport {
+  readonly taskId: string;
+  readonly source: BackgroundTaskSource;
+  /** 触发这条任务的用户原话/意图（用于指代对齐与上下文回注） */
+  readonly query: string;
+  /** 给前台口语汇报 / 写入上下文的简洁结论 */
+  readonly summary: string;
+  /** 若非空，表示含精确数字/端口/代码/长文，须走逐字朗读路径（如 omni-tts / TTS） */
+  readonly verbatim?: string;
+  /** 需要用户确认的问题（由唯一前台直接向用户发问，闭环在同一上下文里） */
+  readonly needsConfirm?: string;
+  /** 可选情绪标签（透传给回落 TTS） */
+  readonly emotion?: string;
 }
 
 /**
@@ -394,6 +437,10 @@ export interface AgentProvider {
    * 不用额外发请求。给快车道用来**照实回答**「好了吗 / 查到没」，而不是瞎编进度。
    */
   taskStatus?(): string;
+  /** Pure Live 模式下接收后台任务完成汇报（路由到 DialogRuntime 的播报空窗） */
+  setTaskReporter?(cb: ((report: BackgroundTaskReport) => void) | null): void;
+  /** 显式取消所有在途后台任务（「算了 / 别查了」）；返回是否确实取消了任务 */
+  cancelBackgroundTasks?(): boolean;
   /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。

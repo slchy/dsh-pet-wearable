@@ -41,6 +41,11 @@ export type Lane = 'live' | 'cascade' | 'dsh';
 const ACTION_CUES =
   /(记一下|记下来|提醒我|定个|订一下|预约|开个|打开|关掉|关闭|删除|删掉|清掉|发个|发一条|查一下|搜一下|查查|搜搜|读一下|念一下)/u;
 
+/** 这句是不是「有副作用」的动作请求。路由与早规则竞速共用这一份动词表 */
+export function isActionRequest(text: string): boolean {
+  return ACTION_CUES.test(text);
+}
+
 /**
  * 「不要了」——用户**显式下令取消**在跑的委派任务。
  *
@@ -181,7 +186,7 @@ export function routeTurn(text: string, ctx: RouteContext): RouteDecision {
   if (looksMemorable(text)) {
     return { lane: 'dsh', why: 'memorable' };
   }
-  if (ACTION_CUES.test(text)) {
+  if (isActionRequest(text)) {
     return { lane: 'dsh', why: 'action' };
   }
   if (ctx.lastLane === 'dsh' && looksLikeFollowUp(text)) {

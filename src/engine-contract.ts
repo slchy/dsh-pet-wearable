@@ -26,17 +26,15 @@
  *    `truncated` 管记账与外部记忆回注；它们曾经是同一个 `interrupted`。
  * 5. {@link FastVoiceEngine}——Live 与级联只在这一个接口后面不同。
  *
- * ## 当前阶段边界（契约按接入进度分两段，别把「已实现」当「已接线」）
+ * ## 当前阶段边界
  *
- * - **已接热路径**：契约 ①–④（{@link AudioFrame}、{@link AsrSyncState}、
- *   `baseCommitSeq`、{@link TurnOutcome}）及控制内核（`kernel.ts`）已全面接入生产
- *   热路径 ——「换引擎零改内核」在这一层已经成立。
- * - **就绪待接入（下一阶段）**：契约 ⑤（{@link FastVoiceEngine.respond} 及其两份
- *   实现 `LiveVoiceEngine` / `CascadeVoiceEngine`）**已实现并通过契约测试**
- *   （`tests/fast-voice-engine.test.ts`），但**尚未切入 `TurnRunner` 生产热路径**：
- *   `TurnRunner` 当前仍维护 `omni` / `stream` / `pump` 三分支，以保留 `FrontedAgent`
- *   的双轨投机、流式 TTS 异常回落与逐轮延迟埋点。换引擎目前仍需同步更新
- *   `TurnRunner` —— 这是**刻意分期，非漏接线**。
+ * {@link FastVoiceEngine} 现在是 `live` 与 `cascade` 两条主管道共用的**热路径泵契约**。
+ * 启动期由 `VOICE_PIPELINE` 显式二选一（`pipeline-mode.ts`），会话内严格互斥。
+ * 内核只认 `respond()` 吐出的 {@link EngineEvent}，不关心背后是 omni 直出还是文本级联。
+ *
+ * 契约 ①–④（{@link AudioFrame}、{@link AsrSyncState}、`baseCommitSeq`、
+ * {@link TurnOutcome}）及控制内核（`kernel.ts`）已经在生产热路径上。
+ * 「换引擎零改内核」靠的就是这一份泵契约：两条管道只在 {@link FastVoiceEngine} 后面不同。
  *
  * **为什么票上要带水位线、谁负责锁存**：票据由**确定性内核**铸造（`DialogFsm` 只是
  * 它的门面），内核本身不认识 ASR —— 它只认显式事件。所以宿主在发 `beginTurn` 时
@@ -99,6 +97,17 @@ export interface TurnInput {
   readonly startedAtMs: number;
   /** 这一轮要不要带照片 */
   readonly hasImage: boolean;
+  /** 可选：本轮携带的图片（识图轮；引擎不依赖具体 `session.ts` 类型，保持契约层无环） */
+  readonly image?: { readonly bytes: Buffer; readonly mime: string; readonly name?: string };
+  /** 可选：本轮系统注记（设备现状 / 打断续话尾巴） */
+  readonly note?: string;
+  /** 可选：完整票据（供需要按票据取消/回滚的引擎使用） */
+  readonly ticket?: {
+    readonly no: number;
+    readonly gen: number;
+    readonly baseCommitSeq?: number;
+    readonly startedAtMs?: number;
+  };
 }
 
 /**
@@ -182,13 +191,30 @@ export function outcomeOf(input: {
 
 /** 引擎吐给内核的事件流（两种引擎**完全同构**） */
 export type EngineEvent =
-  /** 引擎自己的正文音频。**回执不在这里**——回执是内核自己用 TTS 说的 */
-  | { readonly type: 'audio'; readonly pcm: Buffer }
+  /** 引擎自己的正文音频。`sampleRate` 缺省时由宿主按 TTS 默认采样率解读 */
+  | { readonly type: 'audio'; readonly pcm: Buffer; readonly sampleRate?: number }
   /** 文本增量（记账 / 逐字对齐用） */
   | { readonly type: 'text'; readonly delta: string }
-  /** 引擎自己决定转交 dsh（omni 的 `tool_call`） */
+  /** 引擎自己决定转交 dsh（omni 的 `tool_call` 或文本模型 `[[DELEGATE]]`） */
   | { readonly type: 'delegate'; readonly reason: string; readonly rewrittenQuery: string | null }
-  | { readonly type: 'done'; readonly fullText: string };
+  /**
+   * 可观测元信息（只用于档案埋点与记账，不改变控制流）：
+   * - `path`：这一轮由哪条路径答的（`'omni' | 'fast' | 'dsh'`）
+   * - `firstTokenMs`：模型首 token 延迟（进 `llm.first`）
+   * - `firstSynthAtMs`：送给 TTS 的起始墙钟时刻（算 `tts.first`）
+   * - `delegate`：进入慢车道的原因（`turn.end.delegate`）
+   * - `nonBlocking`：为真表示引擎已在后台异步派单，本轮播完垫话即收尾，不阻塞等结果
+   */
+  | {
+    readonly type: 'meta';
+    readonly path?: 'fast' | 'dsh' | 'omni';
+    readonly firstTokenMs?: number;
+    readonly firstSynthAtMs?: number;
+    readonly delegate?: string;
+    readonly nonBlocking?: boolean;
+  }
+  /** 本轮结束。`speech` 是清洗后真正播出的文本（省略时由宿主使用 `fullText`） */
+  | { readonly type: 'done'; readonly fullText: string; readonly speech?: string };
 
 /**
  * 快车道语音引擎。
@@ -201,14 +227,12 @@ export type EngineEvent =
  * 其余全部同步 `void`——订阅、放弃投机、回注都是「告诉引擎发生了什么」，
  * 引擎内部可以慢，内核绝不等。这条不靠注释守，靠签名守。
  *
- * ## 接入状态：就绪，但**不在**生产热路径上
+ * ## 接入状态：`live` / `cascade` 共用的热路径泵
  *
- * 本接口（契约 ⑤）的两份实现都已落地，并由 `tests/fast-voice-engine.test.ts`
- * 按契约逐条验过。**但 `TurnRunner` 目前不走这里**：它仍按 `omni` / `stream` /
- * `pump` 三分支调 `AgentProvider`，因为那三条分支上挂着 `FrontedAgent` 的双轨投机、
- * 流式 TTS 的异常回落、以及逐轮延迟埋点 —— 这些先按现状保留，下一阶段再随引擎
- * 一起收口。所以「换引擎」目前**还需要**同步改 `TurnRunner`，那是刻意分期：
- * 契约 ①–④ 与控制内核（`kernel.ts`）已经在热路径上，这一条还没切过去，不是漏接线。
+ * 本接口是两条主管道的统一出话泵，启动期用 `VOICE_PIPELINE` 显式选定
+ * （`'live'` 走 omni 直出，`'cascade'` 走文本快车道再合成）。会话内不混跑。
+ * `LiveVoiceEngine` / `CascadeVoiceEngine` 都走 `respond()` → {@link EngineEvent}，
+ * `tests/fast-voice-engine.test.ts` 按契约验过同构。内核不用知道自己是哪一种。
  */
 export interface FastVoiceEngine {
   readonly mode: 'live' | 'cascade';
