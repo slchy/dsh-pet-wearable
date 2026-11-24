@@ -23,7 +23,12 @@
  * - **发什么由调用方定**：这里只管「什么时候」，不碰 agent 的接口细节。
  */
 
-import type { AgentProvider } from './providers.ts';
+import type {
+  AgentImage,
+  AgentProvider,
+  AgentReplyView,
+  TurnContext,
+} from './providers.ts';
 
 /** 保活用的输入。刻意写得不像用户的话，模型不会把它当成一句招呼去回应。 */
 export const KEEPALIVE_PROMPT = '（保活信号，不需要回应）';
@@ -63,43 +68,68 @@ export function newActivityState(now: number): ActivityState {
  * - `setAnnouncer` 漏了 —— 后台任务的汇报再也播不出来
  * - `attachLiveSink` 漏了 —— 流式增量到了 `session` 却没人接，边生成边合成拿到
  *   空文本，每轮都退回整段合成（实测踩过：日志里 `首增量` 一次都不出现）
+ * - `attachAudioLane` / `willServeAudio` / `noteServedTurn` 漏了 —— omni 一晚上
+ *   4 轮全部静默退回文本快车道，从现象上看不出来
  *
- * 给 `AgentProvider` 加新的可选方法时，这里要跟着加一行。
+ * 所以这里**不再逐个列举**：以前那份手工转发表每加一个可选方法就得跟着加一行，
+ * 忘了就是静默降级（同一类事故已经踩过至少三次）。改成 `Proxy` 之后，任何属性
+ * （包括以后新加的、甚至运行时才挂上去的）都自动转发，只有 `reply` 被包一层记账。
+ *
+ * 两条实现细节别改：
+ * - `Reflect.get(target, prop, target)` 的第三个参数必须是 **`target`**而不是
+ *   `receiver`：实现方用 `#私有字段` 的 getter 会在 receiver 上找私有槽，传 Proxy
+ *   会直接抛 "Receiver must be an instance of class"。
+ * - 方法要 `.bind(target)`：宿主是拿下来再调的（`const fn = agent.prefetch` 这类
+ *   写法也有），不绑就会丢 `this`，私有字段同样会炸。
  */
 export function trackActivity(
   agent: AgentProvider,
   state: ActivityState,
   now: () => number = Date.now,
 ): AgentProvider {
-  return {
-    name: agent.name,
-    get sessionId() { return agent.sessionId ?? null; },
-    async reply(userText, image, note, turn) {
-      state.inflight += 1;
-      try {
-        return await agent.reply(userText, image, note, turn);
-      } finally {
-        state.inflight -= 1;
-        state.last = now();
-      }
-    },
-    ...(agent.setAnnouncer === undefined ? {} : { setAnnouncer: agent.setAnnouncer.bind(agent) }),
-    ...(agent.attachLiveSink === undefined ? {} : { attachLiveSink: agent.attachLiveSink.bind(agent) }),
-    // 每个可选能力都必须显式透传 —— 漏一个就是静默降级（`keepalive.ts` 顶部踩过）
-    ...(agent.cancelTurn === undefined ? {} : { cancelTurn: agent.cancelTurn.bind(agent) }),
-    // 「交给慢车道了」的回执钩子：漏转发 = 委派轮永远没有回执（静默降级）
-    ...(agent.setDelegateHook === undefined
-      ? {}
-      : { setDelegateHook: agent.setDelegateHook.bind(agent) }),
-    ...(agent.interruptTurn === undefined ? {} : { interruptTurn: agent.interruptTurn.bind(agent) }),
-    ...(agent.taskStatus === undefined ? {} : { taskStatus: agent.taskStatus.bind(agent) }),
-    // 判停前起跑：漏转发 = 每次多等判停那一拍，日志里连一行都不出（静默降级）
-    ...(agent.prefetch === undefined ? {} : { prefetch: agent.prefetch.bind(agent) }),
-    // 中间结果投机：同样漏一条就静默降级（少抢 500–1200 ms）
-    ...(agent.speculatePartial === undefined
-      ? {}
-      : { speculatePartial: agent.speculatePartial.bind(agent) }),
+  const trackedReply = async (
+    userText: string,
+    image?: AgentImage,
+    note?: string,
+    turn?: TurnContext,
+  ): Promise<AgentReplyView> => {
+    state.inflight += 1;
+    try {
+      return await agent.reply(userText, image, note, turn);
+    } finally {
+      state.inflight -= 1;
+      state.last = now();
+    }
   };
+
+  /**
+   * 方法值 → 绑到原对象上的版本。
+   *
+   * 按**函数对象**缓存（不是按属性名）：同一个方法重复取到的是同一个包装，
+   * `proxy.prefetch === proxy.prefetch` 成立；而运行时把某个能力换成另一个函数时，
+   * 键变了自然就重新绑，不会拿到旧的。
+   */
+  const bound = new WeakMap<Function, Function>();
+  const boundTo = (target: AgentProvider, value: unknown): unknown => {
+    if (typeof value !== 'function') return value;
+    const cached = bound.get(value);
+    if (cached !== undefined) return cached;
+    const wrapper: Function = value.bind(target);
+    bound.set(value, wrapper);
+    return wrapper;
+  };
+
+  return new Proxy(agent, {
+    get(target, prop) {
+      if (prop === 'reply') return trackedReply;
+      // 老包装把「没有 sessionId」归成 null（调用方按 null 判「不用 dsh」），保持原样
+      if (prop === 'sessionId') return target.sessionId ?? null;
+      // `constructor` 不绑：`main.ts` 的装配自检靠它打印真实类名，
+      // 绑过之后会变成 "bound FrontedAgent"；它也不是「能力」，不需要 this
+      if (prop === 'constructor') return Reflect.get(target, prop, target);
+      return boundTo(target, Reflect.get(target, prop, target));
+    },
+  });
 }
 
 export interface KeepaliveOptions {

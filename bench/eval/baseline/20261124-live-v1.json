@@ -1,0 +1,3872 @@
+{
+  "baselineId": "20261124-live-v1",
+  "gitHead": "0a70c77",
+  "corpus": "eval-v1 (55 turns, 16kHz mono PCM, CosyVoice longanhuan+longanyang, -22dBFS peak)",
+  "sharedServerRun": {
+    "version": "eval-v1",
+    "runId": "20261124-113005-live",
+    "startedAt": "2026-11-24T11:30:05.272Z",
+    "hourCst": 19,
+    "pipeline": "live",
+    "backend": "stub",
+    "totalCases": 55,
+    "s1Routing": {
+      "chitchatTotal": 8,
+      "chitchatFalseDelegate": 2,
+      "actionTotal": 6,
+      "actionDelegated": 6,
+      "actionDualAnswerConflict": 0,
+      "realtimeTotal": 6,
+      "realtimeDelegated": 4,
+      "trapTotal": 4,
+      "trapClean": 3,
+      "precision": 0.7692,
+      "recall": 0.8333,
+      "f1": 0.8
+    },
+    "s2Asr": {
+      "total": 10,
+      "meanCer": 0.0729,
+      "termHits": 27,
+      "termTotal": 30,
+      "termHitRate": 0.9,
+      "foreignHallucinations": 0
+    },
+    "s3ContextMemory": {
+      "memoryStaticPassed": 1,
+      "memoryStaticTotal": 4,
+      "crossLaneContextPassed": 0,
+      "crossLaneContextTotal": 1,
+      "reportFollowupPassed": 0,
+      "reportFollowupTotal": 2,
+      "verbatimPassed": 0,
+      "verbatimTotal": 2
+    },
+    "s4Eot": {
+      "pauseMerged": 0,
+      "pauseTotal": 4,
+      "completeNoOverExtend": 4,
+      "completeTotal": 4
+    },
+    "s5Latency": {
+      "firstWord": {
+        "count": 49,
+        "median": 904.8267559999949,
+        "p90": 1250.1968893999936,
+        "max": 2469.6520879999734,
+        "min": 629.2574020000175
+      },
+      "silenceToAsr": {
+        "count": 55,
+        "median": 400.45601800002623,
+        "p90": 494.73569359997055,
+        "max": 2283.3195919999853,
+        "min": -2090.8133480000542
+      },
+      "asrToTurn": {
+        "count": 69,
+        "median": 3,
+        "p90": 571.8000000000001,
+        "max": 4982,
+        "min": 1
+      },
+      "turnToAudio": {
+        "count": 69,
+        "median": 449,
+        "p90": 994.6000000000001,
+        "max": 3016,
+        "min": 0
+      },
+      "omniAudioMs": {
+        "count": 92,
+        "median": 783,
+        "p90": 1063.7,
+        "max": 2449,
+        "min": 594
+      },
+      "bgReportCount": 10
+    },
+    "cases": [
+      {
+        "caseId": "s1_chat_01",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "你好呀，今天过得怎么样？",
+        "asrTexts": [
+          "你好呀。",
+          "今天过得怎么样？"
+        ],
+        "asrJoined": "你好呀。今天过得怎么样？",
+        "turnsCount": 2,
+        "interruptedTurns": 0,
+        "fgSaid": "今天 已处理：今天过得怎么样？",
+        "fgPaths": [
+          "omni",
+          "dsh"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "今天过得怎么样？"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          183.45800899999995,
+          370.28033999999934,
+          370.28033999999934,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "误委派(dsh=1, delegates=none)"
+        ]
+      },
+      {
+        "caseId": "s1_chat_02",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "我今天加班好累啊。",
+        "asrTexts": [
+          "我今天加班好累呀。"
+        ],
+        "asrJoined": "我今天加班好累呀。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "辛苦了，早点休息吧。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0.125,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_chat_03",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "你叫什么名字来着？",
+        "asrTexts": [
+          "你叫什么名字来着？"
+        ],
+        "asrJoined": "你叫什么名字来着？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我叫米馍。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_chat_04",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "讲个简短的冷笑话吧。",
+        "asrTexts": [
+          "讲个简短的冷笑话吧。"
+        ],
+        "asrJoined": "讲个简短的冷笑话吧。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "为什么数学老师结婚从不请客？因为他只会解方程，不会做饭。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_chat_05",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "水在标准大气压下多少度沸腾？",
+        "asrTexts": [
+          "水在标准大气压下多少度沸腾？"
+        ],
+        "asrJoined": "水在标准大气压下多少度沸腾？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "标准大气压下，水在100摄氏度沸腾。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_chat_06",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "他还写过哪些作品？",
+        "asrTexts": [
+          "他还写过哪些作品？"
+        ],
+        "asrJoined": "他还写过哪些作品？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我看看。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+        ],
+        "dshReceivedQueries": [
+          "他还写过哪些作品？"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "已处理：他还写过哪些作品？",
+            "transcript": "哥，你问的是哪位作者呀？名字没给全，我没法列作品。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "tool_call",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "误委派(dsh=1, delegates=delegate)"
+        ]
+      },
+      {
+        "caseId": "s1_chat_07",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "我觉得今天心情还不错。",
+        "asrTexts": [
+          "我觉得今天心情还不错。"
+        ],
+        "asrJoined": "我觉得今天心情还不错。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "那就好，心情好比啥都强。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_chat_08",
+        "sessionId": "s1-chitchat",
+        "suite": "S1",
+        "group": "chitchat",
+        "refText": "晚安，早点休息。",
+        "asrTexts": [
+          "晚安。",
+          "早点休息。"
+        ],
+        "asrJoined": "晚安。早点休息。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "晚安，做个好梦。 好嘞，你也早点歇着。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_act_01",
+        "sessionId": "s1-action-tool",
+        "suite": "S1",
+        "group": "action_tool",
+        "refText": "记一下我明天下午三点要开会。",
+        "asrTexts": [
+          "记一下。",
+          "我明天下午三点要开会。"
+        ],
+        "asrJoined": "记一下。我明天下午三点要开会。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "记好了，随时喊我。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 2,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆",
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最喜欢的科幻作家是波兰的莱姆\n用户最常连的测试网关端口是 9420\n用户养了一只橘猫，名字叫团子\n\n上一轮你被打断：**全文你已经写出来了，但只念到中途，下面这一段他真的没听到**：「记好了，随时喊我。」。所以：如果他问你\"说完了吗\"\"好了吗\"，如实说没说完，然后把这段接着讲掉；如果他要你继续说，就接着说；如果他换了话题，就正常回答新话题，别主动翻旧账。"
+        ],
+        "dshReceivedQueries": [
+          "记一下。",
+          "明天下午三点开会\n用户原话：「我明天下午三点要开会。」"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "已经记下了，明天下午三点开会。",
+            "transcript": "行，哥，明天下午三点开会这事儿我记下了。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "early_rule",
+            "verbatim": false
+          },
+          {
+            "source": "tool_call",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_act_02",
+        "sessionId": "s1-action-tool",
+        "suite": "S1",
+        "group": "action_tool",
+        "refText": "帮我打开客厅的灯。",
+        "asrTexts": [
+          "帮我打开客厅的灯。"
+        ],
+        "asrJoined": "帮我打开客厅的灯。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就帮你把客厅灯打开。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆\n\n刚才那条后台汇报你只念了一半就被哥打断，**剩下这段他真的没听到**：「明天下午三点开会这事儿我记下了。」。要不要接着补你自己判断：他问「刚才说什么」「结果呢」就接着说；他已经在问别的事，就别翻旧账；你觉得这结论重要、一句话能说完，就直接补上。"
+        ],
+        "dshReceivedQueries": [
+          "帮我打开客厅的灯。"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "已经记下了，明天下午三点开会。",
+            "transcript": "哥，明天下午三点开会这事儿我记下了。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "early_rule",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_act_03",
+        "sessionId": "s1-action-tool",
+        "suite": "S1",
+        "group": "action_tool",
+        "refText": "眼镜现在还剩多少电？",
+        "asrTexts": [
+          "眼睛现在还剩多少电？"
+        ],
+        "asrJoined": "眼睛现在还剩多少电？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我帮你看看眼镜还剩多少电。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最喜欢的科幻作家是波兰的莱姆\n用户最常连的测试网关端口是 9420\n用户养了一只橘猫，名字叫团子"
+        ],
+        "dshReceivedQueries": [
+          "查看智能眼镜的剩余电量\n用户原话：「眼睛现在还剩多少电？」"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "fallback",
+            "verbatim": false,
+            "speech": "客厅的灯已经打开了。",
+            "transcript": "哥，客厅"
+          },
+          {
+            "kind": "fallback_spoken",
+            "verbatim": false,
+            "speech": "客厅的灯已经打开了。"
+          },
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "眼镜现在还剩百分之七十八的电。",
+            "transcript": "哥，眼镜还剩百分之七十八的电。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "tool_call",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0.1111,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_act_04",
+        "sessionId": "s1-action-tool",
+        "suite": "S1",
+        "group": "action_tool",
+        "refText": "帮我查一下最近一笔快递到哪了。",
+        "asrTexts": [
+          "帮我查一下最近一笔快递到哪了。"
+        ],
+        "asrJoined": "帮我查一下最近一笔快递到哪了。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我来帮你查一下最近一笔快递到哪了。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+        ],
+        "dshReceivedQueries": [
+          "帮我查一下最近一笔快递到哪了。"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "你的快递已经到成都转运中心，预计明天送达。",
+            "transcript": "哥，快递到成都转运中心了，明天就能送到。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "early_rule",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_act_05",
+        "sessionId": "s1-action-tool",
+        "suite": "S1",
+        "group": "action_tool",
+        "refText": "帮我发一条消息给老王说晚上七点见。",
+        "asrTexts": [
+          "帮我发一条消息给老王，说晚上七点见。"
+        ],
+        "asrJoined": "帮我发一条消息给老王，说晚上七点见。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就给老王发个消息，说晚上七点见。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+        ],
+        "dshReceivedQueries": [
+          "帮我发一条消息给老王，说晚上七点见。"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "已经发消息给老王，说晚上七点见。",
+            "transcript": "哥，消息已经发给老王了，约好晚上七点见。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "early_rule",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_act_06",
+        "sessionId": "s1-action-tool",
+        "suite": "S1",
+        "group": "action_tool",
+        "refText": "把刚才定的七点闹钟关掉。",
+        "asrTexts": [
+          "把刚才定的七点闹钟关掉。"
+        ],
+        "asrJoined": "把刚才定的七点闹钟关掉。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "行，这就把七点的闹钟关了。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_rt_01",
+        "sessionId": "s1-realtime-fact",
+        "suite": "S1",
+        "group": "realtime_fact",
+        "refText": "明天北京天气怎么样？",
+        "asrTexts": [
+          "明天北京天气怎么样？"
+        ],
+        "asrJoined": "明天北京天气怎么样？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_rt_02",
+        "sessionId": "s1-realtime-fact",
+        "suite": "S1",
+        "group": "realtime_fact",
+        "refText": "现在几点了？",
+        "asrTexts": [
+          "现在几点了？"
+        ],
+        "asrJoined": "现在几点了？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "现在是晚上八点半。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "漏委派(未触发 dsh)"
+        ]
+      },
+      {
+        "caseId": "s1_rt_03",
+        "sessionId": "s1-realtime-fact",
+        "suite": "S1",
+        "group": "realtime_fact",
+        "refText": "英伟达今天股价多少？",
+        "asrTexts": [
+          "英伟达今天股价多少？"
+        ],
+        "asrJoined": "英伟达今天股价多少？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_rt_04",
+        "sessionId": "s1-realtime-fact",
+        "suite": "S1",
+        "group": "realtime_fact",
+        "refText": "今天是几月几号星期几？",
+        "asrTexts": [
+          "今天是几月几号星期几？"
+        ],
+        "asrJoined": "今天是几月几号星期几？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "今天是2026年7月25日，星期六。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "漏委派(未触发 dsh)"
+        ]
+      },
+      {
+        "caseId": "s1_rt_05",
+        "sessionId": "s1-realtime-fact",
+        "suite": "S1",
+        "group": "realtime_fact",
+        "refText": "外面现在在下雨吗？",
+        "asrTexts": [
+          "外面现在在下雨吗？"
+        ],
+        "asrJoined": "外面现在在下雨吗？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我这就去查查外面的天气情况。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_rt_06",
+        "sessionId": "s1-realtime-fact",
+        "suite": "S1",
+        "group": "realtime_fact",
+        "refText": "从这里开车去双流机场堵不堵？",
+        "asrTexts": [
+          "从这里开车去双流机场堵不堵？"
+        ],
+        "asrJoined": "从这里开车去双流机场堵不堵？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我这就去查查路况。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_trap_01",
+        "sessionId": "s1-negative-trap",
+        "suite": "S1",
+        "group": "negative_trap",
+        "refText": "你看过星球大战没？",
+        "asrTexts": [
+          "你看过星球大战没？"
+        ],
+        "asrJoined": "你看过星球大战没？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "看过啊，经典中的经典。你是想聊剧情还是角色？",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_trap_02",
+        "sessionId": "s1-negative-trap",
+        "suite": "S1",
+        "group": "negative_trap",
+        "refText": "算了算了，他算得对。",
+        "asrTexts": [
+          "算了算了。",
+          "他算得对。"
+        ],
+        "asrJoined": "算了算了。他算得对。",
+        "turnsCount": 2,
+        "interruptedTurns": 0,
+        "fgSaid": "行 已处理：他算得对。",
+        "fgPaths": [
+          "omni",
+          "dsh"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "他算得对。"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "误委派(dsh=1, delegates=none)"
+        ]
+      },
+      {
+        "caseId": "s1_trap_03",
+        "sessionId": "s1-negative-trap",
+        "suite": "S1",
+        "group": "negative_trap",
+        "refText": "我姓什么来着？",
+        "asrTexts": [
+          "我姓什么来着？"
+        ],
+        "asrJoined": "我姓什么来着？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "你姓林。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s1_trap_04",
+        "sessionId": "s1-negative-trap",
+        "suite": "S1",
+        "group": "negative_trap",
+        "refText": "电影里主角把门关掉那段真紧张。",
+        "asrTexts": [
+          "电影里主角把门关掉那段真紧张。"
+        ],
+        "asrJoined": "电影里主角把门关掉那段真紧张。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "是啊，那种密闭空间的压迫感确实让人手心冒汗。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_01",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "你知道波兰作家莱姆写的其主之声吗？",
+        "asrTexts": [
+          "你知道波兰作家莱姆写的《棋手之声》吗？"
+        ],
+        "asrJoined": "你知道波兰作家莱姆写的《棋手之声》吗？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "知道，那是莱姆的《其主之声》。讲的是科学家破译外星信号的故事，挺烧脑的。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0.125,
+        "expectedTermHits": 1,
+        "expectedTermTotal": 2,
+        "missingTerms": [
+          "其主之声"
+        ],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "ASR 漏词: 其主之声"
+        ]
+      },
+      {
+        "caseId": "s2_asr_02",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "帮我看看dsh的日志和端口状态。",
+        "asrTexts": [
+          "帮我看看D S H的日志和端口状态。"
+        ],
+        "asrJoined": "帮我看看D S H的日志和端口状态。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就去查查SSH的日志和端口状态。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 3,
+        "expectedTermTotal": 3,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_03",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "这段全双工声学链路用的是小米智能眼镜。",
+        "asrTexts": [
+          "这段全双工声学链路用的是小米智能眼镜。"
+        ],
+        "asrJoined": "这段全双工声学链路用的是小米智能眼镜。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "好，我这就轻声帮你看看。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 4,
+        "expectedTermTotal": 4,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_04",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "请检查一下订单号W8665881的进度。",
+        "asrTexts": [
+          "请检查一下订单号。",
+          "w八六六五八八幺的进度。"
+        ],
+        "asrJoined": "请检查一下订单号。w八六六五八八幺的进度。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "我这就去查一下订单号。\n\n 我来查一下订单 W8665881 的进度。\n\n",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate",
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0.3684,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 1,
+        "missingTerms": [
+          "W8665881"
+        ],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "ASR 漏词: W8665881"
+        ]
+      },
+      {
+        "caseId": "s2_asr_05",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "把分支合并推送之后再做一次编译构建。",
+        "asrTexts": [
+          "把分支合并推送之后。",
+          "再做一次编译构建。"
+        ],
+        "asrJoined": "把分支合并推送之后。再做一次编译构建。",
+        "turnsCount": 2,
+        "interruptedTurns": 0,
+        "fgSaid": "好 已处理：再做一次编译构建。",
+        "fgPaths": [
+          "omni",
+          "dsh"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "再做一次编译构建。"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 5,
+        "expectedTermTotal": 5,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_06",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "黄仁勋在发布会上讲了最新的大模型芯片。",
+        "asrTexts": [
+          "黄仁勋在发布会上讲了最新的大模型芯片。"
+        ],
+        "asrJoined": "黄仁勋在发布会上讲了最新的大模型芯片。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "黄仁勋在发布会上确实讲了最新的大模型芯片。他主要介绍了专为AI推理和训练优化的新一代GPU，强调了算力提升和对大语言模型的适配能力。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 2,
+        "expectedTermTotal": 2,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_07",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "这个热词配置和环境变量需要重启进程吗？",
+        "asrTexts": [
+          "这个热词配置和环境变量需要重启进程吗？"
+        ],
+        "asrJoined": "这个热词配置和环境变量需要重启进程吗？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这得看具体配置。环境变量通常重启才生效，热更新配置可能不用。你改的是哪一项？",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 4,
+        "expectedTermTotal": 4,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_08",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "蓝牙麦克风和扬声器的电量都正常吗？",
+        "asrTexts": [
+          "蓝牙麦克风和扬声器的电量都正常吗？"
+        ],
+        "asrJoined": "蓝牙麦克风和扬声器的电量都正常吗？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我这就去查查蓝牙麦克风和扬声器的电量。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最喜欢的科幻作家是波兰的莱姆\n用户最常连的测试网关端口是 9420\n用户养了一只橘猫，名字叫团子"
+        ],
+        "dshReceivedQueries": [
+          "检查蓝牙麦克风和扬声器的电量是否正常\n用户原话：「蓝牙麦克风和扬声器的电量都正常吗？」"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "已处理：检查蓝牙麦克风和扬声器的电量是否正常\n用户原话：「蓝牙麦克风和扬声器的电量都正常",
+            "transcript": "哥，蓝牙麦克风和扬声器的电量都正常。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "tool_call",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 4,
+        "expectedTermTotal": 4,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_09",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "单元测试和工具调用的提示词都写好了。",
+        "asrTexts": [
+          "单元测试和工具调用的提示词都写好了。"
+        ],
+        "asrJoined": "单元测试和工具调用的提示词都写好了。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "行，那接下来是跑测试还是直接提交？",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 3,
+        "expectedTermTotal": 3,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s2_asr_10",
+        "sessionId": "s2-asr-nouns",
+        "suite": "S2",
+        "group": "asr_noun",
+        "refText": "把服务端口8766的回滚方案记一下。",
+        "asrTexts": [
+          "把服务端口八七六六的回滚方案记一下。"
+        ],
+        "asrJoined": "把服务端口八七六六的回滚方案记一下。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就帮你记下服务端口8766的回滚方案。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420"
+        ],
+        "dshReceivedQueries": [
+          "把服务端口八七六六的回滚方案记一下。"
+        ],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "已处理：把服务端口八七六六的回滚方案记一下。",
+            "transcript": "哥，端口8766的回滚方案已经记好了。"
+          }
+        ],
+        "announceEvents": [
+          {
+            "source": "early_rule",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0.2353,
+        "expectedTermHits": 1,
+        "expectedTermTotal": 2,
+        "missingTerms": [
+          "8766"
+        ],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "ASR 漏词: 8766"
+        ]
+      },
+      {
+        "caseId": "s3_m1_01",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "还记得我叫什么名字、住在哪吗？",
+        "asrTexts": [
+          "还记得我叫什么名字？",
+          "住在哪吗？"
+        ],
+        "asrJoined": "还记得我叫什么名字？住在哪吗？",
+        "turnsCount": 2,
+        "interruptedTurns": 0,
+        "fgSaid": "你叫陈默，住在成都高新区。",
+        "fgPaths": [
+          "omni",
+          "dsh"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "住在哪吗？"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          200,
+          200
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": true,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s3_m1_02",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "我养的那只橘猫叫什么来着？",
+        "asrTexts": [
+          "我养的那只橘猫叫什么来着？"
+        ],
+        "asrJoined": "我养的那只橘猫叫什么来着？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就帮你查查那只橘猫的名字。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 团子（实际说出: \"这就帮你查查那只橘猫的名字。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m1_03",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "我想点份宫保鸡丁，你觉得合适吗？",
+        "asrTexts": [
+          "我想点份宫保鸡丁。",
+          "你觉得合适吗？"
+        ],
+        "asrJoined": "我想点份宫保鸡丁。你觉得合适吗？",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "行，这就帮你点份宫保鸡丁。 宫保鸡丁挺合适的，下饭又经典。不过要是想换换口味，也可以试试麻婆豆腐或者鱼香肉丝。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 花生/过敏（实际说出: \"行，这就帮你点份宫保鸡丁。 宫保鸡丁挺合适的，下饭又经典。不过要是想换换口味，也可以试试麻婆豆腐或者鱼香肉丝。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m1_04",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "我最常连的测试网关是哪个端口？",
+        "asrTexts": [
+          "我最常连的测试网关是哪个端口？"
+        ],
+        "asrJoined": "我最常连的测试网关是哪个端口？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这个我得帮你查一下设备上的网络配置，看看你最常连的那个测试网关具体是哪个端口。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 9420/九四二零/九千四百二十（实际说出: \"这个我得帮你查一下设备上的网络配置，看看你最常连的那个测试网关具体是哪个端口。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m2_01",
+        "sessionId": "s3-m2-cross-lane",
+        "suite": "S3",
+        "group": "cross_lane",
+        "refText": "我刚买了一本叫银翼回声的冷门小说，作者是林远山。",
+        "asrTexts": [
+          "我刚买了一本叫《灵异回声》的冷门小说。",
+          "作者是林远山。"
+        ],
+        "asrJoined": "我刚买了一本叫《灵异回声》的冷门小说。作者是林远山。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "《银翼回声》这名字挺有诗意，冷门小说往往藏着惊喜。你读了几页了？ 林远山，名字听着像那种会写孤独感的人。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0.0909,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s3_m2_02",
+        "sessionId": "s3-m2-cross-lane",
+        "suite": "S3",
+        "group": "cross_lane",
+        "refText": "这书是前年出的，讲深海科考站的故事。",
+        "asrTexts": [
+          "这书是前年出的。",
+          "讲深海科考站的故事。"
+        ],
+        "asrJoined": "这书是前年出的。讲深海科考站的故事。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "前年出的话，现在买正好赶上热度退去、口碑沉淀的阶段。 深海科考站，这设定自带封闭感和未知恐惧。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          198.34044899995206,
+          398.34044899995206,
+          398.34044899995206,
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s3_m2_03",
+        "sessionId": "s3-m2-cross-lane",
+        "suite": "S3",
+        "group": "cross_lane",
+        "refText": "帮我查一下它的豆瓣评分和页数。",
+        "asrTexts": [
+          "帮我查一下它的豆瓣评分和页数。"
+        ],
+        "asrJoined": "帮我查一下它的豆瓣评分和页数。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "《银翼回声》目前豆瓣上还没开分，评价人数不够。书大概是三百二十页左右，不同版本会有点出入。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": false,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "漏委派(未触发 dsh)",
+          "dsh 未被调用，无跨轨上下文"
+        ]
+      },
+      {
+        "caseId": "s3_m3_01",
+        "sessionId": "s3-m3-report-followup",
+        "suite": "S3",
+        "group": "report_followup",
+        "refText": "帮我查一下明晚去上海的航班时间。",
+        "asrTexts": [
+          "帮我查一下明晚去上海的航班时间。"
+        ],
+        "asrJoined": "帮我查一下明晚去上海的航班时间。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就去查明晚飞上海的航班时间。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s3_m3_02",
+        "sessionId": "s3-m3-report-followup",
+        "suite": "S3",
+        "group": "report_followup",
+        "refText": "刚才查的航班是几点起飞的？",
+        "asrTexts": [
+          "刚才查的航班是几点起飞的？"
+        ],
+        "asrJoined": "刚才查的航班是几点起飞的？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "刚才查到的航班是从浦东国际机场起飞的。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 八点十五/8点15/20点15/20:15/八点一十五（实际说出: \"刚才查到的航班是从浦东国际机场起飞的。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m3_03",
+        "sessionId": "s3-m3-report-followup",
+        "suite": "S3",
+        "group": "report_followup",
+        "refText": "帮我查一下明天下午的会议室定在几楼。",
+        "asrTexts": [
+          "帮我查一下明天下午的会议室定在几楼？"
+        ],
+        "asrJoined": "帮我查一下明天下午的会议室定在几楼？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我这就去查。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s3_m3_04",
+        "sessionId": "s3-m3-report-followup",
+        "suite": "S3",
+        "group": "report_followup",
+        "refText": "刚才那个会议室在几楼来着？",
+        "asrTexts": [
+          "刚才那个会议室在几楼来着？"
+        ],
+        "asrJoined": "刚才那个会议室在几楼来着？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "刚才没查成，我这就重新去确认一下会议室在几楼。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 七楼/7楼/松林（实际说出: \"刚才没查成，我这就重新去确认一下会议室在几楼。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m4_01",
+        "sessionId": "s3-m4-verbatim",
+        "suite": "S3",
+        "group": "verbatim",
+        "refText": "帮我查一下那笔退款订单号和回执码。",
+        "asrTexts": [
+          "帮我查一下那笔退款订单号和回执码。"
+        ],
+        "asrJoined": "帮我查一下那笔退款订单号和回执码。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "这就去查那笔退款的订单号和回执码。\n\n",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": false,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: W8665881, 904218（实际说出: \"这就去查那笔退款的订单号和回执码。\\n\\n\"）",
+          "未触发 verbatim 逐字朗读（被交给 Omni 口语改写）"
+        ]
+      },
+      {
+        "caseId": "s3_m4_02",
+        "sessionId": "s3-m4-verbatim",
+        "suite": "S3",
+        "group": "verbatim",
+        "refText": "帮我查一下语音服务的端口号和版本号。",
+        "asrTexts": [
+          "帮我查一下语音服务的端口号和版本号。"
+        ],
+        "asrJoined": "帮我查一下语音服务的端口号和版本号。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "稍等，我这就去查语音服务的端口号和版本号。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": false,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 8766, v2.3.1/2.3.1（实际说出: \"稍等，我这就去查语音服务的端口号和版本号。\"）",
+          "未触发 verbatim 逐字朗读（被交给 Omni 口语改写）"
+        ]
+      },
+      {
+        "caseId": "s4_p_300",
+        "sessionId": "s4-eot-pause",
+        "suite": "S4",
+        "group": "eot_pause",
+        "refText": "我觉得这件事吧，最好明天早上再确认一下。",
+        "asrTexts": [
+          "我觉得这件事吧。",
+          "最好明天早上再确认一下。"
+        ],
+        "asrJoined": "我觉得这件事吧。最好明天早上再确认一下。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "嗯，我在听。 行，明天早上再确认一遍。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": false,
+        "pass": false,
+        "reasons": [
+          "EOT 切分异常: turns=2(期望 1), interrupted=1"
+        ]
+      },
+      {
+        "caseId": "s4_p_500",
+        "sessionId": "s4-eot-pause",
+        "suite": "S4",
+        "group": "eot_pause",
+        "refText": "实在不甘心的话，可以趁现在停下来再想想。",
+        "asrTexts": [
+          "实在不甘心的话。",
+          "可以趁现在停下来再想想。"
+        ],
+        "asrJoined": "实在不甘心的话。可以趁现在停下来再想想。",
+        "turnsCount": 2,
+        "interruptedTurns": 0,
+        "fgSaid": "那 已处理：可以趁现在停下来再想想。",
+        "fgPaths": [
+          "omni",
+          "dsh"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "可以趁现在停下来再想想。"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": false,
+        "pass": false,
+        "reasons": [
+          "EOT 切分异常: turns=2(期望 1), interrupted=0"
+        ]
+      },
+      {
+        "caseId": "s4_p_700",
+        "sessionId": "s4-eot-pause",
+        "suite": "S4",
+        "group": "eot_pause",
+        "refText": "你帮我讲讲那本书里，主角最后为什么离开城市了。",
+        "asrTexts": [
+          "你帮我讲讲那本书里。",
+          "主角最后为什么离开城市啦？"
+        ],
+        "asrJoined": "你帮我讲讲那本书里。主角最后为什么离开城市啦？",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "你说的是哪本书？",
+        "fgPaths": [
+          "dsh",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "你帮我讲讲那本书里。"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0,
+          200,
+          200,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0.0476,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": false,
+        "pass": false,
+        "reasons": [
+          "EOT 切分异常: turns=2(期望 1), interrupted=1"
+        ]
+      },
+      {
+        "caseId": "s4_p_900",
+        "sessionId": "s4-eot-pause",
+        "suite": "S4",
+        "group": "eot_pause",
+        "refText": "如果明天下午不下雨的话，我们就去公园走一圈。",
+        "asrTexts": [
+          "如果明天下午不下雨的话。",
+          "我们就去公园走一圈。"
+        ],
+        "asrJoined": "如果明天下午不下雨的话。我们就去公园走一圈。",
+        "turnsCount": 2,
+        "interruptedTurns": 1,
+        "fgSaid": "好，那明天下午不下雨就按原计划来。 行，那就去公园走一圈。",
+        "fgPaths": [
+          "omni",
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0,
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": false,
+        "pass": false,
+        "reasons": [
+          "EOT 切分异常: turns=2(期望 1), interrupted=1"
+        ]
+      },
+      {
+        "caseId": "s4_c_01",
+        "sessionId": "s4-eot-complete",
+        "suite": "S4",
+        "group": "eot_complete",
+        "refText": "你重复一遍。",
+        "asrTexts": [
+          "你重复一遍。"
+        ],
+        "asrJoined": "你重复一遍。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "行，那我把刚才说的再讲一遍。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": true,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s4_c_02",
+        "sessionId": "s4-eot-complete",
+        "suite": "S4",
+        "group": "eot_complete",
+        "refText": "帮我算一下。",
+        "asrTexts": [
+          "帮我算一下。"
+        ],
+        "asrJoined": "帮我算一下。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "没问题，把要算的式子发给我。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": true,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s4_c_03",
+        "sessionId": "s4-eot-complete",
+        "suite": "S4",
+        "group": "eot_complete",
+        "refText": "你在说什么？",
+        "asrTexts": [
+          "你在说什么啊？"
+        ],
+        "asrJoined": "你在说什么啊？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "我刚才在说，你把要算的式子发给我，我就帮你算。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0.2,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": true,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s4_c_04",
+        "sessionId": "s4-eot-complete",
+        "suite": "S4",
+        "group": "eot_complete",
+        "refText": "嗯，好的。",
+        "asrTexts": [
+          "嗯。",
+          "好的。"
+        ],
+        "asrJoined": "嗯。好的。",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "已处理：好的。",
+        "fgPaths": [
+          "dsh"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 1,
+        "dshReceivedNotes": [
+          ""
+        ],
+        "dshReceivedQueries": [
+          "好的。"
+        ],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200,
+          0
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": null,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": true,
+        "pass": true,
+        "reasons": []
+      }
+    ]
+  },
+  "unmaskedPerSessionRuns": {
+    "s1-negative-trap": {
+      "version": "eval-v1",
+      "runId": "20261124-114404-live",
+      "startedAt": "2026-11-24T11:44:04.859Z",
+      "hourCst": 19,
+      "pipeline": "live",
+      "backend": "stub",
+      "totalCases": 4,
+      "s1Routing": {
+        "chitchatTotal": 0,
+        "chitchatFalseDelegate": 0,
+        "actionTotal": 0,
+        "actionDelegated": 0,
+        "actionDualAnswerConflict": 0,
+        "realtimeTotal": 0,
+        "realtimeDelegated": 0,
+        "trapTotal": 4,
+        "trapClean": 1,
+        "precision": 0,
+        "recall": null,
+        "f1": null
+      },
+      "s2Asr": {
+        "total": 0,
+        "meanCer": 0,
+        "termHits": 0,
+        "termTotal": 0,
+        "termHitRate": 1,
+        "foreignHallucinations": 0
+      },
+      "s3ContextMemory": {
+        "memoryStaticPassed": 0,
+        "memoryStaticTotal": 0,
+        "crossLaneContextPassed": 0,
+        "crossLaneContextTotal": 0,
+        "reportFollowupPassed": 0,
+        "reportFollowupTotal": 0,
+        "verbatimPassed": 0,
+        "verbatimTotal": 0
+      },
+      "s4Eot": {
+        "pauseMerged": 0,
+        "pauseTotal": 0,
+        "completeNoOverExtend": 0,
+        "completeTotal": 0
+      },
+      "s5Latency": {
+        "firstWord": {
+          "count": 3,
+          "median": 864.6247430000003,
+          "p90": 1705.3270910000006,
+          "max": 1915.5026780000007,
+          "min": 790.7240069999998
+        },
+        "silenceToAsr": {
+          "count": 4,
+          "median": 427.0637105000005,
+          "p90": 443.59422779999994,
+          "max": 445.7240069999998,
+          "min": -437.53863699999783
+        },
+        "asrToTurn": {
+          "count": 5,
+          "median": 285,
+          "p90": 3078.0000000000005,
+          "max": 4892,
+          "min": 2
+        },
+        "turnToAudio": {
+          "count": 5,
+          "median": 914,
+          "p90": 1943,
+          "max": 2421,
+          "min": 60
+        },
+        "omniAudioMs": {
+          "count": 6,
+          "median": 853,
+          "p90": 2088.5,
+          "max": 2301,
+          "min": 745
+        },
+        "bgReportCount": 2
+      },
+      "cases": [
+        {
+          "caseId": "s1_trap_01",
+          "sessionId": "s1-negative-trap",
+          "suite": "S1",
+          "group": "negative_trap",
+          "refText": "你看过星球大战没？",
+          "asrTexts": [
+            "你看过星球大战没？"
+          ],
+          "asrJoined": "你看过星球大战没？",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "看过，从1977年第一部到最新的剧集都了解。你最喜欢哪一部？",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 0,
+          "dshReceivedNotes": [],
+          "dshReceivedQueries": [],
+          "bgReports": [],
+          "announceEvents": [],
+          "judgeWaitsMs": [
+            200,
+            200
+          ],
+          "delegated": false,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        },
+        {
+          "caseId": "s1_trap_02",
+          "sessionId": "s1-negative-trap",
+          "suite": "S1",
+          "group": "negative_trap",
+          "refText": "算了算了，他算得对。",
+          "asrTexts": [
+            "算了算了。",
+            "他算得对。"
+          ],
+          "asrJoined": "算了算了。他算得对。",
+          "turnsCount": 2,
+          "interruptedTurns": 0,
+          "fgSaid": "嗯，那就不聊这个了。 已处理：他算得对。",
+          "fgPaths": [
+            "omni",
+            "dsh"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            ""
+          ],
+          "dshReceivedQueries": [
+            "他算得对。"
+          ],
+          "bgReports": [],
+          "announceEvents": [],
+          "judgeWaitsMs": [
+            200,
+            200,
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": false,
+          "reasons": [
+            "误委派(dsh=1, delegates=none)"
+          ]
+        },
+        {
+          "caseId": "s1_trap_03",
+          "sessionId": "s1-negative-trap",
+          "suite": "S1",
+          "group": "negative_trap",
+          "refText": "我姓什么来着？",
+          "asrTexts": [
+            "我姓什么来着？"
+          ],
+          "asrJoined": "我姓什么来着？",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "这就帮你查查你的姓氏。\n\n",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [
+            "delegate"
+          ],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最喜欢的科幻作家是波兰的莱姆\n用户最常连的测试网关端口是 9420\n用户养了一只橘猫，名字叫团子"
+          ],
+          "dshReceivedQueries": [
+            "查询用户的姓氏\n用户原话：「我姓什么来着？」"
+          ],
+          "bgReports": [
+            {
+              "kind": "omni_attempt",
+              "result": "spoken",
+              "verbatim": false,
+              "speech": "已处理：查询用户的姓氏\n用户原话：「我姓什么来着？」",
+              "transcript": "哥，你姓张。"
+            }
+          ],
+          "announceEvents": [
+            {
+              "source": "tool_call",
+              "verbatim": false
+            }
+          ],
+          "judgeWaitsMs": [
+            200,
+            200
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": false,
+          "reasons": [
+            "误委派(dsh=1, delegates=delegate)",
+            "问句误触发静默记忆写 dsh"
+          ]
+        },
+        {
+          "caseId": "s1_trap_04",
+          "sessionId": "s1-negative-trap",
+          "suite": "S1",
+          "group": "negative_trap",
+          "refText": "电影里主角把门关掉那段真紧张。",
+          "asrTexts": [
+            "电影里主角把门关掉那段真紧张。"
+          ],
+          "asrJoined": "电影里主角把门关掉那段真紧张。",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "是啊，那段氛围拉满，心跳都跟着加速。",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+          ],
+          "dshReceivedQueries": [
+            "电影里主角把门关掉那段真紧张。"
+          ],
+          "bgReports": [
+            {
+              "kind": "omni_attempt",
+              "result": "spoken",
+              "verbatim": false,
+              "speech": "已处理：电影里主角把门关掉那段真紧张。",
+              "transcript": "确实，那一下关门声太有压迫感了。"
+            }
+          ],
+          "announceEvents": [
+            {
+              "source": "early_rule",
+              "verbatim": false
+            }
+          ],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": false,
+          "reasons": [
+            "误委派(dsh=1, delegates=none)"
+          ]
+        }
+      ]
+    },
+    "s3-m2-cross-lane": {
+      "version": "eval-v1",
+      "runId": "20261124-114455-live",
+      "startedAt": "2026-11-24T11:44:55.249Z",
+      "hourCst": 19,
+      "pipeline": "live",
+      "backend": "stub",
+      "totalCases": 3,
+      "s1Routing": {
+        "chitchatTotal": 0,
+        "chitchatFalseDelegate": 0,
+        "actionTotal": 0,
+        "actionDelegated": 0,
+        "actionDualAnswerConflict": 0,
+        "realtimeTotal": 0,
+        "realtimeDelegated": 0,
+        "trapTotal": 0,
+        "trapClean": 0,
+        "precision": null,
+        "recall": null,
+        "f1": null
+      },
+      "s2Asr": {
+        "total": 0,
+        "meanCer": 0,
+        "termHits": 0,
+        "termTotal": 0,
+        "termHitRate": 1,
+        "foreignHallucinations": 0
+      },
+      "s3ContextMemory": {
+        "memoryStaticPassed": 0,
+        "memoryStaticTotal": 0,
+        "crossLaneContextPassed": 0,
+        "crossLaneContextTotal": 1,
+        "reportFollowupPassed": 0,
+        "reportFollowupTotal": 0,
+        "verbatimPassed": 0,
+        "verbatimTotal": 0
+      },
+      "s4Eot": {
+        "pauseMerged": 0,
+        "pauseTotal": 0,
+        "completeNoOverExtend": 0,
+        "completeTotal": 0
+      },
+      "s5Latency": {
+        "firstWord": {
+          "count": 2,
+          "median": 1719.9040664999975,
+          "p90": 2312.015998099996,
+          "max": 2460.0439809999953,
+          "min": 979.7641519999997
+        },
+        "silenceToAsr": {
+          "count": 3,
+          "median": 369.76415199999974,
+          "p90": 419.58801519999616,
+          "max": 432.04398099999526,
+          "min": -1806.6960949999993
+        },
+        "asrToTurn": {
+          "count": 5,
+          "median": 405,
+          "p90": 5352.800000000001,
+          "max": 8494,
+          "min": 2
+        },
+        "turnToAudio": {
+          "count": 5,
+          "median": 907,
+          "p90": 2131,
+          "max": 2201,
+          "min": 346
+        },
+        "omniAudioMs": {
+          "count": 5,
+          "median": 959,
+          "p90": 1870,
+          "max": 2440,
+          "min": 849
+        },
+        "bgReportCount": 1
+      },
+      "cases": [
+        {
+          "caseId": "s3_m2_01",
+          "sessionId": "s3-m2-cross-lane",
+          "suite": "S3",
+          "group": "cross_lane",
+          "refText": "我刚买了一本叫银翼回声的冷门小说，作者是林远山。",
+          "asrTexts": [
+            "我刚买了一本叫《灵异回声》的冷门小说。",
+            "作者是林远山。"
+          ],
+          "asrJoined": "我刚买了一本叫《灵异回声》的冷门小说。作者是林远山。",
+          "turnsCount": 2,
+          "interruptedTurns": 1,
+          "fgSaid": "《银翼回声》这名字听着就很有画面感。你是想聊聊它的剧情，还是想知道作者的其他作品？ 林远山这名字挺有诗意的。他是写科幻还是悬疑的？",
+          "fgPaths": [
+            "omni",
+            "omni"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 0,
+          "dshReceivedNotes": [],
+          "dshReceivedQueries": [],
+          "bgReports": [],
+          "announceEvents": [],
+          "judgeWaitsMs": [
+            200,
+            200,
+            0
+          ],
+          "delegated": false,
+          "dualAnswerConflict": false,
+          "cer": 0.0909,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        },
+        {
+          "caseId": "s3_m2_02",
+          "sessionId": "s3-m2-cross-lane",
+          "suite": "S3",
+          "group": "cross_lane",
+          "refText": "这书是前年出的，讲深海科考站的故事。",
+          "asrTexts": [
+            "这书是前年出的。",
+            "讲深海科考站的故事。"
+          ],
+          "asrJoined": "这书是前年出的。讲深海科考站的故事。",
+          "turnsCount": 2,
+          "interruptedTurns": 0,
+          "fgSaid": "前 已处理：讲深海科考站的故事。",
+          "fgPaths": [
+            "omni",
+            "dsh"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            ""
+          ],
+          "dshReceivedQueries": [
+            "讲深海科考站的故事。"
+          ],
+          "bgReports": [],
+          "announceEvents": [],
+          "judgeWaitsMs": [
+            193.35931600000185,
+            393.35931600000185,
+            393.35931600000185,
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": false,
+          "reasons": [
+            "误委派(dsh=1, delegates=none)"
+          ]
+        },
+        {
+          "caseId": "s3_m2_03",
+          "sessionId": "s3-m2-cross-lane",
+          "suite": "S3",
+          "group": "cross_lane",
+          "refText": "帮我查一下它的豆瓣评分和页数。",
+          "asrTexts": [
+            "帮我查一下它的豆瓣评分和页数。"
+          ],
+          "asrJoined": "帮我查一下它的豆瓣评分和页数。",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "这就帮你查查它的评分和页数。",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [
+            "delegate"
+          ],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+          ],
+          "dshReceivedQueries": [
+            "帮我查一下它的豆瓣评分和页数。"
+          ],
+          "bgReports": [
+            {
+              "kind": "omni_attempt",
+              "result": "spoken",
+              "verbatim": false,
+              "speech": "银翼回声豆瓣评分八点六，全书三百一十二页。",
+              "transcript": "哥，查到了。《银翼回声》豆瓣8.6分，一共312页。"
+            }
+          ],
+          "announceEvents": [
+            {
+              "source": "early_rule",
+              "verbatim": false
+            }
+          ],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": false,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": false,
+          "reasons": [
+            "dsh 上下文缺前文指代: 银翼回声, 林远山"
+          ]
+        }
+      ]
+    },
+    "s3-m3-report-followup": {
+      "version": "eval-v1",
+      "runId": "20261124-114547-live",
+      "startedAt": "2026-11-24T11:45:47.386Z",
+      "hourCst": 19,
+      "pipeline": "live",
+      "backend": "stub",
+      "totalCases": 4,
+      "s1Routing": {
+        "chitchatTotal": 0,
+        "chitchatFalseDelegate": 0,
+        "actionTotal": 0,
+        "actionDelegated": 0,
+        "actionDualAnswerConflict": 0,
+        "realtimeTotal": 0,
+        "realtimeDelegated": 0,
+        "trapTotal": 0,
+        "trapClean": 0,
+        "precision": null,
+        "recall": null,
+        "f1": null
+      },
+      "s2Asr": {
+        "total": 0,
+        "meanCer": 0,
+        "termHits": 0,
+        "termTotal": 0,
+        "termHitRate": 1,
+        "foreignHallucinations": 0
+      },
+      "s3ContextMemory": {
+        "memoryStaticPassed": 0,
+        "memoryStaticTotal": 0,
+        "crossLaneContextPassed": 0,
+        "crossLaneContextTotal": 0,
+        "reportFollowupPassed": 2,
+        "reportFollowupTotal": 2,
+        "verbatimPassed": 0,
+        "verbatimTotal": 0
+      },
+      "s4Eot": {
+        "pauseMerged": 0,
+        "pauseTotal": 0,
+        "completeNoOverExtend": 0,
+        "completeTotal": 0
+      },
+      "s5Latency": {
+        "firstWord": {
+          "count": 4,
+          "median": 741.9578719999972,
+          "p90": 950.9932170999994,
+          "max": 1011.7521520000009,
+          "min": 661.5440580000031
+        },
+        "silenceToAsr": {
+          "count": 4,
+          "median": 425.64810500000203,
+          "p90": 456.8110080999995,
+          "max": 469.6933749999989,
+          "min": 416.2223689999955
+        },
+        "asrToTurn": {
+          "count": 4,
+          "median": 7,
+          "p90": 166.40000000000003,
+          "max": 233,
+          "min": 3
+        },
+        "turnToAudio": {
+          "count": 4,
+          "median": 293,
+          "p90": 378.6,
+          "max": 390,
+          "min": 194
+        },
+        "omniAudioMs": {
+          "count": 4,
+          "median": 711.5,
+          "p90": 925.4000000000001,
+          "max": 992,
+          "min": 640
+        },
+        "bgReportCount": 2
+      },
+      "cases": [
+        {
+          "caseId": "s3_m3_01",
+          "sessionId": "s3-m3-report-followup",
+          "suite": "S3",
+          "group": "report_followup",
+          "refText": "帮我查一下明晚去上海的航班时间。",
+          "asrTexts": [
+            "帮我查一下明晚去上海的航班时间。"
+          ],
+          "asrJoined": "帮我查一下明晚去上海的航班时间。",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "这就帮你查查明晚去上海的航班时间。\n\n",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [
+            "delegate"
+          ],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+          ],
+          "dshReceivedQueries": [
+            "帮我查一下明晚去上海的航班时间。"
+          ],
+          "bgReports": [
+            {
+              "kind": "omni_attempt",
+              "result": "spoken",
+              "verbatim": false,
+              "speech": "明晚去上海的航班是晚上八点十五分从双流起飞。",
+              "transcript": "哥，明晚去上海的航班是晚上八点十五分从双流起飞。"
+            }
+          ],
+          "announceEvents": [
+            {
+              "source": "early_rule",
+              "verbatim": false
+            }
+          ],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        },
+        {
+          "caseId": "s3_m3_02",
+          "sessionId": "s3-m3-report-followup",
+          "suite": "S3",
+          "group": "report_followup",
+          "refText": "刚才查的航班是几点起飞的？",
+          "asrTexts": [
+            "刚才查的航班是几点起飞的？"
+          ],
+          "asrJoined": "刚才查的航班是几点起飞的？",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "八点十五分从双流起飞。",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 0,
+          "dshReceivedNotes": [],
+          "dshReceivedQueries": [],
+          "bgReports": [],
+          "announceEvents": [],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": false,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": true,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        },
+        {
+          "caseId": "s3_m3_03",
+          "sessionId": "s3-m3-report-followup",
+          "suite": "S3",
+          "group": "report_followup",
+          "refText": "帮我查一下明天下午的会议室定在几楼。",
+          "asrTexts": [
+            "帮我查一下明天下午的会议室定在几楼？"
+          ],
+          "asrJoined": "帮我查一下明天下午的会议室定在几楼？",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "查到了，明天下午的会议室定在5楼。",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+          ],
+          "dshReceivedQueries": [
+            "帮我查一下明天下午的会议室定在几楼？"
+          ],
+          "bgReports": [],
+          "announceEvents": [
+            {
+              "source": "early_rule",
+              "verbatim": false
+            }
+          ],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": null,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        },
+        {
+          "caseId": "s3_m3_04",
+          "sessionId": "s3-m3-report-followup",
+          "suite": "S3",
+          "group": "report_followup",
+          "refText": "刚才那个会议室在几楼来着？",
+          "asrTexts": [
+            "刚才那个会议室在几楼来着？"
+          ],
+          "asrJoined": "刚才那个会议室在几楼来着？",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "七楼。",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [],
+          "dshCallCount": 0,
+          "dshReceivedNotes": [],
+          "dshReceivedQueries": [],
+          "bgReports": [
+            {
+              "kind": "omni_attempt",
+              "result": "spoken",
+              "verbatim": false,
+              "speech": "明天下午的会议室定在七楼松林会议室。",
+              "transcript": "哥，明天下午的会议室定在七楼松林会议室。"
+            }
+          ],
+          "announceEvents": [],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": false,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": true,
+          "dshContextPass": null,
+          "verbatimPass": null,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        }
+      ]
+    },
+    "s3-m4-verbatim": {
+      "version": "eval-v1",
+      "runId": "20261124-114629-live",
+      "startedAt": "2026-11-24T11:46:29.360Z",
+      "hourCst": 19,
+      "pipeline": "live",
+      "backend": "stub",
+      "totalCases": 2,
+      "s1Routing": {
+        "chitchatTotal": 0,
+        "chitchatFalseDelegate": 0,
+        "actionTotal": 0,
+        "actionDelegated": 0,
+        "actionDualAnswerConflict": 0,
+        "realtimeTotal": 0,
+        "realtimeDelegated": 0,
+        "trapTotal": 0,
+        "trapClean": 0,
+        "precision": null,
+        "recall": null,
+        "f1": null
+      },
+      "s2Asr": {
+        "total": 0,
+        "meanCer": 0,
+        "termHits": 0,
+        "termTotal": 0,
+        "termHitRate": 1,
+        "foreignHallucinations": 0
+      },
+      "s3ContextMemory": {
+        "memoryStaticPassed": 0,
+        "memoryStaticTotal": 0,
+        "crossLaneContextPassed": 0,
+        "crossLaneContextTotal": 0,
+        "reportFollowupPassed": 0,
+        "reportFollowupTotal": 0,
+        "verbatimPassed": 1,
+        "verbatimTotal": 2
+      },
+      "s4Eot": {
+        "pauseMerged": 0,
+        "pauseTotal": 0,
+        "completeNoOverExtend": 0,
+        "completeTotal": 0
+      },
+      "s5Latency": {
+        "firstWord": {
+          "count": 2,
+          "median": 1458.9726210000008,
+          "p90": 1926.7873578000015,
+          "max": 2043.7410420000015,
+          "min": 874.2042000000001
+        },
+        "silenceToAsr": {
+          "count": 2,
+          "median": 465.9726210000008,
+          "p90": 481.3578842000003,
+          "max": 485.2042000000001,
+          "min": 446.74104200000147
+        },
+        "asrToTurn": {
+          "count": 2,
+          "median": 307,
+          "p90": 311,
+          "max": 312,
+          "min": 302
+        },
+        "turnToAudio": {
+          "count": 2,
+          "median": 686,
+          "p90": 1173.2,
+          "max": 1295,
+          "min": 77
+        },
+        "omniAudioMs": {
+          "count": 3,
+          "median": 958,
+          "p90": 1810.8000000000002,
+          "max": 2024,
+          "min": 853
+        },
+        "bgReportCount": 2
+      },
+      "cases": [
+        {
+          "caseId": "s3_m4_01",
+          "sessionId": "s3-m4-verbatim",
+          "suite": "S3",
+          "group": "verbatim",
+          "refText": "帮我查一下那笔退款订单号和回执码。",
+          "asrTexts": [
+            "帮我查一下那笔退款订单号和回执码。"
+          ],
+          "asrJoined": "帮我查一下那笔退款订单号和回执码。",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "我这就帮你查查那笔退款的订单号和回执码。\n\n",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [
+            "delegate"
+          ],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420\n用户最喜欢的科幻作家是波兰的莱姆"
+          ],
+          "dshReceivedQueries": [
+            "帮我查一下那笔退款订单号和回执码。"
+          ],
+          "bgReports": [],
+          "announceEvents": [
+            {
+              "source": "early_rule",
+              "verbatim": true
+            }
+          ],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": false,
+          "dshContextPass": null,
+          "verbatimPass": false,
+          "eotPass": null,
+          "pass": false,
+          "reasons": [
+            "未命中关键事实: W8665881, 904218（实际说出: \"我这就帮你查查那笔退款的订单号和回执码。\\n\\n\"）"
+          ]
+        },
+        {
+          "caseId": "s3_m4_02",
+          "sessionId": "s3-m4-verbatim",
+          "suite": "S3",
+          "group": "verbatim",
+          "refText": "帮我查一下语音服务的端口号和版本号。",
+          "asrTexts": [
+            "帮我查一下语音服务的端口号和版本号。"
+          ],
+          "asrJoined": "帮我查一下语音服务的端口号和版本号。",
+          "turnsCount": 1,
+          "interruptedTurns": 0,
+          "fgSaid": "这就去查语音服务的端口号和版本号。",
+          "fgPaths": [
+            "omni"
+          ],
+          "fgDelegates": [
+            "delegate"
+          ],
+          "dshCallCount": 1,
+          "dshReceivedNotes": [
+            "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户最常连的测试网关端口是 9420"
+          ],
+          "dshReceivedQueries": [
+            "帮我查一下语音服务的端口号和版本号。"
+          ],
+          "bgReports": [
+            {
+              "kind": "fallback_spoken",
+              "verbatim": true,
+              "speech": "退款已受理，订单号 W8665881，回执码 904218。"
+            },
+            {
+              "kind": "omni_attempt",
+              "result": "spoken",
+              "verbatim": false,
+              "speech": "服务跑在端口 8766，当前版本 v2.3.1。",
+              "transcript": "哥，语音服务跑在8766端口，版本是v2.3.1。"
+            }
+          ],
+          "announceEvents": [
+            {
+              "source": "early_rule",
+              "verbatim": false
+            }
+          ],
+          "judgeWaitsMs": [
+            0
+          ],
+          "delegated": true,
+          "dualAnswerConflict": false,
+          "cer": 0,
+          "expectedTermHits": 0,
+          "expectedTermTotal": 0,
+          "missingTerms": [],
+          "foreignHallucination": false,
+          "memoryOrFactPass": true,
+          "dshContextPass": null,
+          "verbatimPass": true,
+          "eotPass": null,
+          "pass": true,
+          "reasons": []
+        }
+      ]
+    }
+  },
+  "realDshSmoke": {
+    "version": "eval-v1",
+    "runId": "20261124-114807-live",
+    "startedAt": "2026-11-24T11:48:07.919Z",
+    "hourCst": 19,
+    "pipeline": "live",
+    "backend": "real-dsh",
+    "totalCases": 4,
+    "s1Routing": {
+      "chitchatTotal": 0,
+      "chitchatFalseDelegate": 0,
+      "actionTotal": 0,
+      "actionDelegated": 0,
+      "actionDualAnswerConflict": 0,
+      "realtimeTotal": 0,
+      "realtimeDelegated": 0,
+      "trapTotal": 0,
+      "trapClean": 0,
+      "precision": null,
+      "recall": null,
+      "f1": null
+    },
+    "s2Asr": {
+      "total": 0,
+      "meanCer": 0,
+      "termHits": 0,
+      "termTotal": 0,
+      "termHitRate": 1,
+      "foreignHallucinations": 0
+    },
+    "s3ContextMemory": {
+      "memoryStaticPassed": 1,
+      "memoryStaticTotal": 4,
+      "crossLaneContextPassed": 0,
+      "crossLaneContextTotal": 0,
+      "reportFollowupPassed": 0,
+      "reportFollowupTotal": 0,
+      "verbatimPassed": 0,
+      "verbatimTotal": 0
+    },
+    "s4Eot": {
+      "pauseMerged": 0,
+      "pauseTotal": 0,
+      "completeNoOverExtend": 0,
+      "completeTotal": 0
+    },
+    "s5Latency": {
+      "firstWord": {
+        "count": 3,
+        "median": 904.9173810000011,
+        "p90": 933.3231042000018,
+        "max": 940.4245350000019,
+        "min": 828.7045059999946
+      },
+      "silenceToAsr": {
+        "count": 4,
+        "median": 453.81094349999785,
+        "p90": 520.3085262999997,
+        "max": 548.4245350000019,
+        "min": -471.37478699999974
+      },
+      "asrToTurn": {
+        "count": 5,
+        "median": 303,
+        "p90": 2008.0000000000002,
+        "max": 3076,
+        "min": 2
+      },
+      "turnToAudio": {
+        "count": 5,
+        "median": 450,
+        "p90": 2264.2000000000003,
+        "max": 3179,
+        "min": 89
+      },
+      "omniAudioMs": {
+        "count": 8,
+        "median": 797,
+        "p90": 890.1,
+        "max": 902,
+        "min": 685
+      },
+      "bgReportCount": 1
+    },
+    "cases": [
+      {
+        "caseId": "s3_m1_01",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "还记得我叫什么名字、住在哪吗？",
+        "asrTexts": [
+          "还记得我叫什么名字？",
+          "住在哪吗？"
+        ],
+        "asrJoined": "还记得我叫什么名字？住在哪吗？",
+        "turnsCount": 2,
+        "interruptedTurns": 0,
+        "fgSaid": "没记到哥住在哪个城市。",
+        "fgPaths": [
+          "omni",
+          "dsh"
+        ],
+        "fgDelegates": [
+          "delegate"
+        ],
+        "dshCallCount": 2,
+        "dshReceivedNotes": [
+          "你是米馍的无头执行与记忆后端，不直接对用户说话。直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。\n\n用户养了一只橘猫，名字叫团子\n用户最喜欢的科幻作家是波兰的莱姆\n用户最常连的测试网关端口是 9420",
+          ""
+        ],
+        "dshReceivedQueries": [
+          "告诉我用户的名字是什么\n用户原话：「还记得我叫什么名字？」",
+          "住在哪吗？"
+        ],
+        "bgReports": [],
+        "announceEvents": [
+          {
+            "source": "tool_call",
+            "verbatim": false
+          }
+        ],
+        "judgeWaitsMs": [
+          200,
+          200,
+          200,
+          200
+        ],
+        "delegated": true,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 陈默, 成都（实际说出: \"没记到哥住在哪个城市。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m1_02",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "我养的那只橘猫叫什么来着？",
+        "asrTexts": [
+          "我养的那只橘猫叫什么来着？"
+        ],
+        "asrJoined": "我养的那只橘猫叫什么来着？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "你养的那只橘猫叫团子。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [
+          {
+            "kind": "omni_attempt",
+            "result": "spoken",
+            "verbatim": false,
+            "speech": "没记住名字。长期记忆里只有团子、莱姆和九四二〇端口，没有哥的名字。",
+            "transcript": "哥，我没记住你的名字。长期记忆里只有团子、莱姆和九四二〇端口，没有你的名字。"
+          }
+        ],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": true,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": true,
+        "reasons": []
+      },
+      {
+        "caseId": "s3_m1_03",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "我想点份宫保鸡丁，你觉得合适吗？",
+        "asrTexts": [
+          "我想点份宫保鸡丁，你觉得合适吗？"
+        ],
+        "asrJoined": "我想点份宫保鸡丁，你觉得合适吗？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "挺合适的，宫保鸡丁下饭又不会太辣。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          0
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 花生/过敏（实际说出: \"挺合适的，宫保鸡丁下饭又不会太辣。\"）"
+        ]
+      },
+      {
+        "caseId": "s3_m1_04",
+        "sessionId": "s3-m1-memory-static",
+        "suite": "S3",
+        "group": "memory_static",
+        "refText": "我最常连的测试网关是哪个端口？",
+        "asrTexts": [
+          "我最常连的测试网关是哪个端口？"
+        ],
+        "asrJoined": "我最常连的测试网关是哪个端口？",
+        "turnsCount": 1,
+        "interruptedTurns": 0,
+        "fgSaid": "你最常连的是九四二〇端口。",
+        "fgPaths": [
+          "omni"
+        ],
+        "fgDelegates": [],
+        "dshCallCount": 0,
+        "dshReceivedNotes": [],
+        "dshReceivedQueries": [],
+        "bgReports": [],
+        "announceEvents": [],
+        "judgeWaitsMs": [
+          200,
+          200
+        ],
+        "delegated": false,
+        "dualAnswerConflict": false,
+        "cer": 0,
+        "expectedTermHits": 0,
+        "expectedTermTotal": 0,
+        "missingTerms": [],
+        "foreignHallucination": false,
+        "memoryOrFactPass": false,
+        "dshContextPass": null,
+        "verbatimPass": null,
+        "eotPass": null,
+        "pass": false,
+        "reasons": [
+          "未命中关键事实: 9420/九四二零/九千四百二十（实际说出: \"你最常连的是九四二〇端口。\"）"
+        ]
+      }
+    ]
+  }
+}

@@ -45,7 +45,7 @@
     "demo"
   ],
   "scripts": {
-    "sync:voice": "node ../../scripts/sync-voice.mjs",
+    "sync:voice": "node scripts/sync-voice.mjs",
     "build:node": "tsc -p tsconfig.build.json",
     "build:browser": "esbuild src/browser/client.ts --bundle --format=esm --outfile=lib/browser.mjs",
     "build:browser-types": "tsc -p tsconfig.browser-types.json",
@@ -56,14 +56,15 @@
     "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "~3.18.5",
+    "@deepseek-ai/schemastery": "^3.19.0",
+    "undici": "^6.22.0",
     "ws": "^8.23.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5"
+    "@deepseek-ai/cordis": "^4.0.1"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/cordis": "^4.1.0",
     "@types/node": "^22.10.0",
     "@types/ws": "^8.18.2",
     "esbuild": "^0.28.2",

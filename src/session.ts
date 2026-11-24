@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh 会话封装：把一段文本交给 DeepSeek Harness，拿回回复文本。
  *
  * 实测事实（2026-11-05，Oracle aarch64，dsh 0.2.1-rc.2）：
@@ -118,6 +118,12 @@ export interface AskResult {
   firstTokenMs?: number;
   /** 是否沿用了已有会话 */
   resumed: boolean;
+  /**
+   * 这一轮被**放手**了（见 `detachTurn`）：dsh 还在跑，答案之后从播报口出来。
+   *
+   * 上层看到它就别把空 `text` 当失败 —— 那只是「这一轮不再等它」。
+   */
+  detached?: boolean;
 }
 
 /**
@@ -391,6 +397,38 @@ export class DshSession {
   /** 当前在途那一轮是不是**被我们主动取消**的（是的话收成空答复，不抛错） */
   private cancelRequested = false;
   /**
+   * 当前在途那一轮被**放手**了（见 `detachTurn`）：`ask` 立刻收尾，但 dsh 那一轮
+   * 还在跑，答完之后没有等待者 —— 由 `onAnnounce` 播出去。
+   */
+  private detached = false;
+  /**
+   * 放手那一轮的答复文本（独立一份：新一轮开起来会清 `assistantText`）
+   */
+  private detachedText = '';
+  /** 放手那一轮的用户原话（回注记忆要成对，见 `onDetachedAnswer`） */
+  private detachedUserText = '';
+  /** 正在跑的那一轮的用户原话（`detachTurn` 时抄进 `detachedUserText`） */
+  private activeUserText = '';
+  /**
+   * 轮号：`turn/start` / `turn/end` 的 `data.turn`（dsh 自己发的单调递增整数）。
+   *
+   * **不用 idle 计数认领轮次**：`session.status` 只有 `{sessionId, status}`，没有轮号；
+   * 而「发了几条 prompt / 收了几条 idle」只要错一格（排队的 prompt 被 `outcome:canceled`
+   * 取消时就不会有 turn、也就没有 idle），后面每一轮的答案都会交给错的人。
+   * `turn/start` / `turn/end` 是**逐轮**事件，轮号对得上才结算。
+   */
+  private currentTurn: number | null = null;
+  /** 放手那一轮要认领的轮号（`null` = 放手时还没有 turn/start，下一次 turn/end 就是它） */
+  private detachedTurn: number | null = null;
+  /**
+   * 下一条 `idle` 属于刚结算的「放手」那一轮，**不能拿去唤醒新一轮的等待者**。
+   *
+   * `idle` 不带轮号，只能靠顺序：`turn/end` 一定先于同一轮的 `idle`。所以放手那一轮
+   * 结算时打上这个一次性标记，把紧随其后的那条 idle 吃掉。下一轮 `turn/start` 一到
+   * 就清掉（万一那条 idle 压根没发，别把它留到下一轮去误吃）。
+   */
+  private swallowNextIdle = false;
+  /**
    * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
    * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
    */
@@ -409,6 +447,16 @@ export class DshSession {
    * 就是接住它的唯一入口 —— 不接就是静默丢弃。
    */
   onAnnounce: ((text: string) => void) | null = null;
+  /**
+   * 放手那一轮的答案回来了 —— **无论用户是不是已经问了新问题**都要回注记忆。
+   *
+   * 与 `onAnnounce` 分工：`onAnnounce` 是"播出去"（用户已经在问新问题时不该补播，
+   * 会打断他），这条是"记下来"。委派轮被打断之后，dsh 的活儿照样跑完了，答案就在
+   * 会话里；不记的话用户之后提起这件事，快车道和 omni 都当没发生过。
+   */
+  onDetachedAnswer:
+    | ((userText: string, answer: string, spoken: boolean) => void)
+    | null = null;
   /**
    * 流式文本（侧通道）。三个事件：`start` 交出前 N 个 token、`delta` 逐 token 直通、
    * `end` 这条流结束。**没到阈值的整段也走 start+end**，调用方据 `gate.streaming`
@@ -431,6 +479,14 @@ export class DshSession {
   liveDropCount = 0;
   /** 侧通道接收端；懒启动 */
   private liveRelay: LiveTextRelay | null = null;
+  /**
+   * 侧通道端口；拉起 dsh 子进程时以 `VOICE_LIVE_PORT` 塞进**它自己的**环境。
+   *
+   * 为什么不是 `process.env['VOICE_LIVE_PORT']`：那是整个宿主进程的全局状态，
+   * 同一进程里起两个会话（或测试并行跑）会互相覆盖，dsh 之外的东西也读得到。
+   * 环境变量的作用域应当只是「这一个子进程」。
+   */
+  private liveRelayPort: number | null = null;
   private readonly liveThreshold: number;
   private liveGate: LiveGate;
   /**
@@ -536,7 +592,8 @@ export class DshSession {
   cancelTurn(ticket?: TurnTicket): void {
     const sessionId = this.openSessionId ?? this.readSession();
     const waiter = this.onIdle;
-    if (this.proc === null || sessionId === null || waiter === null) {
+    // 放手的委派轮没有等待者，但它**还在跑** —— 那里也要能取消（用户显式下令取消）
+    if (this.proc === null || sessionId === null || (waiter === null && !this.detached)) {
       return;
     }
     // **按代次丢弃迟到的取消**：只有「当前在途那一轮」的票据才允许取消。
@@ -563,11 +620,30 @@ export class DshSession {
       );
     }
     setTimeout(() => {
-      if (this.onIdle === waiter) {
+      if (waiter !== null && this.onIdle === waiter) {
         this.onIdle = null;
         waiter();
       }
     }, CANCEL_GRACE_MS).unref?.();
+    // 放手那一轮被取消：它不会再结算了，把等着回注的那份也一起清掉 ——
+    // 用户说了"不要了"，答案就不该再回注记忆
+    if (this.detached) {
+      this.detached = false;
+      this.detachedTurn = null;
+      this.detachedText = '';
+      this.detachedUserText = '';
+      this.log('  取消    放手的委派轮也一起取消（用户显式说了不要）');
+    }
+  }
+
+  /**
+   * dsh 那边有没有在跑的活儿（含**放手的**委派轮）。
+   *
+   * 用户说「算了 / 别查了」时要据此决定是否真的发取消 —— 没有在跑的东西，那就是
+   * 一句普通闲聊，别去打扰 dsh。
+   */
+  isBusy(): boolean {
+    return this.proc !== null && (this.onIdle !== null || this.detached);
   }
 
   /**
@@ -587,6 +663,107 @@ export class DshSession {
       proc.kill('SIGINT');
     } catch {
       // 已经退了
+    }
+  }
+
+  /**
+   * 放手：**不取消** dsh 那一轮，只把「有人在等它」摘掉。
+   *
+   * 为什么不是取消：`session/cancel` 只作废下游输出，**上游的活儿照跑**（真机实测
+   * 05:08:50 取消之后 2 s，`bash「nproc; free -h」` 才刚结束）—— 所以取消省下的是
+   * 最后那一步总结，丢掉的却是用户唯一能听到的答案。之后用户还得把问题重问一遍。
+   *
+   * 放手之后：`ask` 立刻收成空答复（这一轮已经作废了，没人要），dsh 继续跑完；
+   * 回来的那条 `assistant/message` 记在 {@link detachedText}，`idle` 时交给
+   * `onAnnounce` —— 与「后台任务结算」同一口播报，用户照样能听到答案。
+   *
+   * 票据按代次校验，规则与 `cancelTurn` 一致：迟到的放手不能摘掉下一轮的等待者。
+   */
+  detachTurn(ticket?: TurnTicket): void {
+    if (this.proc === null) {
+      return;
+    }
+    const active = this.activeTicket;
+    if (ticket !== undefined && active !== null
+      && (ticket.no !== active.no || ticket.gen !== active.gen)) {
+      this.log(`  放手    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
+      return;
+    }
+    this.detached = true;
+    this.detachedTurn = this.currentTurn;
+    this.detachedText = this.assistantText.trim();
+    this.detachedUserText = this.activeUserText;
+    if (this.detachedTurn === null) {
+      // 还没收到 turn/start：下一次 turn/end 就是它的（dsh 串行，不会有别人的）
+      this.log('  放手    放手的时刻还没开轮 → 认下一次 turn/end');
+    }
+    // `ask` 的等待者立刻收尾：这一轮已经作废，别让它挂到超时
+    const fire = this.onIdle;
+    this.onIdle = null;
+    fire?.();
+  }
+
+  /**
+   * 认轮次边界：`turn/start` 记住当前轮号，`turn/end` 到达时看是不是「放手」那一轮。
+   *
+   * 这与「等 idle」不等价：`turn/end` 是逐轮事件、带轮号，而 `idle` 不带任何标识。
+   * 放手的一轮跑完时在这里结算（播报或丢弃），`idle` 则照旧只负责唤醒 prompt 的
+   * 等待者 —— 两条互不干扰，也就不会出现「上一轮的答案交给新一轮」。
+   */
+  private observeTurnBoundary(e: Record<string, unknown>, sessionId: string): void {
+    const type = typeof e['type'] === 'string' ? e['type'] : '';
+    if (type !== 'turn/start' && type !== 'turn/end') {
+      return;
+    }
+    if (sessionId !== '' && this.openSessionId !== null && sessionId !== this.openSessionId) {
+      return;
+    }
+    const data = e['data'] as Record<string, unknown> | undefined;
+    const turn = typeof data?.['turn'] === 'number' ? data['turn'] : null;
+    if (type === 'turn/start') {
+      this.currentTurn = turn;
+      // 新一轮开起来了：上一轮那条 idle 要么已经来过、要么不会来了
+      this.swallowNextIdle = false;
+      return;
+    }
+    // turn/end
+    const settles = this.detached
+      && (this.detachedTurn === null || this.detachedTurn === turn);
+    this.currentTurn = null;
+    if (!settles) {
+      return;
+    }
+    this.detached = false;
+    this.detachedTurn = null;
+    // 同一轮的 idle 紧跟着就来，它属于这一轮（不是新一轮的）
+    this.swallowNextIdle = true;
+    const text = (this.detachedText || this.assistantText).trim();
+    this.detachedText = '';
+    this.assistantText = '';
+    if (text === '') {
+      this.detachedUserText = '';
+      return;
+    }
+    // 回注记忆**先于**「要不要补播」这个判断：答案是真的，用户听没听到是另一回事
+    const userText = this.detachedUserText;
+    this.detachedUserText = '';
+    // `onIdle === null` 表示没有新一轮在等 → 下面会走播报，用户能听到
+    const willSpeak = this.onIdle === null && this.onAnnounce !== null;
+    try {
+      this.onDetachedAnswer?.(userText, text, willSpeak);
+    } catch (error) {
+      this.log(`  放手    ✗ 回注失败：${(error as Error).message}`);
+    }
+    // 用户已经问了新问题时旧答案直接丢掉，别补播一次他不想听的
+    if (this.onIdle !== null) {
+      this.log('  放手    答案回来时用户已经问了新问题 → 不补播（已回注记忆）');
+      return;
+    }
+    if (this.onAnnounce) {
+      const reason = data?.['reason'] as Record<string, unknown> | undefined;
+      const kind = typeof reason?.['kind'] === 'string' ? reason['kind'] : '';
+      this.log(`  放手    委派轮跑完了${kind === '' ? '' : `（${kind}）`} → 答案转成播报`);
+      this.onAnnounce(text);
     }
   }
 
@@ -696,6 +873,7 @@ export class DshSession {
     this.spontaneous.reset();
     // 记下这一轮的票据：`cancelTurn(ticket)` 靠它丢弃迟到的取消
     this.activeTicket = ticket ?? null;
+    this.activeUserText = text;
     this.cancelRequested = false;
     const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
 
@@ -726,6 +904,7 @@ export class DshSession {
 
     const answer = this.assistantText.trim();
     const cancelled = this.cancelRequested;
+    const detached = this.detached;
     this.cancelRequested = false;
     if (this.exitError !== null) {
       const reason = this.exitError;
@@ -733,8 +912,9 @@ export class DshSession {
       throw new DshError(reason);
     }
     // 被我们主动取消的那一轮：正常收尾成空答复，**不能抛** —— 上层没人在等一个
-    // 「用户不要了」的异常，抛出去就是未捕获的 rejection（实测把 bench harness 打死）
-    if (!answer && !cancelled) throw new DshError('sdk 没有返回任何文本');
+    // 「用户不要了」的异常，抛出去就是未捕获的 rejection（实测把 bench harness 打死）。
+    // 放手的那一轮同理：它还在跑，只是这一轮不再等它（答案之后从播报口出来）。
+    if (!answer && !cancelled && !detached) throw new DshError('sdk 没有返回任何文本');
 
     return {
       text: answer,
@@ -743,6 +923,7 @@ export class DshSession {
       durationMs: Date.now() - started,
       resumed,
       ...(this.firstTokenMs === null ? {} : { firstTokenMs: this.firstTokenMs }),
+      ...(detached ? { detached: true } : {}),
     };
   }
 
@@ -964,6 +1145,12 @@ export class DshSession {
       this.sdkReady = false;
       // 进程没了，里面的会话也就不在了；下次必须重新 resume
       this.openSessionId = null;
+      // 放手状态一起归零：进程都没了，那一轮的 turn/end 再也不会来
+      this.detached = false;
+      this.detachedText = '';
+      this.detachedTurn = null;
+      this.currentTurn = null;
+      this.swallowNextIdle = false;
       if (this.proc === proc) this.proc = null;
       // 没收到 shutdown 就退出，说明崩了；挂起的请求全部失败
       for (const [, p] of this.pending) p.reject(new DshError(`sdk 进程退出（code=${code}）`));
@@ -1032,8 +1219,11 @@ export class DshSession {
   }
 
   /**
-   * 起侧通道（幂等）。端口通过 `VOICE_LIVE_PORT` 传给 dsh 子进程 —— 这一行就是
+   * 起侧通道（幂等）。端口通过 `VOICE_LIVE_PORT` 传给 dsh 子进程 —— 这就是
    * `mcp/voice-live` 插件的开关：读不到就不启用。
+   *
+   * 端口存在**实例字段**里、spawn 时局部拼进 env：不写 `process.env`，否则同一
+   * 进程里的第二个会话 / 并行测试会互相污染（见字段上的注释）。
    */
   private async ensureLiveRelay(): Promise<void> {
     if (this.liveRelay !== null) {
@@ -1048,7 +1238,7 @@ export class DshSession {
     }
     relay.onMessage((msg) => { this.onLiveMessage(msg); });
     this.liveRelay = relay;
-    process.env['VOICE_LIVE_PORT'] = String(port);
+    this.liveRelayPort = port;
   }
 
   /**
@@ -1181,7 +1371,10 @@ export class DshSession {
           this.activeTicket,
         );
       }
-      if (e['type'] !== 'assistant/message') return;
+      if (e['type'] !== 'assistant/message') {
+        this.observeTurnBoundary(e, typeof p['sessionId'] === 'string' ? p['sessionId'] : '');
+        return;
+      }
 
       const data = e['data'] as Record<string, unknown> | undefined;
       const message = data?.['message'] as Record<string, unknown> | undefined;
@@ -1196,6 +1389,11 @@ export class DshSession {
       }
       if (parts.length > 0) {
         this.assistantText = parts.join('');
+        // 被放手那一轮的答复可能在这之后才到，而新一轮的开头会清 `assistantText`
+        // —— 单独留一份，否则「放手」的答案会被下一轮冲掉
+        if (this.detached) {
+          this.detachedText = this.assistantText;
+        }
         // 没挂流式桥时（bench 就是这样）拿不到 token 级时刻，退一步记「首条 assistant
         // 消息到达」。它晚于真正的首 token，但仍是"模型开始产出"的可比口径。
         if (this.firstTokenMs === null && this.turnStartedAt > 0) {
@@ -1214,6 +1412,11 @@ export class DshSession {
 
     if (method === 'session.status') {
       const status = typeof p['status'] === 'string' ? p['status'] : '';
+      // 这条 idle 属于刚结算的「放手」那一轮 —— 吃掉它，别去唤醒新一轮的等待者
+      if (status === 'idle' && this.swallowNextIdle) {
+        this.swallowNextIdle = false;
+        return;
+      }
       const waiting = this.onIdle !== null;
       const verdict = this.spontaneous.onStatus(status, waiting);
       if (verdict === 'begin') {
@@ -1302,9 +1505,14 @@ export class DshSession {
     const isShim = process.platform === 'win32' && /\.(cmd|bat)$/i.test(this.program);
     const argv = isShim ? ['/c', this.program, ...args] : args;
     const command = isShim ? (process.env['COMSPEC'] ?? 'cmd.exe') : this.program;
+    // 侧通道端口只传给**这个子进程**：不写 `process.env`（那会污染同一进程里的
+    // 其他会话与测试）。端口没起来就原样继承，插件读不到自然不启用。
+    const env = this.liveRelayPort === null
+      ? process.env
+      : { ...process.env, VOICE_LIVE_PORT: String(this.liveRelayPort) };
     return spawn(command, argv, {
       cwd: this.workDir,
-      env: process.env,
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -1362,3 +1570,4 @@ export class DshSession {
     });
   }
 }
+

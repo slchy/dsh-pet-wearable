@@ -16,9 +16,10 @@
  */
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
+import { pcm16PeakDbfs } from './pcm.ts';
+import { voicingVerdict } from './barge-voicing.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
-import { performance } from 'node:perf_hooks';
 
 import {
   captureMode,
@@ -37,8 +38,10 @@ import {
   type V1Session,
 } from './devices/index.ts';
 import { AppSession } from './app/session.ts';
-import { DialogRuntime } from './app/dialog.ts';
+import { DialogRuntime, type AnnounceItem } from './app/dialog.ts';
 import { SystemClock, type Clock } from './app/clock.ts';
+import type { FastVoiceEngine } from './engine-contract.ts';
+import type { VoicePipelineMode } from './pipeline-mode.ts';
 import { DEFAULT_PET_PARAMS, type PetParams } from './pet/brain/registry.ts';
 import { summarizePetEvent } from './pet/brain/session.ts';
 import type { PetReply } from './pet/brain/types.ts';
@@ -50,15 +53,25 @@ import {
   type CaptureRequest,
   type PhotoOutcome,
 } from './photo-inbox.ts';
-import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './providers.ts';
+import type {
+  AgentAudioAnswer,
+  AgentProvider,
+  BackgroundTaskReport,
+  SttProvider,
+  SttSession,
+  TtsProvider,
+} from './providers.ts';
 import type { SessionCore } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { TurnJudge } from './turn-judge.ts';
-import { startToolControl, type ToolControl } from './tool-control.ts';
+import type { RealtimeSocketFactory } from './qwen-realtime-asr.ts';
+import { OmniShadow } from './omni-shadow.ts';
+import { startToolControl, type ToolControl, type ToolControlHandlers } from './tool-control.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
 import { UplinkPipeline } from './uplink-pipeline.ts';
 import { UtteranceAssembler } from './utterance-assembler.ts';
+import type { SemanticEndpoint } from './semantic-endpoint.ts';
 
 /** 上行采样率：mSBC 解码后固定 16 kHz */
 export const UPSTREAM_SAMPLE_RATE = 16_000;
@@ -238,6 +251,66 @@ export interface VoiceSessionOptions {
    * 配置错误，会退化成 `quietMs: 0`。
    */
   readonly turnJudgeClient?: EndpointDetector;
+  /**
+   * 语义判停（END 标签）：只在「即将开轮」那一刻问「用户这句话说完了没有」。
+   *
+   * 声学判停（`turnJudge`）看音频、判不了语义；不给就是老行为。
+   * 实现见 `semantic-endpoint.ts`，只回 `END`/`MORE`。
+   */
+  readonly semantic?: SemanticEndpoint;
+  /** 等语义判停回话的上限（ms）。等不到按「说完了」走。默认 300 */
+  readonly semanticBudgetMs?: number;
+  /**
+   * omni 影子旁路：只观测，**不发声**。
+   *
+   * 给 `apiKey` 就开，不给就完全不建连。它量的是「把封段→首块交给 omni
+   * 一体模型能快多少」，用来判要不要让它接管快车道 —— 判据见 `EVENTS.omniShadow`。
+   *
+   * **硬前提：STT 必须是 `qwen-realtime`。** 只有「端点由我们控」的 provider 才有
+   * `onCommit`（NLS 的 `commitMs` 是 0），而封段正是影子的起跑线；没有它，
+   * 影子一条数据都出不来（会静默地什么都不发生，所以 `main.ts` 启动时就拦）。
+   */
+  readonly omniShadow?: {
+    readonly apiKey: string;
+    readonly model?: string;
+    /** 认领模式：`off`（只量）/ `full`（真答）。缺省 `off` */
+    readonly serve?: 'off' | 'full';
+    /** 测试注入 realtime 套接字；生产不传，行为与以前一致 */
+    readonly socketFactory?: RealtimeSocketFactory;
+    /**
+     * 长期记忆摘要。字符串原样用；函数在**这条连接**构造影子时调用一次，
+     * 取当时的 MEMORY.md。空白不传。
+     */
+    readonly memoryContext?: string | (() => string);
+    /** 当前日期。原样交给影子，由它在 `session.update` 时调用一次。 */
+    readonly clockContext?: () => string;
+    /** ASR 热词。空白不传。 */
+    readonly asrCorpusText?: string;
+    /** ASR 语言。空白不传。 */
+    readonly asrLanguage?: string;
+  };
+  /** 显式管道模式（'live' | 'cascade'）。未设时兼容旧推断。 */
+  readonly pipelineMode?: VoicePipelineMode;
+  /**
+   * 生产热路径语音引擎（`LiveOrchestrator.toEngine()` 或 `CascadeAgent.toEngine(...)`）。
+   * 传入后 `TurnRunner` 走统一单泵；缺省时由 `TurnRunner` 自动用 `AgentEngineAdapter` 兼容包装。
+   */
+  readonly engine?: FastVoiceEngine;
+  /**
+   * Pure Live 模式下把后台汇报交给 Omni 同嗓子播报（委托给 `TurnRunner.speakAudioAnswer`）。
+   */
+  readonly speakAnnounce?: (
+    item: AnnounceItem,
+    playAudio: (answer: AgentAudioAnswer) => Promise<{
+      readonly spokenBytes: number;
+      readonly interrupted: boolean;
+      readonly transcript: string;
+    }>,
+  ) => Promise<'spoken' | 'defer' | 'fallback'>;
+  /** 插话/双击时同步掐断正在播的 Omni 后台汇报 */
+  readonly cancelAnnounce?: () => void;
+  /** 当某条后台汇报退回 TTS 播完后通知上层（用于静默回注 Omni 上下文） */
+  readonly onFallbackAnnounceSpoken?: (item: AnnounceItem, interrupted: boolean) => void;
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
@@ -271,6 +344,15 @@ export interface VoiceSessionOptions {
      */
     readonly commitMs?: number;
     /**
+     * 静音多久才让 **ASR** 封段解码（默认 = {@link commitMs}，即不拆）。
+     *
+     * `commitMs` 同时点着两个动作：omni 车道起跑（`OmniShadow.seal`）和 ASR 封段。
+     * 前者越早越好（20 ms），后者切早了会把一句话切成两半 —— 真机
+     * `20261123-053719` 两轮都断在书名中间，第二个碎片被解成了德语。
+     * 判停本来要等 200–300 ms 静音，所以 ASR 晚到 150 ms **不花延迟**。
+     */
+    readonly sttCommitMs?: number;
+    /**
      * 开轮的静音门槛（ms）：定稿到达时「截至此刻」的连续静音不够就再等。
      *
      * 只对「端点由我们控」的 provider 有意义 —— 提交得早，定稿会在用户可能
@@ -300,9 +382,17 @@ export interface VoiceSessionOptions {
    *
    * `FrontedAgent` 和 TTS provider 都是**进程级共用**的，而档案是**每条连接一份** ——
    * 所以连接建立时把这些事件接到自己的档案上，断开时摘掉。同时只有一个设备在用时
-   * 归属是精确的；多设备并发会把审计写到最后连上的那一条（档案里带 `tag`，能看出来）。
+   * 归属是精确的。
+   *
+   * **断开时必须带 `expected`（自己当初挂上去的那个 sink）**：弱网重连时旧连接的
+   * 收尾常常晚于新连接的挂载，无令牌的 `null` 会把新连接的档案出口一起摘掉 ——
+   * 之后所有 `agent.*` / `tts.*` 事件静默丢失，日志里一个字都没有
+   * （生产实现见 `main.ts` 的 `createAuditSlot`）。
    */
-  readonly setAudit?: (sink: ((name: string, data: Record<string, unknown>) => void) | null) => void;
+  readonly setAudit?: (
+    sink: ((name: string, data: Record<string, unknown>) => void) | null,
+    expected?: ((name: string, data: Record<string, unknown>) => void) | null,
+  ) => void;
   /** 照片落盘目录；空串表示不落盘（默认） */
   readonly photoDir: string;
   /** 控制口端口与超时 */
@@ -368,6 +458,32 @@ export interface VoiceSessionOptions {
    * 很烦；`--serve` 就是给它准备的。
    */
   readonly serve?: boolean;
+
+  /**
+   * 监听成功：真实端口 + 外部停机入口。
+   *
+   * 给「进程内起栈」的宿主（dsh 插件）用：`port: 0` 时只有这里能拿到端口；
+   * {@link serve} 多设备模式下也只有这里能停机（靠连接结束收不了尾）。
+   * 语义见 `transport.ts` 的同名选项。
+   */
+  readonly onListening?: (info: { readonly port: number; readonly stop: () => void }) => void;
+}
+
+/**
+ * 进程内只该有一份的共用件。
+ *
+ * 两个都是**服务级**的，不是「每条连接一个」：
+ * - {@link VoiceService.control}：控制口端口固定，一条连接建一个会在重连时
+ *   `EADDRINUSE`，而且还在监听的旧 server 会把 MCP 的 `/say`、`take_photo`
+ *   路由给**上一条已经关闭的连接**（见 `tool-control.ts` 顶部）；
+ * - {@link VoiceService.activeSlot}：同一时间只服务一台设备。新连接接管时通过它
+ *   找到旧连接并主动断开，旧连接迟到的收尾也靠它判断「我是不是还该动共享槽」。
+ */
+export interface VoiceService {
+  /** 服务级控制口（`runVoiceServer` 建，监听收尾才关） */
+  readonly control: ToolControl;
+  /** 唯一活跃连接槽；`null` = 此刻没有设备 */
+  readonly activeSlot: { current: VoiceConnection | null };
 }
 
 /**
@@ -376,16 +492,32 @@ export interface VoiceSessionOptions {
  * 监听、鉴权、心跳、TLS 全在 `transport.ts`；这里只决定「一条连接里谁来干活」。
  */
 export async function runVoiceServer(options: VoiceSessionOptions): Promise<number> {
-  return await runTransport({
-    port: options.port,
-    host: options.host,
-    tls: options.tls,
-    authenticate: options.authenticate,
-    idleTimeoutMs: options.idleTimeoutMs,
-    singleConnection: options.serve !== true,
-    log: (line) => { console.log(line); },
-    onConnection: (conn) => { handshake(conn, options); },
+  // 控制口**在这里建一次**，不是每条连接建一个：端口固定，连接级开关就是
+  // EADDRINUSE 的来源（`tool-control.ts` 顶部记了现场表现）。
+  // 连接上来时 `setHandlers` 热切换，断开时带令牌摘掉。
+  const control = startToolControl({
+    port: options.controlPort,
+    photoTimeoutMs: options.photoTimeoutMs,
+    handlers: null,
   });
+  const service: VoiceService = { control, activeSlot: { current: null } };
+  try {
+    return await runTransport({
+      port: options.port,
+      host: options.host,
+      tls: options.tls,
+      authenticate: options.authenticate,
+      idleTimeoutMs: options.idleTimeoutMs,
+      singleConnection: options.serve !== true,
+      log: (line) => { console.log(line); },
+      ...(options.onListening === undefined ? {} : { onListening: options.onListening }),
+      onConnection: (conn) => { handshake(conn, options, service); },
+    });
+  } finally {
+    // `close()` 会 `closeAllConnections()`：不关的话，keep-alive 的工具进程会一直
+    // 占着端口，下一个进程绑定同一个端口就 EADDRINUSE。
+    control.close();
+  }
 }
 
 /**
@@ -402,7 +534,7 @@ const HANDSHAKE_WAIT_MS = 1_000;
  * - 没配鉴权：`Hello` 先到就用它；先到的是别的帧或等满 {@link HANDSHAKE_WAIT_MS} → v1，
  *   那一帧原样转交，不丢
  */
-function handshake(conn: Connection, options: VoiceSessionOptions): void {
+function handshake(conn: Connection, options: VoiceSessionOptions, service: VoiceService): void {
   let decided = false;
   let timer: NodeJS.Timeout | null = null;
 
@@ -420,7 +552,17 @@ function handshake(conn: Connection, options: VoiceSessionOptions): void {
     } else if (hello?.proto !== undefined && hello.proto >= 2) {
       console.log('  握手    设备要 v2 但能力不合法 → 不回 Welcome，按 v1 走');
     }
-    new VoiceConnection(conn, options, link).start(first, hello?.resumed === true);
+    const next = new VoiceConnection(conn, options, link, service);
+    // **单活**：同一时间只服务一台设备。新连接握手完成就顶掉旧的 ——
+    // 手机重启 / 换机之后旧连接往往还挂着（对端已死，这边还没察觉），
+    // 两条连接同时跑会让 ASR/TTS/播报互相抢，人也分不清声音来自哪一台。
+    const previous = service.activeSlot.current;
+    if (previous !== null) {
+      console.log(`  连接    新连接接管（${conn.remote}）→ 主动断开旧连接`);
+      previous.evict();
+    }
+    service.activeSlot.current = next;
+    next.start(first, hello?.resumed === true);
   };
 
   conn.bind({
@@ -438,11 +580,54 @@ function handshake(conn: Connection, options: VoiceSessionOptions): void {
   }
 }
 
-/** 一条连接的完整状态：只负责把各模块接起来。 */
-class VoiceConnection {
+/**
+ * 把宿主给的静态上下文收成 `OmniShadow` 认的形状。
+ *
+ * 记忆可以是函数：每条连接构造影子时调用一次，取当时的 MEMORY.md 摘要。
+ * 日期函数不在这里调用，影子自己在 `session.update` 里调用一次。
+ * 空白字段不传，避免空块写进提示词或 ASR 配置。
+ */
+function omniStaticContext(
+  shadow: NonNullable<VoiceSessionOptions['omniShadow']>,
+): {
+  readonly memoryContext?: string;
+  readonly clockContext?: () => string;
+  readonly asrCorpusText?: string;
+  readonly asrLanguage?: string;
+} {
+  const rawMemory = shadow.memoryContext === undefined
+    ? undefined
+    : (typeof shadow.memoryContext === 'function' ? shadow.memoryContext() : shadow.memoryContext);
+  const memory = textIfPresent(rawMemory);
+  const corpus = textIfPresent(shadow.asrCorpusText);
+  const language = textIfPresent(shadow.asrLanguage);
+  return {
+    ...(memory === undefined ? {} : { memoryContext: memory }),
+    ...(shadow.clockContext === undefined ? {} : { clockContext: shadow.clockContext }),
+    ...(corpus === undefined ? {} : { asrCorpusText: corpus }),
+    ...(language === undefined ? {} : { asrLanguage: language }),
+  };
+}
+
+/** 空白不当事实。有内容则原样返回，不改写。 */
+function textIfPresent(text: string | undefined): string | undefined {
+  if (text === undefined || text.trim() === '') {
+    return undefined;
+  }
+  return text;
+}
+
+/**
+ * 一条连接的完整状态：只负责把各模块接起来。
+ *
+ * 导出只为一件事：**接线的所有权语义要能单测**（`tests/voice-session-reconnect.test.ts`
+ * 直接驱动两条 `VoiceConnection`，不必起真 socket）。生产路径只有 `handshake` 会构造它。
+ */
+export class VoiceConnection {
   private readonly conn: Connection;
   private readonly options: VoiceSessionOptions;
   private readonly link: DeviceLink;
+  private readonly service: VoiceService;
   private readonly caps: DeviceCapabilities;
   /**
    * 设备最近一次上报的电量 / 充电 / 佩戴。
@@ -467,6 +652,17 @@ class VoiceConnection {
    * 模拟器换成 `VirtualClock`。**不要在这里再直接 `Date.now()`**。
    */
   private readonly clock: Clock = new SystemClock();
+  /** 最近一次 ASR 定稿的时刻（插话闸用，见 `barge-voicing.ts`） */
+  private lastSentenceAtMs = Number.NEGATIVE_INFINITY;
+  /**
+   * 装配器与插话闸**共用**的时刻源。
+   *
+   * 写成同一个函数引用，就是为了让「两边各取一个时钟」这件事再也做不出来 ——
+   * 真机踩过：装配器 `Date.now()`、闸 `SystemClock.now()`，闸恒放行且无日志。
+   */
+  private readonly assemblerNow = (): number => this.clock.now();
+  /** 时钟接错只报一次，免得每句话刷一行 */
+  private clockMismatchLogged = false;
   /** 上行编码由能力集决定；档案与解码都要它 */
   private readonly uplinkCodec: 'msbc' | 'pcm16';
 
@@ -477,15 +673,64 @@ class VoiceConnection {
   private readonly ownsTurnJudge: boolean;
   private readonly assembler: UtteranceAssembler;
   private readonly stt: SttSession;
+  /**
+   * omni 影子旁路（`OMNI_SHADOW=1` 才有，默认 null = 零成本）。
+   *
+   * 跟着**这条连接**活：服务空跑时 DashScope realtime 会空闲断链，进程启动就建连
+   * 等于白建一条注定 `broken` 的连接。
+   */
+  private readonly omni: OmniShadow | null;
+  /**
+   * 车道封段序号（omni 的 `seal`）。
+   *
+   * 和 ASR 的 `commitSeq` **不是同一个号**：车道 20 ms 就起跑，ASR 150 ms 才切段
+   * （见 `sttCommitMs`）。两份档案事件用 `asr.commit.lane_seq` 配对。
+   *
+   * ASR 那个号**不在这里**：`commit` 何时真发出去只有 ASR 自己知道
+   * （空缓冲跳过、解码窗口延后都不占号），宿主自己数就会指错段
+   * （见 `qwen-realtime-asr.ts` 的 `_commitSeq` 与 `causal.ts`）。
+   */
+  private sealSeq = 0;
 
-  private control: ToolControl | null = null;
+  /**
+   * 最近一帧的**前端**静音时长（`AudioFrame.silenceMs`，能量门算的）。
+   *
+   * 落进 `asr.commit.front_silence_ms`：组装器那条「静音 20 ms（实际 92 ms）」
+   * 里的 92 是**它自己的 tick 延迟**（下一块音频什么时候到），而真机那句话问的
+   * 「到底静了多久」要的是这个数。两个数并排落档，①a 才拆得开。
+   */
+  private lastFrameSilenceMs = 0;
+
+  /**
+   * 这条连接挂到服务级控制口上的 handlers（`setHandlers(null, this)` 的令牌）。
+   *
+   * 断开时**必须原样带回去**：新连接可能已经接管了控制口，无令牌的 `null` 会把
+   * 它一起清掉（MCP 拍照从此 503）。
+   */
+  private toolHandlers: ToolControlHandlers | null = null;
+
+  /**
+   * 本连接挂到审计槽上的出口。
+   *
+   * 存成字段同样是为了当令牌用（见 {@link VoiceSessionOptions.setAudit}）：
+   * 每次现造一个闭包，摘的时候就认不出「槽里那个是不是我挂的」。
+   */
+  private readonly auditSink = (name: string, data: Record<string, unknown>): void => {
+    this.archive?.event(name, data);
+  };
 
   /** 原始档案（`MIAI_ARCHIVE_DIR` 为空时是 null） */
   private readonly archive: SessionArchive | null;
 
-  constructor(conn: Connection, options: VoiceSessionOptions, link: DeviceLink) {
+  constructor(
+    conn: Connection,
+    options: VoiceSessionOptions,
+    link: DeviceLink,
+    service: VoiceService,
+  ) {
     this.conn = conn;
     this.options = options;
+    this.service = service;
 
     const log = (line: string): void => { console.log(line); };
     // 版本与能力在握手时定好；往下全是能力
@@ -500,10 +745,17 @@ class VoiceConnection {
     // 在 `app/dialog.ts`；这里只把环境接上（ADR-0002 §3.1）
     this.dialog = new DialogRuntime({
       clock: this.clock,
+      // 票据上的两个因果字段：谁认识 ASR 谁注入（FSM 自己不认识转写层）
+      ticketContext: {
+        baseCommitSeq: () => this.stt.commitSeq?.() ?? 0,
+        now: this.assemblerNow,
+      },
       caps: this.caps,
       agent: options.agent,
       tts: options.tts,
       downlink: conn,
+      // 旧连接被顶掉之后，`dispose()` 不许摘新连接的回执钩子（见 DialogOptions）
+      isActiveOwner: () => this.isActiveOwner(),
       imageQuestion: options.imageQuestion,
       photoDir: options.photoDir,
       photoTimeoutMs: options.photoTimeoutMs,
@@ -550,6 +802,17 @@ class VoiceConnection {
         onDialogState: (state) => { this.app?.onDialogState(state); },
       },
       log,
+      ...(options.engine === undefined ? {} : { engine: options.engine }),
+      ...(options.speakAnnounce === undefined
+        ? {}
+        : {
+            speakAnnounce: (item: AnnounceItem) => options.speakAnnounce!(
+              item,
+              (answer) => this.runner.speakAudioAnswer(answer),
+            ),
+            cancelAnnounce: options.cancelAnnounce,
+            onFallbackAnnounceSpoken: options.onFallbackAnnounceSpoken,
+          }),
     });
     // 应用层**总是**要建：话筒（user / reply / announce）必须在同一张表里仲裁，
     // 没有宠物也要（ADR-0001 §6）。宠物只是这套应用层里的一个子系统。
@@ -581,7 +844,20 @@ class VoiceConnection {
       },
     );
     // 快车道的输入/输出、TTS 的两段耗时都接进**这一条**连接的档案（见 `setAudit`）
-    options.setAudit?.((name, data) => this.archive?.event(name, data));
+    options.setAudit?.(this.auditSink);
+
+    this.omni = options.omniShadow === undefined ? null : new OmniShadow({
+      apiKey: options.omniShadow.apiKey,
+      ...(options.omniShadow.model === undefined ? {} : { model: options.omniShadow.model }),
+      ...(options.omniShadow.socketFactory === undefined
+        ? {}
+        : { socketFactory: options.omniShadow.socketFactory }),
+      serve: options.omniShadow.serve ?? 'off',
+      ...omniStaticContext(options.omniShadow),
+      // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
+      emit: (data) => { this.archive?.event(EVENTS.omniShadow, data); },
+      log: (line) => { console.log(line); },
+    });
 
     const turnJudgeOptions = options.turnJudge;
     const detector = resolveEndpointDetector(
@@ -617,6 +893,14 @@ class VoiceConnection {
       ...(turnJudgeOptions?.maxOpenSilenceMs === undefined
         ? {}
         : { maxOpenSilenceMs: turnJudgeOptions.maxOpenSilenceMs }),
+      ...(options.semantic === undefined
+        ? {}
+        : {
+          semanticEndpoint: (text: string) => options.semantic!.judge(text),
+          ...(options.semanticBudgetMs === undefined
+            ? {}
+            : { semanticBudgetMs: options.semanticBudgetMs }),
+        }),
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
       // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。
@@ -632,6 +916,10 @@ class VoiceConnection {
       // 静音一到就把判停跑掉，和 ASR 那 200 ms 静音窗并行 —— 出句时概率已经算好。
       // 门槛用能量门那个（同一路放大后的波形、同一套设备标定）。
       silenceDb: options.gate.thresholdDbfs,
+      // **必须与本类的 `clock` 同一把尺**：`lastVoicedAt` 要拿 `lastSentenceAtMs` 去比
+      // （见 `barge-voicing.ts`）。默认是 `Date.now()`（≈1.76e12），而 `SystemClock`
+      // 是进程启动后的单调毫秒（≈2e4）—— 接错的那一版闸恒放行且毫无日志。
+      now: this.assemblerNow,
       ...(options.gate.pauseDetectMs === undefined || options.gate.pauseDetectMs <= 0
         ? {}
         : { silencePauseMs: options.gate.pauseDetectMs }),
@@ -646,12 +934,41 @@ class VoiceConnection {
         : {
           commitAfterMs: options.gate.commitMs,
           onCommit: (silenceMs) => {
-            this.archive?.event(EVENTS.asrCommit, {
-              silence_ms: Math.round(silenceMs),
-              want_ms: options.gate.commitMs,
-            });
-            this.stt.commit?.();
+            const laneSeq = (this.sealSeq += 1);
+            // 车道起跑（omni 的 `seal`）。**ASR 的 commit 在更晚的 `onSttCommit`**，
+            // 所以这里不再写 `asr.commit` —— 否则 ①a/①b（停嘴→封段→定稿）
+            // 会拿 20 ms 的车道时刻冒充 150 ms 的封段时刻，整份延迟报告偏 130 ms。
+            this.omni?.seal(laneSeq, silenceMs);
           },
+          // ASR 那一路**晚一点**再切（见 `sttCommitMs`）：车道要的是「这半句结束」，
+          // ASR 要的是「这一句结束」，两者的最优值差一个数量级。
+          ...(options.gate.sttCommitMs === undefined || options.gate.sttCommitMs <= 0
+            ? {}
+            : {
+              sttCommitAfterMs: options.gate.sttCommitMs,
+              onSttCommit: (silenceMs) => {
+                // **先真发，再读号**。`commit()` 会跳过（这段没有新音频）、会延后
+                // （上一段还在解码），这两种都**不占号**；宿主以前自己 `+1`，
+                // 跳过时虚增、`hangup()` 时漏增，转写戴的出生证就指错了段
+                // （`causal.ts` 那条水位线全靠这个号）。
+                this.stt.commit?.();
+                const seq = this.stt.commitSeq?.() ?? 0;
+                this.archive?.event(EVENTS.asrCommit, {
+                  seq,
+                  silence_ms: Math.round(silenceMs),
+                  // 前端（能量门）算的真静音时长。与 `silence_ms` 的差就是
+                  // 「静音开始到真有音频帧到达」的 tick 延迟 —— ①a 拆开看这两个数
+                  front_silence_ms: Math.round(this.lastFrameSilenceMs),
+                  want_ms: options.gate.sttCommitMs,
+                  // 与 `omni.shadow` 的 join key：同一段语音的车道序号。
+                  // 两个号从 2026-11-23 起**不再相等**（车道 20 ms 先跑、ASR 150 ms 后切），
+                  // 想配对就看这一个字段，别再假设 `seq` 一样。
+                  lane_seq: this.sealSeq,
+                });
+                // 共享内核的 `input` 区域只认这一个号（`Math.max` 保护：重复不会倒着走）
+                this.core.runtime.dispatch({ type: 'asrCommit', commitSeq: seq });
+              },
+            }),
         }),
       // 开轮门槛：提交早 → 定稿也早，可能人还在说。定稿到达时看「截至此刻的
       // 连续静音」，不够就等 —— 那本来就不该开轮。
@@ -672,7 +989,6 @@ class VoiceConnection {
       // 句子定稿那一刻就让快车道起跑，把判停那一拍从关键路径上挪走。
       // 判停若并了下一段，组装器会拿更长的文本再调一次；认领时按文本比对。
       onSentence: (text) => {
-        this.options.agent.prefetch?.(text);
         // 预热**只跟快车道起跑走**，不跟「这一轮会不会答」走。
         //
         // 因为委派轮一定先出回执（`RECEIPTS`），而回执和正式回答共用同一条 TTS 连接
@@ -681,6 +997,9 @@ class VoiceConnection {
         // `stream:true prewarmed:false`（正式回答），白开一条 task。
         // 试过把回执预合成进缓存来腾出预热，代价是设备刚连上就要占 TTS 约 2 秒，
         // 与用户第一句话抢连接 —— 为 66 ms 不值得，已回滚（`5500c47`）。
+        //
+        // ⚠️ `prefetch` 只许调**一次**：以前这里还多一行无条件的 `prefetch(text)`，
+        // 每句定稿要发两趟（命中缓存那趟不算，但没命中就是重复请求）。
         if (this.options.agent.prefetch?.(text) === true) this.options.tts.prewarm?.();
       },
       // 中间结果投机：比定稿再往前提 p50 731 ms（真机 47 轮）。文本是猜的，
@@ -688,12 +1007,15 @@ class VoiceConnection {
       // 返回 false（没投出去）时组装器不会记「这段语音已投机」，下一个静音 tick
       // 还会再问一次 —— 否则「静音 100 ms 时只凑到 2 个字」就等于整轮放弃。
       onPartial: (text) => this.options.agent.speculatePartial?.(text) ?? false,
+      // 开轮前先等 ASR 那段解完（见 `UtteranceAssemblerOptions.awaitDecode`）。
+      // 闭包里取 `this.stt`：它在本行之后才赋值，构造期不能摸。
+      awaitDecode: () => this.stt?.whenDecoded?.() ?? null,
       log,
     });
 
     this.stt = options.stt.open({
-      onPartial: (text) => { this.onPartial(text); },
-      onSentence: (text, index) => { this.onSentence(text, index); },
+      onPartial: (text, commitSeq) => { this.onPartial(text, commitSeq); },
+      onSentence: (text, index, commitSeq) => { this.onSentence(text, index, commitSeq); },
       onError: (error) => { this.onAsrError(error); },
     });
     // 设备刚连上、用户还没开口：把 TTS 那条 WebSocket 先建好（~170 ms 的
@@ -709,23 +1031,54 @@ class VoiceConnection {
       gate: options.gate,
       gain: options.micGain,
       levelLogMs: options.levelLogMs,
+      /**
+       * **统一时钟**：能量门的保持窗口、`AudioFrame.tsMs`、装配器的静音计时、
+       * 插话闸的 `lastVoicedAt` 全从这里取。
+       *
+       * 不传的话门用 `Date.now()`（≈1.76e12）、宿主用 `SystemClock`（≈2e4），
+       * 两边比出来的「静音多久」是个天文数字 —— 真机踩过，插话判据整场静默失效
+       * 且一行日志都没有（见 `uplink-pipeline.ts` 的同名选项）。
+       */
+      now: this.assemblerNow,
       log,
       onError: (line) => { console.error(`[ffmpeg] ${line}`); },
       onRawPcm: (raw) => { this.archive?.pcmRaw(raw); },
-      onPcm: (pcm) => {
-        // 判停器要看音频本身，不只是文本
-        this.assembler.addAudio(pcm);
-      },
+      // 判停用的音频**不在这里收**：下面 `onFrame` 里的 `assembler.addFrame(frame)`
+      // 是唯一入口。两处都收等于每帧进 `recentChunks` 两次，而且这条老路会按
+      // `silenceDb` **自己重算**能量，与能量门的 `voiced` 两套判据（见 `addAudio`）。
+      onPcm: () => {},
       onSpeechOpen: (peakDbfs, preroll, prerollMs) => {
         this.archive?.event(EVENTS.gateOpen, { peakDbfs: Number(peakDbfs.toFixed(1)), prerollMs });
         // 新一轮开口：判停窗口只留这一句（官方也是按句裁的）。预卷就是这段的开头，
         // 前面那些静音 / 上一轮的回答都不该进模型。
         this.assembler.resetAudio(preroll);
+        // 预卷里**大部分是静音**（它是「触发点之前 800 ms」，不是语音起点）。
+        // 按同一套门限逐块标 voiced：静音只进软起音环，不会一开麦就让服务端先在
+        // 静音上吐一个「嗯。」（那一下还会把宠物话筒改成 owner=user）。
+        //
+        // 比较符必须与 `EnergyGate` 严格一致（`peakDbfs > thresholdDbfs`）：
+        // `>=` 会把「恰好等于门限」的那一块标成有声，而门自己把它当静音。
         for (const part of preroll) {
-          this.stt.feed(part);
+          this.stt.feed(part, pcm16PeakDbfs(part) > options.gate.thresholdDbfs);
         }
+        // 影子按「这一句」重新起一段。封段后到下一次开口之间的静音**一个字节都不推**
+        // （见 `OmniShadow` 的 mute），所以这里只要把预卷补上就行。
+        this.omni?.restart(preroll);
       },
-      onSpeech: (pcm) => { this.stt.feed(pcm); },
+      onFrame: (frame) => {
+        // 能量门周期号进共享内核（只作参考，不参与因果裁决 —— `causal.ts` 顶部）
+        this.core.runtime.dispatch({ type: 'gate', gateSeq: frame.gateSeq });
+        // 声学前端的**唯一出口**：`voiced` / `silenceMs` / `tsMs` 都是门算好的，
+        // 装配器不再按 `silenceDb` 重算一遍（两处各算一遍正是「有时候丢字、
+        // 有时候灌静音」的来源，见 `UtteranceAssembler.addFrame`）。
+        this.assembler.addFrame(frame);
+        this.lastFrameSilenceMs = frame.silenceMs;
+        // `voiced` 必须透传：门比封段晚关约 2 s，不带它 ASR 的「解码期暂存」
+        // 就会把尾静音攒下来补推，换来一句幻觉定稿（实测 150 ms 静音 → 「嗯。」）
+        this.stt.feed(frame.pcm, frame.voiced);
+        // 同一个理由：不带它就会往旁路里灌静音
+        this.omni?.feed(frame.pcm, frame.voiced);
+      },
       onSpeechClose: (gapMs) => {
         // 带上 gapMs：能量门要 holdMs（默认 2 s）才关门，所以 `t` 本身**不是**
         // 「用户停嘴」的时刻，`t - gapMs` 才是。延迟报告靠这个还原真实起点。
@@ -762,8 +1115,28 @@ class VoiceConnection {
     );
     this.archive?.event(EVENTS.deviceLink, { proto: this.link.proto, label: this.link.label });
 
+    // 影子握手（实测 ~1.3 s）与设备握手并行，不占关键路径。
+    // 挂到 agent 上才会发声：显式 `live`，或没写管道模式且 `serve !== 'off'`
+    // （旧的认领推断）。`cascade` 里影子只测量，`start()` 照跑，但不挂车道。
+    const omniServesPlayback = this.options.pipelineMode === 'live'
+      || (
+        this.options.pipelineMode === undefined
+        && this.options.omniShadow !== undefined
+        && this.options.omniShadow.serve !== 'off'
+      );
+    this.omni?.start();
+    // 车道照连接挂：这一条连接答完/断开时必须摘掉，否则下一条连接会认领到
+    // 一条已经死了的 WS（它的 response 永远不会 done）
+    if (this.omni !== null && omniServesPlayback) {
+      this.options.agent.attachAudioLane?.(this.omni);
+    }
+
     // 后台任务完成后的播报落在这条连接上
     this.options.agent.setAnnouncer?.((speech, emotion) => { this.onAnnounce(speech, emotion); });
+    // Pure Live：`BackgroundTaskReport` 进播报空窗。没这个口的 agent 是空操作。
+    this.options.agent.setTaskReporter?.((report) => {
+      this.onTaskReport(report);
+    });
 
     // 上次离线期间攒下的汇报：连上就补播（旧的先播）
     const backlog = this.options.announceStore?.drain() ?? [];
@@ -799,24 +1172,27 @@ class VoiceConnection {
     }
 
     const detail = captureMode(this.caps, 'detail');
-    this.control = startToolControl({
-      port: this.options.controlPort,
+    const handlers: ToolControlHandlers = {
+      capabilities: () => this.caps,
+      takePhoto: () => this.requestToolCapture('glance'),
+      // 没有 `detail` 意图时不传 `takePhotoHq`：`tool-control` 会回落到 `takePhoto`
+      takePhotoHq: detail === null ? undefined : () => this.requestToolCapture('detail'),
+      endSession: () => { this.dialog.dispatch({ type: 'endRequested' }); },
+      say: (text) => {
+        // 调试口：和「用户说完一句」走同一条路，方便没有麦克风时联调
+        this.dialog.dispatch({ type: 'utterance', text });
+      },
+      control: (text) => { this.conn.sendControl(text); },
+      log: (line) => { console.log(line); },
+    };
+    this.toolHandlers = handlers;
+    // 控制口是**服务级**的：这里只热切换 handlers，不重新 bind 端口 ——
+    // 每条连接建一个的后果是重连时 EADDRINUSE，而且旧 server 会把 MCP 的请求
+    // 路由给已经死掉的连接（`tool-control.ts` 顶部的现场记录）。
+    this.service.control.setHandlers(handlers, undefined, {
       photoTimeoutMs: this.options.photoTimeoutMs,
       // HTTP 超时比收件箱的兜底再宽 5 s：让设备上报的失败原因先回来
       hqTimeoutMs: detail === null ? undefined : this.photos.timeoutFor(detail.needsUser) + 5_000,
-      handlers: {
-        capabilities: () => this.caps,
-        takePhoto: () => this.requestToolCapture('glance'),
-        // 没有 `detail` 意图时不传 `takePhotoHq`：`tool-control` 会回落到 `takePhoto`
-        takePhotoHq: detail === null ? undefined : () => this.requestToolCapture('detail'),
-        endSession: () => { this.dialog.dispatch({ type: 'endRequested' }); },
-        say: (text) => {
-          // 调试口：和「用户说完一句」走同一条路，方便没有麦克风时联调
-          this.dialog.dispatch({ type: 'utterance', text });
-        },
-        control: (text) => { this.conn.sendControl(text); },
-        log: (line) => { console.log(line); },
-      },
     });
   }
 
@@ -1150,15 +1526,82 @@ class VoiceConnection {
     this.archive?.event(EVENTS.announce, { len: speech.length, emotion });
     this.dialog.enqueueAnnounce(speech, emotion);
   }
+
+  /**
+   * Pure Live 后台任务完成 → 播报空窗。
+   *
+   * 有 `verbatim` 时必须逐字念（精确数字 / 端口 / 长报告），否则念 `summary`。
+   */
+  private onTaskReport(report: BackgroundTaskReport): void {
+    this.archive?.event(EVENTS.announce, {
+      len: report.summary.length,
+      emotion: report.emotion,
+      source: report.source,
+      verbatim: report.verbatim !== undefined,
+    });
+    this.dialog.enqueueAnnounce({
+      speech: report.verbatim ?? report.summary,
+      emotion: report.emotion,
+      taskId: report.taskId,
+      query: report.query,
+      verbatim: report.verbatim !== undefined,
+      needsConfirm: report.needsConfirm,
+    });
+  }
+
+  /**
+   * 被新连接顶掉：主动断开自己。
+   *
+   * 只 `end()` 连接，**不直接跑收尾** —— 收尾要等对端真的关（`onClose`），
+   * 那时才能保证「先断开、再清槽」的顺序；这里直接清槽会让新旧两条交叠。
+   */
+  evict(): void {
+    console.log(`  连接    被新连接接管，断开旧连接 ${this.conn.remote}`);
+    this.conn.end();
+  }
+
+  /**
+   * 这条连接还是不是**当前活跃的那一条**。
+   *
+   * 判据只有一条：服务级活跃槽里是不是自己。旧连接被顶掉之后仍要走完自己的收尾
+   * （TTS / ASR / 档案都要关），但**不许动共享槽** —— `attachAudioLane` /
+   * `setAnnouncer` / `setTaskReporter` / `setDelegateHook` / `setAudit` /
+   * `ToolControl` 此刻都归新连接。
+   * 弱网重连时「旧连接晚于新连接断开」是常态，不判所有权就会把新连接的东西摘掉。
+   */
+  private isActiveOwner(): boolean {
+    return this.service.activeSlot.current === this;
+  }
+
   private onClose(): void {
+    // 这条连接还是不是「当前那条」——**整段收尾**都按这一份快照判断。
+    // 活跃槽要等收尾结束才清：`DialogRuntime.dispose()`（在 `app.dispose()` 里）
+    // 也要拿 `isActiveOwner()` 决定摘不摘回执钩子，提前清掉它就变成「旧连接」了。
+    const owner = this.isActiveOwner();
+    // 控制口是服务级的，**不关**：只把 handlers 摘回「没有设备」，而且必须带令牌 ——
+    // 新连接可能已经接管了控制口（无令牌的 `null` 会让 MCP 拍照从此 503）。
+    if (this.toolHandlers !== null) {
+      this.service.control.setHandlers(null, this.toolHandlers);
+    }
+    // 先摘车道：`attachAudioLane` 是进程级 agent 上的一个槽，留一条死连接在上面
+    // 会让下一条连接认领到永远不会完成的 response。但**只摘自己的**。
+    if (owner) {
+      this.options.agent.attachAudioLane?.(null);
+    }
     // 有在途开口就记 aborted，然后丢掉执行器手里的计时器
     this.app?.close();
     this.app?.dispose();
     console.log(`\n连接结束，${this.core.turn} 轮`);
-    // 连接没了，后台任务的播报就没有出口了（结果仍会在 dsh 会话里，下次连上可追问）
-    this.options.agent.setAnnouncer?.(null);
+    // 连接没了，后台任务的播报就没有出口了（结果仍会在 dsh 会话里，下次连上可追问）。
+    // `setTaskReporter` 与 `setAnnouncer` 同一条所有权：旧连接迟到收尾不许摘新连接的。
+    if (owner) {
+      this.options.agent.setAnnouncer?.(null);
+      this.options.agent.setTaskReporter?.(null);
+    }
     this.dialog.dispatch({ type: 'closed' });
     // 收件箱里还有等待者的话，定时器会拖住进程（不必再下发 hq_cancel：连接都断了）
+    // 这里的 `dispose()` 已经是个 no-op（`app.dispose()` 里调过一次），回执钩子那一步
+    // 同样走 `isActiveOwner()` 守卫。
     this.dialog.dispose();
     this.assembler.dispose();
     // 只有自己建的那份才销毁：共享侧车由进程持有，断开就 stop 等于每次重连都
@@ -1166,38 +1609,125 @@ class VoiceConnection {
     if (this.ownsTurnJudge) {
       this.turnJudge?.stop();
     }
-    this.control?.close();
-    // 先摘审计出口再关档案：否则最后一批 `agent.done` 会写进已关闭的档案
-    this.options.setAudit?.(null);
+    // 影子最后关：正常断开**不落事件**（`stop()` 不 emit），只有异常才留 `broken`
+    this.omni?.stop();
+    // 先摘审计出口再关档案：否则最后一批 `agent.done` 会写进已关闭的档案。
+    // 两道保护都要：令牌让**槽**认出「这是我挂的那份」，`owner` 让**旧连接根本不发**
+    // 这趟调用 —— 装配方（`main.ts`）若还是 1 参回调、把令牌丢了，无令牌的 `null`
+    // 会把新连接的档案出口清掉，而那一条在线上只表现为「审计事件莫名其妙全没了」。
+    if (owner) {
+      this.options.setAudit?.(null, this.auditSink);
+    }
     this.archive?.close();
     this.stt.close();
     this.uplink.end();
+    // **最后**才清槽；旧连接的迟到收尾走到这里时槽里已经是新连接，不动它。
+    if (owner) {
+      this.service.activeSlot.current = null;
+    }
   }
 
   // ------------------------------------------------------------------ 事件
 
-  private onPartial(text: string): void {
+  private onPartial(text: string, commitSeq?: number): void {
     console.log(`  … ${text}`);
     this.archive?.event(EVENTS.asrPartial, { text });
+    // 插话的**声学**闸：服务端会把同一截缓冲再解一遍，在尾静音上吐 `Thank you`，
+    // 它一旦 ≥2 个字就把正在播的回答整条掐掉（真机两次各丢一整条答案）。
+    // 判据不是语种、不是音量、也不是「距上次有声多久」，而是
+    // **这一段定稿之后还有没有新的声音** —— 见 `barge-voicing.ts`（8 份档案 17 次
+    // 插话逐条压过：3/3 幻觉拦下、13/13 真话放行）。
+    if (this.dialog.core.fsm.state === 'speaking' && this.gatedByVoicing()) {
+      console.log(`  … ${text}（这段已出过定稿、之后没有新声音 → 重复解码，不算插话）`);
+      return;
+    }
+    // **开轮前录的那一段**由内核挡（`SessionCore` → `kernel.ts::isPreTurnCommit`，
+    // 全仓唯一的因果屏障）：产出它的 commit 早于开轮时刻，说明这些音频是在我们
+    // 出声之前录的 —— 那不可能真是插话，是我们抢在用户说完之前开了口。
+    // 真机 `20261123-053719` 第 2 轮：开轮 71 ms 后 `置身吗` 到达，被当成插话，
+    // dsh 那份**完全正确**的答案 `audio_s=0.00` 没了。
+    const genBefore = this.core.fsm.gen;
+    const effects = this.dialog.dispatch({
+      type: 'partial',
+      text,
+      ...(commitSeq === undefined ? {} : { commitSeq }),
+    });
+    // 被内核丢掉时**什么都不许碰**：不进装配器（否则记成「用户还在说」）、
+    // 不收宠物话筒、也不打断旁白 —— 它压根不是这一轮的话。
+    if (effects.some((effect) => effect.type === 'drop' && effect.why === 'pre-turn')) {
+      console.log(`  … ${text}（开轮前录的那段还在解 → 不算插话）`);
+      return;
+    }
     // 判停的**文本判据**：中间结果在出 = 用户还在说。只传信号不拼文本，
     // 中间结果会反复改写，拼起来是乱的。
     this.assembler.notePartial(text);
     // 用户已经开口了，「嗯，我看看」这种回执就没必要了
     // 宠物要在**用户刚开口**就收手，不能等到这句话定稿
     this.app?.userPartial();
-    const effects = this.dialog.dispatch({ type: 'partial', text });
-    if (effects.some((effect) => effect.type === 'call' && effect.call.op === 'audio.stop')) {
+    // 代次变了 = 内核真的判了插话（`audio.stop` 由 `KernelPorts.stopDeviceAudio` 执行，
+    // 这里不再另找那个效果 —— 两处各判一遍迟早漂）。
+    if (this.core.fsm.gen !== genBefore) {
       console.log('  打断    听到识别结果 → 停止播放，已排队的轮次作废');
     }
   }
 
-  private onSentence(text: string, index: number): void {
+  /**
+   * 这段转写是不是「同一截缓冲的重复解码」。
+   *
+   * 判据见 `barge-voicing.ts`。时钟接错时**报一次** —— 那一版闸会静默失效
+   * （`20261123-051448` 第 4 轮被 `Okay` 打断就是这么漏的），不报等于没有仪表。
+   */
+  private gatedByVoicing(): boolean {
+    const verdict = voicingVerdict(this.assembler.lastVoicedAtMs, this.lastSentenceAtMs);
+    if (verdict === 'clock-mismatch' && !this.clockMismatchLogged) {
+      this.clockMismatchLogged = true;
+      console.error(
+        '  ✗ 插话闸   两把时钟不同源'
+        + `（有声 ${this.assembler.lastVoicedAtMs} / 定稿 ${this.lastSentenceAtMs}）`
+        + ' → 闸失效，检查 UtteranceAssembler 的 now',
+      );
+    }
+    return verdict === 'silent';
+  }
+
+  private onSentence(text: string, index: number, commitSeq?: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
     this.archive?.event(EVENTS.asrSentence, { text, index });
-    const effects = this.dialog.dispatch({ type: 'sentence', text });
+    // 解码窗口结束（`.completed` 回来了）—— 这是**事实**，与「这段文本用不用」
+    // 无关，所以放在所有丢弃判据之前。共享内核据此放掉 `awaitingDecode`；
+    // 迟到的 `.completed` 由内核按 `commitSeq` 比较挡掉，不会抹掉更新的那一发。
+    if (commitSeq !== undefined) {
+      this.core.runtime.dispatch({ type: 'decodeSettled', commitSeq });
+    }
+    // 上面那句已经出过结论、之后一直没人说话 → 这一条是同一截缓冲的重复解码。
+    // 它既不该打断播放，也不该开一轮（真机档案里 `Okay.` / `对。` / `好。` 共 13 条，
+    // 底下一条有声帧都没有；回放里它们每个都会开出一轮「答无可答」的轮次，
+    // 直接把 omni 车道撞成 `lane.fallback`）。
+    // 真人说「对。」必然带新的有声帧，所以这条不会误杀确认。
+    if (this.gatedByVoicing()) {
+      console.log(`  句 ${index}  ↳ 定稿之后没有新声音 → 重复解码，丢弃`);
+      return;
+    }
+    // **开轮前录的那一段**的判据只在内核里有一份（`kernel.ts::isPreTurnCommit`，
+    // 全仓唯一的因果屏障）：它的音频早于这一轮，定稿回来时拿去「插话」就是自己掐自己。
+    // 这里连开轮都不开 —— 用户下一句会重新说到它。
+    const genBefore = this.core.fsm.gen;
+    const effects = this.dialog.dispatch({
+      type: 'sentence',
+      text,
+      ...(commitSeq === undefined ? {} : { commitSeq }),
+    });
+    if (effects.some((effect) => effect.type === 'drop' && effect.why === 'pre-turn')) {
+      console.log(`  句 ${index}  ↳ 开轮前录的那段定稿 → 不当插话，也不开轮`);
+      this.archive?.event(EVENTS.asrSentence, { text, index, dropped: 'pre-turn' });
+      return;
+    }
+    // 后面的 partial 拿它当「上一句」：这之后还有没有新的有声帧，决定那些 partial
+    // 是真插话还是重复解码（见 `barge-voicing.ts`）
+    this.lastSentenceAtMs = this.assemblerNow();
     // 打断有两处入口（中间结果 / 定稿），日志必须都打 —— 否则统计打断率会漏掉
     // 「短促插话只出定稿」那一半，真机上就是 4 次里少记 1 次。
-    if (effects.some((effect) => effect.type === 'call' && effect.call.op === 'audio.stop')) {
+    if (this.core.fsm.gen !== genBefore) {
       console.log('  打断    听到定稿 → 停止播放，已排队的轮次作废');
     }
   }

@@ -1,11 +1,27 @@
 /**
- * dsh 插件入口（external protocol driver）。
+ * dsh 插件入口（external protocol driver）—— **目前只有配置骨架，语音栈没接**。
  *
- * 0.0.1 只有骨架：把 Config 定下来、把注入声明清楚，语音栈还没接进来。
- * 接线步骤见 archive/HANDOFF.md §4.1，其中三条纪律（apply 里捕获服务 / 归属用引用比较 /
- * quiesce 幂等且先同步 cancel 再 await dispose）要等接上 agent 之后才谈得上。
+ * <h2>现状（0.0.1）</h2>
  *
- * Config 的更新语义：**只有标了 `volatile()` 的字段**才是热读（dsh 的 loader 原地换引用）；
+ * 这个文件只做三件事：声明插件 `name` / `inject`、把 `Config` 的 schema 定下来、
+ * 在 `apply` 里跑一遍绑定安全检查（`src/bind-policy.ts`）。**它不建监听、不连设备、
+ * 不碰 ASR/TTS/agent** —— `apply` 只打两行日志就返回。
+ *
+ * 也就是说：**插件形态还没接线**。装进 dsh 里只会看到一条「骨架就位」，
+ * 不会有任何端口在听。要真的跑起来用这两个其中之一：
+ *
+ * | 形态 | 入口 | 说明 |
+ * |---|---|---|
+ * | 独立进程 | `src/main.ts`（`npm start`） | 线上用的就是这个 |
+ * | Web 插件 | `packages/dsh-voice-web` | 浏览器侧，语音栈是 `src/` 的副本 |
+ *
+ * 别把本文件当「插件模式已可用」的证据。接线步骤见 `archive/HANDOFF.md` §4.1，
+ * 其中三条纪律（apply 里捕获服务 / 归属用引用比较 / quiesce 幂等且先同步 cancel
+ * 再 await dispose）要等接上 agent 之后才谈得上 —— 现在一条都没实现。
+ *
+ * <h2>Config 的更新语义</h2>
+ *
+ * **只有标了 `volatile()` 的字段**才是热读（dsh 的 loader 原地换引用）；
  * 普通字段变化会让 fiber dispose 后重跑 `apply` —— 监听关闭、连接断开。
  * 端口这类"改了本来就该重建"的保持普通字段，时机参数和音色应当 volatile 化。
  */
@@ -120,6 +136,7 @@ export function apply(ctx: Context, config: PetConfig): void {
     throw new Error(`pet-wearable: ${safety.message}`)
   }
 
-  logger.info('骨架就位：语音栈尚未接线')
+  logger.info('骨架就位：语音栈尚未接线（本插件不监听端口，也不会连设备）')
+  logger.info('要跑语音栈请用独立进程 src/main.ts（npm start）或 Web 插件 packages/dsh-voice-web')
   logger.info(`port=${config.port} host=${config.host} device=${config.device || 'generic'} voice=${config.voice} turnThreshold=${config.turnThreshold}`)
 }

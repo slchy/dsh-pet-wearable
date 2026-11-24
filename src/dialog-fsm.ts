@@ -1,5 +1,5 @@
 /**
- * 一次语音会话的对话状态机。
+ * 一次语音会话的对话状态机 —— 现在是**确定性内核的薄门面**。
  *
  * <h2>为什么要有它</h2>
  *
@@ -14,6 +14,22 @@
  * - `bargeIn` 需要在每轮开头手工复位，漏一次就整轮被当成已打断
  *
  * 这些都不是独立缺陷，是**没有状态定义**的症状。
+ *
+ * <h2>相位定义在哪</h2>
+ *
+ * **不在这个文件里。** 相位的定义、拒绝条件、副作用（`stopDeviceAudio` /
+ * `invalidateTurn` / `abortEngine` / `settleTurn`）全部在
+ * [`kernel.ts`](./kernel.ts) 的 `dialog` 区域：这个类只做三件事 ——
+ *
+ * 1. 把方法调用翻译成一条 {@link KernelEvent} 派发给 {@link KernelRuntime}
+ *    （走 `dispatchAndApply`：装配层绑了端口就执行内核声明的意图，没绑就只推状态）；
+ * 2. 所有 getter 直接读 `runtime.state.dialog`（**不再有第二份** `_turn` / `_gen` /
+ *    `_endAfterSpeech` / `_receiptOnly` / `_lastWhy`）；
+ * 3. 订阅 `runtime` 的转移，把「相位变了」翻译成 `onState`、内核声明的
+ *    `invalidateTurn` 意图翻译成 `onInvalidate`（日志也在这里打）。
+ *
+ * 这样相位只有一份：`TurnRunner` / `DialogRuntime` / `VoiceConnection` 看到的是
+ * 同一个 `KernelRuntime` 的快照，不会出现「状态机说 speaking、内核说 thinking」。
  *
  * <h2>状态与转移</h2>
  *
@@ -49,7 +65,7 @@
  *    （见 `TurnRunner.speakReceipt`）在 `thinking` 期间就已经出声，用户听完
  *    然后说「不用了」是明确的插话。所以回执要把状态推进 `speaking`
  *    （{@link DialogFsm.receiptStarted}），播完再退回 `thinking`
- *    （{@link DialogFsm.receiptEnded}，靠 `_receiptOnly` 跟真回答区分）。
+ *    （{@link DialogFsm.receiptEnded}，靠 `receiptOnly` 跟真回答区分）。
  * 2. **`speaking` 覆盖整段播放**，直到音频真的播完才离开。不是「TTS 生成结束」
  *    就结束（实测：13 轮只成功打断 1 次）。
  * 3. **插话即作废排队轮次**。一轮 = dsh 2–5 s + 播放 5–20 s，用户在此期间说的
@@ -67,9 +83,9 @@
  * `audioDone` 就会把新一轮从 `speaking` 提前切回 `listening`。所以
  * `audioStarted` / `audioDone` 都要求 `no` 等于当前轮次。
  *
- * 这两道都是**运行时单点判定**，不是类型系统的保证。若要类型级保证，
- * 得把状态做成可辨识联合、让 `bargeIn` 只存在于 Speaking 类型上；
- * 本轮没这么改。
+ * 票据由内核在 `beginTurn` 时铸造，并在那一刻锁存**因果水位线**
+ * （`baseCommitSeq` / `startedAtMs`，见 {@link DialogFsmContext}）。此后这张票上的
+ * 值不再变 —— 迟到的转写拿**它自己那一轮**的基线去比，才不会「自己打断自己」。
  *
  * <h2>明确定义的行为（以前没写下来，容易各读一套）</h2>
  *
@@ -98,41 +114,35 @@
  *   `utterance` / `requestEnd` / `closed` 三条边 —— 别在这里加 stale 判定
  * - 提示语（"请按一下快门"）不改状态：它是 `awaiting_shot` 内部的旁白
  */
-
-export type DialogState = 'listening' | 'awaiting_shot' | 'thinking' | 'speaking' | 'ending' | 'closed';
+import { KernelRuntime } from './kernel-runtime.ts';
+import type { DialogState, Effect, KernelEvent, TurnTicket } from './kernel.ts';
 
 /**
- * 一轮的票据。
- *
- * - `no`：轮次号，判断「这还是不是当前这一轮」
- * - `gen`：代次，判断「这一轮是否已被插话作废」
+ * `DialogState` / `TurnTicket` 的**定义在内核**（`kernel.ts` 的 `dialog` 区域是相位的
+ * 唯一真相源）。这里只转出：既让全仓 `from './dialog-fsm.ts'` 的导入保持可用，
+ * 也断掉 `kernel.ts ↔ dialog-fsm.ts` 的模块环。
  */
-export interface TurnTicket {
-  readonly no: number;
-  readonly gen: number;
+export type { DialogState, TurnTicket };
+
+/**
+ * 票据上那两个**随时间变化**的字段从哪来：装配层注入，FSM 自己不认识 ASR。
+ *
+ * 为什么不能放进构造参数属性：Node 的类型擦除不支持参数属性（见下面的说明）。
+ */
+export interface DialogFsmContext {
+  /** 已经发出几发 ASR commit（单调） */
+  readonly baseCommitSeq?: () => number;
+  readonly now?: () => number;
 }
 
 export class DialogFsm {
-  private _state: DialogState = 'listening';
-  private _turn = 0;
-  private _gen = 0;
-  /** 模型已经要求结束：等这段音频播完再走 `ending` */
-  private _endAfterSpeech = false;
   /**
-   * 当前这段 `speaking` 只是回执在响（真回答的音频还没开始）。
+   * 唯一的内核运行时。
    *
-   * 回执发生在 `thinking` 期间，但它确实是用户听得见的声音，所以状态要进
-   * `speaking` 才能被插话打断；播完再退回 `thinking` 等答案。
+   * 默认自己新建一个（单测/离线场景够用）；装配层可以传进来共享 —— 一个会话只该
+   * 有一份 `KernelState`（`SessionCore.runtime` 会把它透出去）。
    */
-  private _receiptOnly = false;
-  /**
-   * 最近一次转移的**原因**（`transition` 的 `why`）。
-   *
-   * 必须能读出来：`thinking → speaking` 既可能是「首块音频下发」也可能是
-   * 「回执出声」，两者对延迟/打断的含义相反。只写 console 的话，档案里就分不出来
-   * （`DialogRuntime.notifyState` 靠它给事件补 `why`）。
-   */
-  private _lastWhy = '';
+  readonly runtime: KernelRuntime;
   /**
    * 日志出口。
    *
@@ -144,27 +154,59 @@ export class DialogFsm {
   private readonly log: (line: string) => void;
   /** 「本轮被作废」的订阅者（见 {@link onInvalidate}） */
   private readonly invalidateListeners: Array<(reason: 'bargeIn' | 'closed') => void> = [];
+  /** 状态转移的观察者（只读，不参与决策） */
+  private readonly stateListeners: Array<(state: DialogState, why: string) => void> = [];
+  /** 票据上那两个随时间变化的字段的来源（见 {@link DialogFsmContext}） */
+  private readonly context: DialogFsmContext;
 
-  constructor(log: (line: string) => void) {
+  constructor(
+    log: (line: string) => void,
+    context: DialogFsmContext = {},
+    runtime?: KernelRuntime,
+  ) {
     this.log = log;
+    this.context = context;
+    this.runtime = runtime ?? new KernelRuntime();
+    // 单点订阅：相位变化 → onState；内核声明的 `invalidateTurn` 意图 → onInvalidate。
+    // 顺序与旧实现一致：**先**状态监听者，**后**作废监听者（取消上游时状态已经是新的）。
+    this.runtime.subscribe((prev, next, _event, effects) => {
+      const from = prev.dialog.phase;
+      const to = next.dialog.phase;
+      if (from !== to) {
+        const why = next.dialog.lastWhy;
+        this.log(`  状态    ${from} → ${to}   (${why})`);
+        for (const cb of [...this.stateListeners]) {
+          cb(to, why);
+        }
+      }
+      // 作废通知唯一来源是内核声明的 `invalidateTurn` 意图（不再按事件名和相位重算一遍）。
+      // 顺序保持不变：先 `onState`，后 `onInvalidate`。
+      for (const effect of effects) {
+        if (effect.type === 'invalidateTurn') {
+          for (const cb of [...this.invalidateListeners]) {
+            cb(effect.reason);
+          }
+        }
+      }
+    });
   }
 
   get state(): DialogState {
-    return this._state;
+    return this.runtime.state.dialog.phase;
   }
 
-  /** 最近一次转移的原因，给档案补 `why` 用（见 {@link _lastWhy}） */
+  /** 最近一次转移的原因，给档案补 `why` 用 */
   get lastTransitionReason(): string {
-    return this._lastWhy;
+    return this.runtime.state.dialog.lastWhy;
   }
 
   /** 本轮编号，从 1 开始 */
   get turn(): number {
-    return this._turn;
+    return this.runtime.state.dialog.turn;
   }
 
   get gen(): number {
-    return this._gen;
+    return this.runtime.state.dialog.gen;
   }
 
   /**
@@ -175,12 +217,39 @@ export class DialogFsm {
    * 否则会把两个行为不同的配置误当成同一个。
    */
   get endAfterSpeech(): boolean {
-    return this._endAfterSpeech;
+    return this.runtime.state.dialog.endAfterSpeech;
   }
 
-  /** 当前代次的票据。入队任务应当持有它，出队时用 {@link isStale} 校验。 */
+  /**
+   * 当前代次的票据。入队任务应当持有它，出队时用 {@link isStale} 校验。
+   *
+   * 还没有过一轮（或刚被插话清掉）时按当前 `{no, gen}` 现造一张：调用方拿它当
+   * **身份**用，不是当因果水位线用（水位线由 `kernel.ts` 的 `isPreTurnCommit` 判）。
+   */
   ticket(): TurnTicket {
-    return { no: this._turn, gen: this._gen };
+    const dialog = this.runtime.state.dialog;
+    if (dialog.ticket !== null) {
+      return dialog.ticket;
+    }
+    return { no: dialog.turn, gen: dialog.gen };
+  }
+
+  /**
+   * 订阅「状态变了」。
+   *
+   * 宿主用它记「这一轮是什么时候开的」—— 判断一条转写是开轮前录的还是开轮后的，
+   * 只有它知道（见 `VoiceSession.turnStartedAt`）。回调里不要做耗时的事。
+   *
+   * @returns 退订函数
+   */
+  onState(cb: (state: DialogState, why: string) => void): () => void {
+    this.stateListeners.push(cb);
+    return () => {
+      const at = this.stateListeners.indexOf(cb);
+      if (at >= 0) {
+        this.stateListeners.splice(at, 1);
+      }
+    };
   }
 
   /**
@@ -201,14 +270,19 @@ export class DialogFsm {
     };
   }
 
-  /** 该票据的轮次是否已被插话作废（代次变了） */
+  /**
+   * 该票据是不是**已经被顶掉**（只比代次）。
+   *
+   * 与 {@link isCurrent} 合起来才等于 `causal.ts` 的 `isStaleTicket`：本类刻意把
+   * 两件事拆开，"哪一轮"和"被插话几次"是不同的因果量，别在一处比完。
+   */
   isStale(t: TurnTicket): boolean {
-    return t.gen !== this._gen;
+    return t.gen !== this.runtime.state.dialog.gen;
   }
 
   /** 该票据是否仍属于当前这一轮（排除上一轮迟到的回调） */
   isCurrent(t: TurnTicket): boolean {
-    return t.no === this._turn;
+    return t.no === this.runtime.state.dialog.turn;
   }
 
   /**
@@ -219,20 +293,28 @@ export class DialogFsm {
    * @returns 该轮票据；已在收尾/已关闭时返回 `null`，调用方应直接放弃这一轮
    */
   beginTurn(): TurnTicket | null {
-    if (this._state === 'ending' || this._state === 'closed') {
-      this.log(`  状态    ✗ 拒绝开新一轮（当前 ${this._state}）`);
+    const phase = this.runtime.state.dialog.phase;
+    if (phase === 'ending' || phase === 'closed') {
+      this.log(`  状态    ✗ 拒绝开新一轮（当前 ${phase}）`);
       return null;
     }
-    if (this._state !== 'listening' && this._state !== 'awaiting_shot') {
+    if (phase !== 'listening' && phase !== 'awaiting_shot') {
       // **`thinking` 是合法前驱，不是调度 bug。** 用户在模型还在跑的时候又说了一句
-      // （真机上一半的句中停顿都走这条路），`_turn += 1` 让旧票过期，旧轮的结果会被
+      // （真机上一半的句中停顿都走这条路），轮次 +1 让旧票过期，旧轮的结果会被
       // `isStale` 丢弃 —— 这正是「出声前吸收窗口」的实现方式。
       // 把它记成异常会让人以为要修，而修掉它就等于取消吸收窗口。
-      this.log(`  状态    ${this._state} 期间又说了一句 → 第 ${this._turn + 1} 轮取代它（旧票作废）`);
+      this.log(
+        `  状态    ${phase} 期间又说了一句 → 第 ${this.turn + 1} 轮取代它（旧票作废）`,
+      );
     }
-    this._turn += 1;
-    this._endAfterSpeech = false;
-    this.transition('thinking', `第 ${this._turn} 轮`);
+    const base = this.context.baseCommitSeq?.();
+    const at = this.context.now?.();
+    this.send({
+      type: 'beginTurn',
+      atMs: at ?? 0,
+      ...(base === undefined ? {} : { baseCommitSeq: base }),
+      ...(at === undefined ? {} : { startedAtMs: at }),
+    });
     return this.ticket();
   }
 
@@ -242,32 +324,23 @@ export class DialogFsm {
    * @returns 票据；不在 `listening` 时返回 `null`（调用方按普通轮次处理）
    */
   beginAwaitShot(): TurnTicket | null {
-    if (this._state !== 'listening') {
-      this.log(`  状态    ⚠ 在 ${this._state} 时想等高清照，忽略`);
+    const phase = this.runtime.state.dialog.phase;
+    if (phase !== 'listening') {
+      this.log(`  状态    ⚠ 在 ${phase} 时想等高清照，忽略`);
       return null;
     }
-    this.transition('awaiting_shot', '等一张高清照');
+    this.send({ type: 'beginAwaitShot' });
     return this.ticket();
   }
 
   /** 不拍了（用户改主意）：`awaiting_shot → listening`。代次不变。 */
   abortAwaitShot(why: string): void {
-    if (this._state !== 'awaiting_shot') {
-      return;
-    }
-    this.transition('listening', `放弃拍照（${why}）`);
+    this.send({ type: 'abortAwaitShot', why });
   }
 
   /** 首块音频真正写出：`thinking → speaking` */
   audioStarted(t: TurnTicket): void {
-    if (this.isStale(t) || !this.isCurrent(t)) {
-      return;
-    }
-    // 真音频接管了这段 `speaking`：回执那一段到此结束
-    this._receiptOnly = false;
-    if (this._state === 'thinking') {
-      this.transition('speaking', '首块音频已下发');
-    }
+    this.send({ type: 'audioStarted', ticket: t });
   }
 
   /**
@@ -278,35 +351,28 @@ export class DialogFsm {
    * 留在 `thinking` 就等于告诉全系统「这段不可打断」—— 用户听完「我看看」
    * 开口说「不用了」，会被当成同一句的下文合并，而不是插话。
    *
-   * 它和真正的回答音频共用 `speaking`，靠 {@link _receiptOnly} 区分：
+   * 它和真正的回答音频共用 `speaking`，靠 `receiptOnly` 区分：
    * 回执自然播完回 `thinking`（答案还在路上），被音频接管则由 `audioStarted` 清标志。
    *
    * @returns 有没有真的进 `speaking`；`false` = 这一轮已经不在等答案（被插话作废 /
    *   已收尾），这时候不该出声
    */
   receiptStarted(): boolean {
-    if (this._state !== 'thinking') {
+    if (this.runtime.state.dialog.phase !== 'thinking') {
       return false;
     }
-    this._receiptOnly = true;
-    this.transition('speaking', '回执出声（可打断）');
+    this.send({ type: 'receiptStarted' });
     return true;
   }
 
   /** 回执这段 `speaking` 结束：回 `thinking` 继续等答案。不动代次。 */
   receiptEnded(): void {
-    if (!this._receiptOnly) {
-      return;
-    }
-    this._receiptOnly = false;
-    if (this._state === 'speaking') {
-      this.transition('thinking', '回执播完，继续等答案');
-    }
+    this.send({ type: 'receiptEnded' });
   }
 
   /** 这段 `speaking` 是不是只有回执（真音频还没开始） */
   get speakingIsReceiptOnly(): boolean {
-    return this._receiptOnly;
+    return this.runtime.state.dialog.receiptOnly;
   }
 
   /**
@@ -314,20 +380,25 @@ export class DialogFsm {
    *
    * 成立时代次 +1，从而作废所有还在排队的轮次。
    *
+   * @param commitSeq 产出这段转写的那一发 ASR commit。给了就先过因果屏障：
+   *   开轮前录的那段迟到转写不算插话（`causal.ts`）
    * @returns 是否真的构成插话
    */
-  bargeIn(why: string): boolean {
-    if (this._state !== 'speaking') {
+  bargeIn(why: string, commitSeq?: number): boolean {
+    if (this.runtime.state.dialog.phase !== 'speaking') {
       return false;
     }
-    this._gen += 1;
-    this._endAfterSpeech = false;
-    this._receiptOnly = false;
-    this.transition('listening', `插话「${why}」→ 代次 ${this._gen}`);
-    for (const cb of [...this.invalidateListeners]) {
-      cb('bargeIn');
-    }
-    return true;
+    const gen = this.runtime.state.dialog.gen;
+    const at = this.context.now?.() ?? 0;
+    this.send({
+      type: 'bargeIn',
+      why,
+      atMs: at,
+      ...(commitSeq === undefined ? {} : { commitSeq }),
+    });
+    // 以**代次真的推进了**为准：带 `commitSeq` 时可能被因果屏障挡下（开轮前录的那段
+    // 迟到转写），那时相位不变、也不该告诉调用方"打断成立了"。
+    return this.runtime.state.dialog.gen !== gen;
   }
 
   /**
@@ -337,14 +408,7 @@ export class DialogFsm {
    * 上一轮迟到的调用会被 `no` 挡掉。
    */
   audioDone(t: TurnTicket): void {
-    if (this.isStale(t) || !this.isCurrent(t)) {
-      return;
-    }
-    // 回执那段 `speaking` 不是本轮音频，别拿它的结束去推进轮次
-    if (this._receiptOnly) {
-      return;
-    }
-    this.transition(this._endAfterSpeech ? 'ending' : 'listening', '本轮音频结束');
+    this.send({ type: 'audioDone', ticket: t });
   }
 
   /**
@@ -356,35 +420,36 @@ export class DialogFsm {
    *   （`awaiting_shot` 的拍照请求由调用方在收到 `ending` 时一并取消）
    */
   requestEnd(): void {
-    this._endAfterSpeech = true;
-    if (this._state === 'listening' || this._state === 'awaiting_shot') {
-      this.transition('ending', '模型要求结束（当前无音频）');
-      return;
+    const phase = this.runtime.state.dialog.phase;
+    this.send({ type: 'requestEnd' });
+    if (phase === 'thinking' || phase === 'speaking') {
+      this.log(`  状态    ${phase}（本轮音频结束后再收尾）`);
     }
-    this.log(`  状态    ${this._state}（本轮音频结束后再收尾）`);
   }
 
-  /** 连接收尾。任何状态都可以直接进 `closed`。 */
+  /** 连接收尾。任何状态都可以直接进 `closed`（吸收态）。 */
   close(): void {
-    this.transition('closed', '连接结束');
-    for (const cb of [...this.invalidateListeners]) {
-      cb('closed');
-    }
+    this.send({ type: 'closed' });
   }
 
-  private transition(to: DialogState, why: string): void {
-    if (this._state === to) {
-      return;
+  /**
+   * 派发一条事件，并保留「已 closed 时迟到的回调被忽略」这条诊断。
+   *
+   * 走 {@link KernelRuntime.dispatchAndApply}：绑了端口（`DialogRuntime` 装配层）时，
+   * 内核声明的意图**在这里执行，且只执行这一次** —— 门面不再另派一份 `audio.stop`。
+   * 没绑端口（纯推演 / 单测 / 形式化验证）时它只推状态，与 `dispatch` 等价。
+   *
+   * 内核是纯函数、不写日志；这条日志只有门面知道（它知道调用方想干什么）。
+   *
+   * @returns 内核声明的意图（调用方只读，不要自己再执行一遍）
+   */
+  private send(event: KernelEvent): readonly Effect[] {
+    const before = this.runtime.state.dialog.phase;
+    const effects = this.runtime.dispatchAndApply(event);
+    const after = this.runtime.state.dialog.phase;
+    if (before === 'closed' && after === 'closed' && event.type !== 'closed') {
+      this.log(`  状态    ⚠ 已 closed，忽略 ${event.type}`);
     }
-    // closed 是吸收态：连接已经断了，任何迟到的回调都不得把状态拉回去。
-    // 反例（由 tests/fsm-verify.ts 的 P2 抓到）：close 之后本轮 finally 里
-    // 的 audioDone 会把 closed 拉回 listening。
-    if (this._state === 'closed') {
-      this.log(`  状态    ⚠ 已 closed，忽略转移 ${to}（${why}）`);
-      return;
-    }
-    this.log(`  状态    ${this._state} → ${to}   (${why})`);
-    this._state = to;
-    this._lastWhy = why;
+    return effects;
   }
 }

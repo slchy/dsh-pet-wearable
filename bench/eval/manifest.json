@@ -1,0 +1,650 @@
+{
+  "version": "eval-v1",
+  "corpusName": "eval-v1",
+  "memorySeed": [
+    "- 2026-11-20 10:00 · 用户叫陈默，住在成都高新区",
+    "- 2026-11-20 10:01 · 用户对花生严重过敏，点餐和推荐食物一定要避开花生",
+    "- 2026-11-20 10:02 · 用户养了一只橘猫，名字叫团子",
+    "- 2026-11-20 10:03 · 用户最常连的测试网关端口是 9420",
+    "- 2026-11-20 10:04 · 用户最喜欢的科幻作家是波兰的莱姆"
+  ],
+  "sessions": [
+    {
+      "id": "s1-chitchat",
+      "suite": "S1",
+      "title": "S1 路由混淆：纯闲聊与常识问答（期望 0 委派）",
+      "cases": [
+        {
+          "id": "s1_chat_01",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "你好呀，今天过得怎么样？",
+          "voice": "female",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s1_chat_02",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "我今天加班好累啊。",
+          "voice": "male",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s1_chat_03",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "你叫什么名字来着？",
+          "voice": "female",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s1_chat_04",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "讲个简短的冷笑话吧。",
+          "voice": "male",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s1_chat_05",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "水在标准大气压下多少度沸腾？",
+          "voice": "female",
+          "expectDelegate": "no",
+          "note": "常识问答，不该委派"
+        },
+        {
+          "id": "s1_chat_06",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "他还写过哪些作品？",
+          "voice": "male",
+          "expectDelegate": "no",
+          "note": "历史踩坑句：工具描述写「查询实时信息」时 3/3 误委派"
+        },
+        {
+          "id": "s1_chat_07",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "我觉得今天心情还不错。",
+          "voice": "female",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s1_chat_08",
+          "suite": "S1",
+          "group": "chitchat",
+          "text": "晚安，早点休息。",
+          "voice": "male",
+          "expectDelegate": "no"
+        }
+      ]
+    },
+    {
+      "id": "s1-action-tool",
+      "suite": "S1",
+      "title": "S1 路由混淆：显式动作与设备读取（期望必须委派且无双答冲突）",
+      "cases": [
+        {
+          "id": "s1_act_01",
+          "suite": "S1",
+          "group": "action_tool",
+          "text": "记一下我明天下午三点要开会。",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "checkDualAnswerConflict": true,
+          "stubReply": "已经记下了，明天下午三点开会。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_act_02",
+          "suite": "S1",
+          "group": "action_tool",
+          "text": "帮我打开客厅的灯。",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "checkDualAnswerConflict": true,
+          "stubReply": "客厅的灯已经打开了。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_act_03",
+          "suite": "S1",
+          "group": "action_tool",
+          "text": "眼镜现在还剩多少电？",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "checkDualAnswerConflict": true,
+          "stubReply": "眼镜现在还剩百分之七十八的电。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000,
+          "note": "无 ACTION_CUES 动词，检验 Omni tool_call 读取设备数据"
+        },
+        {
+          "id": "s1_act_04",
+          "suite": "S1",
+          "group": "action_tool",
+          "text": "帮我查一下最近一笔快递到哪了。",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "checkDualAnswerConflict": true,
+          "stubReply": "你的快递已经到成都转运中心，预计明天送达。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_act_05",
+          "suite": "S1",
+          "group": "action_tool",
+          "text": "帮我发一条消息给老王说晚上七点见。",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "checkDualAnswerConflict": true,
+          "stubReply": "已经发消息给老王，说晚上七点见。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_act_06",
+          "suite": "S1",
+          "group": "action_tool",
+          "text": "把刚才定的七点闹钟关掉。",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "checkDualAnswerConflict": true,
+          "stubReply": "七点的闹钟已经关掉了。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        }
+      ]
+    },
+    {
+      "id": "s1-realtime-fact",
+      "suite": "S1",
+      "title": "S1 路由混淆：无动作动词的实时与外部事实（检测漏委派盲区）",
+      "cases": [
+        {
+          "id": "s1_rt_01",
+          "suite": "S1",
+          "group": "realtime_fact",
+          "text": "明天北京天气怎么样？",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "stubReply": "明天北京多云转晴，气温十到二十二度。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_rt_02",
+          "suite": "S1",
+          "group": "realtime_fact",
+          "text": "现在几点了？",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "stubReply": "现在是下午三点二十分。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_rt_03",
+          "suite": "S1",
+          "group": "realtime_fact",
+          "text": "英伟达今天股价多少？",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "stubReply": "英伟达最新股价一百三十八点五美元。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_rt_04",
+          "suite": "S1",
+          "group": "realtime_fact",
+          "text": "今天是几月几号星期几？",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "stubReply": "今天是十一月二十四日星期二。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_rt_05",
+          "suite": "S1",
+          "group": "realtime_fact",
+          "text": "外面现在在下雨吗？",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "stubReply": "成都现在阴天，没有下雨。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        },
+        {
+          "id": "s1_rt_06",
+          "suite": "S1",
+          "group": "realtime_fact",
+          "text": "从这里开车去双流机场堵不堵？",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "stubReply": "去双流机场现在路况顺畅，大概二十八分钟。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000
+        }
+      ]
+    },
+    {
+      "id": "s1-negative-trap",
+      "suite": "S1",
+      "title": "S1 路由混淆：边界陷阱（不误委派、不误记、不误取消）",
+      "cases": [
+        {
+          "id": "s1_trap_01",
+          "suite": "S1",
+          "group": "negative_trap",
+          "text": "你看过星球大战没？",
+          "voice": "female",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s1_trap_02",
+          "suite": "S1",
+          "group": "negative_trap",
+          "text": "算了算了，他算得对。",
+          "voice": "male",
+          "expectDelegate": "no",
+          "forbidCancel": true,
+          "note": "含「算了」但不该误判为取消指令"
+        },
+        {
+          "id": "s1_trap_03",
+          "suite": "S1",
+          "group": "negative_trap",
+          "text": "我姓什么来着？",
+          "voice": "female",
+          "expectDelegate": "no",
+          "forbidSilentMemory": true,
+          "note": "问句，绝不能触发 memory_silent 写记忆"
+        },
+        {
+          "id": "s1_trap_04",
+          "suite": "S1",
+          "group": "negative_trap",
+          "text": "电影里主角把门关掉那段真紧张。",
+          "voice": "male",
+          "expectDelegate": "no",
+          "note": "叙述句含「关掉」，检测硬正则误伤"
+        }
+      ]
+    },
+    {
+      "id": "s2-asr-nouns",
+      "suite": "S2",
+      "title": "S2 ASR 专名、热词与中英混说准确度",
+      "cases": [
+        {
+          "id": "s2_asr_01",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "你知道波兰作家莱姆写的其主之声吗？",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectedTerms": ["莱姆", "其主之声"],
+          "note": "历史 3/3 错成显克微奇《奇主之声》"
+        },
+        {
+          "id": "s2_asr_02",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "帮我看看dsh的日志和端口状态。",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectedTerms": ["dsh", "日志", "端口"]
+        },
+        {
+          "id": "s2_asr_03",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "这段全双工声学链路用的是小米智能眼镜。",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectedTerms": ["全双工", "声学", "小米", "眼镜"]
+        },
+        {
+          "id": "s2_asr_04",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "请检查一下订单号W8665881的进度。",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectedTerms": ["W8665881"]
+        },
+        {
+          "id": "s2_asr_05",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "把分支合并推送之后再做一次编译构建。",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectedTerms": ["分支", "合并", "推送", "编译", "构建"]
+        },
+        {
+          "id": "s2_asr_06",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "黄仁勋在发布会上讲了最新的大模型芯片。",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectedTerms": ["黄仁勋", "大模型"]
+        },
+        {
+          "id": "s2_asr_07",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "这个热词配置和环境变量需要重启进程吗？",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectedTerms": ["热词", "环境变量", "重启", "进程"]
+        },
+        {
+          "id": "s2_asr_08",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "蓝牙麦克风和扬声器的电量都正常吗？",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectedTerms": ["蓝牙", "麦克风", "扬声器", "电量"]
+        },
+        {
+          "id": "s2_asr_09",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "单元测试和工具调用的提示词都写好了。",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectedTerms": ["单元测试", "工具调用", "提示词"]
+        },
+        {
+          "id": "s2_asr_10",
+          "suite": "S2",
+          "group": "asr_noun",
+          "text": "把服务端口8766的回滚方案记一下。",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectedTerms": ["8766", "回滚"]
+        }
+      ]
+    },
+    {
+      "id": "s3-m1-memory-static",
+      "suite": "S3",
+      "title": "S3-M1 长期记忆：预置 MEMORY.md 直接追问",
+      "cases": [
+        {
+          "id": "s3_m1_01",
+          "suite": "S3",
+          "group": "memory_static",
+          "text": "还记得我叫什么名字、住在哪吗？",
+          "voice": "female",
+          "expectDelegate": "any",
+          "mustIncludeAny": [["陈默"], ["成都"]],
+          "stubReply": "你叫陈默，住在成都高新区。",
+          "waitBgReportMs": 5500
+        },
+        {
+          "id": "s3_m1_02",
+          "suite": "S3",
+          "group": "memory_static",
+          "text": "我养的那只橘猫叫什么来着？",
+          "voice": "female",
+          "expectDelegate": "any",
+          "mustIncludeAny": [["团子"]],
+          "stubReply": "你家橘猫叫团子。",
+          "waitBgReportMs": 5500
+        },
+        {
+          "id": "s3_m1_03",
+          "suite": "S3",
+          "group": "memory_static",
+          "text": "我想点份宫保鸡丁，你觉得合适吗？",
+          "voice": "female",
+          "expectDelegate": "any",
+          "mustIncludeAny": [["花生", "过敏"]],
+          "stubReply": "宫保鸡丁有花生，你对花生过敏，别点这道菜。",
+          "waitBgReportMs": 5500
+        },
+        {
+          "id": "s3_m1_04",
+          "suite": "S3",
+          "group": "memory_static",
+          "text": "我最常连的测试网关是哪个端口？",
+          "voice": "female",
+          "expectDelegate": "any",
+          "mustIncludeAny": [["9420", "九四二零", "九四二〇", "九千四百二十"]],
+          "stubReply": "你最常连的测试网关端口是 9420。",
+          "waitBgReportMs": 5500
+        }
+      ]
+    },
+    {
+      "id": "s3-m2-cross-lane",
+      "suite": "S3",
+      "title": "S3-M2 跨轨指代：前台 Omni 聊两轮后无主语委派 dsh",
+      "cases": [
+        {
+          "id": "s3_m2_01",
+          "suite": "S3",
+          "group": "cross_lane",
+          "text": "我刚买了一本叫银翼回声的冷门小说，作者是林远山。",
+          "voice": "male",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s3_m2_02",
+          "suite": "S3",
+          "group": "cross_lane",
+          "text": "这书是前年出的，讲深海科考站的故事。",
+          "voice": "male",
+          "expectDelegate": "no"
+        },
+        {
+          "id": "s3_m2_03",
+          "suite": "S3",
+          "group": "cross_lane",
+          "text": "帮我查一下它的豆瓣评分和页数。",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "expectDshContextTerms": ["银翼回声", "林远山"],
+          "stubReply": "银翼回声豆瓣评分八点六，全书三百一十二页。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 6000,
+          "note": "检测 dsh 收到的 query+note 是否携带前面两轮的对话账本"
+        }
+      ]
+    },
+    {
+      "id": "s3-m3-report-followup",
+      "suite": "S3",
+      "title": "S3-M3 后台汇报闭环：空窗播报追问 + 未播回注",
+      "cases": [
+        {
+          "id": "s3_m3_01",
+          "suite": "S3",
+          "group": "report_followup",
+          "text": "帮我查一下明晚去上海的航班时间。",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "stubReply": "明晚去上海的航班是晚上八点十五分从双流起飞。",
+          "stubDelayMs": 450,
+          "waitBgReportMs": 7000
+        },
+        {
+          "id": "s3_m3_02",
+          "suite": "S3",
+          "group": "report_followup",
+          "text": "刚才查的航班是几点起飞的？",
+          "voice": "female",
+          "expectDelegate": "no",
+          "mustIncludeAny": [["八点十五", "8点15", "20点15", "20:15", "八点一十五"]],
+          "note": "验证空窗播报后 Omni 记住结论"
+        },
+        {
+          "id": "s3_m3_03",
+          "suite": "S3",
+          "group": "report_followup",
+          "text": "帮我查一下明天下午的会议室定在几楼。",
+          "voice": "female",
+          "expectDelegate": "yes",
+          "stubReply": "明天下午的会议室定在七楼松林会议室。",
+          "stubDelayMs": 250,
+          "skipQuietWait": true,
+          "note": "不等空窗立刻紧接下一句，压出 unspoken 回注或 defer 路径"
+        },
+        {
+          "id": "s3_m3_04",
+          "suite": "S3",
+          "group": "report_followup",
+          "text": "刚才那个会议室在几楼来着？",
+          "voice": "female",
+          "expectDelegate": "no",
+          "mustIncludeAny": [["七楼", "7楼", "松林"]],
+          "waitBgReportMs": 6000
+        }
+      ]
+    },
+    {
+      "id": "s3-m4-verbatim",
+      "suite": "S3",
+      "title": "S3-M4 逐字保真：订单号 / 4 位端口 / 版本号",
+      "cases": [
+        {
+          "id": "s3_m4_01",
+          "suite": "S3",
+          "group": "verbatim",
+          "text": "帮我查一下那笔退款订单号和回执码。",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "expectVerbatim": true,
+          "stubReply": "退款已受理，订单号 W8665881，回执码 904218。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 14000,
+          "mustIncludeAny": [["W8665881"], ["904218"]]
+        },
+        {
+          "id": "s3_m4_02",
+          "suite": "S3",
+          "group": "verbatim",
+          "text": "帮我查一下语音服务的端口号和版本号。",
+          "voice": "male",
+          "expectDelegate": "yes",
+          "expectVerbatim": true,
+          "stubReply": "服务跑在端口 8766，当前版本 v2.3.1。",
+          "stubDelayMs": 350,
+          "waitBgReportMs": 14000,
+          "mustIncludeAny": [["8766"], ["v2.3.1", "2.3.1"]],
+          "note": "刻意检测 4 位端口与 semver 是否被 needsVerbatimRead 漏掉"
+        }
+      ]
+    },
+    {
+      "id": "s4-eot-pause",
+      "suite": "S4",
+      "title": "S4 合成停顿 EOT：300 / 500 / 700 / 900 ms 句中停顿合并",
+      "cases": [
+        {
+          "id": "s4_p_300",
+          "suite": "S4",
+          "group": "eot_pause",
+          "text": "我觉得这件事吧，最好明天早上再确认一下。",
+          "parts": ["我觉得这件事吧，", "最好明天早上再确认一下。"],
+          "pauseMs": 300,
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectTurns": 1
+        },
+        {
+          "id": "s4_p_500",
+          "suite": "S4",
+          "group": "eot_pause",
+          "text": "实在不甘心的话，可以趁现在停下来再想想。",
+          "parts": ["实在不甘心的话，", "可以趁现在停下来再想想。"],
+          "pauseMs": 500,
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectTurns": 1
+        },
+        {
+          "id": "s4_p_700",
+          "suite": "S4",
+          "group": "eot_pause",
+          "text": "你帮我讲讲那本书里，主角最后为什么离开城市了。",
+          "parts": ["你帮我讲讲那本书里，", "主角最后为什么离开城市了。"],
+          "pauseMs": 700,
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectTurns": 1
+        },
+        {
+          "id": "s4_p_900",
+          "suite": "S4",
+          "group": "eot_pause",
+          "text": "如果明天下午不下雨的话，我们就去公园走一圈。",
+          "parts": ["如果明天下午不下雨的话，", "我们就去公园走一圈。"],
+          "pauseMs": 900,
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectTurns": 1
+        }
+      ]
+    },
+    {
+      "id": "s4-eot-complete",
+      "suite": "S4",
+      "title": "S4 完整短句 EOT：不误延拍",
+      "cases": [
+        {
+          "id": "s4_c_01",
+          "suite": "S4",
+          "group": "eot_complete",
+          "text": "你重复一遍。",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectTurns": 1,
+          "maxExpectedWaitMs": 350
+        },
+        {
+          "id": "s4_c_02",
+          "suite": "S4",
+          "group": "eot_complete",
+          "text": "帮我算一下。",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectTurns": 1,
+          "maxExpectedWaitMs": 350
+        },
+        {
+          "id": "s4_c_03",
+          "suite": "S4",
+          "group": "eot_complete",
+          "text": "你在说什么？",
+          "voice": "female",
+          "expectDelegate": "any",
+          "expectTurns": 1,
+          "maxExpectedWaitMs": 350
+        },
+        {
+          "id": "s4_c_04",
+          "suite": "S4",
+          "group": "eot_complete",
+          "text": "嗯，好的。",
+          "voice": "male",
+          "expectDelegate": "any",
+          "expectTurns": 1,
+          "maxExpectedWaitMs": 350
+        }
+      ]
+    }
+  ]
+}

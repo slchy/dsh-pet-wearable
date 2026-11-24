@@ -7,6 +7,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import { EnergyGate } from './energy-gate.ts';
+import type { AudioFrame } from './engine-contract.ts';
 import { pcm16Gain, pcm16PeakDbfs } from './pcm.ts';
 
 export interface UplinkGateConfig {
@@ -45,6 +46,15 @@ export interface UplinkPipelineOptions {
   readonly log: (line: string) => void;
   readonly onError: (line: string) => void;
   /**
+   * 可注入时钟，默认 `Date.now`。
+   *
+   * **必须和宿主（`voice-session` 的 `SystemClock`）是同一把尺**：`AudioFrame.tsMs`
+   * 与能量门的保持窗口都从这里取。不传时门用 `Date.now()`、宿主用单调毫秒，
+   * 两边比出来的「静音多久」是个天文数字（真机踩过一次：帧时戳和判停的时间戳
+   * 差 1.7e12，插话判据整场静默失效且没有一行日志）。
+   */
+  readonly now?: () => number;
+  /**
    * 电平表周期（毫秒）。> 0 时每这么久打一行「上行电平 峰值 -XX dBFS」。
    *
    * 调增益时唯一可靠的依据：只看"开门那一瞬"的峰值会误判 —— 门一开就记录，
@@ -63,7 +73,15 @@ export interface UplinkPipelineOptions {
   readonly onRawPcm?: (pcm: Buffer) => void;
   /** 有声开始：先把 preroll 喂进 STT，再继续喂后续 */
   readonly onSpeechOpen: (peakDbfs: number, preroll: readonly Buffer[], prerollMs: number) => void;
-  readonly onSpeech: (pcm: Buffer) => void;
+  /**
+   * 门开着时的每一块音频 —— **声学前端的唯一出口**（见 `engine-contract.ts` 契约①）。
+   *
+   * 为什么给一整个 `AudioFrame` 而不是 `(pcm, voiced)`：下游各自需要的量不一样
+   * （ASR 要 `voiced` 决定暂存、omni 旁路要它决定 mute、封段/投机/判停要
+   * `silenceMs`），而「各取一个」的后果是各算一遍 —— 真机上就是四个阈值
+   * （20/100/150/200 ms）对不上同一段音频。
+   */
+  readonly onFrame: (frame: AudioFrame) => void;
   /** 持续静音：请 STT 出定稿并挂断这一路。`gapMs` = 距最后一个有声块多久 */
   readonly onSpeechClose: (gapMs?: number) => void;
 }
@@ -72,12 +90,16 @@ export class UplinkPipeline {
   private readonly options: UplinkPipelineOptions;
   private readonly gate: EnergyGate;
   private readonly ffmpeg: ChildProcessWithoutNullStreams | null;
+  /** 统一时钟：能量门、电平表、`AudioFrame.tsMs` 共用（见 `UplinkPipelineOptions.now`） */
+  private readonly now: () => number;
   private received = false;
   private closed = false;
 
   /** 电平表：窗口内峰值与窗口起点 */
   private meterPeak = -Infinity;
   private meterAt = 0;
+  /** 能量门周期号：每次开门 +1（`AudioFrame.gateSeq`）。闭门期间不变 */
+  private gateSeq = 0;
 
   /**
    * 每 `levelLogMs` 打一行窗口峰值。
@@ -89,7 +111,7 @@ export class UplinkPipeline {
     if (period <= 0) {
       return;
     }
-    const now = Date.now();
+    const now = this.now();
     if (this.meterAt === 0) {
       this.meterAt = now;
       this.meterPeak = -Infinity;
@@ -109,6 +131,7 @@ export class UplinkPipeline {
 
   constructor(options: UplinkPipelineOptions) {
     this.options = options;
+    this.now = options.now ?? Date.now;
 
     // 门限作用在**放大后**的波形上：增益越大，小声越容易被判为有声。
     // 早先这里按 +20log10(gain) 同步抬高门限（"保持选择性不变"），结果是
@@ -118,6 +141,9 @@ export class UplinkPipeline {
       holdMs: options.gate.holdMs,
       prerollBytes: Math.round((options.gate.prerollMs / 1000) * options.sampleRate * 2),
       sampleRate: options.sampleRate,
+      // **必须透传**：门自己默认 `Date.now()`，跟宿主的 `SystemClock` 差 1.7e12。
+      // 漏传的症状是「第一块静音就把门关了」（gap 看似无穷大），或反过来永不关门。
+      now: this.now,
     });
 
     this.ffmpeg = options.codec === 'pcm16'
@@ -186,7 +212,7 @@ export class UplinkPipeline {
   }
 
   private onPcm(raw: Buffer): void {
-    const { onPcm, onSpeechOpen, onSpeech, onSpeechClose, onRawPcm, log } = this.options;
+    const { onPcm, onSpeechOpen, onFrame, onSpeechClose, onRawPcm, log } = this.options;
 
     onRawPcm?.(raw);
 
@@ -201,10 +227,19 @@ export class UplinkPipeline {
         `  上行    有声 ${decision.opened.peakDbfs.toFixed(1)} dBFS → 开始推送`
         + `（补 ${decision.opened.preroll.length} 块 / ${decision.opened.prerollMs} ms）`,
       );
+      this.gateSeq += 1;
       onSpeechOpen(decision.opened.peakDbfs, decision.opened.preroll, decision.opened.prerollMs);
     }
     if (decision.forward) {
-      onSpeech(pcm);
+      // 与能量门同一把尺：下游拿 `tsMs` 和宿主的 `lastSentenceAt` 比「这之后有没有人说话」
+      const tsMs = this.now();
+      onFrame({
+        pcm,
+        voiced: decision.voiced,
+        silenceMs: decision.silenceMs,
+        gateSeq: this.gateSeq,
+        tsMs,
+      });
     }
     if (decision.closed) {
       // 带上「距上次有声多久」：holdMs 只有 2 s，如果 gap 远大于它，

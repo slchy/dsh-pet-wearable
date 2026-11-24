@@ -25,9 +25,14 @@ import { closeAnnounceMic, speakAnnouncement } from './announce.ts';
 import { isBackchannelOnly } from '../backchannel.ts';
 import type { Cancel, Clock } from './clock.ts';
 import type { DeviceCall, DeviceCapabilities } from '../devices/primitives.ts';
-import type { TurnTicket, DialogState } from '../dialog-fsm.ts';
+import type { DialogFsmContext, TurnTicket, DialogState } from '../dialog-fsm.ts';
+import { initialKernelState } from '../kernel.ts';
+import { KernelRuntime } from '../kernel-runtime.ts';
 import { PhotoInbox, type CaptureRequest } from '../photo-inbox.ts';
-import { announceInterruptionNote, interruptionNote, remainingSpeech } from '../interrupted-tail.ts';
+import {
+  announceInterruptionNote, interruptionNote, remainingSpeech, TTS_CHARS_PER_SEC,
+} from '../interrupted-tail.ts';
+import type { FastVoiceEngine } from '../engine-contract.ts';
 import { EVENTS } from '../events.ts';
 import type { AgentProvider, DelegateReason, TtsProvider } from '../providers.ts';
 import { SessionCore, type CoreEffect, type CoreEvent } from '../session-core.ts';
@@ -143,10 +148,38 @@ export function composeTurnNote(deviceNote?: string, tailNote?: string): string 
   return parts.length === 0 ? undefined : parts.join('；');
 }
 
+/** 一条后台播报。字符串入队仍合法，字段形态留给 Pure Live 同嗓子汇报。 */
+export interface AnnounceItem {
+  readonly speech: string;
+  readonly emotion?: string;
+  /** 后台任务标识（Pure Live 模式用于防重复回注与上下文关联） */
+  readonly taskId?: string;
+  /** 触发任务的用户原问（供前台汇报对齐指代） */
+  readonly query?: string;
+  /** 为真时必须走逐字朗读路径（如精确数字/端口/长报告），不交给对话态 Omni 自由转述 */
+  readonly verbatim?: boolean;
+  /** 后台任务需要用户确认的问题 */
+  readonly needsConfirm?: string;
+}
+
 export interface DialogOptions {
   /** 时钟端口：超时与等待全走它 */
   readonly clock: Clock;
   readonly caps: DeviceCapabilities;
+  /**
+   * 票据上的 `baseCommitSeq` / `startedAtMs` 从哪来（见 dialog-fsm.ts 的
+   * DialogFsmContext）。由 VoiceSession 注入 —— 只有它认识 ASR。
+   */
+  readonly ticketContext?: DialogFsmContext;
+  /**
+   * 这条会话还是不是**当前活跃的那条连接**（缺省恒 `true`）。
+   *
+   * 唯一用途是 `dispose()` 时决定要不要摘 agent 上的回执钩子：`setDelegateHook`
+   * 是**进程级共用**的一个槽，而旧连接（被新连接顶掉的那条）的收尾常常晚于
+   * 新连接的挂载 —— 不判所有权就摘，等于把新连接的回执掐掉（表现是「重连之后
+   * 它再也不说『我看看』」）。
+   */
+  readonly isActiveOwner?: () => boolean;
   readonly agent: AgentProvider;
   readonly tts: TtsProvider;
   readonly downlink: DownlinkSink;
@@ -174,6 +207,20 @@ export interface DialogOptions {
    */
   readonly env: DialogEnv;
   readonly log: (line: string) => void;
+  /** 可选：热路径语音引擎（Pure Live / Pure Cascade 由装配层显式注入；缺省时由 TurnRunner 包装 agent+tts） */
+  readonly engine?: FastVoiceEngine;
+  /**
+   * 可选：自定义后台播报播放口（Pure Live 模式下用 Omni `speakFromText()` 同嗓子汇报）。
+   *
+   * - `'spoken'`：已通过实时前台播出并入历史
+   * - `'defer'`：实时前台此刻正忙 / 有用户缓冲，排回队首顺延重试
+   * - `'fallback'`：要求逐字朗读或前台不可用，退回 `runner.speakCanned()`
+   */
+  readonly speakAnnounce?: (item: AnnounceItem) => Promise<'spoken' | 'defer' | 'fallback'>;
+  /** 可选：插话或双击清空播报时，同步掐断正在播的自定义后台汇报（例如 Omni `cancelBackgroundSpeech()`） */
+  readonly cancelAnnounce?: () => void;
+  /** 可选：当某条播报走回落 TTS（`verbatim` 或 `'fallback'`）播完/被打断后通知上层（用于静默回注 Omni 历史） */
+  readonly onFallbackAnnounceSpoken?: (item: AnnounceItem, interrupted: boolean) => void;
 }
 
 export class DialogRuntime {
@@ -184,12 +231,26 @@ export class DialogRuntime {
   private readonly options: DialogOptions;
   /** 上一次通知过的状态机状态（只在真的变了时回调 `onDialogState`） */
   private lastDialogState: DialogState;
+  /**
+   * 挂在 agent 上的回执钩子。
+   *
+   * 存成字段而不是匿名闭包：`dispose()` 要按**值**判断「现在挂的是不是我那份」，
+   * 现造一个新闭包摘不掉别人的（`setDelegateHook` 没有令牌参数）。
+   */
+  private readonly delegateHook = (reason: DelegateReason): void => {
+    if (this.disposed) {
+      return;
+    }
+    this.runner.speakReceipt(pickReceipt(reason));
+  };
+  /** `fsm.onState` 的退订函数（`dispose()` 时摘掉，别让死连接继续收通知） */
+  private readonly unsubscribeState: () => void;
   /** 一轮、一次拍照都排在这条链上，不并发 */
   private serialChain: Promise<void> = Promise.resolve();
   /** 串行队列里还没跑完的任务数 */
   private queued = 0;
 
-  private readonly announceQueue: Array<{ speech: string; emotion?: string }> = [];
+  private readonly announceQueue: AnnounceItem[] = [];
   private announcing = false;
   private disposed = false;
   /** 用户最后一次开口（中间结果也算）的时刻，用来判断「他是不是还在说」。 */
@@ -222,10 +283,25 @@ export class DialogRuntime {
   constructor(options: DialogOptions) {
     this.options = options;
 
+    // **一个会话只有一份 `KernelState`**：这里种好它（含「上一轮谁答的」），
+    // `SessionCore` / `DialogFsm` / `TurnRunner` 拿到的是同一个实例。
+    // `lastLedgerLane` 是重连时唯一的记性：内核是新建的，不播种就不知道上一轮是 dsh，
+    // 用户顺着它的追问回一句会被当成闲聊抢答。
+    const kernelRuntime = new KernelRuntime(
+      initialKernelState(0, options.agent.lastLedgerLane?.() ?? null),
+    );
     this.core = new SessionCore({
       imageQuestion: options.imageQuestion,
       log: options.log,
       capabilities: options.caps,
+      runtime: kernelRuntime,
+      ticketContext: {
+        ...(options.ticketContext ?? {}),
+        // `now` 必须有：`bargeIn` 的结算时刻（`endedAtMs` / `heardMs`）从它来。
+        // 缺了就是 `atMs = 0`，插话当场结算会算出「一秒都没听到」，与真机行为不同。
+        // 模拟器（`DialogSim`）不注入 `ticketContext`，也要走这一条虚拟时钟。
+        now: options.ticketContext?.now ?? (() => options.clock.now()),
+      },
     });
     this.lastDialogState = this.core.fsm.state;
 
@@ -242,6 +318,7 @@ export class DialogRuntime {
       clock: options.clock,
       agent: options.agent,
       tts: options.tts,
+      ...(options.engine === undefined ? {} : { engine: options.engine }),
       downlink: options.downlink,
       fsm: this.core.fsm,
       playbackTailMs: options.playbackTailMs,
@@ -262,15 +339,58 @@ export class DialogRuntime {
       log: options.log,
     });
 
+    // **生产端口**：内核声明的意图从这里落到真实世界 —— 停设备音频、作废在途轮次、
+    // 放弃引擎投机、把这一轮的结算交回 `TurnRunner` 并写进账本。
+    //
+    // 绑一次，此后每一条事件都走 `dispatchAndApply`，意图**只执行一次**：
+    // 门面（`DialogFsm`）不再另发一份 `audio.stop`，`TurnRunner` 也不再订阅
+    // `onInvalidate` 自己取消一遍。
+    //
+    // **`dispose()` 不许 `attachPorts(null)`**：`VoiceConnection.onClose` 里
+    // `app.dispose()`（含本类 `dispose()`）跑在 `dialog.dispatch({type:'closed'})`
+    // **之前**，而 `closed` 必须还能通过 `invalidateTurn` 取消在途的上游请求。
+    this.core.runtime.attachPorts({
+      stopDeviceAudio: () => {
+        options.env.call({ op: 'audio.stop' });
+      },
+      invalidateTurn: (ticket, reason) => {
+        this.runner.invalidateTurn(ticket, reason ?? 'bargeIn');
+      },
+      abortEngine: (reason) => {
+        // 引擎在场时只走 `abortSpeculation`：cascade 内部已经 `dropPrefetch`，
+        // live 内部已经 `abortLane`。再打到 agent 上就是同一次中止执行两遍。
+        // 引擎缺席（模拟器 / 旧测试）才落到裸 agent，理由字符串与既有装配一致。
+        if (options.engine !== undefined) {
+          options.engine.abortSpeculation(reason);
+          return;
+        }
+        options.agent.dropPrefetch?.(`内核中止(${reason})`);
+      },
+      settleTurn: (turn) => {
+        // `TurnRunner` 拿它结算这一轮；账本（`ConversationLedger`）按同一张票据
+        // 补上「用户到底听全没有」—— 两份账必须同源，否则路由按哪份都错。
+        this.runner.acceptSettlement(turn);
+        options.agent.reconcileTurnOutcome?.({
+          ticket: turn.ticket,
+          truncated: turn.truncated,
+          endedAtMs: turn.endedAtMs,
+        });
+      },
+      log: options.log,
+    });
+
     // 委派轮的回执：快车道判出「这轮答不了」时补一句，填掉 1.8–2.9 s 的安静。
     // 挂在 `DialogRuntime` 而不是 `voice-session`：轮次在这里，判断「这一轮还要不要说话」
     // 只有它做得了（票据在 `TurnRunner` 里）。
-    options.agent.setDelegateHook?.((reason) => {
-      if (this.disposed) {
-        return;
-      }
-      this.runner.speakReceipt(pickReceipt(reason));
-    });
+    options.agent.setDelegateHook?.(this.delegateHook);
+
+    // 状态机的**每一次**转移都要走一遍通知（`notifyState` 自己去重）。
+    //
+    // 只在 `dispatch()` 结尾调一次是不够的：一个事件里可能**同步连续**跳好几格
+    // （`awaiting_shot` 里改主意会先 `abortAwaitShot` 回 `listening`、再为同一句话
+    // 重新 `beginAwaitShot`），末尾读到的状态和起点相同，去重之后就一条都不通知 ——
+    // `AppSession` 的话筒归属和档案里的 `dialog.state` 都会漏掉中间那一格。
+    this.unsubscribeState = this.core.fsm.onState(() => { this.notifyState(); });
   }
 
   // ---------------------------------------------------------------- 输入面
@@ -281,6 +401,12 @@ export class DialogRuntime {
    * @returns 这一批效果（调用方偶尔要先看一眼，比如"是不是要求停播"）
    */
   dispatch(event: CoreEvent): readonly CoreEffect[] {
+    // 先让判定核跑：它才知道这段转写是不是**开轮前录的旧段**（因果屏障）。
+    const effects = this.core.dispatch(event);
+    // 旧段既不能打断，也不能当「用户刚开口」去掐旁白、去刷新「他还在说话」的时间戳 ——
+    // 判停抢跑补回来的那半句会让一条后台汇报莫名其妙停下，或让播报一直让路。
+    const droppedPreTurn = effects.some((effect) => effect.type === 'drop' && effect.why === 'pre-turn');
+
     // 用户只要开口（中间结果 / 定稿 / 成句），任何正在念的「回执」和「播报」都要停。
     // 只在 `onPartial` 上收回执是不够的：短促的插话常常只出定稿（真机 05:17:24）。
     //
@@ -288,7 +414,10 @@ export class DialogRuntime {
     // 只剩下一个空壳 `if` —— 表现是「用户插话，旁白照念」。别再把这段改成空的：
     // 旁白（后台汇报 / 回执）不占轮次票据，状态机也停在 `listening`，
     // 所以 `bargeIn` 那条路对它不成立，**它是唯一能掐断播报的地方**。
-    if (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance') {
+    if (
+      !droppedPreTurn
+      && (event.type === 'sentence' || event.type === 'partial' || event.type === 'utterance')
+    ) {
       this.lastUserSpeechAt = this.options.clock.now();
       if (event.type !== 'partial') {
         this.lastUserSentenceAt = this.options.clock.now();
@@ -299,7 +428,6 @@ export class DialogRuntime {
         this.interruptCanned();
       }
     }
-    const effects = this.core.dispatch(event);
     this.execute(effects);
     this.notifyState();
     return effects;
@@ -335,6 +463,7 @@ export class DialogRuntime {
    */
   private interruptCanned(): void {
     this.runner.cancelCanned();
+    this.options.cancelAnnounce?.();
     const residue = this.runner.takeCannedResidue();
     if (residue === null) {
       return;
@@ -384,6 +513,7 @@ export class DialogRuntime {
         case 'call':
           if (effect.call.op === 'capture.cancel') {
             this.runner.cancelCanned();
+            this.options.cancelAnnounce?.();
             this.photos.cancel('用户改主意或收尾');
           } else {
             env.call(effect.call);
@@ -416,7 +546,11 @@ export class DialogRuntime {
       const note = composeTurnNote(this.options.env.deviceNote?.(), this.takeTailNote());
       try {
         const result = await this.runner.run(text, image, note);
-        if (result !== null && result.interrupted) {
+        if (result !== null) {
+          // 不只看 `interrupted`：真机 2026-11-23 第 11/13 轮，41–45 字的答案只合成出
+          // 1.1–1.4 s 音频（TTS 那边把上一条被放弃的流的残留当成了自己的），
+          // `interrupted=false` 却少念了大半段 —— 那一半也得交给下一轮。
+          // 判定在 `rememberTail` 里，两者共用同一把尺。
           this.rememberTail(result);
         }
       } finally {
@@ -452,8 +586,22 @@ export class DialogRuntime {
     return notes.length === 0 ? undefined : notes.join('\n');
   }
 
-  /** 记下这一轮被打断后**没念出口**的部分。 */
+  /**
+   * 记下这一轮**没念出口**的部分。
+   *
+   * 两种来路都要记：被插话打断（`interrupted`），以及音频根本没覆盖全文
+   * （TTS 只吐了一部分，`interrupted=false`）。第二种用「这段字该有多长」兜：
+   * 真机那两轮是 41–45 字只出 1.1–1.4 s（应 ~8.5–9.4 s，占比 0.13–0.15），
+   * 正常轮是 100 字 19.44 s（占比 0.93）—— 取 0.6 两边都够不着。
+   */
   private rememberTail(result: TurnResult): void {
+    const chars = [...result.speech].length;
+    const expectedSeconds = chars / TTS_CHARS_PER_SEC;
+    const shortAudio = result.audioSeconds > 0 && result.audioSeconds < expectedSeconds * 0.6;
+    if (!result.interrupted && !shortAudio) {
+      this.tail = null;
+      return;
+    }
     const rest = remainingSpeech(result.speech, result.playedSeconds);
     if (rest === '') {
       this.tail = null;
@@ -498,8 +646,11 @@ export class DialogRuntime {
    * 这条**不属于任何一轮**（`speakCanned` 的旁白通道），所以不占轮次票据、不改状态机。
    * 用户正在说话或正在播报时排队，等回到 `listening` 再放出来 —— 抢话比晚两秒更烦人。
    */
-  enqueueAnnounce(speech: string, emotion?: string): void {
-    this.announceQueue.push({ speech, emotion });
+  enqueueAnnounce(speechOrItem: string | AnnounceItem, emotion?: string): void {
+    const item: AnnounceItem = typeof speechOrItem === 'string'
+      ? { speech: speechOrItem, ...(emotion === undefined ? {} : { emotion }) }
+      : speechOrItem;
+    this.announceQueue.push(item);
     // 有货就要让宠物知道：它在「让位」闸门里等着这条
     this.options.env.onAnnounce?.(true, false);
     void this.flushAnnounce();
@@ -509,6 +660,7 @@ export class DialogRuntime {
   clearAnnounce(): void {
     this.announceQueue.length = 0;
     this.runner.cancelCanned();
+    this.options.cancelAnnounce?.();
     // 双击是明确的「别念了」：残句连"要不要补"都不该再问，直接作废
     this.runner.takeCannedResidue();
     this.announceTail = null;
@@ -542,13 +694,31 @@ export class DialogRuntime {
         if (item === undefined) {
           break;
         }
-        // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动
-        const speak = (text: string): Promise<void> => this.runner.speakCanned(text, item.emotion);
+        // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动。
+        // `deferred` 由 `speak` 在 `'defer'` 时置位；两条开麦分支共用后面的结算。
+        let deferred = false;
+        const speak = async (text: string): Promise<void> => {
+          if (item.verbatim !== true && this.options.speakAnnounce !== undefined) {
+            const outcome = await this.options.speakAnnounce(item);
+            if (outcome === 'spoken') {
+              return;
+            }
+            if (outcome === 'defer') {
+              deferred = true;
+              return;
+            }
+            // 'fallback' → 落到下面走 runner.speakCanned
+          }
+          await this.runner.speakCanned(text, item.emotion);
+          const interrupted = this.core.phase !== 'listening'
+            || this.options.clock.now() - this.lastUserSpeechAt < ANNOUNCE_QUIET_MS;
+          this.options.onFallbackAnnounceSpoken?.(item, interrupted);
+        };
         // 开麦这一段是异步的（最长 1.5 s），期间的整句记录用来判断要不要让路
         const mark = this.options.clock.now();
+        let spoke = true;
         if (mic === undefined) {
           await speak(item.speech);
-          spokeAny = true;
         } else {
           // 设备能开麦就先开：播报一开口就能被插话（ADR-0001 §6）。超时照播。
           const result = await speakAnnouncement(item.speech, {
@@ -562,14 +732,22 @@ export class DialogRuntime {
             shouldSpeak: () => this.lastUserSentenceAt <= mark,
             speak,
           });
-          if (!result.spoke) {
-            // 排回**队首**：这条只是被推迟，不是被丢掉
-            this.announceQueue.unshift(item);
-            this.options.log('  播报    开麦期间用户说了一句 → 排回队首，等安静');
-            break;
-          }
-          spokeAny = true;
+          spoke = result.spoke;
         }
+        if (deferred) {
+          // 排回**队首**：前台正忙，这条只是被推迟。不要记成出过声，
+          // `finally` 看到队列非空会自己排 `ANNOUNCE_QUIET_MS` 后再试。
+          this.announceQueue.unshift(item);
+          this.options.log('  播报    前台车道正忙 → 排回队首，等空窗重试');
+          break;
+        }
+        if (mic !== undefined && !spoke) {
+          // 排回**队首**：这条只是被推迟，不是被丢掉
+          this.announceQueue.unshift(item);
+          this.options.log('  播报    开麦期间用户说了一句 → 排回队首，等安静');
+          break;
+        }
+        spokeAny = true;
         // 播报期间用户说话了：这条已经被 `cancelCanned` 掐断，剩下的留到下一轮结束
         if (
           this.core.phase !== 'listening'
@@ -600,9 +778,20 @@ export class DialogRuntime {
       return;
     }
     this.disposed = true;
+    // **不要在这里 `attachPorts(null)`**：`VoiceConnection.onClose` 的顺序是
+    // `app.dispose()`（含本方法）→ `dialog.dispatch({type:'closed'})`。摘了端口，
+    // `closed` 就发不出 `invalidateTurn`，在途的上游轮次会一直跑到超时才收。
+    // 端口属于「这条会话的内核」，随实例一起被丢弃，不需要显式解绑。
+    this.unsubscribeState();
     this.announceQueue.length = 0;
     this.announceRetry?.();
     this.announceRetry = null;
     this.photos.dispose();
+    // 回执钩子是**进程级 agent 上的一个槽**：只有「我还是当前那条连接」时才摘。
+    // 旧连接的 `dispose()` 晚于新连接挂载是弱网重连的常态，无条件摘会把新连接
+    // 那份回执一起掐掉（`setDelegateHook` 没有令牌参数，只能靠这条守卫）。
+    if (this.options.isActiveOwner?.() ?? true) {
+      this.options.agent.setDelegateHook?.(null);
+    }
   }
 }

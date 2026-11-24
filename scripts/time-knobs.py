@@ -51,6 +51,7 @@ OUT = ROOT / "docs" / "TIME-KNOBS.md"
 CLOCK: dict[str, str] = {
     # 封段 / 静音
     "VOICE_COMMIT_MS": "wall→audio（见下方备注）",
+    "VOICE_STT_COMMIT_MS": "wall→audio（同 VOICE_COMMIT_MS，见下方备注）",
     "VOICE_PAUSE_DETECT_MS": "wall",
     "VOICE_SPECULATE_MS": "wall",
     "VOICE_HOLD_MS": "wall",
@@ -65,6 +66,9 @@ CLOCK: dict[str, str] = {
     "TURN_JUDGE_QUIET_MS": "wall",
     "TURN_JUDGE_MAX_OPEN_SILENCE_MS": "audio",
     "TURN_JUDGE_TRIM_MS": "audio",
+    # 语义判停（END 标签）：一次网络往返，藏在静候窗里
+    "SEMANTIC_END_TAG_TIMEOUT_MS": "wall",
+    "SEMANTIC_END_TAG_BUDGET_MS": "wall",
     # 模型
     "FAST_LANE_TIMEOUT_MS": "wall",
     # TTS
@@ -91,6 +95,14 @@ CLOCK: dict[str, str] = {
     "FORK_TIMEOUT_MS": "wall",
     "PLAYED_GRACE_MS": "wall",
     "PLAYBACK_POLL_MS": "wall",
+    # 插话闸的时钟自检：两把时钟量级差超过它就算接错（不是等待时长）
+    "CLOCK_MISMATCH_MS": "—（判据）",
+    "SEMANTIC_SKIP_P": "—（判据）",
+    "SEMANTIC_PREFIX_SLACK_CHARS": "—（判据）",
+    "TRUNCATED_EPSILON_MS": "—（判据）",
+    "OMNI_DELEGATE_MAX_SPOKEN_MS": "wall",
+    # TTS 放弃一条已作废的合成后，等服务端 response.done 的上限
+    "ABANDON_TIMEOUT_MS": "wall",
     "ASSEMBLER_FALLBACK_WINDOW_MS": "wall",
     "ASSEMBLER_PREDICT_LEAD_MS": "audio",
     "ASSEMBLER_TRAILING_TRIM_MS": "audio",
@@ -128,10 +140,18 @@ SHADED_BY: dict[str, str] = {
     "TURN_JUDGE_WAIT_BUDGET_MS": "同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算",
     "TURN_JUDGE_QUIET_MS": "模型段",
     "TURN_JUDGE_MAX_OPEN_SILENCE_MS": "无（它自己是上限）",
+    "SEMANTIC_END_TAG_BUDGET_MS": "静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行",
+    "SEMANTIC_END_TAG_TIMEOUT_MS": "同上（它只决定这一次判定放弃得多早，不单独产生等待）",
     "VOICE_PAUSE_DETECT_MS": "ASR 解出句之前（提前起跑，不额外等）",
     "VOICE_SPECULATE_MS": "同上（投机与 ASR 并行）",
     "PREWARM_TTL_MS": "定稿→开轮之间（正常 0–600 ms，用不完）",
     "STALL_PROBE_MS": "无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待）",
+    "CLOCK_MISMATCH_MS": "无（纯判据：只用来发现两把时钟接错，不放慢任何东西）",
+    "SEMANTIC_SKIP_P": "无（纯判据：声学已经很确定时**省掉**一段等待）",
+    "SEMANTIC_PREFIX_SLACK_CHARS": "无（纯判据：决定定稿要不要再问一趟语义判停）",
+    "TRUNCATED_EPSILON_MS": "无（纯判据：轮末判「用户少听了没有」，不产生任何等待）",
+    "OMNI_DELEGATE_MAX_SPOKEN_MS": "无（判据：超过它就不再把 dsh 的答案拼在后面）",
+    "ABANDON_TIMEOUT_MS": "无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环）",
     "ASSEMBLER_PREDICT_LEAD_MS": "ASR 出句之前",
     "PLAYBACK_POLL_MS": "设备播报期间（轮询，不加延迟）",
     # 查源码后补的
@@ -141,6 +161,7 @@ SHADED_BY: dict[str, str] = {
     "TURN_JUDGE_TRIM_MS": "判停侧车输入预处理（不额外等）",
     "TURN_JUDGE_SEQUENCE_BUDGET_MS": "模型段（只对数字/字母/「然后」这类句尾生效）",
     "VOICE_COMMIT_MS": "无 —— 它就是封段的那一刻，实际门槛被上行包长盖住",
+    "VOICE_STT_COMMIT_MS": "无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠）",
     "VOICE_OPEN_QUIET_MS": "ASR 已出句、等静音够了才开轮（**这段是纯等待**）",
     "VOICE_OPEN_QUIET_SHORT_MS": "同上（p ≥ 0.8 时走这条）",
     "ASSEMBLER_FALLBACK_WINDOW_MS": "ASR 出句之后（兜底，正常不触发）",

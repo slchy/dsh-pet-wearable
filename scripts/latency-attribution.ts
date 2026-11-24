@@ -17,11 +17,16 @@
  * 1. 每段的 p50 / p90 / p95 / 最大（只在**该段有值**的轮次上算，缺失不当 0）；
  * 2. 完整轮次（①②③ 都有）上，各段占 `firstWordMs` 的份额；
  * 3. 对第 2 步的份额按轮次求「谁最大」，并单独列出 p90 那一轮的三段拆分。
+ *
+ * Pure Live 后台汇报（`announce` 带 `source`）是**异步段**：文末单独成节，
+ * 指标一律叫「后台委派→汇报」。它不并进「闭嘴→出声」的 p50 / p90；
+ * 配不到委派轮记 `null`，不拿 0 冒充。
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { computeTurns, parseEvents, percentile, type TurnLatency } from '../src/latency-report.ts';
+import { isMainModule } from '../src/main.ts';
+import { computeTurns, parseEvents, percentile, type ArchiveEvent, type TurnLatency } from '../src/latency-report.ts';
 
 type Seg = 'silenceToAsr' | 'asrToTurn' | 'turnToAudio';
 
@@ -66,15 +71,237 @@ function segmentsOf(turn: TurnLatency): { key: Seg; label: string; value: number
   return out;
 }
 
-function reportOne(dir: string): string {
-  const file = join(dir, 'events.jsonl');
-  let text: string;
-  try {
-    text = readFileSync(file, 'utf8');
-  } catch (error) {
-    return `# ${dir}\n\n读不到 events.jsonl：${(error as Error).message}\n`;
+/**
+ * 后台汇报离它认领的那次 `turn.start` 超过这么久，就不再当成同一次任务。
+ * 5 分钟：再晚的播报对不上「用户刚说的那句」，硬配会把无关等待算进周转。
+ */
+const BACKGROUND_TURNAROUND_WINDOW_MS = 300_000;
+
+/**
+ * 从这一轮用户话派出去、和委派轮一一对应的来源。
+ * 按汇报时间贪心认领「最近一条还没被配对的委派 `turn.start`」，同一轮不许分给两条。
+ *
+ * `dsh_background` 不在这里：那是 dsh 自己的播报，可以贴最近一条委派轮，但不占名额。
+ */
+const CLAIMING_SOURCES: ReadonlySet<string> = new Set(['tool_call', 'early_rule', 'image']);
+
+export interface BackgroundTurnaround {
+  readonly announceAt: number;
+  readonly source: string;
+  readonly verbatim: boolean;
+  /** 距最近一条尚未配对的委派轮 `turn.start` 的时长（ms）；配不到则为 `null` */
+  readonly turnaroundMs: number | null;
+  readonly matchedTurn: number | null;
+}
+
+interface DelegatedTurn {
+  /** 与 `computeTurns` 相同：按 `turn.start` 出现顺序，从 1 计 */
+  readonly turn: number;
+  readonly startAt: number;
+  claimed: boolean;
+}
+
+function eventRecord(event: ArchiveEvent): Record<string, unknown> {
+  return event as unknown as Record<string, unknown>;
+}
+
+function stringField(event: ArchiveEvent, key: 'source' | 'delegate'): string | undefined {
+  const value = eventRecord(event)[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function verbatimField(event: ArchiveEvent): boolean {
+  return eventRecord(event)['verbatim'] === true;
+}
+
+/**
+ * 委派轮：某次 `turn.start` 对应的 `turn.end`（下一次 `turn.start` 之前）带有
+ * `delegate` 字符串。边界与本文件里「按路径拆」取 `path` 的方式相同。
+ */
+function collectDelegatedTurns(events: readonly ArchiveEvent[]): DelegatedTurn[] {
+  const startTimes: number[] = [];
+  for (const event of events) {
+    if (event.ev === 'turn.start') {
+      startTimes.push(event.t);
+    }
   }
-  const events = parseEvents(text);
+  const out: DelegatedTurn[] = [];
+  for (let i = 0; i < startTimes.length; i += 1) {
+    const startAt = startTimes[i];
+    if (startAt === undefined) {
+      continue;
+    }
+    const next = startTimes[i + 1] ?? Number.POSITIVE_INFINITY;
+    const end = events.find((event) => event.ev === 'turn.end' && event.t > startAt && event.t < next);
+    if (end !== undefined && stringField(end, 'delegate') !== undefined) {
+      out.push({ turn: i + 1, startAt, claimed: false });
+    }
+  }
+  return out;
+}
+
+/** 开跑时刻 ≤ 汇报时刻、且落在窗口内的委派轮里，取最近的一条。 */
+function nearestDelegated(
+  turns: readonly DelegatedTurn[],
+  announceAt: number,
+  unclaimedOnly: boolean,
+): DelegatedTurn | null {
+  let best: DelegatedTurn | null = null;
+  for (const turn of turns) {
+    if (unclaimedOnly && turn.claimed) {
+      continue;
+    }
+    if (!Number.isFinite(turn.startAt) || turn.startAt > announceAt) {
+      continue;
+    }
+    const delta = announceAt - turn.startAt;
+    if (delta > BACKGROUND_TURNAROUND_WINDOW_MS) {
+      continue;
+    }
+    if (best === null || turn.startAt > best.startAt || (turn.startAt === best.startAt && turn.turn > best.turn)) {
+      best = turn;
+    }
+  }
+  return best;
+}
+
+/**
+ * Pure Live 后台汇报的周转：每条带 `source` 的 `announce` 一条。
+ *
+ * - `tool_call` / `early_rule` / `image`：贪心认领最近一条**尚未配对**、
+ *   且 `turn.start` ≤ 汇报时刻、间隔 ≤ 300_000 ms 的委派轮。
+ * - `dsh_background`：贴最近一条满足同一时间窗的委派轮（不要求未被认领），
+ *   也不把那一轮占掉。
+ * - 配不到：`turnaroundMs` 与 `matchedTurn` 都是 `null`，绝不写成 0。
+ */
+export function computeBackgroundTurnarounds(events: readonly ArchiveEvent[]): BackgroundTurnaround[] {
+  const turns = collectDelegatedTurns(events);
+  const announces: { readonly at: number; readonly source: string; readonly verbatim: boolean; readonly order: number }[] = [];
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i];
+    if (event === undefined || event.ev !== 'announce') {
+      continue;
+    }
+    const source = stringField(event, 'source');
+    if (source === undefined) {
+      continue;
+    }
+    announces.push({ at: event.t, source, verbatim: verbatimField(event), order: i });
+  }
+  announces.sort((a, b) => a.at - b.at || a.order - b.order);
+
+  const out: BackgroundTurnaround[] = [];
+  for (const announce of announces) {
+    let matched: DelegatedTurn | null = null;
+    if (announce.source === 'dsh_background') {
+      matched = nearestDelegated(turns, announce.at, false);
+    } else if (CLAIMING_SOURCES.has(announce.source)) {
+      matched = nearestDelegated(turns, announce.at, true);
+      if (matched !== null) {
+        matched.claimed = true;
+      }
+    }
+    out.push({
+      announceAt: announce.at,
+      source: announce.source,
+      verbatim: announce.verbatim,
+      turnaroundMs: matched === null ? null : announce.at - matched.startAt,
+      matchedTurn: matched === null ? null : matched.turn,
+    });
+  }
+  return out;
+}
+
+function appendBackground(lines: string[], events: readonly ArchiveEvent[]): void {
+  const rows = computeBackgroundTurnarounds(events);
+  if (rows.length === 0) {
+    return;
+  }
+  lines.push('## Pure Live 后台委派→汇报（异步段，不计入首声 p50）');
+  lines.push(`- 条数：${rows.length}`);
+  const bySource = new Map<string, number>();
+  for (const row of rows) {
+    bySource.set(row.source, (bySource.get(row.source) ?? 0) + 1);
+  }
+  const breakdown = [...bySource.entries()].map(([source, count]) => `${source} ${count}`).join('、');
+  lines.push(`- 按 source：${breakdown}`);
+  let verbatim = 0;
+  const paired: number[] = [];
+  for (const row of rows) {
+    if (row.verbatim) {
+      verbatim += 1;
+    }
+    if (row.turnaroundMs !== null) {
+      paired.push(row.turnaroundMs);
+    }
+  }
+  lines.push(`- verbatim：${verbatim}`);
+  lines.push(`- 后台委派→汇报 p50 / p90：${describe(paired)}`);
+  const unpaired = rows.length - paired.length;
+  if (unpaired > 0) {
+    lines.push(`- 未配对：${unpaired}（turnaroundMs = null，不拿 0 冒充）`);
+  }
+  lines.push('');
+}
+
+/**
+ * `parseEvents` 只抄延迟分段要的字段，`source` / `verbatim` / `delegate` 会丢。
+ * 那份解析器在 `src/latency-report.ts`，归 `npm run mutate` 守着，这里不能改。
+ * 跳行规则与它保持一致，再把这三项贴回到同一条事件上。
+ */
+function overlayLiveFields(jsonl: string, events: readonly ArchiveEvent[]): ArchiveEvent[] {
+  const rawKept: Record<string, unknown>[] = [];
+  for (const line of jsonl.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') {
+      continue;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!raw || typeof raw !== 'object') {
+      continue;
+    }
+    const obj = raw as Record<string, unknown>;
+    const t = obj['t'];
+    const ev = obj['ev'];
+    if (typeof t !== 'number' || !Number.isFinite(t) || typeof ev !== 'string' || ev === '') {
+      continue;
+    }
+    rawKept.push(obj);
+  }
+  if (rawKept.length !== events.length) {
+    return [...events];
+  }
+  return events.map((event, index) => {
+    const raw = rawKept[index];
+    if (raw === undefined || raw['t'] !== event.t || raw['ev'] !== event.ev) {
+      return event;
+    }
+    const extra: { source?: string; verbatim?: boolean; delegate?: string } = {};
+    if (typeof raw['source'] === 'string') {
+      extra.source = raw['source'];
+    }
+    if (typeof raw['verbatim'] === 'boolean') {
+      extra.verbatim = raw['verbatim'];
+    }
+    if (typeof raw['delegate'] === 'string') {
+      extra.delegate = raw['delegate'];
+    }
+    return { ...event, ...extra };
+  });
+}
+
+/**
+ * 归因报告。`label` 写在标题上（通常是会话目录）。
+ *
+ * 各段分布、份额、按路径拆、③ 内部拆分、p90 归因、超预算轮次与原先一致。
+ * 有后台汇报时，文末另起一节，不改上面任何一行。
+ */
+export function formatAttribution(events: readonly ArchiveEvent[], label: string): string {
   const turns = computeTurns(events);
 
   // 每轮走的哪条（`turn.end.path`）。必须按**顺序**对齐：`computeTurns` 按 `turn.start`
@@ -87,7 +314,7 @@ function reportOne(dir: string): string {
     return typeof value === 'string' ? value : null;
   });
 
-  const lines: string[] = [`# ${dir}（${turns.length} 轮）`, ''];
+  const lines: string[] = [`# ${label}（${turns.length} 轮）`, ''];
 
   // ---- 1. 每段自己的分布 ----
   lines.push('## 各段分布（只在该段有值的轮次上算，缺失不补 0）');
@@ -231,7 +458,19 @@ function reportOne(dir: string): string {
     );
   }
   lines.push('');
+  appendBackground(lines, events);
   return lines.join('\n');
+}
+
+function reportOne(dir: string): string {
+  const file = join(dir, 'events.jsonl');
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (error) {
+    return `# ${dir}\n\n读不到 events.jsonl：${(error as Error).message}\n`;
+  }
+  return formatAttribution(overlayLiveFields(text, parseEvents(text)), dir);
 }
 
 function main(argv: readonly string[]): number {
@@ -270,4 +509,6 @@ function main(argv: readonly string[]): number {
   return 0;
 }
 
-process.exitCode = main(process.argv.slice(2));
+if (isMainModule(process.argv[1], import.meta.url)) {
+  process.exitCode = main(process.argv.slice(2));
+}

@@ -15,6 +15,20 @@ import type { TurnTicket } from './dialog-fsm.ts';
 /** 一轮的上下文：现在只有票据，将来要加东西就放这里，别再加位置参数。 */
 export interface TurnContext {
   readonly ticket: TurnTicket;
+  /**
+   * 强制走慢车道。
+   *
+   * 用在「omni 自己发了 `tool_call`」：音频已经/正在播，宿主 drain 完才知道要转交，
+   * 那时不能再走一次路由判断 —— 判断会把它又送回同一条车道。
+   */
+  readonly forceDelegate?: DelegateReason;
+  /**
+   * 这一轮已经有人替我们说过话（omni 的垫音）→ **不要再叠一句回执**。
+   *
+   * 两份不同的声音接在一起，用户听到的是「我帮你查一下。我看看。」；而且
+   * 垫音一旦播出去就收不回来，所以只能压自己的回执。
+   */
+  readonly receiptSpoken?: boolean;
 }
 
 /**
@@ -52,6 +66,128 @@ export interface AgentImage {
   readonly data: string;
 }
 
+/**
+ * 快车道的「音频直出」答案（omni）。
+ *
+ * **认领时首块通常还没到**（认领在定稿 ~220 ms，首块在 600–760 ms），所以
+ * `chunks` 是一个**活的**流；更关键的是判停延拍时认领会晚到 700–870 ms，
+ * 那时首块已经发过来了 —— 实现方必须在 `seal()` 之后就开始缓冲 PCM，
+ * 否则句首一两个字会被吞掉。
+ */
+export interface AgentAudioAnswer {
+  /** PCM16（s16le / 单声道），采样率见 `sampleRate` */
+  readonly chunks: AsyncIterable<Buffer>;
+  readonly sampleRate: number;
+  /**
+   * 已收到的转写。**活的**：随流增长，流结束才是完整的一句。
+   *
+   * 为什么不是 `Promise<string>`：被打断时 `Promise` 永远不 resolve，而这里
+   * 的当前值正好是「已播出去的部分」，审计与续话要的就是它。
+   */
+  transcript(): string;
+  /**
+   * 流结束后：omni 自己决定转 dsh 吗（`tool_call`）。`null` = 它自己答。
+   *
+   * 有这个才敢放量 —— 本地判据只挡**形态**（空串 / 超字数 / 阿拉伯数字），
+   * 判不出「这事得问助手」。
+   */
+  delegateReason?(): DelegateReason | null;
+  /**
+   * omni 在 `tool_call` 里写下的那句「用户要什么」。没有就是 `null`（退回 ASR 原话）。
+   *
+   * 和 {@link delegateReason} 分开：那个只回答「要不要转」，这个带上**内容**。
+   */
+  delegateText?(): string | null;
+}
+
+/**
+ * 「这一轮由音频直出」的车道（omni）。
+ *
+ * 为什么不另起一条旁路：快车道的**记忆**就是 `FrontedAgent.pending` 与
+ * `remember()`（`keepTurns`、`overcap`、给 dsh 带的上下文全长在那里）。
+ * 旁路一旦绕开它，omni 答过的轮次就不进历史 —— 下一轮委派给 dsh 就失忆。
+ * 所以车道只负责「有没有音频」，**要不要用、记不记账由 Agent 决定**。
+ */
+export interface FastLaneAudioLane {
+  /**
+   * 这一轮**能不能**由本车道作答。纯读、不改任何账。
+   *
+   * 必须与 `claim()` 的判据一致：宿主会先在 TTS 起跑前问一次（决定要不要开
+   * 流式合成），再在 `reply()` 里问一次。
+   */
+  willServe(): boolean;
+  /**
+   * 只进档案的排障信息（`agent.lane`）。**不参与任何决策。**
+   *
+   * 为什么需要：`willServe()` 是个布尔，false 的时候看不出是「没开」「没 response」
+   * 「被取消了」还是「并段轮被 clip 档挡掉」—— 这四种的修法完全不同，而线上
+   * 又没法打日志重放。
+   */
+  explain?(): Record<string, unknown>;
+  /** 认领本轮音频；`null` = 此刻拿不到（连接没就绪 / 这一份已经被取消） */
+  claim(): AgentAudioAnswer | null;
+  /**
+   * 这一轮不采纳（走 dsh / 判据否决）。
+   *
+   * 实现方必须**立刻 `response.cancel`** —— 否则它会在后台把整段废音频生成完，
+   * 既烧输出 token，又让下一轮开口时它还挂着 busy。
+   *
+   * 与 {@link interrupt} 的差别只有一点但很要害：`discard` 意味着这一轮**一个字都没播**，
+   * 那条回复应当从服务端历史里删掉；`interrupt` 是播到一半被打断，**必须留着**。
+   */
+  discard(): void;
+  /**
+   * 播到一半被用户打断：取消生成，但保留已说出去的回复。
+   *
+   * 缺失时退回 `discard()` 也能用，只是会把用户听过的那半句也删掉 ——
+   * 和快车道 `pending` 里记的那半句就对不上了。
+   */
+  interrupt?(): void;
+  /**
+   * 把别的车道答出来的内容回注进本车道的上下文（委派轮用）。
+   *
+   * 没有它，omni 不知道自己那一轮被 dsh 接走了；下一轮用户顺着 dsh 的回答追问，
+   * omni 会答非所问。实现方应自行决定「什么时候能发」（如等 `ready`）。
+   *
+   * @param kind 这句话有没有真的念给用户听（见 {@link InjectKind}）
+   */
+  injectAnswer?(userText: string, said: string, kind?: InjectKind): void;
+  /**
+   * 当前是否处于可安全发起后台汇报的状态：
+   * 必须同时满足 `ready`、无在途回复、无排队封段、无脏音频缓冲。
+   */
+  canSpeakBackground?(): boolean;
+  /**
+   * 在安全空窗期往同一条实时会话写入后台结论并触发音频回复（同一副嗓子 + 自然进上下文）。
+   * 返回 `null` 表示此刻不可发（忙 / 有用户音频 / 已断线），调用方应顺延重试。
+   */
+  speakFromText?(
+    promptText: string,
+    meta?: { readonly taskId?: string; readonly query?: string },
+  ): AgentAudioAnswer | null;
+  /** 只掐掉正在播的后台汇报回复（`origin === 'announce'`），绝不误掐用户自己的回复。 */
+  cancelBackgroundSpeech?(): void;
+}
+
+/**
+ * 回注的口气 —— **用户到底听到没有**。
+ *
+ * 分清这一条的前提是搞清「谁念的」：dsh 的答案**确实是 omni 念的**，但走的是
+ * `omni-tts` 那条**专用朗读连接**（`念这段：<文本>`，实测逐字 100%），和聊天用的
+ * `omni-shadow` 不是同一条 —— 朗读连接念完就 `item.delete`，是无状态的。
+ * 所以「用户听到了」而「omni 的对话历史里没发生过」是同一件事的两面。
+ *
+ * 两条口径：
+ * - `spoken`：**用第一人称**说「你已经用语音把这段话念给用户了」。因为真是同一副
+ *   嗓子念的，从用户视角就是 omni 说的 —— 这样它后面讲「我刚才说过」是**真话**，
+ *   不用让它克制。
+ * - `unspoken`：一个字都没下发，用户不知道内容。真机 `20261123-053719` 第 2 轮：
+ *   dsh 答出了《其主之声》，`audio_s=0.00`，结果 omni 后面把书名当成《奇书》。
+ *
+ * 播了一半（`truncated`）**不注** —— 那是"用户少听了一段"，不是"没播"。
+ */
+export type InjectKind = 'spoken' | 'unspoken';
+
 /** Agent 回复。只保留编排层真正需要的字段。 */
 export interface AgentReplyView {
   /** 原始文本（日志/调试用） */
@@ -60,6 +196,14 @@ export interface AgentReplyView {
   readonly firstTokenMs?: number;
   /** 清洗后、准备送 TTS 的文本 */
   readonly speech: string;
+  /**
+   * 答案自带音频（omni 直出）。有它就不走 TTS —— 编排层只负责播。
+   *
+   * **契约**：有 `audio` 时 `text` / `speech` 是活的（随音频流增长），
+   * 轮末使用（`said` 审计、记忆回写、打断续话）必须在音频流 drain 之后读。
+   * 这不是疏忽 —— 被打断时它的当前值正好是「已播出去的部分」。
+   */
+  readonly audio?: AgentAudioAnswer;
   /**
    * 情绪（`happy` / `proud` / `calm` / `worried` / `sulk`）。
    *
@@ -74,7 +218,7 @@ export interface AgentReplyView {
    * 而 qwen 现场回的轮次是 200–660，`dsh` 是 885–1342，**三段有重叠**
    * （真机：`还在吗？` 343 ms 是快车道，`我怎么说？` 662 ms 是 dsh）。
    */
-  readonly path?: 'fast' | 'dsh';
+  readonly path?: 'fast' | 'dsh' | 'omni';
   /**
    * 交给慢车道的原因（只有 `path === 'dsh'` 时有意义）。
    *
@@ -83,6 +227,34 @@ export interface AgentReplyView {
    * 没有它，「这一轮为什么走 dsh」在日志里和「本地闸挡住」长得一模一样。
    */
   readonly delegate?: DelegateReason;
+}
+
+export type BackgroundTaskSource =
+  | 'tool_call'
+  | 'early_rule'
+  | 'image'
+  | 'memory_silent'
+  | 'dsh_background';
+
+/**
+ * 后台执行器（dsh）完成后回流给唯一前台的标准化结果。
+ *
+ * 无论是短工具调用、识图、还是 dsh 内部 `run_in_background` / `subagent` 跑完，
+ * 都归一成这一个形状再交给播报空窗（FloorArbiter）统一调度。
+ */
+export interface BackgroundTaskReport {
+  readonly taskId: string;
+  readonly source: BackgroundTaskSource;
+  /** 触发这条任务的用户原话/意图（用于指代对齐与上下文回注） */
+  readonly query: string;
+  /** 给前台口语汇报 / 写入上下文的简洁结论 */
+  readonly summary: string;
+  /** 若非空，表示含精确数字/端口/代码/长文，须走逐字朗读路径（如 omni-tts / TTS） */
+  readonly verbatim?: string;
+  /** 需要用户确认的问题（由唯一前台直接向用户发问，闭环在同一上下文里） */
+  readonly needsConfirm?: string;
+  /** 可选情绪标签（透传给回落 TTS） */
+  readonly emotion?: string;
 }
 
 /**
@@ -110,6 +282,74 @@ export interface AgentProvider {
    * 那个带 20 token 门槛、只给日志判断用。
    */
   attachLiveSink?(sink: ((text: string) => void) | null): void;
+  /**
+   * 可选能力：挂上/摘掉「音频直出」车道（omni）。传 `null` = 摘掉。
+   *
+   * **按连接挂**：omni 的连接是设备连接的一个子资源，`VoiceConnection` 建连时挂、
+   * 断开时摘。实现方必须容忍「挂着但这一轮用不上」（那就照常走文本路）。
+   */
+  attachAudioLane?(lane: FastLaneAudioLane | null): void;
+  /**
+   * 可选能力：这一轮会不会走音频直出。
+   *
+   * 宿主在**起跑流式 TTS 之前**问一次 —— 那一步会真的开一个合成 task，而 omni
+   * 轮没有任何文本可送，服务端会拒空文本并让整轮退化成兜底。判据必须与
+   * `reply()` 内部一致，否则两边打架。
+   */
+  willServeAudio?(text: string): boolean;
+  /**
+   * 可选能力：记一轮**不是自己答的**（omni 直出），让上下文与 dsh 交接不断链。
+   *
+   * 为什么必须有：omni 那一轮没走 `reply()`，如果宿主播完就完事，
+   * 这一轮的「用户问了什么、答了什么」在快车道历史和 dsh 眼里都不存在 ——
+   * 下一轮一旦委派给 dsh，系统直接失忆。
+   *
+   * `said` 应当是**实际播出去的那部分**（被打断时按已播比例截断）。
+   *
+   * @param truncated 那一轮是不是**没播完**（被打断）。与 `said` 本身无关：
+   *   文本可以一个字不少，但用户只听到了一半。实现方用它决定回写上下文时
+   *   要不要标注「这句没说完」。
+   */
+  noteServedTurn?(userText: string, said: string, truncated?: boolean): void;
+  /**
+   * 可选能力：把**结算后才知道的事实**按票据对回账本。
+   *
+   * 由内核的 `settleTurn` 端口调用（见 `kernel-runtime.ts`）：`truncated` 与
+   * `endedAtMs` 在**播完之后**才算得出来，而这一轮的账早在 `reply()` 返回时就记下了。
+   * 不回来改这一笔，`KernelState.ledger` 与 `ConversationLedger` 就会各说一套
+   * （内核说少听了、账本说听全了），路由与回注按哪一份走都是错的。
+   *
+   * **按 `{ no, gen }` 精确认领**：只有票据一字不差的那一笔允许改。票据对不上
+   * 必须**什么都不做** —— 那是迟到的结算，落到别的轮次上就是把「听全了」改成
+   * 「被打断」，下一轮会凭空多注一次不该注的记忆。
+   */
+  reconcileTurnOutcome?(info: {
+    readonly ticket: { readonly no: number; readonly gen: number };
+    readonly truncated: boolean;
+    readonly endedAtMs: number;
+  }): void;
+  /**
+   * 可选能力：**上一轮是谁答的**（账本口径，`null` = 还没有答过的轮次）。
+   *
+   * 由 `DialogRuntime` 在建连时读一次，用来给 `initialKernelState` 的
+   * `ledger.lastLane` 播种：重连之后内核以为「没有上文」，而 agent 的账本明明
+   * 记得上一轮是 dsh —— 于是用户顺着 dsh 的追问说一句，被当成闲聊抢答。
+   *
+   * `pet`（宠物主动开口）**不在此列**：那不是「回答用户这一轮」，按没有上文处理，
+   * 实现方应把它归并成 `null`。
+   */
+  lastLedgerLane?(): 'live' | 'cascade' | 'dsh' | null;
+  /**
+   * 可选能力：把**委派轮**的答案回注进音频车道（omni）的上下文。
+   *
+   * 为什么需要：委派轮是 omni 先答了个开头、然后被掐掉交给 dsh；omni 的服务端
+   * 历史里只有「用户问了什么」，**不知道 dsh 答了什么**。下一轮用户顺着 dsh 的
+   * 回答追问，omni 接不上。
+   *
+   * @param kind 用户到底听到了没有（见 `providers.ts` 的 `InjectKind`）。
+   *   **没播出去也要注**：那是这一轮的事实结论，用户下一轮问的就是它。
+   */
+  injectAnsweredTurn?(userText: string, said: string, kind?: InjectKind): void;
   /**
    * 可选能力：**取消在途的一轮**（宿主侧能力，走 dsh 的 `session/cancel`）。
    *
@@ -158,6 +398,16 @@ export interface AgentProvider {
    */
   speculatePartial?(text: string): boolean;
   /**
+   * 可选能力：**掐掉在途的预跑 / 投机**（`why` 只进日志，不参与决策）。
+   *
+   * 由内核的 `abortEngine` 端口调用（见 `kernel-runtime.ts`）：交给 dsh、被新轮顶掉、
+   * 被插话 —— 这三种情况下那一趟的答案**已经确定不会被采用**，不掐就会一直跑到
+   * 首字 1200 ms / 整句 2800 ms 的超时，白占一条连接，还会让下一轮的投机配额白白用光。
+   *
+   * 实现方应当把配额一起归零：一次中止不该吃掉后面几轮的机会。
+   */
+  dropPrefetch?(why: string): void;
+  /**
    * 可选能力：**硬中断**（`SIGINT` 给 dsh 子进程，等同 TUI 里 Ctrl-C）。
    *
    * 会杀掉进程，下一轮要重启并 resume（实测多花 ~2 s）。只在「这一轮肯定不要了、
@@ -165,12 +415,32 @@ export interface AgentProvider {
    */
   interruptTurn?(): void;
   /**
+   * 可选能力：**放手**——不取消 dsh 那一轮，只把「有人在等它」这件事摘掉。
+   *
+   * 委派轮撞上插话时用这个替掉 `cancelTurn`：工具已经跑过的活儿不会因为
+   * `session/cancel` 消失（bash 照样跑完），取消只省下最后那一步总结，却把
+   * **用户唯一能听到的答案**一起丢了。放手之后它答完时没有等待者，
+   * 走「没有任何一轮」的播报链路（`setAnnouncer`）说出来 —— 与后台任务结算同一口。
+   */
+  detachTurn?(ticket?: TurnTicket): void;
+  /**
+   * 可选能力：慢车道**手上有没有活儿**（含放手的委派轮）。
+   *
+   * 用户说「算了 / 别查了」时要据此决定是否真的发取消：没有在跑的东西，那就是一句
+   * 普通闲聊，不该去打扰 dsh。
+   */
+  dshBusy?(): boolean;
+  /**
    * 可选能力：**后台任务状态**的一句话事实（「在跑什么 / 刚跑完什么 / 什么都没有」）。
    *
    * 数据来自 dsh 自己发的事件（`job/registered`、`job/settled`、`subagent/catalog`），
    * 不用额外发请求。给快车道用来**照实回答**「好了吗 / 查到没」，而不是瞎编进度。
    */
   taskStatus?(): string;
+  /** Pure Live 模式下接收后台任务完成汇报（路由到 DialogRuntime 的播报空窗） */
+  setTaskReporter?(cb: ((report: BackgroundTaskReport) => void) | null): void;
+  /** 显式取消所有在途后台任务（「算了 / 别查了」）；返回是否确实取消了任务 */
+  cancelBackgroundTasks?(): boolean;
   /**
    * @param note 可选的**上下文注记**（例如"上一轮被打断、还剩哪句没说"）。
    *   实现方应当把它和用户话术分开，别让模型以为这是用户说的。
@@ -194,6 +464,18 @@ export interface AgentProvider {
    */
   setAnnouncer?(cb: ((speech: string, emotion?: string) => void) | null): void;
   /**
+   * 可选能力：**放手那一轮**（委派轮被打断、但没取消）跑完之后，把答案交出来。
+   *
+   * 与 `setAnnouncer` 的分工：`setAnnouncer` 是"播出去"，用户已经在问新问题时不该
+   * 补播；这条是"记下来"—— 无论用户听没听到，都要回注记忆，否则用户之后提起这件
+   * 事，两条车道都当没发生过。
+   *
+   * `spoken` 表示这次答案会不会顺带播出去（播报口还挂着、也没人在等新答案）。
+   */
+  setDetachedAnswerSink?(
+    cb: ((userText: string, answer: string, spoken: boolean) => void) | null,
+  ): void;
+  /**
    * 可选能力：**这一轮交给慢车道了**，编排层可以给用户一句回执（「我看看。」）。
    *
    * 快车道判定自己答不了（本地判据否决 / 暗号 / 超时 / 空答复）时叫一次。
@@ -206,8 +488,19 @@ export interface AgentProvider {
 
 /** STT 会话：一次连接一个，流式喂 PCM。 */
 export interface SttSession {
-  /** 喂一块 PCM16 16 kHz mono。 */
-  feed(pcm: Buffer): void;
+  /**
+   * 喂一块 PCM16 16 kHz mono。
+   *
+   * @param voiced 这一帧能量门判为「有声」吗（`EnergyGateDecision.voiced`）。
+   *
+   * 为什么要传：`qwen-realtime-asr` 在 commit 之后、定稿之前的窗口里会**暂存**
+   * 音频（那段时间 append 上来的会被服务端丢掉，见该文件的 `heldDuringDecode`）。
+   * 而尾静音也会被 `onSpeech` 一路灌进来 —— 攒下来的纯静音补推上去会让服务端
+   * 稳定吐一个幻觉定稿（实测 150 ms 纯静音 → 「嗯。」）。所以暂存要能区分有声帧。
+   *
+   * 不传 = 调用方不知道（老路径），实现方按「全都有声」保守处理。
+   */
+  feed(pcm: Buffer, voiced?: boolean): void;
   /** 「这段说完了」：请求厂商出最终结果（不必关闭连接）。 */
   hangup(): void;
   close(): void;
@@ -223,6 +516,17 @@ export interface SttSession {
    */
   commit?(): void;
   /**
+   * 可选能力：**已经真正发出去**的 commit 序号（单调递增，从 0 起）。
+   *
+   * 「真正发出去」是字面意思：空缓冲被 `dirty` 闸挡掉的那一发、解码窗口内被
+   * 延后（`commitDeferred`）的那一发，**都不占号**。宿主曾经自己维护这份账
+   * （`commit()` 一被调就 +1），于是和 ASR 实际封段对不上 —— 跳过时虚增、
+   * `hangup()` 漏增，转写戴着的出生证就指错了段（见 `causal.ts`）。
+   *
+   * 这是**唯一**的号源：转写事件的 `commitSeq` 与它同源，宿主不要再自己数。
+   */
+  commitSeq?(): number;
+  /**
    * 可选能力：**下一次识别结果作废**。
    *
    * 打断时用。DashScope realtime 协议没有 `input_audio_buffer.clear`
@@ -230,13 +534,41 @@ export interface SttSession {
    * 再把回来的文本扔掉。不实现这个方法就表示「作废不了，别扔」。
    */
   discard?(): void;
+  /**
+   * 可选能力：**手上还有一段没解完**（`commit` 已经发出去、定稿还没回来）。
+   *
+   * 为什么要暴露：封装段的时刻是我们定的（`commitMs`），而定稿要 261 ms ——
+   * 判停那一拍（静音 200–300 ms）经常在解完之前就到了。这时开轮拿到的是**半句话**，
+   * 后半句解码回来就变成「插话」，把自己这一轮掐掉。真机 `20261123-053719`
+   * 第 2 轮就是这么杀了 dsh 一份正确答案（`audio_s=0.00 barge_in=1`）。
+   */
+  decoding?(): boolean;
+  /**
+   * 可选能力：等手上那段解完。没有在解的返回 `null`。
+   *
+   * 复位在 `onSentence` **之后**的微任务里才生效，所以等它回来时，
+   * 新定稿已经进过组装器（`seq` 已经变了）—— 抢跑那一轮自然作废重排。
+   */
+  whenDecoded?(): Promise<void> | null;
 }
 
 export interface SttHandlers {
-  /** 中间结果（边说边出字），可选。 */
-  onPartial?: (text: string) => void;
-  /** 一句说完。`index` 是本次连接内的句序。 */
-  onSentence: (text: string, index: number) => void;
+  /**
+   * 中间结果（边说边出字），可选。
+   *
+   * @param commitSeq 这段增量所属那一发 commit 的**因果出生证**（见 `causal.ts`）。
+   *   解码窗口里的增量是**正在解的那一发**（可能是旧段）；空闲时用户新开口的
+   *   增量属于**下一发**。不传 = 这个 provider 不提供因果坐标，宿主一律
+   *   判「不是旧段」——宁可让一次插话通过，也不能凭空吞掉一轮回答。
+   */
+  onPartial?: (text: string, commitSeq?: number) => void;
+  /**
+   * 一句说完。`index` 是本次连接内的句序。
+   *
+   * @param commitSeq 产出这句定稿的**那一发** commit 的序号。`undefined` =
+   *   这个 provider 不提供因果坐标（服务端 VAD 判句，如 `aliyun-asr`）。
+   */
+  onSentence: (text: string, index: number, commitSeq?: number) => void;
   onError?: (error: Error) => void;
 }
 

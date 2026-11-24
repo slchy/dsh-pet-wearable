@@ -7,11 +7,25 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { QwenRealtimeAsr, type RealtimeSocket } from '../src/qwen-realtime-asr.ts';
+import {
+  QwenRealtimeAsr,
+  mergeCorpusText,
+  qwenRealtimeStt,
+  type RealtimeSocket,
+} from '../src/qwen-realtime-asr.ts';
 
 interface Sent {
   type: string;
-  session?: { turn_detection?: unknown };
+  session?: {
+    modalities?: string[];
+    input_audio_format?: string;
+    turn_detection?: unknown;
+    input_audio_transcription?: {
+      model?: string;
+      language?: string;
+      corpus?: { text?: string };
+    };
+  };
   audio?: string;
 }
 
@@ -58,19 +72,26 @@ const asSocket = (s: FakeSocket): RealtimeSocket => s as unknown as RealtimeSock
 function make(options: { onSentence?: (t: string, i: number) => void } = {}) {
   const socket = new FakeSocket();
   const sentences: Array<{ text: string; index: number }> = [];
+  /** 每条定稿带出来的因果出生证（`undefined` = provider 不提供） */
+  const sentenceStamps: Array<number | undefined> = [];
   const partials: string[] = [];
+  const partialStamps: Array<number | undefined> = [];
   const errors: string[] = [];
   const asr = new QwenRealtimeAsr({
     apiKey: 'k',
-    onSentence: (text, index) => {
+    onSentence: (text, index, commitSeq) => {
       sentences.push({ text, index });
+      sentenceStamps.push(commitSeq);
       options.onSentence?.(text, index);
     },
-    onPartial: (t) => { partials.push(t); },
+    onPartial: (t, commitSeq) => {
+      partials.push(t);
+      partialStamps.push(commitSeq);
+    },
     onError: (e) => { errors.push(e.message); },
     socketFactory: () => asSocket(socket),
   });
-  return { asr, socket, sentences, partials, errors };
+  return { asr, socket, sentences, sentenceStamps, partials, partialStamps, errors };
 }
 
 /** 连上并等到就绪（服务端回 `session.updated`）。 */
@@ -115,6 +136,44 @@ test('喂过音频才 commit，同一段只发一次', async () => {
     '第二段没新音频，不能重复封段',
   );
 
+  // 解码结束之后又来的音频才算**下一段**
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('解码还没回来时喂的音频不算新一段 —— 那一发空 commit 会被服务端拒', async () => {
+  // 真机 5 场 5 次 `maybe no invalid audio stream` 全是这个形状：两次封段隔
+  // 181–292 ms，中间推了 225–300 ms 音频，但那段音频服务端算进**上一条**缓冲
+  // （反证：那 5 次的定稿文本全部完整）。客户端却把它记成新音频 → 提交空缓冲。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1);
+
+  // 解码窗口内继续推音频、再封一次段
+  asr.feed(Buffer.alloc(640));
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    1,
+    '这些音频归正在解的那一条，不该再发 commit',
+  );
+
+  // 解码结束 → 之后再来音频才允许封段
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('服务端报错之后要重新武装，否则再也 commit 不出去', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  socket.message({ type: 'error', error: { message: 'maybe no invalid audio stream' } });
   asr.feed(Buffer.alloc(640));
   asr.commit();
   assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
@@ -237,4 +296,433 @@ test('服务端错误转成 onError，不吞', async () => {
   const { socket, errors } = await ready();
   socket.message({ type: 'error', error: { code: 'invalid_value', message: 'boom' } });
   assert.deepEqual(errors, ['服务端错误: boom']);
+});
+
+test('解码窗口内喂的音频先存本地，定稿之后补推（服务端会把它丢掉）', async () => {
+  // 实测：commit 在飞时 append 的 500 ms 语音，既不进第一段定稿也不进第二段 —— 凭空消失。
+  // 所以这一段必须在客户端攒住，等 `.completed` 之后再推。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  const appendsAfterCommit = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+
+  asr.feed(Buffer.alloc(640));
+  asr.feed(Buffer.alloc(640));
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length,
+    appendsAfterCommit,
+    '解码窗口内不该直接 append',
+  );
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length,
+    appendsAfterCommit + 2,
+    '定稿之后要把攒下的两帧补推上去',
+  );
+
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2,
+    '补推之后才算新的一段，这时才允许再封段');
+});
+
+test('补推出来的音频也要能封段（dirty 由 flush 置位）', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  asr.feed(Buffer.alloc(640)); // 攒着
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('解码窗口里的纯尾静音不许补推（补上去会换一句幻觉的「嗯。」）', async () => {
+  // 每轮正常对话都在这个形状里：封段 → 能量门还要 2 s 才关 → 窗口里灌进 ~260 ms 尾静音。
+  // 实测 150 ms 纯静音就能让 DashScope 吐一个「嗯。」定稿。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+  for (let i = 0; i < 13; i += 1) asr.feed(Buffer.alloc(640), false); // 260 ms 静音
+  asr.commit(); // 延后，等定稿
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '你好。' });
+
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before,
+    '窗口里全是静音，一个字都不该补推');
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1,
+    '延后的那发也要落空：没有语音可封段');
+});
+
+test('窗口里先说了话、再灌尾静音：静音不许跟着补推（真机 320 ms 就换一句幻觉定稿）', async () => {
+  // `20261123-051448`：第 4 轮补推 16 帧后吐 `Okay.`、第 6 轮 16 帧后 `Thank you.`、
+  // 第 7 轮 14 帧后 `嗯。` —— 那 16 帧里绝大部分是封段之后的尾静音。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+
+  asr.feed(Buffer.alloc(640, 1), true); // 解码期又开口
+  for (let i = 0; i < 16; i += 1) asr.feed(Buffer.alloc(640), false); // 320 ms 尾静音
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '我刚下班回来。' });
+
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length - before,
+    1,
+    '只补推那一帧有声，尾静音一个字节都不许跟着上去',
+  );
+});
+
+test('封段之后的尾静音不点亮 dirty —— gate.close 的 hangup 不该再 commit', async () => {
+  // 真机 `20261123-051448` 第 5 轮：第 4 轮刚被打断，2 s 后 gate.close 挂断时又 commit 了一发，
+  // 纯静音封出定稿 `Okay.`，白开一轮（还掉回级联）。
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '我刚下班回来。' });
+  const commits = socket.types().filter((t) => t === 'input_audio_buffer.commit').length;
+  const appends = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+
+  for (let i = 0; i < 100; i += 1) asr.feed(Buffer.alloc(640), false); // 能量门 hold 的 2 s 静音
+  asr.hangup(); // == gate.close
+
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    commits,
+    '没有新的人声就不该封段',
+  );
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.append').length,
+    appends,
+    '尾静音也不该进缓冲（进去就会改变解码上下文）',
+  );
+});
+
+test('解码窗口里真说了话：补推之后要补发延后的 commit（否则尾巴会粘到下一句句头）', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1);
+
+  asr.feed(Buffer.alloc(640), false); // 静音（进 ring）
+  asr.feed(Buffer.alloc(640), true); // 又开口 → ring 转正
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit(); // 撞在解码期 → 延后
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1,
+    '解码期不该发第二发');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2,
+    '补推之后必须补发延后的 commit，否则这段语音会悬到下一句');
+});
+
+test('软起音：窗口里先到几帧静音、再开口 → ring 里那几帧要一起转正', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+  asr.feed(Buffer.alloc(640), false);
+  asr.feed(Buffer.alloc(640), false);
+  asr.feed(Buffer.alloc(640), true);
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before + 3,
+    '2 帧静音 + 1 帧有声都该补推');
+});
+
+test('断连时把窗口暂存一起清掉，别漏进下一句', async () => {
+  const { asr, socket } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  asr.feed(Buffer.alloc(640), true); // 攒了一份
+  socket.close();
+  // 重连之后的新会话不该背着上一句的尾巴
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  socket.message({ type: 'session.updated', session: {} });
+  const before = socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, before + 1,
+    '只有新喂的这一帧');
+});
+
+// ------------------------------------------------------- commitSeq：因果出生证
+//
+// 这份账以前由宿主自己维护（`commit()` 一被调就 +1），三处会静默失步：
+// 跳过/延后时虚增、`hangup()` 时漏增、`flushHeld()` 之后先于定稿交付改了号。
+// 现在号源**只有一处**：真正写进 WebSocket 的那一刻。
+
+test('commitSeq 只在真发出 commit 时 +1 —— 跳过和延后都不占号', async () => {
+  const { asr, socket } = await ready();
+  assert.equal(asr.commitSeq(), 0, '从 0 起');
+
+  asr.commit(); // 空缓冲 → 闸掉
+  assert.equal(
+    socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    0,
+  );
+  assert.equal(asr.commitSeq(), 0, '跳过的那一发不许虚增');
+
+  asr.feed(Buffer.alloc(640));
+  asr.commit();
+  assert.equal(asr.commitSeq(), 1);
+
+  asr.feed(Buffer.alloc(640), true); // 解码窗口里又开口 → 攒住
+  asr.commit(); // 撞在解码期 → 延后
+  assert.equal(asr.commitSeq(), 1, '延后的要等 flushHeld 真发出去才占号');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯。' });
+  assert.equal(asr.commitSeq(), 2, '定稿之后补发的延后 commit 才 +1');
+});
+
+test('hangup 真发出 commit 时要占号 —— 定稿带回来的就是这个号', async () => {
+  // 以前 `hangup()` 走的是同一条 `commit()`，但号记在宿主那边、只在组装器封段时 +1，
+  // 所以 gate.close 封出来的这一段拿不到出生证。
+  const { asr, socket, sentences, sentenceStamps } = await ready();
+  asr.feed(Buffer.alloc(640), true);
+  asr.hangup(); // == gate.close
+  assert.equal(asr.commitSeq(), 1, 'hangup 走的也是 commit()，不能漏号');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '你好。' });
+  assert.deepEqual(sentences, [{ text: '你好。', index: 0 }]);
+  assert.deepEqual(sentenceStamps, [1], '这条定稿的出生证就是 hangup 那一发');
+});
+
+test('延后的 commit：定稿交付旧段序号，下一发在交付之后才占号', async () => {
+  // 关键顺序缺陷：`.completed` 里若先 `flushHeld()`，它会立刻补发延后的下一发、
+  // 把 `awaitingDecode` 置回 true、把号改写 —— 那条定稿于是戴着下一段的出生证。
+  const socket = new FakeSocket();
+  let asr: QwenRealtimeAsr;
+  /** 交付定稿那一刻的三个事实：出生证 / 已发出的号 / 已发出的 commit 条数 */
+  const atSentence: Array<{ stamp: number | undefined; seq: number; commits: number }> = [];
+  asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    onSentence: (_text, _index, commitSeq) => {
+      atSentence.push({
+        stamp: commitSeq,
+        seq: asr.commitSeq(),
+        commits: socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+      });
+    },
+    socketFactory: () => asSocket(socket),
+  });
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  socket.message({ type: 'session.updated', session: {} });
+
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit(); // 1 号，开始解码
+  asr.feed(Buffer.alloc(640), true); // 窗口里真说了话
+  asr.commit(); // 只能延后
+  assert.equal(asr.commitSeq(), 1);
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 1);
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '第一段。' });
+  assert.deepEqual(
+    atSentence,
+    [{ stamp: 1, seq: 1, commits: 1 }],
+    '交付旧段时还是 1 号，延后的下一发还没发出',
+  );
+  assert.equal(asr.commitSeq(), 2, '下一发在交付之后才占号');
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 2);
+});
+
+test('onPartial 的出生证：解码期属于当前那一发，空闲新开口属于下一发', async () => {
+  const { asr, socket, partialStamps } = await ready();
+  assert.equal(asr.commitSeq(), 0);
+
+  // 还没封过段：用户新开口的增量属于**下一发**（1 号）
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', text: '', stash: '嗯' });
+  assert.deepEqual(partialStamps, [1]);
+
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', text: '', stash: '嗯，见' });
+  assert.deepEqual(partialStamps, [1, 1], '解码期间属于正在解的那一发');
+
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '嗯，见面了。' });
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', text: '', stash: '下' });
+  assert.deepEqual(partialStamps, [1, 1, 2], '解码结束后属于下一发 commit');
+});
+
+test('qwenRealtimeStt 把 commitSeq 透传给宿主（这是唯一的号源）', async () => {
+  // 漏透传不会报错，只会让宿主退回自己数 —— 表现就是旧段判错、自己打断自己。
+  const socket = new FakeSocket();
+  const stt = qwenRealtimeStt({ apiKey: 'k', socketFactory: () => asSocket(socket) });
+  const session = stt.open({ onSentence: () => {} });
+  assert.equal(typeof session.commitSeq, 'function', '可选能力必须真的接上');
+
+  session.feed(Buffer.alloc(640), true); // 懒连接：有音频才建
+  socket.open();
+  await new Promise((r) => { setImmediate(r); });
+  socket.message({ type: 'session.updated', session: {} });
+
+  assert.equal(session.commitSeq?.(), 0);
+  session.commit?.();
+  assert.equal(session.commitSeq?.(), 1);
+  assert.equal(session.commit?.(), undefined, 'commit 仍然不返回值（老调用点不受影响）');
+});
+
+// ------------------------------------------------------- 静态 corpus / language
+//
+// 缺省时一个字段都不能多：旧断言和线上对照都认这份报文。
+// 给了热词或语言才带 `input_audio_transcription`，热路径不再多一次往返。
+
+const MANUAL_SESSION_UPDATE = {
+  type: 'session.update',
+  session: {
+    modalities: ['text'],
+    input_audio_format: 'pcm',
+    turn_detection: null,
+  },
+};
+
+async function sessionUpdateOf(opts: {
+  model?: string;
+  corpusText?: string;
+  language?: string;
+  turnDetection?: 'manual' | 'vad';
+  vadSilenceMs?: number;
+} = {}): Promise<Sent> {
+  const socket = new FakeSocket();
+  const asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    onSentence: () => {},
+    socketFactory: () => asSocket(socket),
+    ...opts,
+  });
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  const update = socket.sent.find((s) => s.type === 'session.update');
+  assert.ok(update, '要先发 session.update');
+  return update;
+}
+
+test('不传 corpusText / language 时 session.update 保持原报文', async () => {
+  const { socket } = await ready();
+  const update = socket.sent.find((s) => s.type === 'session.update');
+  assert.deepEqual(update, MANUAL_SESSION_UPDATE);
+});
+
+test('corpusText 和 language 只有空白时也不改报文', async () => {
+  assert.deepEqual(
+    await sessionUpdateOf({ corpusText: ' \n\t', language: '  ' }),
+    MANUAL_SESSION_UPDATE,
+  );
+});
+
+test('传 corpusText + language 时 session.update 精确带上 input_audio_transcription', async () => {
+  assert.deepEqual(
+    await sessionUpdateOf({
+      model: 'custom-asr',
+      corpusText: '  莱姆 《其主之声》  ',
+      language: '\nzh\n',
+    }),
+    {
+      type: 'session.update',
+      session: {
+        modalities: ['text'],
+        input_audio_format: 'pcm',
+        turn_detection: null,
+        input_audio_transcription: {
+          model: 'custom-asr',
+          language: 'zh',
+          corpus: { text: '莱姆 《其主之声》' },
+        },
+      },
+    },
+  );
+});
+
+test('只给一边时，另一边的键不出现', async () => {
+  assert.deepEqual(
+    (await sessionUpdateOf({ language: '  en  ', corpusText: ' \n' })).session?.input_audio_transcription,
+    { model: 'qwen3-asr-flash-realtime', language: 'en' },
+  );
+  assert.deepEqual(
+    (await sessionUpdateOf({
+      corpusText: '  莱姆\n眼镜  ',
+      language: '   ',
+    })).session?.input_audio_transcription,
+    { model: 'qwen3-asr-flash-realtime', corpus: { text: '莱姆\n眼镜' } },
+  );
+});
+
+test('热词和语言叠在原来的 session 上，不换掉 turn_detection', async () => {
+  assert.deepEqual(
+    await sessionUpdateOf({
+      turnDetection: 'vad',
+      vadSilenceMs: 320,
+      corpusText: '眼镜',
+      language: 'zh',
+    }),
+    {
+      type: 'session.update',
+      session: {
+        modalities: ['text'],
+        input_audio_format: 'pcm',
+        turn_detection: { type: 'server_vad', silence_duration_ms: 320 },
+        input_audio_transcription: {
+          model: 'qwen3-asr-flash-realtime',
+          language: 'zh',
+          corpus: { text: '眼镜' },
+        },
+      },
+    },
+  );
+});
+
+test('qwenRealtimeStt 把 corpusText 和 language 透传到 session.update', async () => {
+  const socket = new FakeSocket();
+  const stt = qwenRealtimeStt({
+    apiKey: 'k',
+    model: 'custom-asr',
+    corpusText: '  眼镜  ',
+    language: ' zh ',
+    socketFactory: () => asSocket(socket),
+  });
+  stt.open({ onSentence: () => {} }).feed(Buffer.alloc(320), true);
+  socket.open();
+  await new Promise((r) => { setImmediate(r); });
+  const update = socket.sent.find((s) => s.type === 'session.update');
+  assert.deepEqual(update?.session?.input_audio_transcription, {
+    model: 'custom-asr',
+    language: 'zh',
+    corpus: { text: '眼镜' },
+  });
+});
+
+test('mergeCorpusText 去注释、去空串、按空白切分并去重', () => {
+  assert.equal(mergeCorpusText(['', '  ', '# 只有注释\n\n#another']), '');
+  // 注释行里的「眼镜不要」不能漏进热词；同一词跨段只留第一次
+  assert.equal(
+    mergeCorpusText([
+      '# 眼镜不要\n眼镜  眼镜',
+      '莱姆\r\n眼镜\n  其主之声  ',
+      '#tail',
+    ]),
+    '眼镜 莱姆 其主之声',
+  );
+  assert.equal(mergeCorpusText(['b a b', 'a c']), 'b a c');
+});
+
+test('mergeCorpusText 截断停在 maxChars 边界', () => {
+  const full = 'abcd efgh';
+  assert.equal(full.length, 9);
+  assert.equal(mergeCorpusText([full], 9), full, '刚好等于上限，整串保留');
+  assert.equal(mergeCorpusText([full], 100), full, '上限更宽，不截');
+  assert.equal(mergeCorpusText([full], 8), 'abcd efg', '超一个字就切到正好上限');
+  assert.equal(mergeCorpusText([full], 8).length, 8);
+  assert.equal(mergeCorpusText([full], 5), 'abcd', '截断点落在分隔空格上时去掉末尾空格');
+  assert.equal(mergeCorpusText([full], 4), 'abcd');
+  assert.equal(mergeCorpusText([full], 3), 'abc');
+  assert.equal(mergeCorpusText([full], 0), '');
+  assert.equal(mergeCorpusText(['ab ab cd'], 4), 'ab c', '先去重再截，不能把重复词算进预算');
+
+  const capped = mergeCorpusText(['词'.repeat(900)]);
+  assert.equal(capped, '词'.repeat(800), '缺省上限 800，截满且不多一个字');
+  assert.equal(mergeCorpusText(['词'.repeat(800)]), '词'.repeat(800));
+  assert.equal(mergeCorpusText(['词'.repeat(799)]).length, 799);
 });

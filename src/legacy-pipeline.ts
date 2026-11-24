@@ -2,7 +2,7 @@
  * 旧的 silero-vad + MiMo 链路（调试/回放用，生产走 main.ts 的阿里云路径）。
  *
  * 从 main.ts 原样搬出：ReplyMode / AudioSink / 双阈值判停常量 /
- * looksComplete / dbSink / speak / Pipeline。
+ * looksComplete / adbSink / speak / Pipeline。
  * **只做搬移，未改行为。**
  */
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';

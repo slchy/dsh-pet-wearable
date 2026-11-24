@@ -4,8 +4,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { EMOTION_STYLES } from '../src/mimo.ts';
-import { BASE_STYLE, EMOTION_LABELS, EMOTIONS, parseEmotion, styleFor } from '../src/emotion.ts';
+import { BASE_STYLE, EMOTION_STYLES, styleFor } from '../src/mimo.ts';
+import { EMOTION_LABELS, EMOTIONS, parseEmotion } from '../src/emotion.ts';
 
 test('八个标签都能认出来，并剥掉标签', () => {
   const cases: Array<[string, string]> = [

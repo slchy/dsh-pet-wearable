@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 对话层的**决策**：给定事件，产出「接下来做什么」。
  *
  * 这里没有 socket、没有 ffmpeg、没有定时器 —— 副作用都以 `CoreEffect` 返回，
@@ -13,7 +13,9 @@ import {
   type DeviceCapabilities,
 } from './devices/primitives.ts';
 import { V1_BASELINE } from './devices/wire-v1.ts';
-import { DialogFsm, type DialogState, type TurnTicket } from './dialog-fsm.ts';
+import { DialogFsm, type DialogFsmContext, type DialogState, type TurnTicket } from './dialog-fsm.ts';
+import { isPreTurnCommit } from './kernel.ts';
+import type { KernelRuntime } from './kernel-runtime.ts';
 import { wantsHighRes } from './hq-intent.ts';
 import type { CaptureRequest } from './photo-inbox.ts';
 import type { ImageAttachment } from './session.ts';
@@ -31,12 +33,17 @@ export function captureFailureHint(failure: CaptureFailure): string {
 }
 
 export type CoreEvent =
-  /** STT 出了一句（还没合并） */
-  | { readonly type: 'sentence'; readonly text: string }
+  /**
+   * STT 出了一句（还没合并）。
+   *
+   * `commitSeq` 是产出这段转写的那一发 ASR commit —— 因果屏障只认它（见
+   * `kernel.ts` 的 `isPreTurnCommit`）。服务端 VAD 的 provider 不知道序号时不传。
+   */
+  | { readonly type: 'sentence'; readonly text: string; readonly commitSeq?: number }
   /** 一句话合并定稿（判停窗口已关） */
   | { readonly type: 'utterance'; readonly text: string }
-  /** STT 的中间结果（插话判据） */
-  | { readonly type: 'partial'; readonly text: string }
+  /** STT 的中间结果（插话判据）。`commitSeq` 同上 */
+  | { readonly type: 'partial'; readonly text: string; readonly commitSeq?: number }
   /** 设备回了一张图，且没有拍照请求在等它 */
   | { readonly type: 'image'; readonly jpeg: Buffer }
   /**
@@ -98,6 +105,17 @@ export interface SessionCoreOptions {
   /** 没人等图时的默认提问 */
   readonly imageQuestion: string;
   readonly log: (line: string) => void;
+  /**
+   * 票据上的 `baseCommitSeq` / `startedAtMs` 从哪来（见 `dialog-fsm.ts` 的
+   * `DialogFsmContext`）。由 `VoiceSession` 注入 —— 只有它认识 ASR。
+   */
+  readonly ticketContext?: DialogFsmContext;
+  /**
+   * 共享的内核运行时。装配层（`DialogRuntime`）传入自己那一个（已按
+   * `initialKernelState(0, agent.lastLedgerLane?.() ?? null)` 播种并绑好端口）；
+   * 不传就由 `DialogFsm` 新建一个 —— 一个会话只该有**一份** `KernelState`。
+   */
+  readonly runtime?: KernelRuntime;
 }
 
 export class SessionCore {
@@ -118,7 +136,7 @@ export class SessionCore {
   constructor(options: SessionCoreOptions) {
     this.options = options;
     this.caps = options.capabilities ?? V1_BASELINE;
-    this.fsm = new DialogFsm(options.log);
+    this.fsm = new DialogFsm(options.log, options.ticketContext, options.runtime);
   }
 
   /** 取消正在等的拍照：解散设备侧流程，并清掉已经在播的旁白。 */
@@ -134,6 +152,17 @@ export class SessionCore {
     ];
   }
 
+  /**
+   * 唯一的内核运行时（相位 + 账本 + 因果裁决都在里面）。
+   *
+   * 一个会话只该有**一份** `KernelState`：`DialogFsm` 是它的门面（`this.fsm.runtime`），
+   * `DialogRuntime` / `TurnRunner` / `VoiceConnection` 拿到的是同一个实例 ——
+   * 这样「状态机说 speaking、内核说 thinking」这类双份状态在结构上不存在。
+   */
+  get runtime(): KernelRuntime {
+    return this.fsm.runtime;
+  }
+
   get phase(): DialogState {
     return this.fsm.state;
   }
@@ -145,6 +174,13 @@ export class SessionCore {
   dispatch(event: CoreEvent): CoreEffect[] {
     switch (event.type) {
       case 'sentence': {
+        // 因果屏障：**唯一**一处判定，谓词在 `kernel.ts`（`isPreTurnCommit`）。
+        // 开轮前就已经录进去的那段迟到转写既不能打断，也不能开轮 —— 它只是那一轮
+        // 自己的后半句（真机「自己后半句杀自己」）。
+        if (isPreTurnCommit(this.runtime.state, event.commitSeq)) {
+          this.options.log('  （开轮前录的那段定稿 → 不当插话，也不开轮）');
+          return [{ type: 'drop', why: 'pre-turn' }];
+        }
         if (isWakeWordOnly(event.text, this.caps.ignorePhrases)) {
           this.options.log('  → 唤醒词，丢弃（不算一轮）');
           return [{ type: 'drop', why: 'wake-word' }];
@@ -157,12 +193,13 @@ export class SessionCore {
         // 一整句「嗯。」却会绕过那道过滤。真机日志里它把正在播的回复打断了
         // （`插话「嗯。」→ 代次 4`），而同一个「嗯」作为中间结果什么都没做。
         // 同一句话不该因为 ASR 有没有加句号而有两种行为。
-        const effects: CoreEffect[] = [];
-        if (!isBackchannelOnly(event.text) && this.fsm.bargeIn(event.text)) {
-          effects.push({ type: 'call', call: { op: 'audio.stop' } });
+        //
+        // 停音频 / 作废轮次 / 结算都由内核在 `bargeIn` 这条事件上声明，`DialogFsm`
+        // 走 `dispatchAndApply` 执行 —— 这里**不补** `audio.stop`，否则就是双份。
+        if (!isBackchannelOnly(event.text)) {
+          this.fsm.bargeIn(event.text, event.commitSeq);
         }
-        effects.push({ type: 'assemble', text: event.text });
-        return effects;
+        return [{ type: 'assemble', text: event.text }];
       }
 
       case 'utterance': {
@@ -239,16 +276,20 @@ export class SessionCore {
       }
 
       case 'partial': {
+        // 因果屏障与定稿共用同一个谓词：开轮前录的那段迟到转写不算插话，也不开轮。
+        if (isPreTurnCommit(this.runtime.state, event.commitSeq)) {
+          return [{ type: 'drop', why: 'pre-turn' }];
+        }
         // 插话判据用「服务端真的解出了字」，不用能量峰值 ——
         // 噪声能骗过峰值，骗不过识别器。能不能打断由状态机定（只有 speaking 算）。
         const bare = event.text.replace(/[\s。.,，!！?？、~～]/g, '');
         if (bare.length < 2) {
           return [];
         }
-        if (!this.fsm.bargeIn(event.text)) {
-          return [];
-        }
-        return [{ type: 'call', call: { op: 'audio.stop' } }];
+        // 副作用全部由内核在 `bargeIn` 上声明（`stopDeviceAudio` / `invalidateTurn` /
+        // `abortEngine` / `settleTurn`），`DialogFsm` 走 `dispatchAndApply` 执行。
+        this.fsm.bargeIn(event.text, event.commitSeq);
+        return [];
       }
 
       case 'image':

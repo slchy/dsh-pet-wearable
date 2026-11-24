@@ -165,6 +165,28 @@ export const EVENTS = {
    */
   judge: 'judge.decide',
 
+  /**
+   * omni 影子旁路：一份 seal 的「封段 → 首块音频」。
+   *
+   * 为什么要它：omni 一体模型能省掉 `①b 定稿 + ② 开轮`，但**必须从封段起跑**
+   * （实测 `response.create` 每推迟 1 ms 首块就晚 1 ms，晚 241 ms 就输给我们）。
+   * 代价是并段/委派轮要 cancel，进而留下脏历史 —— 要不要接管整条快车道，
+   * 只能靠这份数据判。
+   *
+   * `seq` 与 `asr.commit` 同源，两份事件一一对应；`audio_ms` 与 `turn.end` 的
+   * `①b+②+③` **同起点**（都在 `onCommit` 那一行），可以直接相减。
+   */
+  omniShadow: 'omni.shadow',
+
+  /**
+   * 「这一轮会不会走 omni 直出」的判据快照（`{has_lane, lane_ok, text_ok, ok}`）。
+   *
+   * 为什么要它：`path=omni` 没出现时，光看档案分不出是「车道没挂上」「还没起跑」
+   * 「被取消了」「并段轮被 clip 档挡掉」还是「文本判据挡掉」—— 五种原因修法完全不同。
+   * 和 `omni.shadow` 配着看：那个说「测到了」，这个说「为什么没用」。
+   */
+  agentLane: 'agent.lane',
+
   // ---- 设备与下行 ----
   /** v2 设备自报能力 */
   deviceLink: 'device.link',

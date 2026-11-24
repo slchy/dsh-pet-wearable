@@ -4,17 +4,31 @@
 
 ## 状态
 
-**能跑。** `apply()` 会在插件进程内起一份语音栈（内部端口由系统挑），再把 WS 桥接上去，卸载时两边一起收掉。
+**能跑**（`npm install && npm run build` 之后）。`apply()` 会在插件进程内起一份语音栈（内部端口由系统挑），再把 WS 桥接上去，卸载时两边一起收掉。
+
+装配**不是抄一份**：管道判据与热路径装配直接用包① 导出的
+`assemblePipelinePlan()` / `assembleStreamingAgent()`（都在 `src/main.ts`），
+所以 `VOICE_PIPELINE=live|cascade`、快车道、omni 车道、后台汇报、投机这些行为
+与 CLI 逐字同一套代码。`scripts/sync-voice.mjs` 每次构建都会重新同步，漂不了。
+
+与「独立进程」形态**有意不同**的四处：
+
+| 项 | 独立进程 | 本插件 | 为什么 |
+|---|---|---|---|
+| 内层监听端口 | `--listen` 固定 | `0`，靠 `onListening` 拿真实端口 | 省掉「固定端口会不会撞」这条隐式约定 |
+| 停机 | 连接结束 / 进程退出 | `onListening().stop()` | 多标签页要 `serve: true`，而这种模式下**没有任何事件会结束** `runVoiceServer`；没有 `stop()`，卸载插件时监听与控制口都关不掉（泄漏） |
+| TLS | 语音栈自己终结 | 只在 `startWebBridge` 终结，证书读插件自己的 `tls.keyPath/certPath` | 桥用 `net.connect` 连回环，里层套 TLS 根本连不上 |
+| 配置错误 | `process.exit(2)` | 抛异常 | 跑在 dsh 进程里，退出会把宿主一起带走 |
 
 包名已被 `0.0.0-stage` 占住（那个空占位没有 `main`，`import` 会失败）；本仓库的版本尚未发布。
 
 ## 语音栈从哪来
 
-`src/voice/` 是仓根 `src/` 的副本，由 `scripts/sync-voice.mjs` 生成，**不进 git**。`typecheck` 和 `prepack` 都会先跑一次同步。
+`packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/` 和 `demo/`。
 
 为什么不是软连接：实测 npm 11.16 的 packlist **直接跳过 symlink** —— `files: ["src"]`、显式列 `src/voice`、`src/voice/**` 三种写法打出来的 tarball 里都没有链接目标，本地能跑、发出去是空包。
 
-为什么要复制而不是依赖 `dsh-pet-wearable`：包② 要能在没有包① 的情况下装起来，所以不能只留一个 `dependencies` 指过去。代价是两边的 `package.json` 依赖清单得手动对齐。
+为什么要复制而不是依赖 `dsh-pet-wearable`：包② 要能在没有包① 的情况下装起来，所以不能只留一个 `dependencies` 指过去。代价是两边的 `package.json` 依赖清单得手动对齐 —— **漏一个就是编译/运行期才炸**（例如 `undici`：包① 的 `http-agent.ts` 直接引它，web 侧少了它连 `lib/` 都编不出来）。
 
 ## 为什么不用 WebRTC
 
@@ -35,8 +49,15 @@
 不用另外起静态服务器 —— 桥把页面和 WS 发在**同一个端口**，所以：同源（不用配 `origins` 白名单），而且 `http://127.0.0.1` 本身就是安全上下文（`getUserMedia` 才有）。
 
 ```bash
+npm install                # 本包是独立包（仓根没有 workspaces），依赖要在本目录装
 npm run build              # 同步语音栈 + 编译 lib/ + 打包页面
+npm run typecheck          # 不产出文件，只验类型
 ```
+
+`npx tsc --noEmit` 单跑不等于 typecheck：`npm run typecheck` 会先 `sync:voice`，
+副本没同步时缺模块的报错（`Cannot find module './voice/turn-judge.ts'`）才是真的。
+离线验收一把梭：`typecheck` → `build` → `npm pack --dry-run`（后者确认 tarball 里
+`lib/driver.js`、`lib/voice/main.js`、`demo/index.html` 都在）。
 
 `dsh --profile <装了本插件的 profile>` 启动后终端会打出：
 
@@ -60,7 +81,7 @@ dsh: .env sets "DSH_PATCH", which only the launching environment may set
 
 ```powershell
 $env:DSH_BIN  = 'C:\Users\<你>\AppData\Roaming\npm\dsh.cmd'   # 指向 .cmd 垫片，不是 .ps1
-$env:DSH_PATCH = 'C:/dsh-pet-wearable/mcp/camera.yml'
+$env:DSH_PATCH = '<仓库路径>/mcp/camera.yml'
 dsh --profile voice
 ```
 
@@ -68,7 +89,7 @@ dsh --profile voice
 
 ## 打断：v2 发的是 `Call`，不是 `Control`
 
-服务端对 v1 设备发 `Control: stop`，对 **v2 设备（浏览器就是 v2）发的是 `Call {"op":"audio.stop"}`** —— 见 `src/voice/devices/wire-v1.ts` 里那个 `audio.stop → 'stop'` 的翻译，v1 才有这一层。语义写在 `src/voice/devices/primitives.ts`：*「立刻停止播放并清空播放队列（插话）」*。
+服务端对 v1 设备发 `Control: stop`，对 **v2 设备（浏览器就是 v2）发的是 `Call {"op":"audio.stop"}`** —— 见 `src/voice/devices/wire-v1.ts`（仓根 `src/devices/wire-v1.ts` 的同步副本）里那个 `audio.stop → 'stop'` 的翻译，v1 才有这一层。语义写在 `src/voice/devices/primitives.ts`（仓根 `src/devices/primitives.ts` 的同步副本）：*「立刻停止播放并清空播放队列（插话）」*。
 
 所以浏览器客户端必须自己认 `audio.stop` 去 `playback.stop()`。只处理 `Control: stop` 的后果很隐蔽：***一切都正常，只是用户插话之后，已经排进队列的回答还会继续播完***。
 
@@ -87,7 +108,9 @@ dsh --profile voice
 
 ## 回声：要求戴耳机，不做回声消除
 
-整个语音栈**假定声学回声不存在**（见 `src/devices/primitives.ts`：真机眼镜在端侧做 AEC，插件不再重复做），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（默认 −40 dBFS）。
+整个语音栈**假定声学回声不存在**（见 `src/devices/primitives.ts`：真机眼镜在端侧做 AEC，插件不再重复做），服务端没有任何回波抑制，打断判据是绝对能量门 `VOICE_PEAK_DBFS`（两处默认都是 **−30 dBFS**，见 `packages/dsh-voice-web/src/driver.ts` 与仓根 `src/main.ts`）。
+
+**门限与上行增益必须成对看**：门限按**放大后**的电平算。独立进程默认 `MIAI_MIC_GAIN=4`（眼镜 mic 电平低），web 插件默认 **1×** —— 浏览器侧 `getUserMedia` 已经开了 `autoGainControl`，再乘 4 会顶到削波。改其中一个就得回头量另一个。
 
 浏览器这边只有 `echoCancellation: true` 兜一层。**这个项目的决定是：要求戴耳机，不建回波抑制。** 戴耳机之后声学回声路径根本不存在，AEC 只是兜底；外放时残余电平取决于音量、房间、以及浏览器 AEC 的质量，靠调门限是治不了的，而真做自适应滤波是另一个量级的活。
 
@@ -110,6 +133,45 @@ dsh --profile voice
 测量期间请保持安静：页面无法区分「回波」和「你在说话」，你出声会把结果抬高。
 
 用 `tts: silent` 时测不出东西 —— 下行是数字静音，没有可回的声音。
+
+## 离线跑起来（不需要任何密钥）
+
+验「线接没接上」不必先配厂商：`canned`（固定识别结果）+ `silent`（静音下行）+ `echo`
+只走本地回环，装配路径与生产完全相同（同一个 `apply()`、同一条 `runVoiceServer`）。
+
+新建一个独立 profile，别动 `voice` 那个：
+
+```bash
+dsh plugin --profile voicetest add -w link:<仓库路径>/packages/dsh-voice-web
+```
+
+`~/.dsh/profiles/voicetest/cordis.patch.yml`：
+
+```yaml
+- insert:
+    - id: voice-web
+      name: dsh-voice-web
+      config:
+        port: 8791
+        host: 127.0.0.1
+        stt: canned
+        tts: silent
+        agent: echo
+        workDir: <仓库路径>
+```
+
+`dsh --profile voicetest` 之后应当看到：
+
+```
+可替换件 STT=canned  TTS=silent（24000 Hz）
+监听 tcp://127.0.0.1:<随机口>（不鉴权）
+WS 桥监听 ws://127.0.0.1:8791
+web       http://127.0.0.1:8791/   ← 浏览器打开这个地址
+```
+
+内层是**随机口**、外层是配置里的 8791 —— 这就是 `onListening` 在起作用。
+页面 200 / `main.js` 200 / `/../package.json` 404，再加一条 v2 握手
+（收到 `Welcome {"proto":2}`）就说明桥与协议都对上了。
 
 ## 链接
 

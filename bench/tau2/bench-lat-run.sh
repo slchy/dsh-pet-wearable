@@ -14,6 +14,8 @@
 # 环境变量（都有默认值）：
 #   TAU2_DSH_DIR   harness 部署目录，默认 ~/miai-cloud（读它的 .env）
 #   TAU2_PYTHON    装了 tau2 的 python，默认 ~/miai-bench/tau2-bench/.venv/bin/python
+#   VOICE_PIPELINE 调用方在 source .env 之前显式指定的管道；不设则钉死 cascade
+#   TAU2_STT       显式指定 STT。live 且没设它时才补 --stt qwen-realtime
 set -u
 TASK="${1:-18_zh_identity}"
 SECS="${2:-150}"
@@ -27,9 +29,15 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # 命令行里恰好带这串数字的无关进程。
 pkill -f -- '--listen 8766'
 
+# 调用方显式给的 VOICE_PIPELINE 必须在 source .env **之前**抄走。
+# .env 里的 VOICE_PIPELINE=live（或 OMNI_SHADOW=1 + OMNI_ANSWER=full）配 tau2
+# 默认的 --stt aliyun，main.ts 会直接退出。没指定就钉死 cascade。
+CALLER_PIPELINE="${VOICE_PIPELINE:-}"
+
 set -a
 . "$DSH_DIR/.env"
 set +a
+export TAU2_PIPELINE="${CALLER_PIPELINE:-cascade}"
 export TAU2_DSH_TOKEN="$(cat /tmp/bench-token.txt)"
 # SimulationRun 不叫 tau2-lat-*：那个前缀是打点文件专用的，汇总脚本按它通配。
 # 以前叫 tau2-lat-sim.json，汇总时被当成打点读进去，每场都崩在 r['ms'] 上。
@@ -37,11 +45,30 @@ export TAU2_SIM_OUT="/tmp/tau2-sim-${TASK}.json"
 export TAU2_LAT_OUT="/tmp/tau2-lat-${TASK}.json"
 rm -f "$TAU2_LAT_OUT" /tmp/tau2-lat.json /tmp/tau2-lat-sim.json
 
-timeout $((SECS + 60)) "$PYTHON" run_voice.py \
-  --domain retail --task-id "$TASK" --max-steps 200 --timeout "$SECS" --spawn-dsh \
+# cascade 不传 --stt，沿用 run_voice.py 的默认 aliyun。
+# live 必须 qwen-realtime；调用方已经用 TAU2_STT（或事先写进参数的 --stt）指定过就别改写。
+run_args=(
+  --domain retail
+  --task-id "$TASK"
+  --max-steps 200
+  --timeout "$SECS"
+  --spawn-dsh
+  --pipeline "$TAU2_PIPELINE"
+)
+if [ -n "${TAU2_STT:-}" ]; then
+  run_args+=(--stt "$TAU2_STT")
+fi
+if [ "$TAU2_PIPELINE" = "live" ]; then
+  case " ${run_args[*]} " in
+    *" --stt "*) ;;
+    *) run_args+=(--stt qwen-realtime) ;;
+  esac
+fi
+
+timeout $((SECS + 60)) "$PYTHON" run_voice.py "${run_args[@]}" \
   > "/tmp/bench-lat-${TASK}.log" 2>&1
 CODE=$?
-# run_voice.py：0 = reward 非零，1 = reward 为 0（**不是崩了**），2 = 没取到任务，124 = 超时被杀
+# run_voice.py：0 = reward 非零，1 = reward 为 0（**不是崩了**），2 = 没取到任务或管道/STT 不配，124 = 超时被杀
 echo "run_voice 退出码 $CODE（1 表示 reward=0，不是崩溃）"
 grep -E '^=== |工具调用' "/tmp/bench-lat-${TASK}.log"
 

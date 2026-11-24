@@ -7,11 +7,14 @@
  * 走快车道同一个口（`FAST_LANE_*`，默认就是 qwen-flash / DashScope 兼容口），
  * 因为短答由快车道答，它的节奏才决定 ③。
  *
- * 跑法：node scripts/probe-token-cadence.mts
+ * 跑法：node bench/latency/probe-token-cadence.mts
  */
-for (const line of (await import('node:fs')).readFileSync('../../.env', 'utf8').split(/\r?\n/)) {
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+for (const line of readFileSync(resolve(import.meta.dirname, '..', '..', '.env'), 'utf8').split(/\r?\n/)) {
   const m = /^([A-Z_]+)=(.*)$/.exec(line.trim());
-  if (m !== null && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+  if (m !== null && m[1] !== undefined && m[2] !== undefined && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
 }
 
 const apiKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();

@@ -14,8 +14,19 @@
  *   没有麦克风也能验证 agent→TTS→下发整条链）
  * - `POST /control`     → 原样下发一条控制串（**只给调试用**：`stop_capture` /
  *   `start_capture` 这类"要让设备配合做动作"的实验，没法从对话里自然触发）
+ *
+ * <h2>进程/服务级常驻，不是每条连接一个</h2>
+ *
+ * 端口是固定的，所以**一个进程只开一个控制口**；设备重连不要关掉再开：
+ * 旧 server 可能还握着端口（keep-alive 长连接要等 `closeAllConnections()` 才真放），
+ * 新连接立刻 bind 就 `EADDRINUSE`，而且那个还活着的旧 server 会把 `/say`、
+ * `take_photo` 路由给**上一条已经关闭的连接** —— 现场表现是「手机重连一次之后，
+ * MCP 拍照就全都没反应了」。
+ *
+ * 连接上来时 {@link ToolControl.setHandlers} 热切换，断开时传
+ * `setHandlers(null, 自己)`：所有权令牌保证旧连接的迟到断开不会把已经接管的新连接清掉。
  */
-import { createServer, type Server } from 'node:http';
+import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { DeviceCapabilities } from './devices/primitives.ts';
 import type { PhotoOutcome } from './photo-inbox.ts';
 
@@ -41,37 +52,75 @@ export interface ToolControlHandlers {
   readonly log?: (line: string) => void;
 }
 
+/** 跟着设备走的等图预算：v1 手机与 v2 眼镜的 `hq` 时长并不相同 */
+export interface ToolControlTimeouts {
+  /** `spp` 等图的硬上限（收件箱自己也会超时，这里只是兜底） */
+  readonly photoTimeoutMs?: number;
+  /** `hq` 等图的硬上限：要覆盖「建 P2P 15 s + 等用户按快门 25 s」 */
+  readonly hqTimeoutMs?: number;
+}
+
 export interface ToolControlOptions {
   readonly port: number;
   /** `spp` 等图的硬上限（收件箱自己也会超时，这里只是兜底） */
   readonly photoTimeoutMs: number;
   /** `hq` 等图的硬上限：要覆盖「建 P2P 15 s + 等用户按快门 25 s」 */
   readonly hqTimeoutMs?: number;
-  readonly handlers: ToolControlHandlers;
+  /** 初始绑定的连接；进程级常驻时通常先传 `null`，等第一条连接上来再 {@link ToolControl.setHandlers} */
+  readonly handlers: ToolControlHandlers | null;
 }
 
 export interface ToolControl {
   /** 实际监听端口。传 `0` 时由系统分配，读这里拿真实值（测试要用）。 */
   readonly port: number;
-  /** 停止监听。连接结束时必须调用，否则下一个连接会撞端口 */
+  /**
+   * 切换活跃连接（热切换，**不重开端口**）。
+   *
+   * @param handlers 新连接；`null` = 主动断开 / 没有设备
+   * @param expected 所有权令牌。**只在 `handlers === null` 时生效**：仅当当前绑定的
+   *   就是 `expected` 才清空。旧连接断开时一定要带上自己，否则它会把已经接管的新连接
+   *   清掉（弱网重连时「旧连接晚于新连接断开」是常态）。
+   * @param timeouts 随设备更新的等图预算；不传的字段保持原值
+   */
+  readonly setHandlers: (
+    handlers: ToolControlHandlers | null,
+    expected?: ToolControlHandlers | null,
+    timeouts?: ToolControlTimeouts,
+  ) => void;
+  /** 停止监听。**进程退出时**调用；设备重连不要调（改用 {@link ToolControl.setHandlers}） */
   readonly close: () => void;
 }
 
 /**
  * 启动控制口。
  *
- * **每个连接都要新建一个**（端口固定），所以 `error` 必须监听：
- * 上一个连接没关干净时端口会被占，未处理的 `error` 事件会让整个进程退出。
+ * 端口固定，一个进程只开一个；不监听 `error` 的话，端口被占时未处理的 `error`
+ * 事件会让整个进程退出。
  */
 export function startToolControl(options: ToolControlOptions): ToolControl {
-  const { handlers } = options;
-  let photoInFlight = false;
+  /** 当前接管控制口的连接；`null` = 没有设备（进程刚起 / 全部断开） */
+  let active = options.handlers;
+  let photoTimeoutMs = options.photoTimeoutMs;
+  let hqTimeoutMs = options.hqTimeoutMs;
+  /**
+   * 在途拍照的身份令牌。
+   *
+   * 用对象而不是布尔：切换连接时，旧请求的 `.then` / 超时回调**照样会跑**，
+   * 它们若无脑写 `photoInFlight = false`，就会把新连接刚发起的拍照标记清掉
+   * （409 并发保护失效，两张图混在一个响应上）。结算时只认自己的令牌。
+   */
+  let inFlight: object | null = null;
+
+  const noDevice = (res: ServerResponse): void => {
+    res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
+      .end('no device connected');
+  };
 
   const server: Server = createServer((req, res) => {
     // 能力查询是 GET：MCP 工具进程用它决定暴露哪些工具，不做任何硬件动作。
     // 没有连接时回 503，工具进程据此认为「此刻没有可用的拍照能力」。
     if (req.method === 'GET' && req.url === '/capabilities') {
-      const caps = handlers.capabilities?.() ?? null;
+      const caps = active?.capabilities?.() ?? null;
       if (caps === null) {
         res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
           .end('{"error":"no-device"}');
@@ -84,6 +133,13 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
 
     if (req.method !== 'POST') {
       res.writeHead(404).end();
+      return;
+    }
+
+    // 一条请求全程只认开始时的那个连接：中途被热切换时，不要把半条请求发给新设备
+    const handlers = active;
+    if (handlers === null) {
+      noDevice(res);
       return;
     }
 
@@ -134,24 +190,32 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
     const wantHq = req.url === '/take_photo_hq';
     const shooter = wantHq && handlers.takePhotoHq !== undefined ? handlers.takePhotoHq : handlers.takePhoto;
 
-    if (photoInFlight) {
+    if (inFlight !== null) {
       res.writeHead(409, { 'content-type': 'text/plain; charset=utf-8' })
         .end('已有拍照请求在途');
       return;
     }
 
-    photoInFlight = true;
+    const token: object = {};
+    inFlight = token;
+    /** 只清掉**自己那一次**的在途标记（切换连接后可能已经属于别人） */
+    const settle = (): void => {
+      if (inFlight === token) {
+        inFlight = null;
+      }
+    };
+
     const timer = setTimeout(() => {
-      photoInFlight = false;
+      settle();
       if (!res.writableEnded) {
         res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
           .end('等图超时');
       }
-    }, wantHq ? (options.hqTimeoutMs ?? options.photoTimeoutMs) : options.photoTimeoutMs);
+    }, wantHq ? (hqTimeoutMs ?? photoTimeoutMs) : photoTimeoutMs);
 
     void shooter().then((outcome) => {
       clearTimeout(timer);
-      photoInFlight = false;
+      settle();
       if (res.writableEnded) {
         return;
       }
@@ -170,7 +234,7 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
       res.end(jpeg);
     }).catch((error: Error) => {
       clearTimeout(timer);
-      photoInFlight = false;
+      settle();
       if (!res.writableEnded) {
         res.writeHead(500).end(`拍照失败：${error.message}`);
       }
@@ -178,7 +242,7 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
   });
 
   server.on('error', (error: Error) => {
-    handlers.log?.(`  ✗ 控制口 ${options.port}: ${error.message}`);
+    active?.log?.(`  ✗ 控制口 ${options.port}: ${error.message}`);
   });
   server.listen(options.port, '127.0.0.1');
 
@@ -187,12 +251,35 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
       const address = server.address();
       return typeof address === 'object' && address !== null ? address.port : options.port;
     },
+    setHandlers: (handlers, expected, timeouts) => {
+      const previous = active;
+      if (handlers === null) {
+        // 所有权令牌：旧连接迟到的断开不许清掉已经接管的新连接
+        if (expected !== undefined && previous !== expected) {
+          return;
+        }
+        active = null;
+      } else {
+        // 新连接总是接管（重连时新连接可能先于旧连接建立）
+        active = handlers;
+      }
+      if (timeouts?.photoTimeoutMs !== undefined) {
+        photoTimeoutMs = timeouts.photoTimeoutMs;
+      }
+      if (timeouts?.hqTimeoutMs !== undefined) {
+        hqTimeoutMs = timeouts.hqTimeoutMs;
+      }
+      if (active !== previous) {
+        // 旧连接卡死的拍照不能把新连接永久锁在 409 里；它迟到的结算按令牌认领，
+        // 不会碰到新连接刚发起的这一张
+        inFlight = null;
+      }
+    },
     close: () => {
       server.close();
       // `close()` 只是停止**接受**新连接；已经建立的长连接（工具进程、keep-alive）会
-      // 一直占着端口，于是下一条设备连接绑定同一个端口就 EADDRINUSE —— 那个旧 server
-      // 还在活着，并且把 `/say`、`take_photo` 路由给**上一条已关闭的连接**。
-      // 实测：手机重连一次之后，MCP 拍照就全都没反应了。
+      // 一直占着端口，于是下一个 server 绑定同一个端口就 EADDRINUSE —— 那个旧 server
+      // 还活着，并且把 `/say`、`take_photo` 路由给它自己那份已经死掉的 handlers。
       server.closeAllConnections();
     },
   };

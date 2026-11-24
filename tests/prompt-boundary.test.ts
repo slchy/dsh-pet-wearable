@@ -5,16 +5,17 @@
  *
  * - `agent.ts` 的 `VOICE_SYSTEM` → **DeepSeek**。管身份、性格、措辞、场景、标签。
  *   它产出的正文会被念出来，所以这里只放"怎么说人话"。
- * - `emotion.ts` 的 `BASE_STYLE` / `EMOTIONS` → **TTS**。管音色、语速、情绪起伏。
+ * - `mimo.ts` 的 `BASE_STYLE` / `EMOTION_STYLES` → **TTS**。管音色、语速、情绪起伏。
  *   这里写的任何一句都不会进模型上下文，只影响合成。
  *
- * 唯一的接口是**标签**：DeepSeek 在开头写 `[开心]`，`emotion.ts` 把它翻成风格。
+ * 唯一的接口是**标签**：DeepSeek 在开头写 `[开心]`，`emotion.ts` 把它解析成情绪 key，
+ * 再由 provider 把它翻成自己的风格串。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { cleanForSpeech } from '../src/agent.ts';
-import { BASE_STYLE, EMOTION_STYLES } from '../src/emotion.ts';
+import { BASE_STYLE, EMOTION_STYLES } from '../src/mimo.ts';
 
 test('TTS 侧的风格串里不能出现给人看的格式（markdown / 标签）', () => {
   // `EMOTIONS` 是 boolean 表（只有 key 有用），风格串在 `EMOTION_STYLES` 里

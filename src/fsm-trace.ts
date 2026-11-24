@@ -20,6 +20,8 @@
  * `skipped`，不拿「没记录」冒充「没问题」（与 `latency-report` 的 null 口径一致）。
  */
 
+import { computeTurns } from './latency-report.ts';
+
 /** 档案里的一行（`events.jsonl`）。字段随事件而变，这里只钉住复查要用的。 */
 export interface TraceEvent {
   readonly t: number;
@@ -89,6 +91,32 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   ending: ['closed'],
   closed: [],
 };
+
+/**
+ * 这一条 `agent.lane` 是不是「该 omni 答却退回级联」。
+ *
+ * `agent.lane` 的格式换过一代（见 `docs/state-machines.md` §5.6），判据必须两种都认：
+ *
+ * - **新格式** `{has_lane, lane_ok, ok, lane, why}`：`text_ok` 已经被移除，老的
+ *   `lane_ok:false && text_ok:true` 永远不成立 —— 这条规则曾因此**静默失明**。
+ *   现在看两件事：路由自己说 `why === 'live-down'`（车道挂了、退到级联），
+ *   或者「车道确实挂着（`has_lane`）、没接住（`lane_ok:false`）、选的又不是 dsh」。
+ * - **旧格式** 只有 `{lane_ok, text_ok}`（没有 `lane` 字段）：`text_ok:false`
+ *   表示这一句本来就不归快车道（超字数 / 含数字 / 像长期事实），那一直是交给
+ *   dsh 的，不算违约；只有 `lane_ok:false && text_ok:true` 才是车道没接住。
+ *
+ * 正常交给 dsh 的路由（`action` / `memorable` / `dsh-awaiting` / `stick-to-dsh` /
+ * `no-fast-lane`）不会命中：它们的 `lane === 'dsh'`，用户只会听到一副嗓子。
+ */
+function isLaneFallback(lane: TraceEvent): boolean {
+  if (typeof lane['why'] === 'string') {
+    if (lane['why'] === 'live-down') {
+      return true;
+    }
+    return lane['has_lane'] === true && lane['lane_ok'] === false && lane['lane'] !== 'dsh';
+  }
+  return lane['lane'] === undefined && lane['lane_ok'] === false && lane['text_ok'] === true;
+}
 
 export function checkTrace(input: readonly TraceEvent[], options: AuditOptions = {}): AuditResult {
   // 时间序是前提：档案本来是顺序写的，但审计器不该依赖调用方按序传（稳定排序，
@@ -180,10 +208,19 @@ export function checkTrace(input: readonly TraceEvent[], options: AuditOptions =
   }
 
   // ---------------------------------------------------------------- 逐轮检查
+  //
+  // 分段（停嘴 → 定稿 → 开轮 → 首块）**不在这个文件里算**：唯一实现是
+  // `latency-report.computeTurns()`（见 AGENTS.md「一个事实只有一个源」）。
+  // 这里只做字段映射 —— 之前手写过一套 `gate.close` / `asr.sentence` / `tts.first`
+  // 的配对逻辑，两份算法迟早会漂，而两个工具对「哪一轮慢了」说法不一致时，
+  // 没人知道该信哪个。
+  //
+  // `latencies` 与 `spans` 一一对应：两者都由同一串按时间序的 `turn.start` 生成，
+  // `spans` 只是额外记了 `turn.end` / 嵌套，不会漏掉或重排某一轮。
+  const latencies = computeTurns(events);
   const turns: TurnSpan[] = [];
-  /** 已经被某一轮认领的停嘴时刻（一次呼吸只算给第一轮） */
-  const usedStops = new Set<number>();
   for (const [index, span] of spans.entries()) {
+    const latency = latencies[index];
     const nextStartAt = spans[index + 1]?.startAt ?? Number.POSITIVE_INFINITY;
     const loopEnd = span.endAt ?? Number.POSITIVE_INFINITY;
     const inTurn = (ev: string): TraceEvent[] =>
@@ -229,56 +266,72 @@ export function checkTrace(input: readonly TraceEvent[], options: AuditOptions =
       bad(span.startAt, 'turn.tooLong', `第 ${span.no} 轮持续 ${Math.round(span.endAt - span.startAt)} ms`);
     }
 
-    // 插话必须停音频
+    // 插话必须停音频。
+    //
+    // 时间锚点是**插话那一刻**，不是轮结束：作废之后这一轮还要等取消回来
+    // （委派轮等 dsh 2.5–3.2 s），拿结束时刻 ±500 ms 去找会把正常的 audio.stop
+    // 判成缺失（`235949` 回放第 6 轮就是这么误报的）。
     const endedAt = span.endAt;
     if (span.interrupted && endedAt !== null) {
+      const barge = events.find((e) => e.ev === 'dialog.state'
+        && e.t >= span.startAt
+        && e.t <= endedAt
+        && String(e['from'] ?? '') === 'speaking'
+        && String(e['to'] ?? '') === 'listening'
+        && String(e['why'] ?? '').includes('插话'));
+      const anchor = barge?.t ?? endedAt;
       const stop = events.find((e) => e.ev === 'call.send'
-        && e.t >= endedAt - bargeStopWithin
-        && e.t <= endedAt + bargeStopWithin
+        && e.t >= anchor - bargeStopWithin
+        && e.t <= anchor + bargeStopWithin
         && String(e['json'] ?? '').includes('audio.stop'));
       if (stop === undefined) {
-        bad(endedAt, 'barge.noAudioStop', `第 ${span.no} 轮被判插话，但没发 audio.stop`);
+        bad(anchor, 'barge.noAudioStop', `第 ${span.no} 轮被判插话，但没发 audio.stop`);
       }
     }
 
-    // 分段：停嘴 → 首块。
+    // 分段口径直接取 `computeTurns()`：
+    // - `firstWordMs`  → 停嘴（`gate.close.t - gapMs`）→ 首块
+    // - `asrToTurn`    → `asr.sentence` → `turn.start`
+    // - `turnToAudio`  → `turn.start` → 首块
     //
-    // **一次呼吸只算给一轮**：一句话被 ASR 切成两半时（「嗯，是的。」+「辣椒炒肉。」），
-    // 两个 `turn.start` 共享同一个停嘴时刻；把同一个停嘴记两次，第二轮的
-    // 「停嘴→首块」就会虚高到几秒（实测 5064 / 13757 ms），看起来像回退。
-    // 后面的轮次记 null —— 缺仪表，不拿 0 或别人的时刻冒充。
-    const stopCandidate = [...events]
-      // 窗口只留 8 s：真机实测「停嘴→开轮」最长 1.3 s，留 30 s 会把**上一段话**
-      // 的停嘴也算进来（τ² 那场出现过 20229 ms 的假报警）
-      .filter((e) => e.ev === 'gate.close' && e.t >= span.startAt - 8_000 && e.t <= span.startAt + 30_000)
-      .map((e) => e.t - Number(e['gapMs'] ?? 0))
-      .filter((t) => t <= span.startAt + 500)
-      .pop();
-    // 触发这一轮的句子：必须是**开轮之前**那一句（开轮之后到的是被合并进来的后半句）
-    const sentence = [...events]
-      .filter((e) => e.ev === 'asr.sentence' && e.t <= span.startAt)
-      .pop();
-    let stopBefore: number | undefined;
-    // 只有「这句刚说完就开的轮」才算：排队轮（用户第二句等上一轮念完）的
-    // `turn.start` 离它自己那句话好几秒，拿它算「停嘴→首块」等于把排队时间算进去，
-    // 数字会虚高到十几秒（τ² 那场 10 轮的档案上实测过）
-    const triggeredClosely = sentence !== undefined && span.startAt - sentence.t <= 1_500;
-    if (triggeredClosely && stopCandidate !== undefined && !usedStops.has(stopCandidate)) {
-      stopBefore = stopCandidate;
-      usedStops.add(stopCandidate);
-    }
+    // 与旧手写逻辑的**有意**差异（都以 `computeTurns` 为准）：
+    // - `asr.sentence` 只认「上一轮 `turn.start` 之后」的那句：排队轮不会把上一轮
+    //   的句子错认成自己的触发句（旧逻辑只取最近一条，跨轮也照收）。
+    // - `gate.close` 一个只给一轮用、且从本轮的句子往后找；`firstWordMs` 在
+    //   `① < 0` / `① > gapMs` 时已经是 null（坏样本不参与统计与报警）。
+    //   旧逻辑里的 `triggeredClosely ≤ 1500 ms` 启发式随之删除 —— 排队轮的保护
+    //   由「gate 不跨轮复用」承担；边缘情况有差异时相信 `computeTurns` 的数。
+    const stopToFirstMs = latency?.firstWordMs ?? null;
     turns.push({
       no: span.no,
       startAt: span.startAt,
       endAt: span.endAt,
       interrupted: span.interrupted,
-      stopToFirstMs: first !== undefined && stopBefore !== undefined ? first.t - stopBefore : null,
-      sentenceToTurnMs: sentence !== undefined ? span.startAt - sentence.t : null,
-      turnToFirstMs: first !== undefined ? first.t - span.startAt : null,
+      stopToFirstMs,
+      sentenceToTurnMs: latency?.asrToTurn ?? null,
+      turnToFirstMs: latency?.turnToAudio ?? null,
     });
 
-    if (first !== undefined && stopBefore !== undefined && first.t - stopBefore > maxStopToFirst) {
-      bad(stopBefore, 'timing.stopToFirst', `第 ${span.no} 轮停嘴到首块 ${Math.round(first.t - stopBefore)} ms`);
+    if (stopToFirstMs !== null && stopToFirstMs > maxStopToFirst) {
+      bad(span.startAt, 'timing.stopToFirst', `第 ${span.no} 轮停嘴到首块 ${Math.round(stopToFirstMs)} ms`);
+    }
+
+    // omni 车道：开着就不许有「该它答却退回级联」的轮次。
+    //
+    // 判据随 `agent.lane` 的格式换过一代（见 `isLaneFallback`）：新版移除了
+    // `text_ok`，老的 `lane_ok:false && text_ok:true` 永远不成立，这条规则曾因此
+    // 静默失明。新口径看 `why === 'live-down'`，以及「车道挂着、没接住、又没交给
+    // dsh」；正常路由给 dsh 的轮次一律不算 —— 那本来就该 dsh 答，用户只听到一副嗓子。
+    const lane = inTurn('agent.lane')[0];
+    if (lane !== undefined && isLaneFallback(lane)) {
+      bad(lane.t, 'lane.fallback',
+        `第 ${span.no} 轮该由 omni 答却退回级联（lane=${String(lane['lane'] ?? '?')}，`
+        + `why=${String(lane['why'] ?? '?')}，`
+        + `has_lane=${String(lane['has_lane'] ?? '?')}，`
+        + `state=${String(lane['state'] ?? '?')}，`
+        + `has_resp=${String(lane['has_resp'] ?? '?')}，`
+        + `cancelled=${String(lane['cancelled'] ?? '?')}，`
+        + `pending=${String(lane['pending'] ?? '?')}）`);
     }
   }
 

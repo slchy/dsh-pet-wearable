@@ -8,11 +8,12 @@
  *
  * 跑法：node --experimental-strip-types bench/latency/probe-turnjudge-tts.mts <输出目录>
  */
-const REPO = new URL('../../', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+import { resolve } from 'node:path';
+
 const fs = await import('node:fs');
-for (const line of fs.readFileSync(REPO + '.env', 'utf8').split(/\r?\n/)) {
+for (const line of fs.readFileSync(resolve(import.meta.dirname, '..', '..', '.env'), 'utf8').split(/\r?\n/)) {
   const m = /^([A-Z_]+)=(.*)$/.exec(line.trim());
-  if (m !== null && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+  if (m !== null && m[1] !== undefined && m[2] !== undefined && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
 }
 
 const { cosyVoiceTts } = await import(new URL('../../src/cosyvoice.ts', import.meta.url).href);

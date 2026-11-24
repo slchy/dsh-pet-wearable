@@ -140,7 +140,7 @@ test('模型判 [[DELEGATE]] 时交给 dsh，一个字的正文都不出', async
     asked += 1;
     return sse(['[[DELEGATE]]']);
   });
-  const reply = await agent.reply('帮我查一下订单');
+  const reply = await agent.reply('订单查到哪了');
   assert.equal(asked, 1, '本地不再按词挡 —— 是模型自己判的委派');
   assert.equal(reply.path, 'dsh');
   assert.equal(inner.calls.length, 1);
@@ -337,6 +337,63 @@ test('不投机时绝不动手取消：dsh 里在跑的可能是后台任务的�
   assert.equal(cancelled, 0);
 });
 
+test('委派轮撞插话：放手让 dsh 说完，不取消（取消只作废下游，活儿白干）', async () => {
+  // 真机（第 9、10 轮）：omni 说完垫话转 dsh，用户接着说了一句 → `session/cancel`
+  // → dsh 那一轮判成 aborted。可 bash 还在跑（实测取消后 2 s 才结束），
+  // 所以丢掉的不是那 10 秒，而是唯一那一步总结 —— 用户一个字都没听到。
+  const inner = slowInner(150);
+  let cancelled = 0;
+  let detached = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    detachTurn: () => { detached += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']));
+  agent.attachLiveSink(() => {});
+
+    // 第一轮照常走（生产里也是先有一次 reply 才会拿到 forceDelegate 那一轮）
+    const ticket = { no: 1, gen: 1 };
+    await agent.reply('你好呀', undefined, undefined, { ticket });
+    cancelled = 0; // 第一轮快车道胜出时本来就会取消一条投机，不算这一条
+
+    // `receiptSpoken: true` = omni 已经说过垫话（生产里就是这个形态）
+    const pending = agent.reply('帮我查一下订单', undefined, undefined, {
+      ticket,
+      forceDelegate: 'delegate',
+      receiptSpoken: true,
+    });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  agent.cancelTurn(ticket);
+  await pending;
+
+  assert.equal(detached, 1, 'dsh 那一轮要放手，让它把答案说完');
+  assert.equal(cancelled, 0, '取消只会把答案扔掉 —— 上游的活儿已经干过了');
+});
+
+test('普通轮撞插话照旧取消（这条边界不能一起放松）', async () => {
+  const inner = slowInner(150);
+  let cancelled = 0;
+  let detached = 0;
+  const wrapped: AgentProvider = {
+    ...inner.agent,
+    cancelTurn: () => { cancelled += 1; },
+    detachTurn: () => { detached += 1; },
+  };
+  const agent = agentWith(wrapped, async () => sse(['我在呢。']));
+  agent.attachLiveSink(() => {});
+
+  const ticket = { no: 1, gen: 1 };
+  const pending = agent.reply('帮我查一下订单', undefined, undefined, { ticket });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const before = cancelled;
+  agent.cancelTurn(ticket);
+  await pending;
+
+  assert.equal(cancelled, before + 1, '没在委派（dsh 没起）就是普通取消');
+  assert.equal(detached, 0);
+});
+
 test('取消模式 interrupt 走硬中断而不是 rpc', async () => {
   const inner = slowInner(200);
   let rpc = 0;
@@ -482,7 +539,7 @@ test('dsh 上一条在问话：短回话必须交给 dsh，不能被快模型抢
   );
   agent.attachLiveSink(() => {});
 
-  const first = await agent.reply('帮我查一下订单');
+  const first = await agent.reply('订单查到哪了');
   assert.equal(first.path, 'dsh', '模型判委派 → 交给 dsh');
   const reply = await agent.reply('好的');
   assert.equal(fastCalls, 1, '「好的」是对 dsh 那句问话的回答，不是闲聊');
@@ -502,7 +559,7 @@ test('dsh 上一条不是问话：短回话照旧走快车道（别过度拦）'
   );
   agent.attachLiveSink(() => {});
 
-  await agent.reply('帮我查一下订单');
+  await agent.reply('订单查到哪了');
   const reply = await agent.reply('好的');
   assert.equal(fastCalls, 2, '上一句 dsh 不是问话 → 「好的」照旧问快模型');
   assert.equal(reply.path, 'fast');
@@ -797,7 +854,7 @@ test('禁用委派：提示词不带暗号，模型写出暗号也不转 dsh', a
   });
   agent.attachLiveSink(() => {});
 
-  const reply = await agent.reply('帮我查一下订单');
+  const reply = await agent.reply('订单查到哪了');
 
   assert.ok(!systemMsg.includes('[[DELEGATE]]'), '纯聊天版提示词不该提暗号');
   assert.ok(!systemMsg.includes('委派'), '也不该提「委派」这件事');
@@ -897,4 +954,49 @@ test('对冲：第 2 份赢的时候，插话取消必须掐得住它', async ()
     true,
     '★ 胜出的那份也必须被取消掐住 —— 否则插话之后快模型还在生成、继续往 TTS 推字',
   );
+});
+
+test('判据搬进内核后对外导出不变：fronted-agent 的转出与 turn-router 是同一个函数', async () => {
+  // 拆分（Stage 2A）只搬了实现，**没有搬导出**：外部（含本文件的导入）永远从
+  // `fronted-agent.ts` 拿，拿到的必须还是内核里那一个 —— 否则两份实现迟早漂移。
+  const router = await import('../src/turn-router.ts');
+  const slots = await import('../src/prefetch-slot.ts');
+  const agent = await import('../src/fronted-agent.ts');
+
+  assert.equal(looksLikeAnswer, router.looksLikeAnswer);
+  assert.equal(looksMemorable, router.looksMemorable);
+  assert.equal(agent.looksLikeFollowUp, router.looksLikeFollowUp);
+  assert.equal(agent.acceptsSpeculation, slots.acceptsSpeculation);
+});
+
+test('「算了」且有活儿在跑：取消那一轮，回一句短的，不再交给 dsh', async () => {
+  // 用户显式下令取消是**唯一**会真的取消在跑 dsh 任务的路径：插话只放手
+  // （活儿取消不了，答案跑完回注记忆），"不要了"才是取消。
+  const inner = fakeInner();
+  let cancelled = 0;
+  const busyInner: AgentProvider = {
+    ...inner.agent,
+    dshBusy: () => true,
+    cancelTurn: () => { cancelled += 1; },
+  };
+  const agent = agentWith(busyInner, async () => sse(['不该被问到']));
+
+  const reply = await agent.reply('算了。');
+  assert.equal(cancelled, 1, '要真的发出取消，不能只回一句话');
+  assert.equal(reply.speech, '好，不查了。');
+  assert.deepEqual(inner.calls, [], '取消轮不该再往 dsh 送一轮');
+});
+
+test('「算了」但手上没活儿：它就是一句普通闲聊，不要回执也不要乱取消', async () => {
+  const inner = fakeInner();
+  const idleInner: AgentProvider = {
+    ...inner.agent,
+    dshBusy: () => false,
+    cancelTurn: () => {},
+  };
+  const agent = agentWith(idleInner, async () => sse(['算就算了吧。']));
+
+  const reply = await agent.reply('算了。');
+  assert.notEqual(reply.speech, '好，不查了。', '没有在跑的东西，就别假装替他取消了');
+  assert.equal(reply.speech, '算就算了吧。', '照常走快车道/慢车道');
 });

@@ -208,6 +208,9 @@ def spawn_harness(port: int, bench_dir: str, repo: str, base_env: dict[str, str]
         "export MIAI_ANNOUNCE_FILE=; "
         # 基准配置（向量 meta）+ 实验自变量，一次性导出；`.env` 里那些陈旧值被盖掉。
         # `--stt/--tts` 也在里面，所以下面的命令行**不再重复**（配置只有这一处）。
+        # `VOICE_PIPELINE` 以及 cascade 下的 `OMNI_SHADOW=` / `OMNI_ANSWER=off` 也在这一串里：
+        # 必须写在 `. .env` 之后，否则服务器的 live（或 OMNI_SHADOW=1 + OMNI_ANSWER=full）
+        # 会串进 cascade 回放。
         f"{export_str(base_env)} "
         # 收掉上一场：**按端口认进程，别用 `pkill -f '--listen <port>'`** ——
         # 这条 ssh 命令自己的命令行里就含那串字，pkill 会把当前 shell 一起杀掉，
@@ -250,10 +253,20 @@ def kill_orphan_clients() -> str:
 
 
 def export_str(pairs: dict[str, str]) -> str:
-    """一组 KEY=VALUE → 一条 `export` 语句（多个赋值必须在同一个 export 里）。"""
+    """一组 KEY=VALUE → 一条 `export` 语句（多个赋值必须在同一个 export 里）。
+
+    空值必须保留成 `KEY=`（`export OMNI_SHADOW=` 是合法 bash）。少写这个 `=`
+    就盖不住 `.env` 里已经导出的同名变量，cascade 回放会把 `OMNI_SHADOW=1` 串进来。
+    """
     if not pairs:
         return ""
-    return "export " + " ".join(f"{k}={v}" for k, v in pairs.items()) + "; "
+    parts: list[str] = []
+    for key, value in pairs.items():
+        if value == "":
+            parts.append(f"{key}=")
+        else:
+            parts.append(f"{key}={shlex.quote(value)}")
+    return "export " + " ".join(parts) + "; "
 
 
 def bench_env_pairs() -> dict[str, str]:
@@ -287,6 +300,13 @@ def resolve_config(meta: dict, overrides: dict[str, str]) -> tuple[dict[str, str
     `--stt qwen-realtime` 覆盖，两处打架过一次）。`MIAI_BENCH_ENV` 是**实验自变量**：
     它要改基准必须在这里显式列成「覆盖」，并在 `last.json` 留底。
 
+    `VOICE_PIPELINE` 同样不许从 `.env` 漏进来。回放是 `set -a; . .env` 之后再 export
+    这里的结果；漏写管道时，服务器上的 `VOICE_PIPELINE=live`（或 `OMNI_SHADOW=1`
+    加 `OMNI_ANSWER=full`）会把 cascade 向量跑成 live。所以这里**总是**写出
+    `VOICE_PIPELINE`：显式覆盖 > 向量 meta > 由本次 overrides 里的 OMNI_* 推断 >
+    默认 `cascade`。cascade 再把这次实验没点名的 `OMNI_SHADOW` / `OMNI_ANSWER`
+    盖成空 / `off`。
+
     每项只出一行（值就是最终生效值）；缺了就标 `(缺)`，由调用方拒跑 ——
     没有真相源时必须人工声明，不许落到 `.env`。
 
@@ -317,8 +337,8 @@ def resolve_config(meta: dict, overrides: dict[str, str]) -> tuple[dict[str, str
             rows.append((key, "(缺)", f"meta 里没有，也没显式给 —— 必须指定：{need_hint}"))
 
     for key, value in overrides.items():
-        if key in ("MIAI_STT", "MIAI_TTS"):
-            continue   # 已在上面处理
+        if key in ("MIAI_STT", "MIAI_TTS", "VOICE_PIPELINE"):
+            continue   # STT/TTS 已在上面处理；管道在下面单独定，避免和 .env 各写一处
         effective[key] = value
         rows.append((key, value, "MIAI_BENCH_ENV"))
 
@@ -335,6 +355,46 @@ def resolve_config(meta: dict, overrides: dict[str, str]) -> tuple[dict[str, str
             gain_value,
             "**覆盖向量 meta** ← MIAI_BENCH_ENV" if override else f"向量 meta（micGain={recorded_gain}）",
         ))
+
+    # 管道必须显式出口。优先级：本次 MIAI_BENCH_ENV > 向量 meta.pipeline >
+    # 本次 overrides 里的 OMNI_SHADOW+OMNI_ANSWER 推断 > 默认 cascade。
+    explicit_pipeline = overrides.get("VOICE_PIPELINE", "").strip()
+    if explicit_pipeline != "":
+        normalized = explicit_pipeline.lower()
+        pipeline = normalized if normalized in ("live", "cascade") else explicit_pipeline
+        pipeline_source = "← MIAI_BENCH_ENV"
+    else:
+        recorded_pipeline = str(meta.get("pipeline") or "").strip().lower()
+        if recorded_pipeline in ("live", "cascade"):
+            pipeline = recorded_pipeline
+            pipeline_source = "← 向量 meta"
+        elif (
+            overrides.get("OMNI_SHADOW") == "1"
+            and overrides.get("OMNI_ANSWER", "off").lower() != "off"
+        ):
+            pipeline = "live"
+            pipeline_source = "← 推断(OMNI_SHADOW+OMNI_ANSWER)"
+        else:
+            pipeline = "cascade"
+            pipeline_source = "默认（隔离 .env，避免串入 live）"
+    effective["VOICE_PIPELINE"] = pipeline
+    rows.append(("VOICE_PIPELINE", pipeline, pipeline_source))
+
+    if pipeline == "cascade":
+        # 这次实验没点名的影子开关盖成关。`.env` 里的 OMNI_SHADOW=1 不能跟进
+        # cascade 基线；点名了的（包括空串）保持原样。
+        if "OMNI_SHADOW" not in overrides:
+            effective["OMNI_SHADOW"] = ""
+            rows.append(("OMNI_SHADOW", "", "默认空（隔离 .env 的 OMNI_SHADOW）"))
+        if "OMNI_ANSWER" not in overrides:
+            effective["OMNI_ANSWER"] = "off"
+            rows.append(("OMNI_ANSWER", "off", "默认 off（隔离 .env 的 OMNI_ANSWER）"))
+    elif pipeline == "live":
+        stt = effective.get("MIAI_STT", "")
+        if stt != "" and stt != "qwen-realtime":
+            raise SystemExit(
+                f"VOICE_PIPELINE=live 需要 MIAI_STT=qwen-realtime（当前是 {stt}）"
+            )
 
     return effective, rows, cross_asr
 

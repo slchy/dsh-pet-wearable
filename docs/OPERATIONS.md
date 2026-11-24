@@ -14,13 +14,17 @@
 `dsh` 当子进程拉起来说话（`--agent dsh`）：
 
 ```
-node src/main.ts --listen 8766 --stt aliyun --tts mimo --agent dsh
+node src/main.ts --listen 8766 --stt qwen-realtime --tts cosyvoice --agent dsh
   └─ dsh --profile sdk --patch <patch.yml>      ← stdio JSON-RPC，一辈子跟着父进程
      ├─ mcp/mcp-camera.mjs       拍照
      ├─ mcp/mcp-session.mjs      挂断
      ├─ mcp/mcp-memory.mjs       remember（写 MEMORY.md）
      └─ mcp/mcp-sessions.mjs     搜过去的对话
 ```
+
+这行是现网组合：`--stt qwen-realtime`（DashScope，端点由我们控，`VOICE_COMMIT_MS` /
+`VOICE_STT_COMMIT_MS` 才有意义）＋ `--tts cosyvoice`。换回 NLS 写 `--stt aliyun`；
+`--tts` 留空会兜底成 `mimo`（不是静音）。
 
 `MEMORY.md` 放在 `--work-dir` 目录下，由 dsh 的 `agent-instructions` **每轮注入**
 系统提示词（不用调工具，省一轮往返）；改它会让下一轮前缀缓存失效一次。
@@ -49,6 +53,48 @@ python scripts/deploy_cloud.py                             # 不带就回 full
 
 常驻用一个 systemd 单元就够（`Restart=always`、`RestartSec=3`），`WorkingDirectory`
 指向仓库/部署目录，凭据放 `.env` 且**不进同步范围**。
+
+## 语音主管道
+
+一次进程、一次会话只跑一条语音管道。开关是 `VOICE_PIPELINE`，判据在
+[`src/pipeline-mode.ts`](../src/pipeline-mode.ts) 的 `resolveVoicePipeline` /
+`resolveVoicePipelineFromEnv`。这两个函数不读 `process.env`，只解释调用方传入的那一份记录。
+装配层把返回的 `mode` 传给连接的 `pipelineMode`，并把 `LiveOrchestrator.toEngine()`
+或 `CascadeAgent.toEngine()` 交给 `TurnRunner`。
+
+| `VOICE_PIPELINE` | 结果 |
+|---|---|
+| `live` | omni 直出。前台是 `LiveOrchestrator`，出话泵是 `LiveVoiceEngine`。`FastLlmClient` / `PrefetchSlot` 不加载 |
+| `cascade` | 文本快车道 → TTS。前台是 `CascadeAgent`。`OMNI_ANSWER=full` 不会把发声抢回去 |
+| 未设置，或只有空白 | 按下面的旧变量推断 |
+
+大小写和首尾空白都认：`LIVE`、` cascade ` 都合法。其它值直接失败，错误原文是
+`VOICE_PIPELINE 无效值 "<原文>"：只允许 "live" 或 "cascade"`。
+
+**`live` 启动即失败**（默认严格），避免装成开了其实没声音：
+
+| 缺什么 | 错误 |
+|---|---|
+| `OMNI_API_KEY` 与 `DASHSCOPE_API_KEY` 都空（只含空白也算空）。有 `OMNI_API_KEY` 就用它，否则用 `DASHSCOPE_API_KEY` | `VOICE_PIPELINE=live 需要 OMNI_API_KEY 或 DASHSCOPE_API_KEY` |
+| 装配层传入的 STT 不是 `qwen-realtime` | `VOICE_PIPELINE=live 需要 --stt qwen-realtime（当前是 <名字>）` |
+
+两样都缺时先报 key。按旧变量**推断**出来的 live 走同一套失败条件。
+
+**没写 `VOICE_PIPELINE` 时：**
+
+| `OMNI_SHADOW` | `OMNI_ANSWER` | 推断 |
+|---|---|---|
+| `1` | `full` 或 `clip`（凡不是 `off`） | `live` |
+| `1` | `off`，或未设（未设按 `off`） | `cascade`，并挂只读探针（见下） |
+| 不是精确的 `1` | 任意 | `cascade`，不挂探针 |
+
+**只读探针**（cascade 里量封段→首块，不认领、不发声）：`OMNI_SHADOW=1`、
+`OMNI_ANSWER=off`、音频 key 非空，并且 STT 未指定或就是 `qwen-realtime`。
+显式 `VOICE_PIPELINE=cascade` 时同样可以这样挂。`OMNI_ANSWER` 写成 `full` / `clip`
+时探针不挂，启动说明里会有一句
+`显式 VOICE_PIPELINE=cascade：忽略 OMNI_ANSWER，不接管发声`。
+
+`OMNI_SHADOW` 未设 = 不建连、零成本。回滚见 [OMNI-LANE.md](./OMNI-LANE.md) §12.3。
 
 ## 鉴权与 TLS
 
@@ -163,7 +209,19 @@ node tools/fake-phone.ts --port 8768 --sbc tmp/voice.sbc --tls --ca cert.pem
 
 ## 本机控制口
 
-连接建立后，进程在 `--listen + 2` 端口开一个只绑本机的 HTTP 口（`PHOTO_CTL_PORT` 可覆盖）：
+**控制口是服务级的**：进程起来时建一次（`--listen + 2`，`PHOTO_CTL_PORT` 可覆盖，只绑
+`127.0.0.1`），到进程退出才 `close()`。设备重连**不重开端口**，靠热切换 handlers：
+
+- 连接上来 → `setHandlers(handlers, token)` 接管路由；
+- 连接断开 → `setHandlers(null, 自己)` 摘回「没有设备」，**必须带令牌** —— 旧连接迟到的
+  收尾不许把已经接管的新连接清掉（弱网重连时「旧断开晚于新接管」是常态）；
+- 早先「每条连接建一个」的写法会在重连时 `EADDRINUSE`，而且还在监听的旧 server 会把
+  `/say`、`/take_photo` 路由给**上一条已经关闭的连接** —— 现场表现是「手机重连一次之后，
+  MCP 拍照就全都没反应了」（原委见 [`src/tool-control.ts`](../src/tool-control.ts) 顶部）。
+
+`--serve`（或 `MIAI_SERVE=1`）下允许多条连接并存，但**同一时间只有一个活跃连接**：新连接
+完成鉴权就 `evict()` 掉旧的（断开旧 TCP，共享槽整体交给新连接；旧连接迟到的收尾只收自己
+的 TTS / ASR / 档案，不许再动控制口与播报）。
 
 | 路由 | 作用 |
 |---|---|
@@ -218,6 +276,29 @@ node scripts/said-audit.ts <会话目录>            # 逐轮「用户说了什�
 [`src/latency-report.ts`](../src/latency-report.ts)，字段级说明见
 [TOOLS.md](TOOLS.md) §12.1。
 
+## 诊断探针
+
+[`scripts/probe-omni-inject-speak.mjs`](../scripts/probe-omni-inject-speak.mjs)
+在一条 DashScope Realtime 连接上检查 Pure Live 的空窗汇报：dangling `tool_call`
+（故意不回 `function_call_output`）之后，`conversation.item.create`（`role: user`）
+紧接着 `response.create` 还能不能出声，以及下一轮还记不记得注入的事实。
+这就是 `OmniShadow.speakFromText` 的在线复现。`session.update` 的 instructions
+与工具描述和 `src/persona.ts`、`src/omni-shadow.ts` 逐字一致。口径见
+[OMNI-LANE.md](./OMNI-LANE.md) §10.1 与 §12.5。
+
+```bash
+DASHSCOPE_API_KEY=<key> node scripts/probe-omni-inject-speak.mjs
+```
+
+没有 key 时打印用法并以退出码 2 结束，不发起连接。三轮共用一条连接：
+
+1. 用户让查设备数据。看有没有 `tool_call`，并且不回 `function_call_output`。
+2. 回到 ready 后立刻 `conversation.item.create` + `response.create`，量 `audio_ms`、输出字节、转写、协议错误、有没有再次委派。
+3. 追问第 2 轮注入的事实，看转写里还在不在。
+
+可选环境变量：`OMNI_MODEL`（默认 `qwen3.8-omni-flash-realtime`）、`OMNI_PROBE_PCM`
+（16 kHz / s16le / 单声道裸 PCM，用来代替第 1 轮的文本）。脚本不 import `.ts`，只用已安装的 `ws`。
+
 ## 待补播
 
 后台任务完成时如果没有连接，那句话会落到 `~/.voice-agent/announce.jsonl`
@@ -232,7 +313,37 @@ node scripts/said-audit.ts <会话目录>            # 逐轮「用户说了什�
 （`audioSeconds + playbackTailMs`）。
 
 回执（委派轮那句「我看看。」）虽然也占 `speaking`，但**不走这条**：它只要播完就
-`receiptEnded()` 回到 `thinking`，不等设备回执（`audioDone` 在 `_receiptOnly` 时直接返回）。
+`receiptEnded()` 回到 `thinking`，不等设备回执（`audioDone` 在 `receiptOnly` 为真时直接
+忽略）。这个字段在共享内核 [`src/kernel.ts`](../src/kernel.ts) 的 `dialog` 区域里，
+`DialogFsm` 现在只是 `KernelRuntime` 的薄门面，读的是 `runtime.state.dialog.receiptOnly`。
 
 两种情况的上限都是「估算 + 余量」，事件丢了不会把一轮挂死。改这块之前先看
 `src/turn-runner.ts` 里等待环的注释。
+
+## 上行增益与能量门（成对调，别单动一个）
+
+`MIAI_MIC_GAIN` 和 `VOICE_PEAK_DBFS` 是**一对**：门限按**放大后**的电平算
+（`uplink-pipeline.ts`），所以改增益必须同步改门限，否则「用户开口」的触发点会平移。
+
+标定口径：**放大前**的门限 = `VOICE_PEAK_DBFS − 20·log10(MIAI_MIC_GAIN)`。
+这个值才是「多大声算开口」，换增益时保持它不变。
+
+**代码默认值不是现网值**：`src/main.ts` 里是 `4 / −30`（放大前 −42.0 dBFS），web 插件的
+`packages/dsh-voice-web/src/driver.ts` 是 `1 / −40`；现网 `.env` 用的是下面这对
+`2 / −46`（放大前仍是 −52.0 dBFS）—— 别把源码默认值当成线上配置。
+
+2026-11-23 从 `4 / −40`（放大前 −52.0 dBFS）改成 `2 / −46`（放大前 −52.0 dBFS）：
+
+| | 改前 | 改后 |
+|:---|:---|:---|
+| 增益 | 4×（+12 dB） | 2×（+6 dB） |
+| 门限（放大后） | −40 dBFS | −46 dBFS |
+| 触发点（放大前） | −52.0 dBFS | −52.0 dBFS（不变） |
+| 真机峰值落点 | **+5.4 … +0.5 dBFS → 每场都硬削波** | −0.6 … −5.5 dBFS |
+
+起因：7 份真机档案的**放大前**峰值是 −6.6 … −11.5 dBFS，乘 4 之后全部越过 0 dBFS，
+日志里 `电平 峰值` 频繁报 `-0.0 dBFS`。削波发生在辅音和重音上，mSBC 窄带下
+生僻词/书名识别率会雪崩（`20261123-051448` 第 6 轮把《其主之声》听成《基础之森》）。
+
+`电平 峰值` 报的是**放大后**。再出现 `-0.0` 就说明还有人声比这批更响，
+下一档是 `1.5 / −48.5`（放大前同样是 −52.0）。

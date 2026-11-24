@@ -206,6 +206,27 @@ test('热词表：只有配置了真 ID 才下发 vocabulary_id', async () => {
   assert.equal(withVocab['vocabulary_id'], 'voc-123');
 });
 
+// ---------------------------------------------------------------- 因果出生证
+//
+// NLS 由**服务端 VAD** 判句，客户端根本没有「第几发 commit」这个概念。
+// 所以 `SentenceEnd` 的第三个参数必须是 `undefined`，不能硬编一个序号：
+// `causal.ts` 把 `undefined` 解释为「没有因果坐标」→ 一律判「不是旧段」，
+// 宁可让一次插话通过，也不能凭空吞掉一轮回答。
+
+test('SentenceEnd 不带 commitSeq（服务端判句，没有客户端封段号）', async () => {
+  const stamps: Array<number | undefined> = [];
+  const onSentence = (_text: string, _index: number, commitSeq?: number): void => {
+    stamps.push(commitSeq);
+  };
+  const { asr } = makeAsr({ onSentence });
+  const ws = await connectReady(asr);
+
+  ws.msg('SentenceEnd', { result: '你好', index: 1 });
+  await tick();
+
+  assert.deepEqual(stamps, [undefined]);
+});
+
 // ---------------------------------------------------------------- 预热
 //
 // token 缓存必须是**进程级**的：`open()` 每台设备 new 一个实例，缓存若跟着实例走，

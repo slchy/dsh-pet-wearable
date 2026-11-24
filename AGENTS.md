@@ -1,12 +1,20 @@
 # 协作约定
 
-## 开工先读运维记录
+## 开工先读运维记录（如果本机有的话）
 
 **部署形态、密钥与环境变量在哪、设备怎么装 App、协议三层、bench 与生产怎么共存 ——
-全部在 [docs/OPS-RECORD.md](docs/OPS-RECORD.md)。**
+这些事实记在 `docs/OPS-RECORD.md`。**
 
-那份是**核对过的事实清单**（末尾写了怎么重新核对），不是设计文档。别靠上下文记忆：
-本项目多次出现「把 bench 的临时做法当历史协议」「以为密钥在本机」这类错误，每次都浪费一轮。
+那份文件**已经移出版本库并写进 `.gitignore`**：它含真实主机、证书与设备信息，
+只作为**本机私有运维台账**存在。所以：
+
+- 本机有这份文件 —— 先读它。里面是**核对过的事实清单**（末尾写了怎么重新核对），
+  不是设计文档；
+- 本机没有 —— 不要去找、也不要从别处猜，直接以 `src/` 与 `docs/` 的现行内容为准。
+
+别靠上下文记忆：本项目多次出现「把 bench 的临时做法当历史协议」「以为密钥在本机」
+这类错误，每次都浪费一轮。
+
 ## 生产级手段：先说，再动手
 
 **自动化 / 自愈 / 监控这类"生产级"的东西，加之前先讨论，不要直接实现。**
@@ -69,6 +77,20 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 - 【情绪标签】那行的八个标签必须与 `src/emotion.ts` 的 `EMOTION_LABELS` 一致，
   `tests/profile-prompt.test.ts` 会卡住不一致。
 
+### 代码层短人设也只写一份
+
+全量系统人设是 `personaPrefix`；但快车道与 omni 这两条**不走 dsh 系统提示词**的
+链路，各自只有一个 `instructions` 字段。它们的身份头统一从
+[`src/persona.ts`](src/persona.ts) 导出（`PERSONA_NAME` / `OMNI_SHORT_INSTRUCTIONS` /
+`FAST_LANE_PERSONA_HEADER`）。`LIVE_BACKEND_TASK_DIRECTIVE` 与 `buildLiveReportPrompt`
+也住在同一份 [`src/persona.ts`](src/persona.ts) 里，跟这三个放在一起。
+**不要在 `fronted-agent.ts` / `omni-shadow.ts` 里手写字面量**。两处抄一份的下场是
+「只改了一边，用户听出换了个人」—— 而代码不会报错。
+
+`tests/profile-prompt.test.ts` 守着同源：名字、定位、身份措辞要能被同一个来源解释，
+`personaPrefix` 里那八个标签也必须与 `EMOTION_LABELS` 对齐（快车道六种是刻意的既有
+行为，见 `persona.ts` 注释，别顺手「修正」成八种）。
+
 ## 跨层数据要一路接到底
 
 **一处产生、另一处需要的数据，中间每一层的签名都必须带上它。** 用可选字段
@@ -81,9 +103,56 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 | 情绪标签 | 模型回复开头 `[开心]` | `providers.ts` 的 `setAnnouncer` 只声明了 `speech` | 后台汇报永远平静语气 |
 | 电量 / 佩戴 | 设备上行 `{"kind":"power","percent":77}` | 只喂给宠物环，`agent` 那条路上没有 | 问「眼镜还剩多少电」，答「读不到，没有接口」 |
 | 情绪标签（离线） | 同上 | `announceStore` 只存 `text` | 离线攒的播报补播时又变回平静 |
+| 「放手」的答复 | `DshSession.onDetachedAnswer` | `DshAgent` **根本没实现 `detachTurn()`**，而 `FrontedAgent` 写的是 `inner.detachTurn?.(ticket)` | 插话后委派轮跑完既没播报也没回注，日志里连一行都不出（上线以来一次没生效） |
+| `voiced`（门控后的人声态） | 能量门 | `qwen-realtime-asr` 的 provider 包装写成 `feed:(pcm)=>asr.feed(pcm)` | 尾静音过滤上线一次没生效，幻觉定音照样入库 |
+
+**可选能力的透传已经不再靠手抄**：`src/keepalive.ts` 的 `trackActivity()` 用 `Proxy`
+自动转发 `AgentProvider` 上的所有属性，只有 `reply` 被包一层记账 —— 以后新加的可选
+方法（甚至运行时才挂上去的）都会自动透传。两条实现细节别改：`Reflect.get` 的第三参
+必须是 `target`（私有字段的 getter 会在 receiver 上找不到槽），方法要 `.bind(target)`。
+
+仍然要守的是**别的包装层**：任何自己实现 `AgentProvider` 再转发的模块，都得逐项透传。
+`tests/wiring-floor-cancel.test.ts` 卡"生产装配真的接上了"这条。
 
 排查套路：`grep` 数据名，把**每一个**出现点列出来，逐个问「这里是传进来了，还是只是
 在这里定义 / 打印 / 存档」。只在定义处和终点出现、中间跳过的，就是断点。
+
+## 判据放哪儿：三种时间 + 一个家
+
+**全双工链路上的"灵异 bug"几乎都是把「物理到达时刻」当成了因果顺序。** 判据按性质选尺子：
+
+- **因果**（打断算不算数、这份回答归谁）→ 只比序号：`commitSeq` / 票据 `{no, gen}`。
+  唯一的家是 [`src/causal.ts`](src/causal.ts)。**一秒都不看表。**
+- **播放进度**（听到多少、少听没少听）→ 只用媒体时间（字节 / 采样率）。
+  唯一的家是 [`src/engine-contract.ts`](src/engine-contract.ts) 的 `outcomeOf()`。
+- **超时**（等多久算超时、轮询间隔）→ 才用墙钟 `clock.now()`。
+
+**同一件事不许有两个算法**：`TurnRunner` 曾经自己算一遍 `heard`/`truncated`，
+与 `outcomeOf` 各一份，改一处就漂。现在它只喂事实（`audioSent` / `devicePlayed` /
+`ticketInvalidated` / `turnEnded`），结算只取 [`src/kernel.ts`](src/kernel.ts) 的意图。
+
+相位的家也在这里：`DialogFsm` 已收口成 [`src/kernel.ts`](src/kernel.ts) +
+[`src/kernel-runtime.ts`](src/kernel-runtime.ts) 的**薄门面** —— 它只把方法调用翻译成
+`KernelEvent`、只读 `runtime.state.dialog`，自己不再持有 `turn` / `gen`。回注口径
+（`inject: 'spoken' | 'unspoken' | 'none'`）与因果屏障也唯一归口在 `kernel.ts`，
+执行层照单执行，不许按 `audioBytes` 再判一遍。
+
+- 内核 `Effect`（`stopDeviceAudio` / `invalidateTurn` / `abortEngine` / `settleTurn`）
+  由 `DialogRuntime` 通过 `KernelRuntime.attachPorts()` + `dispatchAndApply()` 唯一执行，
+  **不在 `SessionCore` 里另发一份 `call:audio.stop`**。
+- 因果旧段拦截唯一归口在 `kernel.ts::isPreTurnCommit`（`commitSeq` 经 `SessionCore`
+  一路传进 `bargeIn`），**不在 `voice-session.ts` 保留前置副本**（`fromPreTurnSegment` 已删）。
+- `TurnRunner` 已收成**一条统一引擎泵**：`run()` 只消费 `FastVoiceEngine.respond`
+  （`LiveVoiceEngine` / `CascadeVoiceEngine` / 旧装配兜底的 `AgentEngineAdapter`）。
+  启动期用 `VOICE_PIPELINE=live | cascade` 显式二选一
+  （[`src/pipeline-mode.ts`](src/pipeline-mode.ts)），会话内严格互斥 ——
+  Pure Live 是 `LiveOrchestrator` + `BackgroundTaskBus`，Pure Cascade 是 `CascadeAgent`。
+- 账本同源与 `step()` 结构：`KernelPorts.settleTurn` 按 `{no, gen}` 票据回写
+  `FrontedAgent` 的 `ConversationLedger`（`reconcileTurnOutcome` / `reconcileOutcome`），
+  重连由 `agent.lastLedgerLane()` 播种 `initialKernelState`；`kernel.ts` 的 `step()`
+  已按区域拆为 `stepInput` / `stepPlayback` / `stepDialog`。
+
+改判定先看 [ADR-0003](docs/adr/0003-deterministic-kernel.md) 与 `state-machines.md` §5.9。
 
 ## 示例不要用真实地址
 

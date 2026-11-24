@@ -34,6 +34,16 @@ export interface EnergyGateOptions {
 export interface EnergyGateDecision {
   /** 这块音频是否应当送进 ASR */
   readonly forward: boolean;
+  /**
+   * 这一块**本身**有没有超过门限的有声帧。
+   *
+   * 与 {@link forward} 是两件事：`forward` 包住 `holdMs` 尾巴（默认 2 s），
+   * 只说明「门还开着、这块该推给 ASR」；`voiced` 才是「这块真有声音」。
+   * 封段发生在静音 20 ms 时，之后还有 ~1980 ms 的块满足 `forward` 却没有声音 ——
+   * 凡是按「有声」而不是按「门开着」做判断的下游（omni 影子旁路就是），
+   * 必须用这个字段，**不要自己按能量重算**：两处门限一漂移就分不出是丢字还是灌静音。
+   */
+  readonly voiced: boolean;
   /** 刚开门时附带的值：触发开门的那块音频的峰值与补推的预卷 */
   readonly opened?: {
     readonly peakDbfs: number;
@@ -44,9 +54,17 @@ export interface EnergyGateDecision {
   readonly closed: boolean;
   /** 关门时距上次「有声」过去了多久 —— 用来区分「真的安静」和「上行断流」 */
   readonly closedGapMs?: number;
+  /**
+   * 距最近一块**有声**音频过去了多久（ms）。
+   *
+   * 这是全链路**唯一**的静音累计：封段（20/150）、投机（100）、判停（200）
+   * 三个阈值都该读它，而不是各自按能量重算一遍（那正是"配置写 20 ms、实际门槛
+   * 92 ms 还查不出来"的来源）。`voiced` 那一块本身返回 0。
+   */
+  readonly silenceMs: number;
 }
 
-const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false };
+const IDLE_DECISION: EnergyGateDecision = { forward: false, closed: false, voiced: false, silenceMs: 0 };
 
 export class EnergyGate {
   private readonly options: EnergyGateOptions;
@@ -82,6 +100,8 @@ export class EnergyGate {
         return {
           forward: true,
           closed: false,
+          voiced: true,
+          silenceMs: 0,
           opened: {
             peakDbfs,
             preroll,
@@ -89,7 +109,7 @@ export class EnergyGate {
           },
         };
       }
-      return { forward: true, closed: false };
+      return { forward: true, closed: false, voiced: true, silenceMs: 0 };
     }
 
     if (!this.open) {
@@ -102,8 +122,8 @@ export class EnergyGate {
     const gapMs = this.now() - this.lastVoiceAtMs;
     if (gapMs > this.options.holdMs) {
       this.open = false;
-      return { forward: true, closed: true, closedGapMs: gapMs };
+      return { forward: true, closed: true, voiced: false, closedGapMs: gapMs, silenceMs: gapMs };
     }
-    return { forward: true, closed: false };
+    return { forward: true, closed: false, voiced: false, silenceMs: gapMs };
   }
 }

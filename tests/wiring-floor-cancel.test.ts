@@ -16,6 +16,8 @@ import { DialogRuntime } from '../src/app/dialog.ts';
 import { AppSession } from '../src/app/session.ts';
 import { DialogFsm } from '../src/dialog-fsm.ts';
 import type { DialogState } from '../src/dialog-fsm.ts';
+import type { FastVoiceEngine } from '../src/engine-contract.ts';
+import type { LiveAudioLane } from '../src/engines/live-voice-engine.ts';
 import { FrontedAgent } from '../src/fronted-agent.ts';
 import { newActivityState, trackActivity } from '../src/keepalive.ts';
 import type { DeviceCapabilities } from '../src/devices/primitives.ts';
@@ -24,7 +26,15 @@ import type {
   DevicePort,
   Voice,
 } from '../src/pet/brain/types.ts';
-import type { AgentProvider, AgentReplyView, TtsProvider } from '../src/providers.ts';
+import { CascadeAgent } from '../src/pipelines/cascade-agent.ts';
+import { LiveOrchestrator } from '../src/pipelines/live-orchestrator.ts';
+import type {
+  AgentAudioAnswer,
+  AgentProvider,
+  AgentReplyView,
+  DelegateReason,
+  TtsProvider,
+} from '../src/providers.ts';
 import type { DownlinkSink } from '../src/transport.ts';
 import { TurnRunner } from '../src/turn-runner.ts';
 
@@ -112,6 +122,14 @@ test('生产装配：一轮走完话筒要放空，中途要通知到 thinking /
     log: () => {},
   });
 
+  // 内核意图的**唯一执行者**就是这份生产端口（`stopDeviceAudio` / `invalidateTurn` /
+  // `abortEngine` / `settleTurn`）。没绑上 = 插话不断音、dsh 白跑，而且一条日志都没有。
+  assert.notEqual(
+    runtime.core.runtime.ports,
+    null,
+    '生产装配必须给内核绑好端口',
+  );
+
   app.userPartial();
   app.userFinal('你好');
   runtime.dispatch({ type: 'utterance', text: '你好' });
@@ -177,4 +195,292 @@ test('生产装配：插话要把取消送到 dsh，票据就是状态机发的�
     `插话必须调内层 cancelTurn，实际：${JSON.stringify(cancels)}`,
   );
   assert.equal(interrupts.count, 0, '插话只走 rpc 取消，不该 SIGINT 杀进程');
+});
+
+/**
+ * 0.6 s 音频（24 kHz / 16 bit）。插话要落在 `speaking` 的播放等待里，
+ * 1 ms 的块会在轮询醒来之前就播完。
+ */
+const LONG_PCM = Buffer.alloc(28_800, 1);
+
+function longTts(): TtsProvider {
+  return {
+    name: 'fake-long',
+    sampleRate: 24_000,
+    async* synthesize() { yield LONG_PCM; },
+  };
+}
+
+function audioAnswer(
+  chunks: readonly Buffer[],
+  transcript: string,
+  delegate?: { readonly reason: DelegateReason; readonly text: string | null },
+): AgentAudioAnswer {
+  return {
+    sampleRate: 24_000,
+    transcript: () => transcript,
+    ...(delegate === undefined
+      ? {}
+      : {
+        delegateReason: () => delegate.reason,
+        delegateText: () => delegate.text,
+      }),
+    chunks: (async function* iterate() {
+      for (const chunk of chunks) yield chunk;
+    })(),
+  };
+}
+
+/**
+ * `main.ts` 的外层：`trackActivity` 包住管线 agent，热路径引擎另注 `DialogOptions.engine`。
+ * 话筒归属仍由 `AppSession.onDialogState` 跟着状态机走。
+ */
+function openSession(
+  agent: AgentProvider,
+  voice: TtsProvider,
+  engine: FastVoiceEngine,
+): { app: AppSession; runtime: DialogRuntime; states: DialogState[] } {
+  const { voice: petVoice, device, agent: petAgent } = petStubs();
+  const app = new AppSession({
+    clock,
+    caps: CAPS,
+    voice: petVoice,
+    device,
+    agent: petAgent,
+    pet: false,
+  });
+  const states: DialogState[] = [];
+  const runtime = new DialogRuntime({
+    clock,
+    caps: CAPS,
+    agent,
+    tts: voice,
+    engine,
+    downlink,
+    imageQuestion: '',
+    photoDir: '',
+    photoTimeoutMs: 1_000,
+    confirmTimeoutMs: 1_000,
+    playbackTailMs: 0,
+    env: {
+      call: () => true,
+      assemble: () => {},
+      end: () => {},
+      onDialogState: (state) => {
+        states.push(state);
+        app.onDialogState(state);
+      },
+    },
+    log: () => {},
+  });
+  return { app, runtime, states };
+}
+
+/** 回答音频已经在播（回执那段 `speaking` 不算）。 */
+function answerPlaying(runtime: DialogRuntime): boolean {
+  return runtime.core.fsm.state === 'speaking'
+    && !runtime.core.fsm.speakingIsReceiptOnly
+    && runtime.core.runtime.state.playback.sentMediaMs > 0;
+}
+
+test('生产装配（级联）：一轮走完话筒要放空，中途要通知到 thinking / speaking', async () => {
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: async (): Promise<AgentReplyView> => ({ text: '好', speech: '好' }),
+  };
+  const cascade = new CascadeAgent({ inner, apiKey: '', log: () => {} });
+  const agent = trackActivity(cascade, newActivityState(Date.now()));
+  const { app, runtime, states } = openSession(agent, tts, cascade.toEngine(tts));
+  try {
+    assert.notEqual(runtime.core.runtime.ports, null, '生产装配必须给内核绑好端口');
+    app.userPartial();
+    app.userFinal('你好');
+    runtime.dispatch({ type: 'utterance', text: '你好' });
+
+    assert.ok(
+      await until(() => states.includes('speaking')
+        && states.at(-1) === 'listening'
+        && app.floor.owner === null),
+      `话筒没放空或相位没走完，实际 ${JSON.stringify(states)} owner=${String(app.floor.owner)}`,
+    );
+    assert.ok(states.includes('thinking'), `没通知到 thinking，实际：${JSON.stringify(states)}`);
+    assert.ok(states.includes('speaking'), `没通知到 speaking，实际：${JSON.stringify(states)}`);
+    assert.equal(
+      app.floor.owner,
+      null,
+      '一轮结束话筒必须放空（否则宠物的 floorFree 永远不成立、announce 也抢不动 reply）',
+    );
+  } finally {
+    runtime.dispose();
+    app.close();
+  }
+});
+
+test('生产装配（级联）：插话把取消送到 dsh，并经 abortEngine 落到 dropPrefetch', async () => {
+  const cancels: Array<{ readonly no: number; readonly gen: number } | undefined> = [];
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: async (): Promise<AgentReplyView> => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { text: '慢车道答复。', speech: '慢车道答复。' };
+    },
+    cancelTurn: (ticket) => { cancels.push(ticket); },
+  };
+  const cascade = new CascadeAgent({ inner, apiKey: '', log: () => {} });
+  const drops: string[] = [];
+  const originalDrop = cascade.dropPrefetch.bind(cascade);
+  cascade.dropPrefetch = (why: string): void => {
+    drops.push(why);
+    originalDrop(why);
+  };
+  const agent = trackActivity(cascade, newActivityState(Date.now()));
+  const voice = longTts();
+  const engine = cascade.toEngine(voice);
+  const aborts: string[] = [];
+  const originalAbort = engine.abortSpeculation.bind(engine);
+  engine.abortSpeculation = (reason): void => {
+    aborts.push(reason);
+    originalAbort(reason);
+  };
+  const { app, runtime } = openSession(agent, voice, engine);
+  try {
+    app.userPartial();
+    app.userFinal('你好');
+    runtime.dispatch({ type: 'utterance', text: '你好' });
+    assert.ok(await until(() => answerPlaying(runtime)), `回答没进 speaking，实际 ${runtime.core.fsm.state}`);
+
+    const ticket = runtime.core.fsm.ticket();
+    runtime.dispatch({ type: 'partial', text: '停一下' });
+
+    assert.equal(runtime.core.fsm.state, 'listening', '插话成立 → 回到 listening');
+    assert.deepEqual(aborts, ['barge_in'], `abortEngine 要走到引擎的 abortSpeculation；实际 ${JSON.stringify(aborts)}`);
+    assert.deepEqual(
+      drops,
+      ['barge_in'],
+      `abortSpeculation 要落到 CascadeAgent.dropPrefetch 一次；实际 ${JSON.stringify(drops)}`,
+    );
+    assert.equal(cancels.length, 1, `cancelTurn 只能送到 dsh 一次；实际 ${JSON.stringify(cancels)}`);
+    assert.equal(cancels[0]?.no, ticket.no);
+    assert.equal(cancels[0]?.gen, ticket.gen);
+    await until(() => runtime.idle);
+  } finally {
+    runtime.dispose();
+    app.close();
+  }
+});
+
+test('生产装配（直播）：一轮 Omni 走完话筒要放空，中途要通知到 thinking / speaking', async () => {
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: async (): Promise<AgentReplyView> => ({ text: '', speech: '' }),
+  };
+  const lane: LiveAudioLane = {
+    willServe: () => true,
+    claim: () => audioAnswer([TINY_PCM], '好'),
+    discard: () => {},
+    interrupt: () => {},
+  };
+  const live = new LiveOrchestrator({ inner, tts, log: () => {} });
+  live.attachAudioLane(lane);
+  const agent = trackActivity(live, newActivityState(Date.now()));
+  const { app, runtime, states } = openSession(agent, tts, live.toEngine());
+  try {
+    assert.notEqual(runtime.core.runtime.ports, null, '生产装配必须给内核绑好端口');
+    app.userPartial();
+    app.userFinal('你好');
+    runtime.dispatch({ type: 'utterance', text: '你好' });
+
+    assert.ok(
+      await until(() => states.includes('speaking')
+        && states.at(-1) === 'listening'
+        && app.floor.owner === null),
+      `话筒没放空或相位没走完，实际 ${JSON.stringify(states)} owner=${String(app.floor.owner)}`,
+    );
+    assert.ok(states.includes('thinking'), `没通知到 thinking，实际：${JSON.stringify(states)}`);
+    assert.ok(states.includes('speaking'), `没通知到 speaking，实际：${JSON.stringify(states)}`);
+    assert.equal(
+      app.floor.owner,
+      null,
+      '一轮结束话筒必须放空（否则宠物的 floorFree 永远不成立、announce 也抢不动 reply）',
+    );
+  } finally {
+    runtime.dispose();
+    live.dispose();
+    app.close();
+  }
+});
+
+test('生产装配（直播）：tool_call 异步派 dsh 后立刻放回话筒；插话只打断 Omni，别查了才取消 dsh', async () => {
+  const calls = { n: 0 };
+  const cancels: Array<{ readonly no: number; readonly gen: number } | undefined> = [];
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const inner: AgentProvider = {
+    name: 'dsh',
+    cancelTurn: (ticket) => { cancels.push(ticket); },
+    reply: async (): Promise<AgentReplyView> => {
+      calls.n += 1;
+      await gate;
+      return { text: '后台结论', speech: '后台结论' };
+    },
+  };
+  const interrupts = { n: 0 };
+  let claims = 0;
+  const lane: LiveAudioLane = {
+    willServe: () => true,
+    claim: () => {
+      claims += 1;
+      if (claims === 1) {
+        return audioAnswer([TINY_PCM], '我帮你看看。', { reason: 'delegate', text: '明天天气' });
+      }
+      return audioAnswer([LONG_PCM], '今天不错。');
+    },
+    discard: () => {},
+    interrupt: () => { interrupts.n += 1; },
+  };
+  const live = new LiveOrchestrator({ inner, tts, log: () => {} });
+  live.attachAudioLane(lane);
+  const agent = trackActivity(live, newActivityState(Date.now()));
+  const { app, runtime, states } = openSession(agent, tts, live.toEngine());
+  try {
+    app.userPartial();
+    app.userFinal('明天天气怎么样');
+    runtime.dispatch({ type: 'utterance', text: '明天天气怎么样' });
+
+    assert.ok(
+      await until(() => states.includes('speaking')
+        && states.at(-1) === 'listening'
+        && app.floor.owner === null
+        && calls.n >= 1
+        && runtime.idle),
+      `tool_call 应不等 dsh 就回到 listening 并放回话筒，实际 states=${JSON.stringify(states)}`
+      + ` calls=${calls.n} owner=${String(app.floor.owner)} idle=${runtime.idle}`,
+    );
+    assert.equal(cancels.length, 0, '回到 listening 时后台 dsh 还在跑，不该被取消');
+
+    runtime.dispatch({ type: 'utterance', text: '你好' });
+    assert.ok(
+      await until(() => answerPlaying(runtime)),
+      `下一轮 Omni 要进入播放才能插话，实际 ${runtime.core.fsm.state}`,
+    );
+    runtime.dispatch({ type: 'partial', text: '等等' });
+
+    assert.equal(interrupts.n, 1, '插话要打断 Omni');
+    assert.equal(cancels.length, 0, '插话不许调用 dsh.cancelTurn');
+    assert.equal(runtime.core.fsm.state, 'listening');
+    assert.ok(await until(() => runtime.idle), '被插话的那一轮要收干净');
+
+    runtime.dispatch({ type: 'utterance', text: '别查了' });
+    assert.ok(
+      await until(() => cancels.length === 1),
+      `「别查了」要调用 dsh.cancelTurn，实际 ${JSON.stringify(cancels)}`,
+    );
+    assert.equal(calls.n, 1, '取消走的是在跑的那一单，不该再开一轮 dsh');
+    await until(() => runtime.idle);
+  } finally {
+    release();
+    runtime.dispose();
+    live.dispose();
+    app.close();
+  }
 });
