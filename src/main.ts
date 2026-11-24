@@ -39,14 +39,14 @@ import {
   type TtsProvider,
 } from './providers.ts';
 import { DshSession } from './session.ts';
-import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
+import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity, type ActivityState } from './keepalive.ts';
 import type { EngineEvent, FastVoiceEngine } from './engine-contract.ts';
 import { FrontedAgent } from './fronted-agent.ts';
 import { MemoryFile } from './memory-file.ts';
-import { resolveVoicePipelineFromEnv, type PipelinePlan } from './pipeline-mode.ts';
+import { resolveVoicePipelineFromEnv, type PipelinePlan, type VoicePipelineMode } from './pipeline-mode.ts';
 import { CascadeAgent, LiveOrchestrator } from './pipelines/index.ts';
 import { expiryWarning } from './tls-cert.ts';
-import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
+import { runVoiceServer, UPSTREAM_SAMPLE_RATE, type VoiceSessionOptions } from './voice-session.ts';
 import { TurnJudge } from './turn-judge.ts';
  import { semanticEndpoint } from './semantic-endpoint.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
@@ -652,10 +652,11 @@ function watchEngineActivity(
 function armLiveOfflineAnnounce(
   orch: LiveOrchestrator,
   store: AnnounceStore | null,
+  log: (line: string) => void,
 ): LiveOrchestrator {
   const persist = (speech: string, emotion?: string): void => {
     const pending = store?.push(speech, emotion) ?? 0;
-    console.log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
+    log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
   };
   const fallbackAnnouncer = (speech: string, emotion?: string): void => {
     persist(speech, emotion);
@@ -680,6 +681,177 @@ function armLiveOfflineAnnounce(
       return typeof value === 'function' ? value.bind(target) : value;
     },
   }) as LiveOrchestrator;
+}
+
+function envNum(env: Record<string, string | undefined>, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function cancelModeOf(env: Record<string, string | undefined>): 'rpc' | 'interrupt' | 'off' {
+  const mode = env['FAST_LANE_CANCEL'];
+  return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
+}
+
+/**
+ * 级联要逐条记忆，直播编排要一整段注记。调用方统一传
+ * `relevant().join('\n')`，这里再拆开。空串是「没有」，不能变成 `['']`。
+ */
+function memoryLines(memory: (text: string) => string): (text: string) => readonly string[] {
+  return (text) => {
+    const block = memory(text);
+    if (block.trim() === '') return [];
+    return block.split('\n');
+  };
+}
+
+function streamingOmniShadow(
+  plan: PipelinePlan,
+  env: Record<string, string | undefined>,
+  log: (line: string) => void,
+): NonNullable<VoiceSessionOptions['omniShadow']> | undefined {
+  const model = env['OMNI_SHADOW_MODEL'];
+  const modelOpt = model === undefined ? {} : { model };
+  const apiKey = (env['OMNI_API_KEY'] ?? env['DASHSCOPE_API_KEY'] ?? '').trim();
+  if (plan.mode === 'live') {
+    const requested = (env['OMNI_ANSWER'] ?? '').trim().toLowerCase();
+    if (requested !== '' && requested !== 'off' && requested !== 'full' && requested !== 'clip') {
+      throw new Error(`OMNI_ANSWER=${requested} 不合法（off|full；clip 已并入 full）`);
+    }
+    if (requested === 'clip') {
+      log('管道      OMNI_ANSWER=clip 已取消，纯 live 按 full 出声');
+    }
+    const omniShadow = { apiKey, serve: 'full' as const, ...modelOpt };
+    log(
+      `影子    omni 前台开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
+      + `**会出声** serve=${omniShadow.serve}）\n`,
+    );
+    return omniShadow;
+  }
+  if (plan.useOmniProbeOnly) {
+    const omniShadow = { apiKey, serve: 'off' as const, ...modelOpt };
+    log(
+      `影子    omni 只读探针（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`,
+    );
+    return omniShadow;
+  }
+  return undefined;
+}
+
+/** {@link assembleStreamingAgent} 的显式依赖。不读 `process.env`。 */
+export interface AssembleStreamingAgentDeps {
+  readonly plan: PipelinePlan;
+  readonly env: Record<string, string | undefined>;
+  readonly dshAgent: AgentProvider;
+  readonly tts: TtsProvider;
+  readonly activity: ActivityState;
+  readonly memory: (text: string) => string;
+  readonly taskStatus: () => string;
+  readonly audit: (name: string, data: Record<string, unknown>) => void;
+  readonly speculate: boolean;
+  readonly announceStore?: AnnounceStore | null;
+  readonly log?: (line: string) => void;
+}
+
+/** `VOICE_PIPELINE=live | cascade` 装配完、可以直接交给 `runVoiceServer` 的那一套。 */
+export interface AssembledStreamingPipeline {
+  readonly mode: VoicePipelineMode;
+  readonly agent: AgentProvider;
+  /** 已经用 `trackActivity` 的同一份 `activity` 包过 `respond()`。 */
+  readonly engine?: FastVoiceEngine;
+  readonly omniShadow?: VoiceSessionOptions['omniShadow'];
+  readonly speakAnnounce?: VoiceSessionOptions['speakAnnounce'];
+  readonly cancelAnnounce?: VoiceSessionOptions['cancelAnnounce'];
+  readonly onFallbackAnnounceSpoken?: VoiceSessionOptions['onFallbackAnnounceSpoken'];
+  readonly dispose: () => void;
+}
+
+/**
+ * `--agent dsh` 的流式热路径。`live` 与 `cascade` 只装其中一条。
+ *
+ * 不读 `process.env`：密钥、档位、快车道旋钮都只看 `env`。
+ * `main()` 在 TTS 就绪后调用，装配结果与原先写在 `main()` 里的那一段相同。
+ */
+export function assembleStreamingAgent(input: AssembleStreamingAgentDeps): AssembledStreamingPipeline {
+  const {
+    plan, env, dshAgent, tts, activity, memory, taskStatus, audit, speculate,
+  } = input;
+  const announceStore = input.announceStore ?? null;
+  const log = input.log ?? ((line: string) => { console.log(line); });
+
+  if (plan.mode === 'live') {
+    // pure-live-assembly：只要直播编排。文本级联不装。
+    // 非法 OMNI_ANSWER 在造编排器之前抛出，免得退出时留下一条没人 dispose 的总线。
+    const omniShadow = streamingOmniShadow(plan, env, log);
+    const orch = new LiveOrchestrator({
+      inner: dshAgent,
+      tts,
+      // 编排器要的是一整段注记；记忆文件返回的是几条，调用方已经拼好。
+      memory,
+      log,
+    });
+    const surfaced = armLiveOfflineAnnounce(orch, announceStore, log);
+    const agent = trackActivity(surfaced, activity);
+    const engine = watchEngineActivity(orch.toEngine(), activity);
+    return {
+      mode: plan.mode,
+      agent,
+      engine,
+      ...(omniShadow === undefined ? {} : { omniShadow }),
+      speakAnnounce: (item, playAudio) => orch.speakBackgroundReport(item, playAudio),
+      cancelAnnounce: () => { orch.cancelBackgroundSpeech(); },
+      onFallbackAnnounceSpoken: (item, interrupted) => {
+        orch.noteFallbackAnnounceSpoken(item, interrupted);
+      },
+      dispose: () => { orch.dispose(); },
+    };
+  }
+
+  // pure-cascade-assembly：只要级联，或关掉快车道后的直连 dsh。不接 omni 发声。
+  const fastModel = env['FAST_LANE_MODEL'] ?? 'qwen-flash';
+  const baseUrl = env['FAST_LANE_BASE_URL'];
+  const fastBaseUrl = baseUrl === undefined ? {} : { baseUrl };
+  const delegateEnabled = (env['FAST_LANE_DELEGATE'] ?? '0') !== '0';
+  let agent: AgentProvider;
+  let engine: FastVoiceEngine | undefined;
+  if (plan.useCascadeFastLane) {
+    const cascadeAgent = new CascadeAgent({
+      inner: dshAgent,
+      apiKey: plan.cascadeKey,
+      model: fastModel,
+      ...fastBaseUrl,
+      timeoutMs: envNum(env, 'FAST_LANE_TIMEOUT_MS', 1_200),
+      speculate,
+      cancelMode: cancelModeOf(env),
+      maxChars: envNum(env, 'FAST_LANE_MAX_CHARS', 14),
+      prefetch: env['FAST_LANE_PREFETCH'] !== '0',
+      partialSpeculate: env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
+      specMinChars: envNum(env, 'FAST_LANE_SPEC_MIN_CHARS', 6),
+      windowChars: envNum(env, 'FAST_LANE_WINDOW_CHARS', 800),
+      keepTurns: envNum(env, 'FAST_LANE_KEEP_TURNS', 0),
+      hedge: envNum(env, 'FAST_LANE_HEDGE', 2),
+      delegateEnabled,
+      taskStatus,
+      memory: memoryLines(memory),
+      log,
+      audit,
+    });
+    agent = trackActivity(cascadeAgent, activity);
+    engine = watchEngineActivity(cascadeAgent.toEngine(tts), activity);
+  } else {
+    agent = trackActivity(dshAgent, activity);
+    engine = undefined;
+  }
+  const omniShadow = streamingOmniShadow(plan, env, log);
+  return {
+    mode: plan.mode,
+    agent,
+    ...(engine === undefined ? {} : { engine }),
+    ...(omniShadow === undefined ? {} : { omniShadow }),
+    dispose: () => {},
+  };
 }
 
 async function main(): Promise<void> {
@@ -749,15 +921,19 @@ async function main(): Promise<void> {
   const omniWillEnable = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime';
 
   let pipelinePlan: PipelinePlan | null = null;
-  let liveOrch: LiveOrchestrator | null = null;
   /**
-   * TTS 造出来之后才挂得上热路径引擎（live 的编排器要它，cascade 的 `toEngine` 也要）。
-   * 返回值走直线赋值：闭包里写的 `let` 出了函数，类型收窄看不见。
+   * 流式装配要等 TTS。这里只收依赖，对象在 {@link assembleStreamingAgent}。
+   * 退出时 dispose 那一份编排器。
    */
-  let finishPipeline: ((tts: TtsProvider) => {
-    readonly orchestrator: LiveOrchestrator | null;
-    readonly engine: FastVoiceEngine | undefined;
-  }) | null = null;
+  let pendingStreaming: {
+    readonly plan: PipelinePlan;
+    readonly dshAgent: AgentProvider;
+    readonly activity: ActivityState;
+    readonly memory: (text: string) => string;
+    readonly taskStatus: () => string;
+    readonly speculate: boolean;
+  } | null = null;
+  let disposeStreaming: () => void = () => {};
 
   // `--listen 0` 仍然点名了这条装配。非法 `VOICE_PIPELINE` 必须在用法横幅之前失败，
   // 否则 `node src/main.ts --agent dsh --stt qwen-realtime --listen 0` 只会打印用法。
@@ -895,61 +1071,29 @@ async function main(): Promise<void> {
       console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
     };
 
+    // 赋值必须写在这个函数体里。写进闭包的话，控制流分析会一直把
+    // `pendingStreaming` 看成初始的 `null`（后面 `?.plan` 会变成 `never`）。
+    const streamingDeps = (plan: PipelinePlan, speculate: boolean): NonNullable<typeof pendingStreaming> => ({
+      plan,
+      dshAgent,
+      activity,
+      // 直播编排要一整段；级联在 assembleStreamingAgent 里再拆回逐条。
+      memory: (text) => memoryFile.relevant(text).join('\n'),
+      taskStatus: () => session.taskStatus(),
+      speculate,
+    });
     if (pipelinePlan !== null && pipelinePlan.mode === 'live') {
-      // pure-live-assembly：只要直播编排。文本级联不装。
       console.log('快车道    关（纯 live：不加载文本级联快车道）');
-      finishPipeline = (tts) => {
-        const orch = new LiveOrchestrator({
-          inner: dshAgent,
-          tts,
-          // 编排器要的是一整段注记；记忆文件返回的是几条。
-          memory: (text) => memoryFile.relevant(text).join('\n'),
-          log: (line) => { console.log(line); },
-        });
-        const surfaced = armLiveOfflineAnnounce(orch, announceStore);
-        liveOrch = orch;
-        agent = trackActivity(surfaced, activity);
-        const rawEngine = orch.toEngine();
-        return { orchestrator: orch, engine: watchEngineActivity(rawEngine, activity) };
-      };
+      pendingStreaming = streamingDeps(pipelinePlan, false);
     } else if (pipelinePlan !== null && pipelinePlan.mode === 'cascade') {
-      // pure-cascade-assembly：只要级联，或关掉快车道后的直连 dsh。不接 omni 发声。
+      let speculate = false;
       if (pipelinePlan.useCascadeFastLane) {
-        const speculate = await resolveSpeculate();
-        const cascadeAgent = new CascadeAgent({
-          inner: dshAgent,
-          apiKey: pipelinePlan.cascadeKey,
-          model: fastModel,
-          ...fastBaseUrl,
-          timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
-          speculate,
-          cancelMode,
-          maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
-          prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
-          partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
-          specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
-          windowChars: envNumber('FAST_LANE_WINDOW_CHARS', 800),
-          keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 0),
-          hedge: envNumber('FAST_LANE_HEDGE', 2),
-          delegateEnabled,
-          taskStatus: () => session.taskStatus(),
-          memory: (text) => memoryFile.relevant(text),
-          log: (line) => { console.log(line); },
-          audit: (name, data) => { auditSlot.emit(name, data); },
-        });
-        agent = trackActivity(cascadeAgent, activity);
+        speculate = await resolveSpeculate();
         logFastLaneOn();
-        finishPipeline = (tts) => {
-          // `CascadeEngineOptions` 只有时钟。流式增量由引擎自己 `attachLiveSink`，
-          // 这里再传 onLiveAvailable 对不上签名，也会和引擎内部那一次挂载叠在一起。
-          const rawEngine = cascadeAgent.toEngine(tts);
-          return { orchestrator: null, engine: watchEngineActivity(rawEngine, activity) };
-        };
       } else {
         console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
-        agent = trackActivity(dshAgent, activity);
-        // 不挂热路径引擎：TurnRunner 用 AgentEngineAdapter 包这份 dsh。
       }
+      pendingStreaming = streamingDeps(pipelinePlan, speculate);
     } else {
       // legacy-fronted-assembly：回放 / 旧监听 / 识图。流式热路径不进这里。
       const speculate = await resolveSpeculate();
@@ -1036,12 +1180,44 @@ async function main(): Promise<void> {
     });
     process.on('exit', () => {
       stopKeepalive();
-      liveOrch?.dispose();
+      disposeStreaming();
     });
   }
 
+  const assemblePending = (ttsForPipeline: TtsProvider, log: (line: string) => void): AssembledStreamingPipeline => {
+    const pending = pendingStreaming;
+    if (pending === null) {
+      throw new Error('流式管道还没准备好');
+    }
+    return assembleStreamingAgent({
+      plan: pending.plan,
+      env: process.env,
+      dshAgent: pending.dshAgent,
+      tts: ttsForPipeline,
+      activity: pending.activity,
+      memory: pending.memory,
+      taskStatus: pending.taskStatus,
+      audit: (name, data) => { auditSlot.emit(name, data); },
+      speculate: pending.speculate,
+      announceStore,
+      log,
+    });
+  };
+
   // ---------------------------------------------------------------- 图片 -> dsh 冒烟
   if (askImage) {
+    // 识图在 TTS 之前就退出。cascade 原先这时已经包好了 agent；live 要等 TTS，
+    // 所以识图仍走裸 dsh。这里不打影子横幅（那一行在流式分支、识图走不到）。
+    const imagePipeline = pendingStreaming;
+    if (imagePipeline !== null && imagePipeline.plan.mode === 'cascade') {
+      try {
+        const assembled = assemblePending(silentTts(24_000), () => {});
+        agent = assembled.agent;
+        disposeStreaming = assembled.dispose;
+      } catch (error) {
+        fail((error as Error).message);
+      }
+    }
     if (!agent) {
       console.error('--ask-image 需要 --agent（图片只能交给 dsh 看）');
       process.exit(2);
@@ -1109,8 +1285,6 @@ async function main(): Promise<void> {
     });
     const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
-    // live 的编排器和 cascade 的热路径都要这份 TTS。非 dsh 流式这里是空装配。
-    const pipelineHooks = finishPipeline?.(tts) ?? { orchestrator: null, engine: undefined };
 
     const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
     const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
@@ -1124,43 +1298,34 @@ async function main(): Promise<void> {
      * - `cascade`：不发声。只有 `useOmniProbeOnly`（`OMNI_SHADOW=1` 且 `OMNI_ANSWER=off`）
      *   才挂一只只读探针。
      * - 没有管道计划（echo 等）：沿用旧的 `omniWillEnable` + `OMNI_ANSWER`。
+     *
+     * 前两条在 {@link assembleStreamingAgent}。这里只补「想开探针但条件不够」的那句，
+     * 因为它要带上当前的 STT 名字。
      */
-    const omniModel = envString('OMNI_SHADOW_MODEL');
-    const modelOpt = omniModel === undefined ? {} : { model: omniModel };
-    const pipelineOmniKey = (process.env['OMNI_API_KEY'] ?? process.env['DASHSCOPE_API_KEY'] ?? '').trim();
-    let omniShadow: {
-      readonly apiKey: string;
-      readonly model?: string;
-      readonly serve: 'off' | 'full';
-    } | undefined;
-    if (pipelinePlan !== null && pipelinePlan.mode === 'live') {
-      const requested = (envString('OMNI_ANSWER') ?? '').trim().toLowerCase();
-      if (requested !== '' && requested !== 'off' && requested !== 'full' && requested !== 'clip') {
-        fail(`OMNI_ANSWER=${requested} 不合法（off|full；clip 已并入 full）`);
+    let streaming: AssembledStreamingPipeline | null = null;
+    if (pendingStreaming !== null) {
+      let assembled: AssembledStreamingPipeline;
+      try {
+        assembled = assemblePending(tts, (line) => { console.log(line); });
+      } catch (error) {
+        fail((error as Error).message);
       }
-      if (requested === 'clip') {
-        console.log('管道      OMNI_ANSWER=clip 已取消，纯 live 按 full 出声');
-      }
-      omniShadow = { apiKey: pipelineOmniKey, serve: 'full', ...modelOpt };
-      console.log(
-        `影子    omni 前台开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
-        + `**会出声** serve=${omniShadow.serve}）\n`,
-      );
-    } else if (pipelinePlan !== null && pipelinePlan.mode === 'cascade') {
-      if (pipelinePlan.useOmniProbeOnly) {
-        omniShadow = { apiKey: pipelineOmniKey, serve: 'off', ...modelOpt };
-        console.log(
-          `影子    omni 只读探针（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`,
-        );
-      } else if (omniWanted) {
-        const why = pipelineOmniKey === ''
-          ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
-          : resolvedStt !== 'qwen-realtime'
-            ? `STT=${resolvedStt}（需要 qwen-realtime）`
-            : 'OMNI_ANSWER 不是 off（只读探针要求 off，cascade 不接管发声）';
-        console.log(`影子    OMNI_SHADOW=1 但没启用只读探针：${why}\n`);
-      }
-    } else {
+      streaming = assembled;
+      agent = assembled.agent;
+      disposeStreaming = assembled.dispose;
+    }
+    let omniShadow = streaming?.omniShadow;
+    if (streaming !== null && streaming.mode === 'cascade' && omniShadow === undefined && omniWanted) {
+      const pipelineOmniKey = (process.env['OMNI_API_KEY'] ?? process.env['DASHSCOPE_API_KEY'] ?? '').trim();
+      const why = pipelineOmniKey === ''
+        ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
+        : resolvedStt !== 'qwen-realtime'
+          ? `STT=${resolvedStt}（需要 qwen-realtime）`
+          : 'OMNI_ANSWER 不是 off（只读探针要求 off，cascade 不接管发声）';
+      console.log(`影子    OMNI_SHADOW=1 但没启用只读探针：${why}\n`);
+    } else if (streaming === null) {
+      const omniModel = envString('OMNI_SHADOW_MODEL');
+      const modelOpt = omniModel === undefined ? {} : { model: omniModel };
       const omniAnswer = envString('OMNI_ANSWER') ?? 'off';
       if (!['off', 'full'].includes(omniAnswer)) {
         console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|full）`);
@@ -1291,8 +1456,7 @@ async function main(): Promise<void> {
       + ` attach=${typeof agent?.attachAudioLane} will=${typeof agent?.willServeAudio}`,
     );
     const plan = pipelinePlan;
-    const engine = pipelineHooks.engine;
-    const orchestrator = pipelineHooks.orchestrator;
+    const engine = streaming?.engine;
     const code = await runVoiceServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
@@ -1303,14 +1467,12 @@ async function main(): Promise<void> {
       tts,
       ...(plan === null ? {} : { pipelineMode: plan.mode }),
       ...(engine === undefined ? {} : { engine }),
-      ...(orchestrator === null
+      ...(streaming?.speakAnnounce === undefined
         ? {}
         : {
-          speakAnnounce: (item, playAudio) => orchestrator.speakBackgroundReport(item, playAudio),
-          cancelAnnounce: () => { orchestrator.cancelBackgroundSpeech(); },
-          onFallbackAnnounceSpoken: (item, interrupted) => {
-            orchestrator.noteFallbackAnnounceSpoken(item, interrupted);
-          },
+          speakAnnounce: streaming.speakAnnounce,
+          cancelAnnounce: streaming.cancelAnnounce,
+          onFallbackAnnounceSpoken: streaming.onFallbackAnnounceSpoken,
         }),
       // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
       ...(omniShadow === undefined ? {} : { omniShadow }),

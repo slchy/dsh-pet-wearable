@@ -1,25 +1,33 @@
 /**
- * `src/main.ts` 装配层的回归：纯函数判据 + 两条「源码里不许再出现」的形态约束。
+ * `src/main.ts` 装配层的回归：纯函数判据、依赖形态，以及
+ * `assembleStreamingAgent` 的运行时装配。
  *
  * 这一层出错的样子全是**静默**的：
  * - 少造一个 `FrontedAgent`，omni 车道整晚不接管（日志里只有「快车道 关」）；
  * - 审计槽位被旧连接摘掉，档案里从此没有任何 `agent.*` / `tts.*`；
- * - 顶层 `import` 回 `legacy-pipeline.ts`，每次启动多付 VAD/ONNX 的加载钱。
- *
- * 所以这里不测行为链（那些在别的文件里），只钉住「装配判据」和「依赖形态」。
+ * - 顶层 `import` 回 `legacy-pipeline.ts`，每次启动多付 VAD/ONNX 的加载钱；
+ * - 流式 `live` / `cascade` 焊错，旁路探针开始出声，或者离线汇报没人存。
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
+import { AnnounceStore } from '../src/announce-store.ts';
+import { newActivityState, type ActivityState } from '../src/keepalive.ts';
 import {
   assemblePipelinePlan,
+  assembleStreamingAgent,
   createAuditSlot,
   shouldCreateFrontedAgent,
+  type AssembleStreamingAgentDeps,
   type AuditSink,
+  type AssembledStreamingPipeline,
 } from '../src/main.ts';
+import { silentTts, type AgentProvider } from '../src/providers.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const MAIN_TS = fileURLToPath(new URL('../src/main.ts', import.meta.url));
@@ -262,5 +270,285 @@ test('VOICE_PIPELINE=invalid 在 dsh 流式装配上直接失败，不藏进用�
   assert.match(
     status.stderr,
     /VOICE_PIPELINE 无效值 "invalid"：只允许 "live" 或 "cascade"/u,
+  );
+});
+
+// ---------------------------------------------------------------- 流式装配（运行时）
+
+function scriptedDsh(onReply?: () => void): {
+  readonly agent: AgentProvider;
+  announce(speech: string, emotion?: string): void;
+} {
+  let announcer: ((speech: string, emotion?: string) => void) | null = null;
+  const agent: AgentProvider = {
+    name: 'dsh',
+    reply: async (text) => {
+      onReply?.();
+      return { text, speech: text };
+    },
+    setAnnouncer(cb) {
+      announcer = cb;
+    },
+  };
+  return {
+    agent,
+    announce(speech, emotion) {
+      if (announcer === null) {
+        throw new Error('dsh 的 announcer 没有挂上');
+      }
+      announcer(speech, emotion);
+    },
+  };
+}
+
+function streamingFrom(
+  env: Record<string, string | undefined>,
+  hooks?: {
+    readonly activity?: ActivityState;
+    readonly announceStore?: AnnounceStore | null;
+    readonly dsh?: ReturnType<typeof scriptedDsh>;
+    readonly log?: (line: string) => void;
+    readonly onReply?: () => void;
+  },
+): {
+  readonly dsh: ReturnType<typeof scriptedDsh>;
+  readonly activity: ActivityState;
+  readonly assembled: AssembledStreamingPipeline;
+  readonly lines: string[];
+} {
+  const lines: string[] = [];
+  const activity = hooks?.activity ?? newActivityState(0);
+  const dsh = hooks?.dsh ?? scriptedDsh(hooks?.onReply);
+  const plan = assemblePipelinePlan(env, { sttName: 'qwen-realtime', strict: true });
+  const deps: AssembleStreamingAgentDeps = {
+    plan,
+    env,
+    dshAgent: dsh.agent,
+    tts: silentTts(16_000),
+    activity,
+    memory: () => '',
+    taskStatus: () => '',
+    audit: () => {},
+    speculate: false,
+    announceStore: hooks?.announceStore ?? null,
+    log: hooks?.log ?? ((line) => { lines.push(line); }),
+  };
+  return { dsh, activity, assembled: assembleStreamingAgent(deps), lines };
+}
+
+async function withEnv(
+  patch: Record<string, string | undefined>,
+  body: () => Promise<void>,
+): Promise<void> {
+  const previous = new Map<string, string | undefined>();
+  for (const key of Object.keys(patch)) {
+    previous.set(key, process.env[key]);
+    const value = patch[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    await body();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test('assembleStreamingAgent：live 全量出声，trackActivity 透传车道和后台任务', async () => {
+  await withEnv({
+    VOICE_PIPELINE: 'cascade',
+    OMNI_ANSWER: 'not-a-mode',
+    FAST_LANE_API_KEY: 'sk-leaked-from-process',
+  }, async () => {
+    const activity = newActivityState(0);
+    let seen = -1;
+    const dsh = scriptedDsh(() => { seen = activity.inflight; });
+    const lines: string[] = [];
+    const { assembled } = streamingFrom({
+      VOICE_PIPELINE: 'live',
+      DASHSCOPE_API_KEY: 'sk-omni',
+      OMNI_ANSWER: 'clip',
+      FAST_LANE_API_KEY: 'sk-fast',
+      OMNI_SHADOW: '1',
+    }, {
+      activity,
+      dsh,
+      log: (line) => { lines.push(line); },
+    });
+    try {
+      assert.equal(assembled.mode, 'live');
+      assert.equal(assembled.engine?.mode, 'live');
+      assert.equal(assembled.omniShadow?.serve, 'full');
+      assert.equal(assembled.omniShadow?.apiKey, 'sk-omni');
+      assert.equal(typeof assembled.speakAnnounce, 'function');
+      assert.equal(typeof assembled.cancelAnnounce, 'function');
+      assert.equal(typeof assembled.onFallbackAnnounceSpoken, 'function');
+      assert.ok(lines.some((line) => line.includes('OMNI_ANSWER=clip 已取消，纯 live 按 full 出声')));
+      assert.ok(lines.some((line) => line.includes('serve=full')));
+
+      assert.equal(assembled.agent.willServeAudio?.('在吗'), false);
+      const reply = await assembled.agent.reply('在吗');
+      assert.equal(reply.speech, '在吗');
+      assert.equal(seen, 1, '外层 trackActivity 要在 reply 期间把 inflight 加一');
+      assert.equal(activity.inflight, 0);
+      assert.ok(activity.last > 0);
+
+      let cancelled = 0;
+      let injected = 0;
+      assembled.agent.attachAudioLane?.({
+        willServe: () => true,
+        claim: () => null,
+        discard: () => {},
+        canSpeakBackground: () => false,
+        speakFromText: () => null,
+        cancelBackgroundSpeech: () => { cancelled += 1; },
+        injectAnswer: () => { injected += 1; },
+      });
+      assert.equal(assembled.agent.willServeAudio?.('在吗'), true);
+      assert.equal(typeof assembled.agent.setTaskReporter, 'function');
+      assert.equal(typeof assembled.agent.cancelBackgroundTasks, 'function');
+      assert.equal(assembled.agent.cancelBackgroundTasks?.(), false);
+
+      const verdict = await assembled.speakAnnounce?.(
+        { speech: '到了' },
+        async () => ({ spokenBytes: 1, interrupted: false, transcript: '到了' }),
+      );
+      assert.equal(verdict, 'defer');
+      assembled.cancelAnnounce?.();
+      assert.equal(cancelled, 1);
+      assembled.onFallbackAnnounceSpoken?.({ speech: '到了', taskId: 't1' }, false);
+      assembled.onFallbackAnnounceSpoken?.({ speech: '到了', taskId: 't1' }, false);
+      assert.equal(injected, 1, '同一条后台汇报只回注一次');
+    } finally {
+      assembled.dispose();
+      assert.doesNotThrow(() => { assembled.dispose(); });
+    }
+  });
+});
+
+test('assembleStreamingAgent：live 没人接汇报时写入 announceStore', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'miai-asm-'));
+  const opened = AnnounceStore.open({ file: join(dir, 'announce.jsonl'), log: () => {} });
+  assert.ok(opened, '临时队列应当能打开');
+  const store = opened;
+  try {
+    const { dsh, assembled } = streamingFrom({
+      VOICE_PIPELINE: 'live',
+      DASHSCOPE_API_KEY: 'sk-omni',
+    }, { announceStore: store, log: () => {} });
+    try {
+      dsh.announce('查好了', 'happy');
+      assert.equal(store.size, 1, '还没有连接时，dsh 的后台播报要直接进队列');
+
+      const caught: string[] = [];
+      assembled.agent.setTaskReporter?.((report) => { caught.push(report.summary); });
+      dsh.announce('别存');
+      assert.deepEqual(caught, ['别存']);
+      assert.equal(store.size, 1, '接上 reporter 之后不该再往队列里写');
+
+      assembled.agent.setTaskReporter?.(null);
+      dsh.announce('快递到了', 'surprised');
+      const pending = store.drain();
+      assert.deepEqual(pending, [
+        { text: '查好了', emotion: 'happy' },
+        { text: '快递到了', emotion: 'surprised' },
+      ]);
+
+      assert.doesNotThrow(() => { assembled.dispose(); });
+      assert.doesNotThrow(() => { assembled.dispose(); });
+      assert.doesNotThrow(() => { dsh.announce('释放后忽略'); });
+      assert.equal(store.size, 0, 'dispose 之后总线不再把播报写进队列');
+    } finally {
+      assembled.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('assembleStreamingAgent：cascade 有快车道时不接音频车道、也不挂 omni', () => {
+  const { assembled } = streamingFrom({
+    VOICE_PIPELINE: 'cascade',
+    FAST_LANE_API_KEY: 'sk-fast',
+  });
+  assert.equal(assembled.mode, 'cascade');
+  assert.equal(assembled.engine?.mode, 'cascade');
+  assert.equal(assembled.speakAnnounce, undefined);
+  assert.equal(assembled.cancelAnnounce, undefined);
+  assert.equal(assembled.omniShadow, undefined);
+  assert.equal(assembled.agent.attachAudioLane, undefined);
+  assert.equal(assembled.agent.willServeAudio, undefined);
+  assert.equal(typeof assembled.agent.prefetch, 'function');
+  assert.doesNotThrow(() => { assembled.dispose(); });
+});
+
+test('assembleStreamingAgent：cascade 只读探针 serve=off，不会升成 full', () => {
+  const { assembled, lines } = streamingFrom({
+    VOICE_PIPELINE: 'cascade',
+    OMNI_SHADOW: '1',
+    OMNI_ANSWER: 'off',
+    DASHSCOPE_API_KEY: 'sk-omni',
+    FAST_LANE_API_KEY: 'sk-fast',
+  });
+  assert.equal(assembled.mode, 'cascade');
+  assert.equal(assembled.omniShadow?.serve, 'off');
+  assert.equal(assembled.omniShadow?.apiKey, 'sk-omni');
+  assert.ok(lines.some((line) => line.includes('只读探针') && line.includes('只量不发声')));
+  assert.equal(lines.some((line) => line.includes('**会出声**')), false);
+  assembled.dispose();
+});
+
+test('assembleStreamingAgent：cascade 关掉快车道时只包住 dsh，不读 process.env 的 key', async () => {
+  await withEnv({ FAST_LANE_API_KEY: 'sk-leaked-from-process' }, async () => {
+    const cases = [
+      { VOICE_PIPELINE: 'cascade', FAST_LANE: '0', FAST_LANE_API_KEY: 'sk-fast' },
+      { VOICE_PIPELINE: 'cascade' },
+    ];
+    for (const env of cases) {
+      const activity = newActivityState(0);
+      let seen = -1;
+      const dsh = scriptedDsh(() => { seen = activity.inflight; });
+      const { assembled } = streamingFrom(env, { activity, dsh, log: () => {} });
+      assert.equal(assembled.mode, 'cascade');
+      assert.equal(assembled.engine, undefined);
+      assert.equal(assembled.omniShadow, undefined);
+      assert.equal(assembled.speakAnnounce, undefined);
+      assert.equal(assembled.agent.attachAudioLane, undefined);
+      assert.equal(assembled.agent.willServeAudio, undefined);
+      assert.equal(assembled.agent.prefetch, undefined);
+      const reply = await assembled.agent.reply('只走 dsh');
+      assert.equal(reply.speech, '只走 dsh');
+      assert.equal(seen, 1);
+      assert.equal(activity.inflight, 0);
+      assert.ok(activity.last > 0);
+      assembled.dispose();
+    }
+  });
+});
+
+test('assembleStreamingAgent：live 的非法 OMNI_ANSWER 抛错，不退出进程', () => {
+  const env = {
+    VOICE_PIPELINE: 'live',
+    DASHSCOPE_API_KEY: 'sk-omni',
+    OMNI_ANSWER: 'sideways',
+  };
+  const plan = assemblePipelinePlan(env, { sttName: 'qwen-realtime', strict: true });
+  assert.throws(
+    () => assembleStreamingAgent({
+      plan,
+      env,
+      dshAgent: scriptedDsh().agent,
+      tts: silentTts(16_000),
+      activity: newActivityState(0),
+      memory: () => '',
+      taskStatus: () => '',
+      audit: () => {},
+      speculate: false,
+      log: () => {},
+    }),
+    /OMNI_ANSWER=sideways 不合法（off\|full；clip 已并入 full）/u,
   );
 });

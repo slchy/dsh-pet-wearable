@@ -64,6 +64,7 @@ import type {
 import type { SessionCore } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { TurnJudge } from './turn-judge.ts';
+import type { RealtimeSocketFactory } from './qwen-realtime-asr.ts';
 import { OmniShadow } from './omni-shadow.ts';
 import { startToolControl, type ToolControl, type ToolControlHandlers } from './tool-control.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
@@ -245,6 +246,8 @@ export interface VoiceSessionOptions {
     readonly model?: string;
     /** 认领模式：`off`（只量）/ `full`（真答）。缺省 `off` */
     readonly serve?: 'off' | 'full';
+    /** 测试注入 realtime 套接字；生产不传，行为与以前一致 */
+    readonly socketFactory?: RealtimeSocketFactory;
   };
   /** 显式管道模式（'live' | 'cascade'）。未设时兼容旧推断。 */
   readonly pipelineMode?: VoicePipelineMode;
@@ -759,6 +762,9 @@ export class VoiceConnection {
     this.omni = options.omniShadow === undefined ? null : new OmniShadow({
       apiKey: options.omniShadow.apiKey,
       ...(options.omniShadow.model === undefined ? {} : { model: options.omniShadow.model }),
+      ...(options.omniShadow.socketFactory === undefined
+        ? {}
+        : { socketFactory: options.omniShadow.socketFactory }),
       serve: options.omniShadow.serve ?? 'off',
       // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
       emit: (data) => { this.archive?.event(EVENTS.omniShadow, data); },
