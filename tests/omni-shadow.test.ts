@@ -4,10 +4,11 @@
  * 这里只验客户端行为 —— 计时口径、闭嘴（mute）、忙时排队、延迟删、回注。
  * 真实延迟 / 成本 / 服务端协议行为在 `tmp/omni-probe/` 里量。
  *
- * 三条最要紧的回归：
+ * 四条最要紧的回归：
  * - **封段之后一块静音都不许发**（能量门 `holdMs` 2 s 比 `commitMs` 20 ms 长得多）
  * - **忙时不许发 `response.create`**（服务端会拒且那一次 create 永久丢失）
  * - **`delete` 不能当场发**（item id 在 `response.done` 里，那会儿通常连 created 都没到）
+ * - **后台汇报只在完全空闲时开**，读端只绑自己那一份，不许跟到用户的下一段
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -20,6 +21,7 @@ interface Sent {
   audio?: string;
   item_id?: string;
   item?: { role?: string; content?: Array<{ type?: string; text?: string }> };
+  response?: { modalities?: readonly string[] };
   session?: {
     instructions?: string;
     tools?: Array<{ name?: string; description?: string }>;
@@ -97,6 +99,20 @@ function make(serve: 'off' | 'full' = 'off') {
       socket.message({ type: 'session.updated' });
     },
   };
+}
+
+/** 生成器该马上结束。跟错 `next` 时会挂在 `waitLive`（5 s）上，这里先判超时。 */
+function finishSoon(work: Promise<unknown>, ms = 400): Promise<'done' | 'timeout'> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve('timeout'), ms);
+    work.then(() => {
+      clearTimeout(timer);
+      resolve('done');
+    }, (error: unknown) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
 }
 
 test('一轮正常：字段齐、audio_ms 从封段算起', () => {
@@ -943,4 +959,387 @@ test('并段轮：B 段音频在生成期先攒着，done 之后补推再封段'
   assert.equal(h.socket.count('input_audio_buffer.append'), before + 1, 'B 段补推上去了');
   assert.ok(pushAt < commitAt, '补推必须在 commit 之前，否则那一段还是空的');
   assert.equal(h.socket.count('input_audio_buffer.commit'), 2);
+});
+
+test('canSpeakBackground 只在完全空闲的 ready 上为真', () => {
+  const idle = make('full');
+  assert.equal(idle.shadow.currentState, 'idle');
+  assert.equal(idle.shadow.canSpeakBackground(), false);
+  assert.equal(idle.shadow.speakFromText('汇报'), null);
+  assert.equal(idle.socket.sent.length, 0);
+
+  const connecting = make('full');
+  connecting.shadow.start();
+  connecting.socket.open();
+  assert.equal(connecting.shadow.currentState, 'connecting');
+  assert.equal(connecting.shadow.canSpeakBackground(), false);
+  const connectingSent = connecting.socket.sent.length;
+  assert.equal(connecting.shadow.speakFromText('汇报'), null);
+  assert.equal(connecting.socket.sent.length, connectingSent);
+  assert.equal(connecting.socket.count('response.create'), 0);
+
+  const off = make('off');
+  off.ready();
+  assert.equal(off.shadow.currentState, 'ready');
+  assert.equal(off.shadow.canSpeakBackground(), false);
+  const offSent = off.socket.sent.length;
+  assert.equal(off.shadow.speakFromText('汇报'), null);
+  assert.equal(off.socket.sent.length, offSent);
+  assert.equal(off.socket.count('response.create'), 0);
+
+  const quiet = make('full');
+  quiet.ready();
+  assert.equal(quiet.shadow.canSpeakBackground(), true, 'ready、无回复、无排队、无脏音频');
+
+  quiet.shadow.feed(Buffer.alloc(MS * 40), true);
+  assert.equal(quiet.shadow.canSpeakBackground(), false, '有未提交的用户音频');
+
+  const busy = make('full');
+  busy.ready();
+  busy.shadow.restart([Buffer.alloc(MS * 40)]);
+  busy.shadow.seal(1, 10);
+  assert.equal(busy.shadow.currentState, 'busy');
+  assert.equal(busy.shadow.canSpeakBackground(), false);
+  busy.socket.message({ type: 'response.created' });
+  busy.shadow.feed(Buffer.alloc(MS * 40), true);
+  busy.shadow.seal(2, 10);
+  assert.equal(busy.shadow.explain().pending, true);
+  assert.equal(busy.shadow.canSpeakBackground(), false, '有排队封段');
+
+  const broken = make('full');
+  broken.ready();
+  broken.socket.close();
+  assert.equal(broken.shadow.currentState, 'broken');
+  assert.equal(broken.shadow.canSpeakBackground(), false);
+});
+
+test('speakFromText：先刷排队回注，再开汇报，流式音频和转写，done 回到 ready', async () => {
+  const h = make('full');
+  h.shadow.start();
+  h.socket.open();
+  // 还在 connecting：回注只能排队，session.updated 自己不会刷
+  h.shadow.injectAnswer('灯关了吗', '已经关掉了。');
+  assert.equal(h.socket.count('conversation.item.create'), 0);
+  h.socket.message({ type: 'session.updated' });
+  assert.equal(h.shadow.canSpeakBackground(), true);
+
+  const mark = h.socket.sent.length;
+  const answer = h.shadow.speakFromText('用一两句告诉哥：灯已经关了。', {
+    taskId: 'task-1',
+    query: '关灯',
+  });
+  assert.ok(answer);
+  const frames = h.socket.sent.slice(mark);
+  assert.deepEqual(frames.map((frame) => frame.type), [
+    'conversation.item.create',
+    'conversation.item.create',
+    'response.create',
+  ]);
+  const inject = frames[0]?.item;
+  assert.equal(inject?.role, 'user');
+  assert.match(inject?.content?.[0]?.text ?? '', /已经关掉了/);
+  const prompt = frames[1]?.item;
+  assert.equal(prompt?.role, 'user');
+  assert.equal(prompt?.content?.[0]?.type, 'input_text');
+  assert.equal(prompt?.content?.[0]?.text, '用一两句告诉哥：灯已经关了。');
+  assert.deepEqual(frames[2]?.response, { modalities: ['audio', 'text'] });
+
+  assert.equal(h.shadow.currentState, 'busy');
+  assert.equal(h.shadow.willServe(), false, '后台汇报不是用户这一轮的答案');
+  assert.equal(h.shadow.claim(), null);
+  assert.equal(h.shadow.explain().turn_seqs, 0, '不许把汇报记成一次用户封段');
+
+  assert.equal(answer!.transcript(), '');
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '灯' });
+  assert.equal(answer!.transcript(), '灯');
+  h.socket.message({ type: 'response.text.delta', delta: '关好了' });
+  assert.equal(answer!.transcript(), '灯关好了');
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'completed',
+      usage: {
+        input_tokens_details: { text_tokens: 12 },
+        output_tokens_details: { audio_tokens: 8 },
+      },
+      output: [{ id: 'asst_ann', role: 'assistant' }],
+    },
+  });
+
+  const got: Buffer[] = [];
+  for await (const chunk of answer!.chunks) {
+    got.push(chunk);
+  }
+  assert.equal(got.length, 1);
+  assert.equal(got[0]?.length, 480);
+  assert.equal(h.shadow.currentState, 'ready');
+  assert.equal(h.shadow.canSpeakBackground(), true);
+  assert.equal(h.events.length, 0, '后台汇报不能记成 omni.shadow 用户封段');
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '正常说完的助手项要留在上下文里');
+});
+
+test('speakFromText 先删没人听过的孤儿回复，再开汇报', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'orphan_user', role: 'user' } });
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'orphan_asst', role: 'assistant' }] },
+  });
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '孤儿留到下一次开口再删');
+  assert.equal(h.events.length, 1);
+
+  const mark = h.socket.sent.length;
+  const answer = h.shadow.speakFromText('结果是灯关了');
+  assert.ok(answer);
+  const frames = h.socket.sent.slice(mark);
+  assert.deepEqual(frames.map((frame) => frame.type), [
+    'conversation.item.delete',
+    'conversation.item.delete',
+    'conversation.item.create',
+    'response.create',
+  ]);
+  assert.deepEqual(
+    frames.slice(0, 2).map((frame) => frame.item_id),
+    ['orphan_asst', 'orphan_user'],
+  );
+  assert.equal(frames[2]?.item?.content?.[0]?.text, '结果是灯关了');
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.events.length, 1, '汇报的 done 不能再记一条用户 seal');
+  assert.equal(h.events[0]?.['seq'], 1);
+});
+
+test('speakFromText：忙或有脏音频时返回 null，一帧都不发', () => {
+  const busy = make('full');
+  busy.ready();
+  busy.shadow.restart([Buffer.alloc(MS * 40)]);
+  busy.shadow.seal(1, 10);
+  busy.shadow.injectAnswer('灯关了吗', '已经关掉了。');
+  assert.equal(busy.socket.count('conversation.item.create'), 0, '忙时回注只排队');
+  const busySent = busy.socket.sent.length;
+  assert.equal(busy.shadow.speakFromText('汇报'), null);
+  assert.equal(busy.socket.sent.length, busySent, '拒绝时不许把排队的回注提前发出去');
+
+  const dirty = make('full');
+  dirty.ready();
+  dirty.shadow.feed(Buffer.alloc(MS * 20), true);
+  assert.equal(dirty.shadow.canSpeakBackground(), false);
+  const dirtySent = dirty.socket.sent.length;
+  assert.equal(dirty.shadow.speakFromText('汇报'), null);
+  assert.equal(dirty.socket.sent.length, dirtySent);
+  assert.equal(dirty.socket.count('response.create'), 0);
+});
+
+test('cancelBackgroundSpeech：created 之前推迟 cancel，没出声就删助手项并立刻结束', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  const answer = h.shadow.speakFromText('灯已经关了');
+  assert.ok(answer);
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  h.shadow.cancelBackgroundSpeech();
+  assert.equal(await finishSoon(drain), 'done', '生成器必须马上醒，不能等 response.done');
+  assert.equal(got.length, 0);
+  assert.equal(h.socket.count('response.cancel'), 0, 'created 之前发会被服务端拒');
+
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'note_user', role: 'user' } });
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1, 'created 到了才补发');
+
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'cancelled',
+      output: [
+        { id: 'note_user', role: 'user' },
+        { id: 'note_asst', role: 'assistant' },
+      ],
+    },
+  });
+  const deleted = h.socket.sent.filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.deepEqual(deleted, ['note_asst'], '只删没播过的助手项，user 旁注留下');
+  assert.equal(h.shadow.currentState, 'ready');
+  assert.equal(h.events.length, 0);
+});
+
+test('cancelBackgroundSpeech：出过声就留助手项，而且绝不取消用户回复', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  const answer = h.shadow.speakFromText('灯已经关了');
+  assert.ok(answer);
+  h.socket.message({ type: 'response.created' });
+
+  const got: Buffer[] = [];
+  let resolvePulled: (() => void) | undefined;
+  const pulled = new Promise<void>((resolve) => {
+    resolvePulled = resolve;
+  });
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+      resolvePulled?.();
+    }
+  })();
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '灯关了' });
+  await pulled;
+  assert.equal(got.length, 1);
+  assert.equal(got[0]?.length, 480);
+  assert.equal(answer!.transcript(), '灯关了');
+
+  h.shadow.cancelBackgroundSpeech();
+  assert.equal(h.socket.count('response.cancel'), 1);
+  assert.equal(await finishSoon(drain), 'done');
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'cancelled',
+      output: [
+        { id: 'note_user', role: 'user' },
+        { id: 'note_asst', role: 'assistant' },
+      ],
+    },
+  });
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '已经出过声的助手项要留下');
+  assert.equal(h.events.length, 0);
+
+  h.shadow.restart([Buffer.alloc(MS * 80)]);
+  h.shadow.seal(3, 15);
+  h.socket.message({ type: 'response.created' });
+  assert.ok(h.shadow.claim() !== null, '这是用户自己的回复');
+  const cancels = h.socket.count('response.cancel');
+  h.shadow.cancelBackgroundSpeech();
+  assert.equal(h.socket.count('response.cancel'), cancels, '用户回复不许被后台取消误伤');
+  assert.equal(h.shadow.currentState, 'busy');
+});
+
+test('用户开口打断后台汇报：生成器不追 next，用户封段等 announce done 再发', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  const answer = h.shadow.speakFromText('后台：灯已经关了');
+  assert.ok(answer);
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '后台句' });
+  assert.equal(answer!.transcript(), '后台句');
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.claim(), null, '后台这份不能被用户 claim 拿走');
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer!.chunks) {
+      got.push(chunk);
+    }
+  })();
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.shadow.feed(Buffer.alloc(MS * 80), true);
+  h.shadow.seal(9, 30);
+  assert.equal(await finishSoon(drain), 'done', '必须停在自己这份上，不能去等用户的下一段');
+  assert.equal(got.length, 0);
+  assert.equal(h.socket.count('response.create'), 1, 'announce 的 done 之前不能发用户 create');
+  assert.equal(h.shadow.willServe(), true, '排队中的用户封段算能答');
+
+  const user = h.shadow.claim();
+  assert.ok(user);
+  assert.equal(user!.transcript(), '', '认领不能绑到后台那一份上');
+  const userGot: Buffer[] = [];
+  const userDrain = (async () => {
+    for await (const chunk of user!.chunks) {
+      userGot.push(chunk);
+    }
+  })();
+
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1, 'created 之前的取消要补发');
+  assert.equal(h.socket.count('response.create'), 1);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'note_user', role: 'user' } });
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'cancelled',
+      output: [
+        { id: 'note_user', role: 'user' },
+        { id: 'note_asst', role: 'assistant' },
+      ],
+    },
+  });
+  const deleted = h.socket.sent.filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.deepEqual(deleted, ['note_asst'], '一个字都没播过：删助手项，留下 user 旁注');
+  assert.equal(h.socket.count('response.create'), 2, '用户排队的封段在 done 之后发出');
+  const creates = h.socket.sent.filter((frame) => frame.type === 'response.create');
+  assert.deepEqual(creates[0]?.response, { modalities: ['audio', 'text'] });
+  assert.equal(creates[1]?.response, undefined, '用户封段仍是原来的 create，不带汇报的 modalities');
+
+  assert.equal(user!.transcript(), '');
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '用户句' });
+  assert.equal(user!.transcript(), '用户句');
+  assert.equal(answer!.transcript(), '后台句', '后台转写不能被用户的下一段改写');
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(960).toString('base64') });
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await userDrain;
+  assert.equal(userGot.reduce((sum, chunk) => sum + chunk.length, 0), 960);
+  assert.equal(got.length, 0, 'announce 生成器不能去追用户的下一段');
+  assert.equal(h.events.length, 1);
+  assert.equal(h.events[0]?.['seq'], 9);
+  assert.equal(h.events[0]?.['warmup'], true, '汇报不能占掉用户封段的 warmup');
+});
+
+test('后台汇报途中断线、stop 或 response 超时：生成器结束，不挂死', { timeout: 2000 }, async () => {
+  const closed = make('full');
+  closed.ready();
+  const closedAnswer = closed.shadow.speakFromText('灯关了');
+  assert.ok(closedAnswer);
+  const closedDrain = (async () => {
+    for await (const chunk of closedAnswer!.chunks) {
+      void chunk;
+    }
+  })();
+  closed.socket.close();
+  assert.equal(await finishSoon(closedDrain), 'done');
+  assert.equal(closed.shadow.currentState, 'broken');
+
+  const stopped = make('full');
+  stopped.ready();
+  const stoppedAnswer = stopped.shadow.speakFromText('灯关了');
+  assert.ok(stoppedAnswer);
+  const stoppedDrain = (async () => {
+    for await (const chunk of stoppedAnswer!.chunks) {
+      void chunk;
+    }
+  })();
+  stopped.shadow.stop();
+  assert.equal(await finishSoon(stoppedDrain), 'done');
+  assert.equal(stopped.shadow.currentState, 'broken');
+
+  const socket = new FakeSocket();
+  const events: Array<Record<string, unknown>> = [];
+  const shadow = new OmniShadow({
+    apiKey: 'k',
+    serve: 'full',
+    responseTimeoutMs: 30,
+    emit: (data) => { events.push(data); },
+    socketFactory: () => socket as unknown as RealtimeSocket,
+  });
+  shadow.start();
+  socket.open();
+  socket.message({ type: 'session.updated' });
+  const timed = shadow.speakFromText('灯关了');
+  assert.ok(timed);
+  const started = Date.now();
+  const chunks: Buffer[] = [];
+  for await (const chunk of timed!.chunks) {
+    chunks.push(chunk);
+  }
+  assert.equal(chunks.length, 0);
+  assert.ok(Date.now() - started < 1000, 'response 超时要把读端叫醒');
+  assert.equal(shadow.currentState, 'broken');
+  assert.equal(events.some((event) => event['audio_ms'] !== undefined), false);
+  assert.equal(events.some((event) => event['skipped'] === 'broken'), true);
 });

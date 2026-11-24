@@ -28,6 +28,15 @@
  *    而且那一次 create **永久丢失**。所以 `seal()` 撞上 busy 时要先 cancel、等 done。
  * 3. **不自动重连**。影子挂了就等于这次实验结束 —— 少一个半夜自己重连、
  *    把账单和口径都搅乱的东西。`broken` 会落一条事件，人看见了再决定。
+ *
+ * <h2>后台汇报（同一副嗓子）</h2>
+ *
+ * `speakFromText` 往**这条**会话里写一条 user 文本再 `response.create`，
+ * 所以汇报和闲聊是同一副嗓子，上下文也自然接着。只在完全空闲时发：
+ * `ready`、没有在途回复、没有排队封段、没有未提交音频，并且车道开着。
+ * 其它时刻返回 null，调用方等下一个空窗 —— 忙着发 create 会被服务端拒掉
+ * 且那一次永久丢失（上面第 2 条）。这份回复的读端只认自己那一份，
+ * 用户中途开口也不会把下一段的音频抢走。
  */
 import WebSocket from 'ws';
 
@@ -223,8 +232,18 @@ interface SealMeta {
   readonly flushedMs: number;
 }
 
+/** 这份回复是谁开的。用户封段和后台汇报绝不能混成同一条读端。 */
+type ResponseOrigin = 'user' | 'announce';
+
 interface PendingResponse {
   readonly meta: SealMeta;
+  /**
+   * `user`：`seal()` 开出来的。`announce`：`speakFromText` 开出来的。
+   *
+   * 用户 `claim()` 不许把 announce 交出去；announce 的读端也不许顺着 `next`
+   * 去拿用户下一段的音频。
+   */
+  readonly origin: ResponseOrigin;
   /** commit+create 真正发出去的时刻（撞 busy 时晚于 anchor） */
   readonly sentAt: number;
   ackAt: number | null;
@@ -290,6 +309,35 @@ interface PendingResponse {
   userItemId: string | null;
   /** 有没有人认领过（一份只给一个消费者） */
   claimed: boolean;
+}
+
+/** 一份还没开张的回复。`sendSeal` / `speakFromText` 共用，避免哪边漏字段。 */
+function blankPending(meta: SealMeta, origin: ResponseOrigin, sentAt: number): PendingResponse {
+  return {
+    meta,
+    origin,
+    sentAt,
+    ackAt: null,
+    finalAt: null,
+    firstTextAt: null,
+    firstAudioAt: null,
+    outBytes: 0,
+    cancelled: false,
+    audio: [],
+    audioWaiters: [],
+    closed: false,
+    text: '',
+    delegate: null,
+    delegateRequest: null,
+    created: false,
+    cancelPending: false,
+    superseded: false,
+    next: null,
+    deleteOnDone: false,
+    itemIds: [],
+    userItemId: null,
+    claimed: false,
+  };
 }
 
 interface ServerEvent {
@@ -492,7 +540,13 @@ export class OmniShadow {
     this.opened = false;
     this.state = 'broken';
     this.claimReserved = false;
+    const resp = this.resp;
+    this.resp = null;
     this.claimedResp = null;
+    if (resp !== null) {
+      resp.closed = true;
+      this.wakeAudio(resp);
+    }
     // 生成期攒的音频属于这条连接，别漏进下一场
     this.held = [];
     this.heldBytes = 0;
@@ -524,7 +578,12 @@ export class OmniShadow {
       return;
     }
     if (this.resp !== null) {
-      this.cancelCurrent();
+      if (this.resp.origin === 'announce') {
+        // 用户开口：后台汇报立刻停。一个字都没播过就删助手项（user 旁注留下）。
+        this.cancelAnnounce(this.resp);
+      } else {
+        this.cancelCurrent();
+      }
     }
     this.pending = null;
     this.ring = [];
@@ -619,13 +678,20 @@ export class OmniShadow {
     if (this.resp !== null) {
       // 忙时 create 会被服务端拒掉且永久丢失（实测），所以先 cancel 再排队。
       // 标 `superseded`：这是**同一轮的下一段**，不是新一轮 —— 认领要跟过去（见 `sendSeal`）。
-      this.resp.superseded = true;
-      this.supersededPrev = this.resp;
-      // 一个字节音频都没出过的那份没人听过，删掉；出过的留着（用户可能听到了）
-      if (this.resp.claimed && this.resp.firstAudioAt === null) {
-        this.resp.deleteOnDone = true;
+      const current = this.resp;
+      current.superseded = true;
+      this.supersededPrev = current;
+      if (current.origin === 'announce') {
+        // 后台汇报被用户封段顶掉：掐掉它，排队的 seal 等它 done 再发。
+        // 读端只绑自己那份，这里叫醒它，免得它挂到 done 才退出、中途去追 next。
+        this.cancelAnnounce(current);
+      } else {
+        // 一个字节音频都没出过的那份没人听过，删掉；出过的留着（用户可能听到了）
+        if (current.claimed && current.firstAudioAt === null) {
+          current.deleteOnDone = true;
+        }
+        this.cancelCurrent();
       }
-      this.cancelCurrent();
       this.pending = meta;
       return;
     }
@@ -820,6 +886,122 @@ export class OmniShadow {
   }
 
   /**
+   * 现在能不能安全地插一条后台汇报。纯读、不改账。
+   *
+   * 必须同时空闲：服务端没有在途 response（`ready` 且 `resp` / `pending` 都空），
+   * 本地也没有还没 commit 的用户音频。差一条就会在忙时 `response.create`，
+   * 服务端回 `Conversation already has an active response` 并且那一次 create 永久丢失。
+   */
+  canSpeakBackground(): boolean {
+    if ((this.opts.serve ?? 'off') === 'off') {
+      return false;
+    }
+    return this.state === 'ready'
+      && this.resp === null
+      && this.pending === null
+      && this.dirtyBytes === 0;
+  }
+
+  /**
+   * 在空窗里把后台结论写进这条会话，并让 omni 用同一副嗓子说出来。
+   *
+   * 返回的音频流**只**绑 `target` 这一份：用户中途 `restart` / `seal` 会把
+   * `target.next` 接成新的用户回复，这里读了就会把用户的话抢走。
+   * 停在 `cancelled` / `closed` 上，不跟着走。
+   *
+   * 不能发的时候返回 null，**一个帧都不出**。调用方等下一个空窗再试。
+   */
+  speakFromText(
+    promptText: string,
+    meta?: { readonly taskId?: string; readonly query?: string },
+  ): AgentAudioAnswer | null {
+    if (!this.canSpeakBackground()) {
+      return null;
+    }
+    // 还是 ready：先把积压的孤儿回复和回注刷出去，再占用这条会话。
+    // 忙了再发 item.create，会插进别人正在生成的那一轮里。
+    this.flushOrphans();
+    this.flushInjects();
+    const sentAt = this.now();
+    const resp = blankPending({
+      seq: 0,
+      silenceMs: 0,
+      anchor: sentAt,
+      bytes: 0,
+      flushedMs: 0,
+    }, 'announce', sentAt);
+    resp.claimed = true;
+    this.resp = resp;
+    this.claimedResp = resp;
+    this.state = 'busy';
+    const taskId = meta?.taskId ?? '';
+    if (taskId !== '') {
+      this.log(`[omni] 后台汇报 ${taskId}`);
+    }
+    this.send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: promptText }],
+      },
+    });
+    this.send({
+      type: 'response.create',
+      response: { modalities: ['audio', 'text'] },
+    });
+    this.armResponseTimeout();
+    const target = resp;
+    return {
+      sampleRate: DOWNSTREAM_RATE,
+      transcript: () => target.text,
+      delegateReason: () => target.delegate,
+      delegateText: () => target.delegateRequest,
+      chunks: (async function* iterate() {
+        for (;;) {
+          if (target.audio.length > 0) {
+            const chunk = target.audio.shift();
+            if (chunk !== undefined) {
+              yield chunk;
+            }
+            continue;
+          }
+          // 停在自己这份上。`target.next` 是用户的下一段，读了就把人家的音频抢走。
+          if (target.cancelled || target.closed) {
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            target.audioWaiters.push(resolve);
+          });
+        }
+      })(),
+    };
+  }
+
+  /**
+   * 只掐正在播的后台汇报。用户自己的回复（`origin === 'user'`）碰都不碰。
+   *
+   * 一个字节都还没出去：标 `deleteOnDone`，done 时删助手项、留下那条 user 旁注，
+   * 这样下一轮 omni 仍知道事实。已经出过声：助手项留着，跟 `interrupt()` 一样。
+   * `response.created` 还没到就只记账，等它到了再补 `response.cancel`。
+   */
+  cancelBackgroundSpeech(): void {
+    const claimed = this.claimedResp;
+    if (claimed !== null && claimed.origin !== 'announce') {
+      return;
+    }
+    const resp = claimed?.origin === 'announce'
+      ? claimed
+      : this.resp?.origin === 'announce'
+        ? this.resp
+        : null;
+    if (resp === null) {
+      return;
+    }
+    this.cancelAnnounce(resp);
+  }
+
+  /**
    * 把**别的车道答出来的**内容回注进 omni 的上下文（委派轮用）。
    *
    * 为什么必须是 `role:'user'`：实测服务端只允许伪造用户的输入，`role:'assistant'`
@@ -935,10 +1117,11 @@ export class OmniShadow {
     }
   }
 
-  /** 手里那份可用吗（没被取消、没被认领走） */
+  /** 手里那份可用吗（没被取消、没被认领走、也不是后台汇报） */
   private liveResp(): PendingResponse | null {
     const resp = this.resp;
-    if (resp === null || resp.cancelled || resp.claimed) {
+    // announce 即使忘了标 claimed，也不能交给用户的 claim()。
+    if (resp === null || resp.cancelled || resp.claimed || resp.origin === 'announce') {
       return null;
     }
     return resp;
@@ -977,30 +1160,7 @@ export class OmniShadow {
     const sentAt = this.now();
     this.send({ type: 'input_audio_buffer.commit' });
     this.send({ type: 'response.create' });
-    this.resp = {
-      meta,
-      sentAt,
-      ackAt: null,
-      finalAt: null,
-      firstTextAt: null,
-      firstAudioAt: null,
-      outBytes: 0,
-      cancelled: false,
-      audio: [],
-      audioWaiters: [],
-      closed: false,
-      text: '',
-      delegate: null,
-      delegateRequest: null,
-      created: false,
-      cancelPending: false,
-      superseded: false,
-      next: null,
-      deleteOnDone: false,
-      itemIds: [],
-      userItemId: null,
-      claimed: false,
-    };
+    this.resp = blankPending(meta, 'user', sentAt);
     // 接上「谁顶掉了谁」：读端要靠它跟到真正那份答案（见 claim() 的 chunks）
     if (this.supersededPrev !== null) {
       this.supersededPrev.next = this.resp;
@@ -1017,6 +1177,31 @@ export class OmniShadow {
     this.armResponseTimeout();
     // 读端可能正挂在 `waitLive()` 上等这一份
     this.wakeLive();
+  }
+
+  /**
+   * 掐一条后台汇报，并叫醒它自己的读端。
+   *
+   * 不改 `state`：服务端的 response 要等到 `response.done` 才真的没了，
+   * 提前回到 `ready` 会让下一次 create 撞上「already has an active response」。
+   * 一个字节都没播过才标 `deleteOnDone`（只删助手项，user 旁注留着）；
+   * 播过就留着，跟 `interrupt()` 一样。
+   */
+  private cancelAnnounce(resp: PendingResponse): void {
+    if (resp.origin !== 'announce' || resp.closed) {
+      return;
+    }
+    if (resp.outBytes === 0) {
+      resp.deleteOnDone = true;
+    }
+    resp.audio.length = 0;
+    if (!resp.cancelled) {
+      this.cancelCurrent(resp);
+    }
+    if (this.claimedResp === resp) {
+      this.claimedResp = null;
+    }
+    this.wakeAudio(resp);
   }
 
   /**
@@ -1262,6 +1447,9 @@ export class OmniShadow {
     if (resp !== null) {
       // 先标 closed 再唤醒：读端要知道「再等也没有了」
       resp.closed = true;
+      if (resp.origin === 'announce' && this.claimedResp === resp) {
+        this.claimedResp = null;
+      }
       this.wakeAudio(resp);
     }
     if (this.state !== 'broken') {
@@ -1294,7 +1482,9 @@ export class OmniShadow {
     // 排队中的回注：现在回到 `ready` 了，可以发
     this.flushInjects();
 
-    if (resp !== null) {
+    // 后台汇报没有用户封段序号。记进 `omni.shadow` 会被 latency-report / fsm-trace
+    // 当成一次用户开口的 seal，口径就脏了。断线那种 `skipped` 另走 `break()`。
+    if (resp !== null && resp.origin !== 'announce') {
       const { meta } = resp;
       const usage = ev.response?.usage;
       const inDetails = usage?.input_tokens_details ?? {};

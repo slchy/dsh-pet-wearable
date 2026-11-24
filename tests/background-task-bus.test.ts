@@ -1,0 +1,722 @@
+/**
+ * `BackgroundTaskBus`：同一轮只打一次 dsh、静默记忆不插队、取消后迟到的结果不播。
+ */
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import {
+  BackgroundTaskBus,
+  clipSummary,
+  needsVerbatimRead,
+  stripVerbatimTag,
+  type BackgroundTaskRunner,
+} from '../src/background-task-bus.ts';
+import type { AgentImage, BackgroundTaskReport } from '../src/providers.ts';
+
+const FAILURE = '刚才那个任务没跑成，稍后可以再让我试一次。';
+
+interface ExecCall {
+  readonly taskId: string;
+  readonly query: string;
+  readonly image?: AgentImage;
+  readonly note?: string;
+  readonly silent: boolean;
+  readonly signal: AbortSignal;
+}
+
+interface Slot {
+  readonly resolve: (value: { text: string; speech?: string; emotion?: string }) => void;
+  readonly reject: (err: unknown) => void;
+}
+
+function must<T>(value: T | undefined, what: string): T {
+  assert.ok(value, what);
+  return value;
+}
+
+function flush(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+function holdRunner(): {
+  runner: BackgroundTaskRunner;
+  calls: ExecCall[];
+  cancels: string[];
+  pending: Slot[];
+} {
+  const calls: ExecCall[] = [];
+  const cancels: string[] = [];
+  const pending: Slot[] = [];
+  const runner: BackgroundTaskRunner = {
+    execute(req) {
+      calls.push(req);
+      return new Promise((resolve, reject) => {
+        pending.push({ resolve, reject });
+      });
+    },
+    cancelRunning(reason) {
+      cancels.push(reason);
+    },
+  };
+  return { runner, calls, cancels, pending };
+}
+
+test('dispatch 排队、开跑、完成，播报前剥掉情绪和排版', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  const handle = bus.dispatch({
+    query: '天气怎么样',
+    source: 'tool_call',
+    turnNo: 1,
+    note: '上一轮被打断',
+    image: { mimeType: 'image/jpeg', data: 'img' },
+  });
+
+  assert.equal(handle.state(), 'queued');
+  assert.equal(handle.deduplicated, false);
+  assert.equal(handle.turnNo, 1);
+  assert.equal(handle.source, 'tool_call');
+  assert.equal(handle.silent, false);
+  assert.equal(bus.activeCount(), 1);
+  assert.equal(bus.hasActiveReportable(), true);
+
+  await flush();
+  assert.equal(handle.state(), 'running');
+  assert.equal(bus.activeCount(), 1);
+  assert.equal(held.calls.length, 1);
+  const call = must(held.calls[0], 'execute');
+  assert.equal(call.taskId, handle.taskId);
+  assert.equal(call.query, '天气怎么样');
+  assert.equal(call.note, '上一轮被打断');
+  assert.equal(call.silent, false);
+  assert.equal(call.signal.aborted, false);
+  assert.deepEqual(call.image, { mimeType: 'image/jpeg', data: 'img' });
+
+  must(held.pending[0], 'slot').resolve({ text: '[开心]**明天北京晴，12到22度**' });
+  await flush();
+  assert.equal(handle.state(), 'completed');
+  assert.equal(bus.activeCount(), 0);
+  assert.equal(bus.hasActiveReportable(), false);
+  assert.equal(reports.length, 1);
+  const report = must(reports[0], 'report');
+  assert.equal(report.taskId, handle.taskId);
+  assert.equal(report.source, 'tool_call');
+  assert.equal(report.query, '天气怎么样');
+  assert.equal(report.summary, '明天北京晴，12到22度');
+  assert.equal(report.emotion, 'happy');
+  assert.equal(report.verbatim, undefined);
+  assert.equal(report.summary.includes('开心'), false);
+  assert.equal(report.summary.includes('*'), false);
+
+  const hinted = bus.dispatch({ query: '再问一句', source: 'early_rule' });
+  await flush();
+  must(held.pending[1], 'hint slot').resolve({ text: '没有标签', emotion: '开心' });
+  await flush();
+  assert.equal(hinted.state(), 'completed');
+  const hintedReport = must(reports[1], 'hint report');
+  assert.equal(hintedReport.summary, '没有标签');
+  assert.equal(hintedReport.emotion, 'happy');
+  assert.equal(hintedReport.verbatim, undefined);
+});
+
+test('同一轮 early_rule 接着 tool_call 只执行一次，还在排队就升级查询', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+
+  const early = bus.dispatch({
+    query: 'asr原话',
+    source: 'early_rule',
+    turnNo: 7,
+    note: '旧注',
+  });
+  const tool = bus.dispatch({
+    query: '听见的完整问题',
+    source: 'tool_call',
+    turnNo: 7,
+    note: '新注',
+  });
+  assert.equal(early.state(), 'queued');
+  assert.equal(early.deduplicated, false);
+  assert.equal(tool.deduplicated, true);
+  assert.equal(tool.taskId, early.taskId);
+  assert.equal(tool.source, 'early_rule');
+  assert.equal(bus.activeCount(), 1);
+
+  await flush();
+  assert.equal(held.calls.length, 1);
+  assert.equal(early.state(), 'running');
+  const call = must(held.calls[0], 'execute');
+  assert.equal(call.taskId, early.taskId);
+  assert.equal(call.query, '听见的完整问题');
+  assert.equal(call.note, '新注');
+
+  const late = bus.dispatch({
+    query: '太晚了不该覆盖',
+    source: 'tool_call',
+    turnNo: 7,
+    note: '晚注',
+  });
+  assert.equal(late.deduplicated, true);
+  assert.equal(late.taskId, early.taskId);
+  assert.equal(held.calls.length, 1);
+
+  must(held.pending[0], 'slot').resolve({ text: '[开心]查到了' });
+  await flush();
+  assert.equal(early.state(), 'completed');
+  assert.equal(tool.state(), 'completed');
+  assert.equal(late.state(), 'completed');
+  assert.equal(reports.length, 1);
+  const report = must(reports[0], 'report');
+  assert.equal(report.taskId, early.taskId);
+  assert.equal(report.source, 'early_rule');
+  assert.equal(report.query, '听见的完整问题');
+  assert.equal(report.summary, '查到了');
+  assert.equal(report.emotion, 'happy');
+
+  const again = bus.dispatch({ query: '再来一次', source: 'tool_call', turnNo: 7 });
+  assert.equal(again.deduplicated, true);
+  assert.equal(again.state(), 'completed');
+  await flush();
+  assert.equal(held.calls.length, 1);
+  assert.equal(reports.length, 1);
+
+  const early2 = bus.dispatch({
+    query: '原话',
+    source: 'early_rule',
+    turnNo: 8,
+    note: '保留',
+  });
+  const tool2 = bus.dispatch({ query: '更全的问法', source: 'tool_call', turnNo: 8 });
+  const rule2 = bus.dispatch({ query: '不要退回这句', source: 'early_rule', turnNo: 8 });
+  assert.equal(tool2.deduplicated, true);
+  assert.equal(rule2.deduplicated, true);
+  assert.equal(rule2.taskId, early2.taskId);
+  await flush();
+  const second = must(held.calls[1], 'second execute');
+  assert.equal(second.query, '更全的问法');
+  assert.equal(second.note, '保留');
+  must(held.pending[1], 'second slot').resolve({ text: '好' });
+  await flush();
+  assert.equal(must(reports[1], 'second report').query, '更全的问法');
+});
+
+test('静默任务不参与 turnNo 去重', async () => {
+  const held = holdRunner();
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: () => { throw new Error('静默轮不该汇报'); },
+  });
+  const loud = bus.dispatch({ query: '要说', source: 'tool_call', turnNo: 9 });
+  const quiet = bus.dispatch({ query: '只记', source: 'memory_silent', turnNo: 9 });
+  assert.equal(loud.deduplicated, false);
+  assert.equal(quiet.deduplicated, false);
+  assert.equal(quiet.silent, true);
+  assert.notEqual(loud.taskId, quiet.taskId);
+  await flush();
+  assert.equal(must(held.calls[0], 'loud').query, '要说');
+  assert.equal(quiet.state(), 'queued');
+  must(held.pending[0], 'loud slot').resolve({ text: '说了' });
+  await flush();
+  assert.equal(must(held.calls[1], 'quiet').query, '只记');
+  assert.equal(must(held.calls[1], 'quiet').silent, true);
+  must(held.pending[1], 'quiet slot').resolve({ text: '记下了' });
+  await flush();
+  assert.equal(quiet.state(), 'completed');
+});
+
+test('要播报的任务排在静默记忆前面，静默成功和失败都不播报', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const lines: string[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    now: () => 50,
+    log: (line) => { lines.push(line); },
+    onReport: (report) => { reports.push(report); },
+  });
+
+  bus.dispatch({ query: '占线', source: 'image' });
+  await flush();
+  const silent = bus.dispatch({ query: '写记忆', source: 'memory_silent', turnNo: 3 });
+  const urgent = bus.dispatch({ query: '现在几点', source: 'tool_call', turnNo: 4 });
+  assert.equal(silent.silent, true);
+  assert.equal(silent.state(), 'queued');
+  assert.equal(urgent.state(), 'queued');
+  assert.equal(bus.activeCount(), 3);
+  assert.equal(bus.hasActiveReportable(), true);
+
+  must(held.pending[0], 'blocker').resolve({ text: '占线结束' });
+  await flush();
+  assert.equal(must(held.calls[1], 'urgent').query, '现在几点');
+  assert.equal(urgent.state(), 'running');
+  assert.equal(silent.state(), 'queued');
+
+  must(held.pending[1], 'urgent slot').resolve({ text: '三点' });
+  await flush();
+  assert.equal(must(held.calls[2], 'silent').query, '写记忆');
+  assert.equal(must(held.calls[2], 'silent').silent, true);
+  assert.equal(bus.hasActiveReportable(), false);
+  assert.equal(bus.activeCount(), 1);
+
+  must(held.pending[2], 'silent slot').resolve({ text: '记好了不该播' });
+  await flush();
+  assert.equal(silent.state(), 'completed');
+  assert.deepEqual(reports.map((report) => report.summary), ['占线结束', '三点']);
+  assert.equal(reports.some((report) => report.source === 'memory_silent'), false);
+  assert.equal(lines.some((line) => line.includes('不播报')), true);
+
+  const bad = bus.dispatch({ query: '再写', source: 'memory_silent', silent: true });
+  const after = bus.dispatch({ query: '接着说', source: 'early_rule' });
+  await flush();
+  assert.equal(must(held.calls[3], 'after').query, '接着说');
+  assert.equal(bad.state(), 'queued');
+  must(held.pending[3], 'after slot').resolve({ text: '接着说完了' });
+  await flush();
+  assert.equal(must(held.calls[4], 'bad').query, '再写');
+  must(held.pending[4], 'bad slot').reject(new Error('disk'));
+  await flush();
+  assert.equal(bad.state(), 'failed');
+  assert.equal(after.state(), 'completed');
+  assert.deepEqual(reports.map((report) => report.summary), ['占线结束', '三点', '接着说完了']);
+  assert.equal(reports.some((report) => report.summary === FAILURE), false);
+});
+
+test('cancelAll 打断在跑的任务并丢掉排队的播报，迟到结果不发', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+
+  const running = bus.dispatch({ query: '在查', source: 'tool_call', turnNo: 1 });
+  await flush();
+  const queued = bus.dispatch({ query: '还没开始', source: 'early_rule', turnNo: 2 });
+  const silent = bus.dispatch({ query: '写记忆', source: 'memory_silent' });
+  const signal = must(held.calls[0], 'call').signal;
+
+  assert.equal(bus.cancelAll('别查了'), true);
+  assert.equal(running.state(), 'cancelled');
+  assert.equal(queued.state(), 'cancelled');
+  assert.equal(silent.state(), 'queued');
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(held.cancels, ['别查了']);
+  assert.equal(bus.hasActiveReportable(), false);
+
+  must(held.pending[0], 'late').resolve({ text: '查到了不该播' });
+  await flush();
+  assert.equal(reports.length, 0);
+  assert.equal(running.state(), 'cancelled');
+  assert.equal(held.calls.every((call) => call.query !== '还没开始'), true);
+  assert.equal(must(held.calls[1], 'silent').query, '写记忆');
+
+  must(held.pending[1], 'silent slot').resolve({ text: '记忆写了' });
+  await flush();
+  assert.equal(reports.length, 0);
+  assert.equal(silent.state(), 'completed');
+  assert.equal(bus.cancelAll(), false);
+  assert.equal(bus.activeCount(), 0);
+});
+
+test('取消之后 runner 拒绝也不会变成失败播报', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  const handle = bus.dispatch({ query: '在查', source: 'tool_call' });
+  await flush();
+  assert.equal(bus.cancelAll(), true);
+  assert.deepEqual(held.cancels, ['user_cancel']);
+  must(held.pending[0], 'slot').reject(new Error('aborted'));
+  await flush();
+  assert.equal(reports.length, 0);
+  assert.equal(handle.state(), 'cancelled');
+  assert.equal(bus.hasActiveReportable(), false);
+});
+
+test('cancelAll 默认留着静默记忆，includeSilent 才一起停', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  assert.equal(bus.cancelAll(), false);
+
+  const silent = bus.dispatch({ query: '写记忆', source: 'memory_silent' });
+  assert.equal(bus.hasActiveReportable(), false);
+  assert.equal(bus.activeCount(), 1);
+  assert.equal(bus.cancelAll('别查了'), false);
+  assert.equal(silent.state(), 'queued');
+  assert.equal(held.cancels.length, 0);
+
+  await flush();
+  assert.equal(silent.state(), 'running');
+  assert.equal(bus.cancelAll(), false);
+  assert.equal(must(held.calls[0], 'call').signal.aborted, false);
+  assert.equal(held.cancels.length, 0);
+
+  assert.equal(bus.cancelAll('停', { includeSilent: true }), false);
+  assert.equal(silent.state(), 'cancelled');
+  assert.equal(must(held.calls[0], 'call').signal.aborted, true);
+  assert.deepEqual(held.cancels, ['停']);
+
+  must(held.pending[0], 'slot').resolve({ text: '不该播' });
+  await flush();
+  assert.equal(reports.length, 0);
+  assert.equal(silent.state(), 'cancelled');
+  assert.equal(bus.activeCount(), 0);
+});
+
+test('外部 onAnnounce 收成 dsh_background，剥情绪并认出逐字稿', async () => {
+  const reports: BackgroundTaskReport[] = [];
+  let executed = 0;
+  const bus = new BackgroundTaskBus({
+    runner: {
+      async execute() {
+        executed += 1;
+        return { text: '' };
+      },
+    },
+    onReport: (report) => { reports.push(report); },
+  });
+
+  bus.ingestExternalAnnouncement('[开心]查好了', undefined, '刚才那个');
+  bus.ingestExternalAnnouncement('[VERBATIM]单号 W8665881');
+  bus.ingestExternalAnnouncement('   ');
+  bus.ingestExternalAnnouncement('[开心]');
+  bus.ingestExternalAnnouncement('[VERBATIM]');
+  bus.ingestExternalAnnouncement('到了', '惊讶', '快递');
+
+  assert.equal(executed, 0);
+  assert.equal(reports.length, 3);
+  const spoken = must(reports[0], 'spoken');
+  assert.equal(spoken.source, 'dsh_background');
+  assert.equal(spoken.summary, '查好了');
+  assert.equal(spoken.emotion, 'happy');
+  assert.equal(spoken.query, '刚才那个');
+  assert.equal(spoken.verbatim, undefined);
+  assert.equal(spoken.summary.includes('开心'), false);
+
+  const verbatim = must(reports[1], 'verbatim');
+  assert.equal(verbatim.source, 'dsh_background');
+  assert.equal(verbatim.query, '');
+  assert.equal(verbatim.summary, '单号 W8665881');
+  assert.equal(verbatim.verbatim, '单号 W8665881');
+  assert.equal(verbatim.emotion, 'calm');
+  assert.equal(verbatim.verbatim.includes('VERBATIM'), false);
+
+  const hinted = must(reports[2], 'hinted');
+  assert.equal(hinted.summary, '到了');
+  assert.equal(hinted.emotion, 'surprised');
+  assert.equal(hinted.query, '快递');
+  assert.notEqual(spoken.taskId, verbatim.taskId);
+
+  bus.dispose();
+  bus.ingestExternalAnnouncement('不该出现');
+  assert.equal(reports.length, 3);
+});
+
+test('needsVerbatimRead 只在必须逐字念的时候为真', () => {
+  assert.equal(needsVerbatimRead('明天北京晴，12到22度'), false);
+  assert.equal(needsVerbatimRead('已经帮你把闹钟定在明天早上七点了'), false);
+  assert.equal(needsVerbatimRead('今年是2024年'), false);
+  assert.equal(needsVerbatimRead('端口8080'), false);
+  assert.equal(needsVerbatimRead('main.ts'), false);
+  assert.equal(needsVerbatimRead('甲'.repeat(180)), false);
+  assert.equal(needsVerbatimRead(`  ${'甲'.repeat(180)}  `), false);
+
+  assert.equal(needsVerbatimRead('[VERBATIM]就这句'), true);
+  assert.equal(needsVerbatimRead('【VERBATIM】念这个'), true);
+  assert.equal(needsVerbatimRead('[开心][VERBATIM]你好'), true);
+  assert.equal(needsVerbatimRead('端口 63993'), true);
+  assert.equal(needsVerbatimRead('单号 W8665881'), true);
+  assert.equal(needsVerbatimRead('单号AB1234'), true);
+  assert.equal(needsVerbatimRead('改在 src/main.ts'), true);
+  assert.equal(needsVerbatimRead('src\\main.py'), true);
+  assert.equal(needsVerbatimRead('deploy/app.yml'), true);
+  assert.equal(needsVerbatimRead('地址 10.1.2.3'), true);
+  assert.equal(needsVerbatimRead('甲'.repeat(181)), true);
+
+  assert.equal(stripVerbatimTag('[VERBATIM]你好'), '你好');
+  assert.equal(stripVerbatimTag('前[VERBATIM]后'), '前后');
+  assert.equal(stripVerbatimTag('【VERBATIM】留下'), '留下');
+  assert.equal(clipSummary('abc', 10), 'abc');
+  assert.equal(clipSummary('甲'.repeat(20), 5), '甲'.repeat(5));
+});
+
+test('逐字结果带 verbatim，普通短句不带，超长摘要被截断', async () => {
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: {
+      async execute(req) {
+        return { text: req.query };
+      },
+    },
+    onReport: (report) => { reports.push(report); },
+  });
+  const long = '甲'.repeat(181);
+  const cases: ReadonlyArray<{
+    query: string;
+    summary: string;
+    emotion: string;
+    verbatim?: string;
+  }> = [
+    {
+      query: '明天北京晴，12到22度',
+      summary: '明天北京晴，12到22度',
+      emotion: 'calm',
+    },
+    {
+      query: '已经帮你把闹钟定在明天早上七点了',
+      summary: '已经帮你把闹钟定在明天早上七点了',
+      emotion: 'calm',
+    },
+    {
+      query: '[VERBATIM]就这一句',
+      summary: '就这一句',
+      emotion: 'calm',
+      verbatim: '就这一句',
+    },
+    {
+      query: '[开心][VERBATIM]端口63993',
+      summary: '端口63993',
+      emotion: 'happy',
+      verbatim: '端口63993',
+    },
+    {
+      query: '[VERBATIM][开心]端口63993',
+      summary: '端口63993',
+      emotion: 'happy',
+      verbatim: '端口63993',
+    },
+    {
+      query: '[VERBATIM]**端口63993**',
+      summary: '端口63993',
+      emotion: 'calm',
+      verbatim: '端口63993',
+    },
+    {
+      query: '单号 W8665881',
+      summary: '单号 W8665881',
+      emotion: 'calm',
+      verbatim: '单号 W8665881',
+    },
+    {
+      query: '改好了 src/main.ts',
+      summary: '改好了 src/main.ts',
+      emotion: 'calm',
+      verbatim: '改好了 src/main.ts',
+    },
+    {
+      query: long,
+      summary: '甲'.repeat(160),
+      emotion: 'calm',
+      verbatim: long,
+    },
+  ];
+
+  const empty = bus.dispatch({ query: '[开心]', source: 'tool_call' });
+  for (const item of cases) {
+    bus.dispatch({ query: item.query, source: 'tool_call' });
+  }
+  await flush();
+  assert.equal(empty.state(), 'completed');
+  assert.equal(reports.length, cases.length);
+  for (let i = 0; i < cases.length; i += 1) {
+    const item = must(cases[i], `case ${i}`);
+    const report = must(reports[i], `report ${i}`);
+    assert.equal(report.query, item.query);
+    assert.equal(report.summary, item.summary);
+    assert.equal(report.emotion, item.emotion);
+    assert.equal(report.verbatim, item.verbatim);
+    assert.equal(report.summary.includes('[VERBATIM]'), false);
+    assert.equal(report.summary.includes('开心'), false);
+  }
+  const longReport = must(reports[cases.length - 1], 'long');
+  assert.equal(longReport.summary.length, 160);
+  assert.equal(longReport.verbatim?.startsWith(longReport.summary), true);
+});
+
+test('执行失败给兜底句，并继续后面的任务', async () => {
+  const calls: string[] = [];
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: {
+      async execute(req) {
+        calls.push(req.query);
+        if (req.query === '会失败') throw new Error('boom');
+        return { text: `[得意]${req.query}好了` };
+      },
+    },
+    onReport: (report) => { reports.push(report); },
+  });
+  const failed = bus.dispatch({ query: '会失败', source: 'tool_call', turnNo: 2 });
+  const next = bus.dispatch({ query: '下一件', source: 'early_rule', turnNo: 3 });
+  await flush();
+  assert.equal(failed.state(), 'failed');
+  assert.equal(next.state(), 'completed');
+  assert.deepEqual(calls, ['会失败', '下一件']);
+  assert.equal(reports.length, 2);
+  const failure = must(reports[0], 'failure');
+  assert.equal(failure.summary, FAILURE);
+  assert.equal(failure.source, 'tool_call');
+  assert.equal(failure.query, '会失败');
+  assert.equal(failure.taskId, failed.taskId);
+  assert.equal(failure.verbatim, undefined);
+  assert.equal(failure.emotion, undefined);
+  const followed = must(reports[1], 'next');
+  assert.equal(followed.summary, '下一件好了');
+  assert.equal(followed.emotion, 'proud');
+  assert.equal(followed.query, '下一件');
+  assert.equal(followed.source, 'early_rule');
+
+  const retry = bus.dispatch({ query: '再试', source: 'tool_call', turnNo: 2 });
+  assert.equal(retry.deduplicated, false);
+  await flush();
+  assert.equal(retry.state(), 'completed');
+  assert.equal(must(reports[2], 'retry').summary, '再试好了');
+  assert.deepEqual(calls, ['会失败', '下一件', '再试']);
+});
+
+test('dispose 吃掉在途完成，而且不调用 cancelRunning', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  const running = bus.dispatch({ query: '在查', source: 'tool_call' });
+  const queued = bus.dispatch({ query: '还没开始', source: 'early_rule' });
+  const silent = bus.dispatch({ query: '写记忆', source: 'memory_silent' });
+  await flush();
+  const signal = must(held.calls[0], 'call').signal;
+
+  bus.dispose();
+  bus.dispose();
+  assert.equal(running.state(), 'cancelled');
+  assert.equal(queued.state(), 'cancelled');
+  assert.equal(silent.state(), 'cancelled');
+  assert.equal(signal.aborted, true);
+  assert.equal(held.cancels.length, 0);
+  assert.equal(bus.activeCount(), 0);
+  assert.equal(bus.hasActiveReportable(), false);
+
+  must(held.pending[0], 'late').resolve({ text: '迟到' });
+  await flush();
+  assert.equal(reports.length, 0);
+  assert.equal(running.state(), 'cancelled');
+  assert.equal(held.calls.length, 1);
+
+  const ghost = bus.dispatch({ query: '新的', source: 'tool_call' });
+  assert.equal(ghost.state(), 'cancelled');
+  assert.equal(ghost.deduplicated, false);
+  bus.ingestExternalAnnouncement('[开心]不该出现', undefined, '问');
+  await flush();
+  assert.equal(reports.length, 0);
+  assert.equal(held.calls.length, 1);
+});
+
+test('还没开跑就 dispose，一条都不会执行', async () => {
+  const held = holdRunner();
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: () => { throw new Error('不该汇报'); },
+  });
+  const first = bus.dispatch({ query: '一', source: 'tool_call' });
+  const second = bus.dispatch({ query: '二', source: 'memory_silent' });
+  assert.equal(first.state(), 'queued');
+  bus.dispose();
+  await flush();
+  assert.equal(held.calls.length, 0);
+  assert.equal(held.cancels.length, 0);
+  assert.equal(first.state(), 'cancelled');
+  assert.equal(second.state(), 'cancelled');
+});
+
+test('汇报回调抛错不会停掉后面的任务', async () => {
+  const reports: string[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: {
+      async execute(req) {
+        return { text: req.query };
+      },
+    },
+    onReport(report) {
+      reports.push(report.summary);
+      if (report.summary === '第一') throw new Error('下游挂了');
+    },
+  });
+  const first = bus.dispatch({ query: '第一', source: 'tool_call' });
+  const second = bus.dispatch({ query: '第二', source: 'early_rule' });
+  await flush();
+  assert.deepEqual(reports, ['第一', '第二']);
+  assert.equal(first.state(), 'completed');
+  assert.equal(second.state(), 'completed');
+});
+
+test('同一时间只有一个 runner.execute', async () => {
+  let active = 0;
+  let max = 0;
+  const bus = new BackgroundTaskBus({
+    onReport: () => {},
+    runner: {
+      async execute() {
+        active += 1;
+        max = Math.max(max, active);
+        await Promise.resolve();
+        active -= 1;
+        return { text: '好' };
+      },
+    },
+  });
+  bus.dispatch({ query: 'a', source: 'tool_call' });
+  bus.dispatch({ query: 'b', source: 'early_rule' });
+  bus.dispatch({ query: 'c', source: 'image' });
+  await flush();
+  assert.equal(max, 1);
+  assert.equal(active, 0);
+});
+
+test('队列超过上限就丢，去重不算新任务', async () => {
+  const held = holdRunner();
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: () => {},
+    maxQueue: 1,
+  });
+  const first = bus.dispatch({ query: '先', source: 'early_rule', turnNo: 1 });
+  const upgraded = bus.dispatch({ query: '先的完整版', source: 'tool_call', turnNo: 1 });
+  const dropped = bus.dispatch({ query: '多余', source: 'tool_call', turnNo: 2 });
+  assert.equal(upgraded.deduplicated, true);
+  assert.equal(upgraded.taskId, first.taskId);
+  assert.equal(dropped.state(), 'cancelled');
+  assert.equal(dropped.deduplicated, false);
+  await flush();
+  assert.equal(held.calls.length, 1);
+  assert.equal(must(held.calls[0], 'call').query, '先的完整版');
+  assert.equal(bus.activeCount(), 1);
+
+  const next = bus.dispatch({ query: '后续', source: 'image' });
+  assert.equal(next.state(), 'queued');
+  assert.equal(bus.activeCount(), 2);
+  must(held.pending[0], 'first').resolve({ text: '好' });
+  await flush();
+  assert.equal(must(held.calls[1], 'next').query, '后续');
+  must(held.pending[1], 'next slot').resolve({ text: '也好' });
+  await flush();
+  assert.equal(next.state(), 'completed');
+  assert.equal(bus.activeCount(), 0);
+});
