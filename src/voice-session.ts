@@ -418,6 +418,15 @@ export interface VoiceSessionOptions {
    * 很烦；`--serve` 就是给它准备的。
    */
   readonly serve?: boolean;
+
+  /**
+   * 监听成功：真实端口 + 外部停机入口。
+   *
+   * 给「进程内起栈」的宿主（dsh 插件）用：`port: 0` 时只有这里能拿到端口；
+   * {@link serve} 多设备模式下也只有这里能停机（靠连接结束收不了尾）。
+   * 语义见 `transport.ts` 的同名选项。
+   */
+  readonly onListening?: (info: { readonly port: number; readonly stop: () => void }) => void;
 }
 
 /**
@@ -460,6 +469,7 @@ export async function runVoiceServer(options: VoiceSessionOptions): Promise<numb
       authenticate: options.authenticate,
       idleTimeoutMs: options.idleTimeoutMs,
       singleConnection: options.serve !== true,
+      ...(options.onListening === undefined ? {} : { onListening: options.onListening }),
       log: (line) => { console.log(line); },
       onConnection: (conn) => { handshake(conn, options, service); },
     });

@@ -82,7 +82,7 @@ async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
 }
 
 /** `--stt aliyun|qwen-realtime|noop|canned|<path>` */
-async function buildStt(
+export async function buildStt(
   spec: string,
   creds: {
     akId: string; akSecret: string; appkey: string; region: string;
@@ -117,8 +117,16 @@ async function buildStt(
   return loadProvider<SttProvider>(spec, 'stt');
 }
 
-/** `--tts cosyvoice|omni|mimo|silent|<path>` */
-async function buildTts(spec: string): Promise<TtsProvider> {
+/**
+ * `--tts cosyvoice|omni|mimo|silent|<path>`
+ *
+ * `audit` 是 `tts.*` 事件的出口。CLI 不传，落到进程级 {@link auditSlot}；
+ * 插件宿主自己 `createAuditSlot()` 传进来 —— 同一个进程里可能有多份宿主，
+ * 不该共用同一个全局槽（谁先挂上谁就写走了别人的档案）。
+ */
+export async function buildTts(spec: string, audit?: AuditSink): Promise<TtsProvider> {
+  const emit = audit
+    ?? ((name: string, data: Record<string, unknown>): void => { auditSlot.emit(name, data); });
   if (spec === 'silent') return silentTts(24_000);
   if (spec === 'cosyvoice') {
     if (!process.env['DASHSCOPE_API_KEY']) {
@@ -139,13 +147,13 @@ async function buildTts(spec: string): Promise<TtsProvider> {
       useInstruction:
         (process.env['COSYVOICE_EMOTION_MODE'] ?? DEFAULT_COSYVOICE_EMOTION_MODE) === 'instruction',
       // 每个 task 的「建立 / 首包」两段，常开落到当前档案（见 `tts.task`）
-      onTask: (info) => { auditSlot.emit(EVENTS.ttsTask, { ...info }); },
+      onTask: (info) => { emit(EVENTS.ttsTask, { ...info }); },
       // 流式 task 的分批送达明细，收尾时落一次（见 `tts.done`）
-      onDone: (info) => { auditSlot.emit(EVENTS.ttsDone, { ...info }); },
+      onDone: (info) => { emit(EVENTS.ttsDone, { ...info }); },
       // 首块 600 ms 还没回来：**当场**采这一条 socket（`unacked`/`rto` 只在那一瞬有意义）
       onStall: (info) => {
         void sampleSocket(info.local_port).then((socket) => {
-          auditSlot.emit(EVENTS.ttsStall, { ...info, socket });
+          emit(EVENTS.ttsStall, { ...info, socket });
         });
       },
     });
@@ -191,7 +199,7 @@ interface AgentBundle {
 }
 
 /** `--agent dsh|echo|none|<path>` */
-async function buildAgent(
+export async function buildAgent(
   spec: string,
   dsh: { workDir: string; useSdk: boolean; provider: string; model: string; log: (line: string) => void },
   announceStore: AnnounceStore | null,
@@ -238,8 +246,14 @@ async function buildAgent(
   return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
 }
 
-/** 证书从文件读，路径只走环境变量 —— 部署细节不进源码。 */
-function loadTls(): { key: Buffer; cert: Buffer } | undefined {
+/**
+ * 证书从文件读，路径只走环境变量 —— 部署细节不进源码。
+ *
+ * **配置错误抛异常，不退出进程**：插件宿主（`dsh-voice-web`）跑在 dsh 进程里，
+ * `process.exit` 会把整个宿主带走。CLI 在 `main()` 里接住再转 {@link fail}，
+ * 退出码与提示一字不变。
+ */
+export function loadTls(): { key: Buffer; cert: Buffer } | undefined {
   const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
   const certPath = process.env['MIAI_TLS_CERT'] ?? '';
   if (!keyPath || !certPath) {
@@ -247,7 +261,7 @@ function loadTls(): { key: Buffer; cert: Buffer } | undefined {
     if (keyPath || certPath) {
       const given = keyPath ? 'MIAI_TLS_KEY' : 'MIAI_TLS_CERT';
       const absent = keyPath ? 'MIAI_TLS_CERT' : 'MIAI_TLS_KEY';
-      fail(`只给了 ${given}，缺 ${absent}：TLS 要么两个都给，要么都不给`);
+      throw new Error(`只给了 ${given}，缺 ${absent}：TLS 要么两个都给，要么都不给`);
     }
     return undefined;
   }
@@ -260,7 +274,7 @@ function loadTls(): { key: Buffer; cert: Buffer } | undefined {
     }
     return { key: readFileSync(keyPath), cert };
   } catch (error) {
-    fail(`TLS 证书读不到：${(error as Error).message}`);
+    throw new Error(`TLS 证书读不到：${(error as Error).message}`);
   }
 }
 
@@ -277,8 +291,11 @@ function fail(message: string): never {
  * - 配了就必须首帧 `Hello`，且 token 要过强度校验（见 `tokens.ts`）
  * - 文件变了自动重读，**吊销不必重启进程**
  * - 写了 `token:deviceId` 就是真绑定：`Hello.deviceId` 对不上同样拒绝
+ *
+ * 与 {@link loadTls} 一样：配置错误**抛异常**，由调用方决定是退出还是收下
+ * （插件宿主不能退出）。
  */
-function loadAuthenticator(log: (line: string) => void): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
+export function loadAuthenticator(log: (line: string) => void): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
   const path = process.env['MIAI_TOKENS'] ?? '';
   if (!path.trim()) return undefined;
 
@@ -286,13 +303,13 @@ function loadAuthenticator(log: (line: string) => void): ((hello: { deviceId?: s
   // 启动时就报出弱/错 token，别等到设备连上来才发现「配了等于没配」
   const { entries, bad } = readTokenFile(resolved);
   for (const item of bad) {
-    fail(
+    throw new Error(
       `${resolved} 第 ${item.line} 行不合格：${describeTokenProblem(item.raw, item.problem)}\n`
       + '（要重新发一个：node src/pair.ts new --device <id>）',
     );
   }
   if (entries.length === 0) {
-    fail(`${resolved} 里没有任何可用的 token`);
+    throw new Error(`${resolved} 里没有任何可用的 token`);
   }
 
   const gate = new TokenGate(resolved, log);
@@ -416,13 +433,13 @@ const DEFAULT_SENTENCE_SILENCE_MS = 200;
  *
  * 不引依赖：格式就这么点。**已存在的环境变量优先**，所以命令行临时覆盖仍然有效。
  */
-function loadDotEnv(): void {
+export function loadDotEnv(): number {
   const path = join(process.cwd(), '.env');
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch {
-    return;
+    return 0;
   }
   let count = 0;
   for (const rawLine of text.split(/\r?\n/)) {
@@ -448,6 +465,7 @@ function loadDotEnv(): void {
   if (count > 0) {
     console.log(`凭据    ${path}（${count} 项）`);
   }
+  return count;
 }
 
 /**
@@ -1457,6 +1475,16 @@ async function main(): Promise<void> {
     );
     const plan = pipelinePlan;
     const engine = streaming?.engine;
+    // 这两项配错要**在 CLI 里退出 2**。函数本身改成抛异常了（插件宿主不能退出），
+    // 所以在这里接住、转成 `fail()` —— 退出码与提示语与改之前一字不差。
+    let tls: { key: Buffer; cert: Buffer } | undefined;
+    let authenticate: ((hello: { deviceId?: string; token?: string }) => boolean) | undefined;
+    try {
+      tls = loadTls();
+      authenticate = loadAuthenticator((line) => { console.log(line); });
+    } catch (error) {
+      fail((error as Error).message);
+    }
     const code = await runVoiceServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
@@ -1607,8 +1635,8 @@ async function main(): Promise<void> {
         : envNumber('MIAI_HQ_ARM_TIMEOUT_MS', 15_000) + envNumber('MIAI_HQ_SHUTTER_TIMEOUT_MS', 25_000),
       imageQuestion: '这张图里有什么？用一两句话口语化描述。',
       announceStore,
-      tls: loadTls(),
-      authenticate: loadAuthenticator((line) => { console.log(line); }),
+      tls,
+      authenticate,
       idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
       serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
       // 主动开口默认关：开着它会自己说话，得人明确要

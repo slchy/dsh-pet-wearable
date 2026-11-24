@@ -3,35 +3,51 @@
  *
  * 一条链：浏览器 ⇄ WS ⇄ 本进程的桥 ⇄ TCP 127.0.0.1 ⇄ 本进程内的语音栈。
  * 语音栈就是包① 那一套（`src/voice/` 是它的副本，由 `scripts/sync-voice.mjs`
- * 生成、不进 git），装配走与 CLI 共用的 `assembly.ts` —— 两边不会漂。
+ * 生成、不进 git），装配**直接复用包① 导出的那两个函数**
+ * （`assemblePipelinePlan` / `assembleStreamingAgent`）—— 与 CLI 是同一份装配代码，
+ * 两边不会漂。
  *
- * 为什么不是子进程：装配抽出来之后进程内起栈不需要复制任何代码，卸载时还能
- * 整块收掉，不用管僵尸子进程与信号转发。
+ * 与「独立进程」形态不同的三处，都是有意的：
  *
- * 语音栈的内部端口用 `0`（系统挑空闲口），拿到真实端口再把桥接上 ——
- * 省掉「固定端口会不会撞」这条隐式约定。
+ * - **端口**：内部语音栈绑 `0`，靠 `onListening` 拿真实端口；同一个回调里的
+ *   `stop()` 也是唯一的停机入口（多设备模式下没有任何事件会结束 `runVoiceServer`，
+ *   没有它，卸载插件时监听与控制口都关不掉）。
+ * - **TLS**：只在 `startWebBridge` 终结，证书读本插件自己的 `tls.keyPath/certPath`。
+ *   里层是 127.0.0.1 的**明文** TCP —— 桥连内网走 `net.connect`，套上 TLS 连不上。
+ * - **配置错误抛异常**：`loadTls` / `loadAuthenticator` 在 CLI 里是 `process.exit(2)`，
+ *   这里跑在 dsh 进程内，退出会把宿主一起带走。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
 import { startWebBridge, type WebBridge } from './bridge.ts'
 import {
-  AssemblyError,
+  assemblePipelinePlan,
+  assembleStreamingAgent,
   buildAgent,
   buildStt,
   buildTts,
+  createAuditSlot,
   loadAuthenticator,
   loadDotEnv,
-  loadTls,
-  openAnnounceStore,
-  wireAgent,
-} from './voice/assembly.ts'
-import { envNumber, envString } from './voice/util.ts'
+  type AssembledStreamingPipeline,
+} from './voice/main.ts'
+import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './voice/announce-store.ts'
 import { checkBindSafety } from './voice/bind-policy.ts'
+import {
+  KEEPALIVE_PROMPT,
+  newActivityState,
+  startKeepalive,
+  systemClock,
+} from './voice/keepalive.ts'
+import { MemoryFile } from './voice/memory-file.ts'
+import { semanticEndpoint } from './voice/semantic-endpoint.ts'
 import { TurnJudge } from './voice/turn-judge.ts'
+import { envNumber, envString } from './voice/util.ts'
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice/voice-session.ts'
-import type { AgentProvider } from './voice/providers.ts'
 import type { DshSession } from './voice/session.ts'
 
 export const name = 'voice-web'
@@ -46,14 +62,58 @@ function sttCreds(): {
   appkey: string
   region: string
   maxSentenceSilenceMs: number
+  vocabularyId?: string
 } {
+  // 热词表 ID 留空就不下发该字段（传不存在的 ID 会被服务端静默忽略，不报错）
+  const vocabularyId = process.env['ALIYUN_VOCAB_ID'] ?? ''
   return {
     akId: process.env['ALIYUN_AK_ID'] ?? '',
     akSecret: process.env['ALIYUN_AK_SECRET'] ?? '',
     appkey: process.env['ALIYUN_APPKEY'] ?? '',
     region: process.env['ALIYUN_NLS_REGION'] ?? 'cn-shanghai',
     maxSentenceSilenceMs: Number(process.env['MIAI_SENTENCE_SILENCE'] ?? 200),
+    ...(vocabularyId === '' ? {} : { vocabularyId }),
   }
+}
+
+/**
+ * 桥的 TLS：读插件配置里的文件，**不看 `MIAI_TLS_KEY`/`MIAI_TLS_CERT`**。
+ *
+ * 那两个环境变量是「独立进程直接对外监听」用的；插件对外的是桥，证书归插件配置。
+ * 里层语音栈永远明文（见文件头）。
+ */
+function loadBridgeTls(config: VoiceWebConfig): { key: Buffer; cert: Buffer } | undefined {
+  if (config.tls.keyPath === '') {
+    return undefined
+  }
+  try {
+    return {
+      key: readFileSync(config.tls.keyPath),
+      cert: readFileSync(config.tls.certPath),
+    };
+  } catch (error) {
+    throw new Error(`voice-web: TLS 证书读不到（${(error as Error).message}）`);
+  }
+}
+
+/**
+ * 投机的前置条件：宿主得能取消在途那一轮。
+ *
+ * 与 CLI 同一条判据 —— 没有 `session/cancel` 时，快车道命中会在 dsh 那边留下一轮
+ * 「用户没听过的回答」（白花钱 + 幽灵历史），所以探测失败就退回串行。
+ */
+async function resolveSpeculate(
+  session: DshSession,
+  report: (line: string) => void,
+): Promise<boolean> {
+  if (process.env['FAST_LANE_SPECULATE'] === '0') {
+    return false;
+  }
+  const canCancel = await session.probeCancelSupport(20_000);
+  report(canCancel
+    ? '快车道    投机=开（宿主支持 session/cancel，命中时可作废在途那一轮）'
+    : '快车道    投机=关 → 退回串行（宿主没有 session/cancel，作废不了在途那一轮）');
+  return canCancel;
 }
 
 export interface VoiceWebConfig {
@@ -71,9 +131,9 @@ export interface VoiceWebConfig {
     /** TLS 证书路径 */
     certPath: string
   }
-  /** 上行识别：`aliyun`（真厂商）/ `canned`（零密钥冒烟）/ `<模块路径>` */
+  /** 上行识别：`aliyun` / `qwen-realtime` / `canned` / `<模块路径>` */
   stt: string
-  /** 下行合成：`mimo` / `cosyvoice` / `silent` / `<模块路径>` */
+  /** 下行合成：`cosyvoice` / `omni` / `mimo` / `silent` / `<模块路径>` */
   tts: string
   /** 接话的 agent：`dsh` / `echo` / `none` */
   agent: string
@@ -92,8 +152,8 @@ export const Config: Schema<VoiceWebConfig> = Schema.object({
     keyPath: Schema.string().default('').description('TLS 私钥路径'),
     certPath: Schema.string().default('').description('TLS 证书路径'),
   }),
-  stt: Schema.string().default('aliyun').description('上行识别实现：aliyun / canned / <模块路径>'),
-  tts: Schema.string().default('mimo').description('下行合成实现：mimo / cosyvoice / silent / <模块路径>'),
+  stt: Schema.string().default('aliyun').description('上行识别实现：aliyun / qwen-realtime / canned / <模块路径>'),
+  tts: Schema.string().default('cosyvoice').description('下行合成实现：cosyvoice / omni / mimo / silent / <模块路径>'),
   agent: Schema.string().default('dsh').description('接话的 agent：dsh / echo / none'),
   workDir: Schema.string().default('').description('dsh 工作目录；留空 = 当前目录'),
   device: Schema.string().default('').description('v1 手机的型号提示；浏览器用不到'),
@@ -103,13 +163,8 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
   const logger = ctx.logger('voice-web')
 
   // 配置一写错就在加载时报，不等浏览器连上来才发现
-  const hasTls = config.tls.keyPath !== '' && config.tls.certPath !== ''
-  if (!hasTls && (config.tls.keyPath !== '' || config.tls.certPath !== '')) {
+  if ((config.tls.keyPath === '') !== (config.tls.certPath === '')) {
     throw new Error('voice-web: tls.keyPath 与 tls.certPath 必须成对给，只给一半等于把连接降级成明文')
-  }
-  const safety = checkBindSafety({ host: config.host, hasTls, hasAuth: true })
-  if (!safety.ok) {
-    throw new Error(`voice-web: ${safety.message}`)
   }
   // 非本机地址必须明说来源：wss 下浏览器不替服务端拦跨站页面，
   // 一个任意网页就能接上来推流。同源兜底在这里不够用。
@@ -124,30 +179,55 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
     const voice: { stop: (() => void) | null } = { stop: null }
     let dshSession: DshSession | null = null
     let turnJudge: TurnJudge | null = null
-    let stopWired: () => void = () => {}
+    let streaming: AssembledStreamingPipeline | null = null
+    let stopKeepalive: () => void = () => {}
 
     try {
       // 运维看的是这一路：与 CLI 一致打到 stdout。`logger` 的输出在 dsh 里看不到，
-      // 而「快车道开没开」「投机有没有生效」「保活多少分钟」必须能一眼确认 ——
-      // 这几行恰恰是判断"线接没接上"的唯一凭据。
+      // 而「管道是哪条」「快车道开没开」「判停接没接上」必须能一眼确认。
       const report = (line: string): void => { console.log(line) }
 
       // `process.cwd()/.env`。dsh 自己会经 `@deepseek-ai/dsh-launch-environment`
-      // 把调用目录的 `.env` 合并进 `process.env`，所以这里通常返回 0；
-      // 留着是因为别的宿主不一定这么做，而"配了密钥却说没配"很难查。
+      // 把调用目录的 `.env` 合并进 `process.env`，所以这里通常返回 0；留着是因为
+      // 别的宿主不一定这么做，而"配了密钥却说没配"很难查。
       // 必须在 `buildStt` / `buildTts` **之前** —— 那两个函数直接读 process.env。
       const loaded = loadDotEnv()
       if (loaded > 0) {
         report(`凭据    ${process.cwd()}\\.env（${loaded} 项）`)
       }
-      const tls = loadTls(report)
+
+      // 审计出口自己造一份：`createAuditSlot()` 是每个宿主一份，不共用包① 的全局槽。
+      // TTS provider 与流式装配都往这里写，`setAudit` 再把「当前连接」的档案挂上来。
+      const auditSlot = createAuditSlot()
+      const audit = (event: string, data: Record<string, unknown>): void => {
+        auditSlot.emit(event, data)
+      }
+
+      const tls = loadBridgeTls(config)
       const authenticate = loadAuthenticator(report)
+      // 鉴权是「配了才有」，所以这条判据必须拿到 `authenticate` 之后才能算 ——
+      // 以前无条件写 `hasAuth: true`，等于在非本机地址上假装有鉴权。
+      const safety = checkBindSafety({
+        host: config.host,
+        hasTls: tls !== undefined,
+        hasAuth: authenticate !== undefined,
+      })
+      if (!safety.ok) {
+        throw new Error(`voice-web: ${safety.message}`)
+      }
+
       const stt = await buildStt(config.stt, sttCreds())
-      const tts = await buildTts(config.tts)
+      const tts = await buildTts(config.tts, audit)
       report(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）`)
+
       const workDir = config.workDir === '' ? process.cwd() : config.workDir
       // 与 CLI 同一个队列：任务结果离线时先存着，重连后补播
-      const announceStore = openAnnounceStore(report)
+      const announceStore = AnnounceStore.open({
+        file: process.env['MIAI_ANNOUNCE_FILE'] ?? join(homedir(), '.voice-agent', 'announce.jsonl'),
+        maxItems: envNumber('MIAI_ANNOUNCE_MAX', DEFAULT_ANNOUNCE_MAX),
+        log: report,
+      })
+
       const bundle = await buildAgent(
         config.agent,
         {
@@ -163,32 +243,109 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       if (bundle.agent === null) {
         throw new Error(`agent=${config.agent} 没有产出 agent，语音栈起来也没人接话`)
       }
+      const baseAgent = bundle.agent
+      let agent = baseAgent
 
-      // 快车道 / 保活 / 记忆 / 活动跟踪。与 CLI 逐字同一套 —— 少了这一整段，
-      // 语音栈照样能跑，但每句都退化成等完整 dsh：中间结果投机、静音 100 ms 起跑、
-      // TTS 提前合成的窗口、对冲、短句直答全都没了。
-      const wired = await wireAgent({
-        agent: bundle.agent,
-        dsh: dshSession,
-        workDir,
-        announceStore,
-        log: report,
-      })
-      stopWired = wired.stop
-      const agent = wired.agent
+      /**
+       * 主管道。判据、强校验、`live` 的 `qwen-realtime` 前提全在包① 的纯函数里 ——
+       * 这里只传「当前选的 STT 叫什么」。
+       *
+       * 非 dsh（`echo` / `none`）不装管道：与 CLI 一致，那两条路本来就没有快车道。
+       */
+      const plan = config.agent === 'dsh'
+        ? assemblePipelinePlan(process.env, { sttName: config.stt, strict: true })
+        : null
 
-      // 判停侧车与 CLI 同一套环境变量。少了它 web 会退回固定合并窗口，
-      // 判停明显变差 —— 那不是"兼容性差异"，是功能缺失。
+      if (plan !== null) {
+        report(
+          `管道      ${plan.mode === 'live' ? 'Pure Live（Omni 单前台 + dsh 纯异步后台）' : 'Pure Cascade（ASR + 级联快车道/dsh + TTS）'}`
+          + `${plan.explicit ? ' [VOICE_PIPELINE]' : ' [兼容推断]'}`,
+        )
+        for (const note of plan.notes) {
+          report(`          ${note}`)
+        }
+
+        const session = dshSession
+        if (session === null) {
+          throw new Error('管道装配需要 dsh 会话，但 agent 不是 dsh')
+        }
+        const activity = newActivityState(Date.now())
+        const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md')
+        const memoryFile = new MemoryFile(memoryPath)
+
+        // 投机只在级联 + 真有快车道时才问；live 不加载文本快车道，问了也没用
+        const speculate = plan.mode === 'cascade' && plan.useCascadeFastLane
+          ? await resolveSpeculate(session, report)
+          : false
+
+        // 热路径引擎 / omni 影子 / 后台汇报出口都在这一句里，与 CLI 逐字同一套 ——
+        // 少了它，语音栈照样能跑，但每句都退化成「等完整 dsh」。
+        streaming = assembleStreamingAgent({
+          plan,
+          env: process.env,
+          dshAgent: baseAgent,
+          tts,
+          activity,
+          // 直播编排要一整段；级联在 assembleStreamingAgent 里再拆回逐条。
+          memory: (text) => memoryFile.relevant(text).join('\n'),
+          taskStatus: () => session.taskStatus(),
+          audit,
+          speculate,
+          announceStore,
+          log: report,
+        })
+        agent = streaming.agent
+        report(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`)
+
+        // 前缀保活：与 CLI 一样**直连 dsh**，不经过快车道/直播编排 ——
+        // 走编排层会被短句认领，dsh 根本没被叫到，前缀照样凉。
+        const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180)
+        if (keepaliveMinutes > 0) {
+          stopKeepalive = startKeepalive({
+            clock: systemClock,
+            intervalMs: keepaliveMinutes * 60_000,
+            idleFor: () => Date.now() - activity.last,
+            isBusy: () => activity.inflight > 0,
+            ping: async () => {
+              activity.inflight += 1
+              try {
+                await baseAgent.reply(KEEPALIVE_PROMPT)
+              } finally {
+                activity.inflight -= 1
+                activity.last = Date.now()
+              }
+            },
+            log: report,
+          })
+          report(`保活      空闲 ${keepaliveMinutes} 分钟发一次前缀保活（KEEPALIVE_MINUTES=0 关闭）`)
+        }
+      }
+
+      // 判停侧车与语义判停：旋钮与默认值都与 CLI 一致（见 `src/main.ts` 的
+      // `runVoiceServer({...})`）。**改那边记得改这里** —— 这两块是唯一还没抽成
+      // 共用函数的部分。
       const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? ''
       const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? ''
       const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
         && turnJudgePython !== '' && turnJudgeScript !== ''
-      const turnJudgeClient = turnJudgeEnabled
-        ? new TurnJudge({
-          python: turnJudgePython,
-          script: turnJudgeScript,
+
+      const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim()
+      const semantic = envString('SEMANTIC_END_TAG') === '0' || semanticKey === ''
+        ? null
+        : semanticEndpoint({
+          apiKey: semanticKey,
+          ...(process.env['FAST_LANE_MODEL'] === undefined
+            ? {}
+            : { model: process.env['FAST_LANE_MODEL'] }),
+          ...(process.env['FAST_LANE_BASE_URL'] === undefined
+            ? {}
+            : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
+          timeoutMs: envNumber('SEMANTIC_END_TAG_TIMEOUT_MS', 400),
           log: report,
         })
+
+      const turnJudgeClient = turnJudgeEnabled
+        ? new TurnJudge({ python: turnJudgePython, script: turnJudgeScript, log: report })
         : null
       if (turnJudgeClient !== null) {
         // 低幅正弦而不是全零：全零在 log-mel 里是 −∞ dB，不该拿它当"正常输入"试模型
@@ -198,11 +355,11 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
         }
         const startedAt = Date.now()
         const p = await turnJudgeClient.predict(warmup)
-        logger.info(`判停侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}）`)
+        report(`判停    侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}），之后所有连接共用这一份`)
       }
       turnJudge = turnJudgeClient
 
-      // 语音栈先起：端口 0 → 等它报出真实端口，再把桥接上去
+      // 语音栈先起：端口 0 → `onListening` 报出真实端口，再把桥接上去
       const voicePort = await new Promise<number>((resolve) => {
         void runVoiceServer({
           port: 0,
@@ -212,43 +369,80 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
           agent,
           stt,
           tts,
-          ...(turnJudgeClient === null ? {} : {
-            turnJudge: {
-              pythonPath: turnJudgePython,
-              scriptPath: turnJudgeScript,
-              quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
-              extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 400),
-              maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 7),
-              threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
-              unfinishedWaitMs: envNumber('TURN_JUDGE_UNFINISHED_MS', 250),
-              partialGraceMs: envNumber('TURN_JUDGE_PARTIAL_GRACE_MS', 150),
-            },
-            turnJudgeClient,
-          }),
+          ...(plan === null ? {} : { pipelineMode: plan.mode }),
+          ...(streaming?.engine === undefined ? {} : { engine: streaming.engine }),
+          ...(streaming?.speakAnnounce === undefined
+            ? {}
+            : {
+              speakAnnounce: streaming.speakAnnounce,
+              cancelAnnounce: streaming.cancelAnnounce,
+              onFallbackAnnounceSpoken: streaming.onFallbackAnnounceSpoken,
+            }),
+          // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
+          ...(streaming?.omniShadow === undefined ? {} : { omniShadow: streaming.omniShadow }),
+          ...(turnJudgeClient === null
+            ? {}
+            : {
+              turnJudge: {
+                pythonPath: turnJudgePython,
+                scriptPath: turnJudgeScript,
+                quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
+                extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 200),
+                maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 2),
+                maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 1),
+                trailingTrimMs: envNumber('TURN_JUDGE_TRIM_MS', 20),
+                threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
+                thresholdCjk: envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35),
+                waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 200),
+                waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 1_200),
+                maxOpenSilenceMs: envNumber('TURN_JUDGE_MAX_OPEN_SILENCE_MS', 650),
+              },
+              turnJudgeClient,
+            }),
+          ...(semantic === null
+            ? {}
+            : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 300) }),
           gate: {
-            thresholdDbfs: envNumber('VOICE_PEAK_DBFS', -40),
+            // 默认 −30 与线上一致。**但上行增益用 1×，不是 CLI 的 4×**：
+            // 浏览器侧 `getUserMedia` 已经开着 autoGainControl，再乘 4 会顶到削波。
+            // 门限按「放大后」算，所以这两项要成对看 —— 改一个就得回头量另一个。
+            thresholdDbfs: envNumber('VOICE_PEAK_DBFS', -30),
             holdMs: envNumber('VOICE_HOLD_MS', 2000),
             prerollMs: envNumber('VOICE_PREROLL_MS', 800),
             pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
             speculateMs: envNumber('VOICE_SPECULATE_MS', 100),
+            // 端点由我们控的 ASR 才由宿主封段；服务端自己判句的 provider（NLS）必须留 0
+            commitMs: envNumber('VOICE_COMMIT_MS', config.stt === 'qwen-realtime' ? 20 : 0),
+            sttCommitMs: envNumber('VOICE_STT_COMMIT_MS', config.stt === 'qwen-realtime' ? 150 : 0),
+            ...(config.stt === 'qwen-realtime'
+              ? {
+                openQuietMs: envNumber('VOICE_OPEN_QUIET_MS', 300),
+                openQuietShortMs: envNumber('VOICE_OPEN_QUIET_SHORT_MS', 200),
+              }
+              : {}),
           },
           playbackTailMs: 600,
-          micGain: envNumber('MIAI_MIC_GAIN', 1),
-          ttsGain: envNumber('MIAI_TTS_GAIN', 1),
+          ttsGain: envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1)),
+          micGain: envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1)),
           levelLogMs: envNumber('MIAI_LEVEL_LOG', 0),
           archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
           archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
           archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
+          // 连接建立/断开时把审计（快车道 + TTS 两段）接到这条档案上。
+          // 两参都转发：槽位靠 `expected` 做所有权守卫（旧连接收尾摘不掉新连接的）。
+          setAudit: (sink, expected) => { auditSlot.set(sink, expected) },
           photoDir: process.env['PHOTO_DIR'] ?? '',
-          // 内部端口是 0（系统随机），控制口交给系统另挑一个 —— 浏览器没有拍照，
-          // 这个口不会有真实流量，但不能省：类型上是必填，且留空会撞端口
+          // 浏览器没有拍照，但这个口不能省：类型上必填，留空会撞端口。
+          // 0 = 系统挑空闲口（里层端口本身就是 0，没有固定偏移可用）
           controlPort: envNumber('PHOTO_CTL_PORT', 0),
-          photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 20_000),
+          photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 60_000),
           confirmTimeoutMs: envNumber('MIAI_CONFIRM_TIMEOUT_MS', 30_000),
           imageQuestion: '这张图里有什么？用一两句话口语化描述。',
-          tls,
+          announceStore,
+          // 里层明文：桥用 `net.connect` 连进来（见文件头）
           authenticate,
           idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
+          // 多标签页 = 多条连接；同时也是「必须靠 onListening().stop() 收尾」的原因
           serve: true,
           onListening: (info) => {
             voice.stop = info.stop
@@ -288,21 +482,21 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       await bridge?.close()
       voice.stop?.()
       turnJudge?.stop()
-      stopWired()
+      streaming?.dispose()
+      stopKeepalive()
       dshSession?.stop()
-      if (error instanceof AssemblyError) {
-        throw new Error(`voice-web: ${error.message}`)
-      }
-      throw error
+      throw new Error(`voice-web: ${(error as Error).message}`)
     }
 
     return async () => {
-      // 先断桥：它的 TCP 客户端一断，语音栈那边每条连接的看门狗就停了，
-      // 之后 `server.close()` 才真的能在没有活动连接的情况下收尾。
+      // 先断桥：它的 TCP 客户端一断，语音栈那边每条连接的看门狗就停了。
+      // 再 `stop()`：关监听、断掉残留连接、`runVoiceServer` 的 finally 关控制口 ——
+      // 这才是 dsh 卸载/重载插件时不泄漏的原因。
       await bridge?.close()
       voice.stop?.()
       turnJudge?.stop()
-      stopWired()
+      streaming?.dispose()
+      stopKeepalive()
       dshSession?.stop()
     }
   }, 'voice-web')

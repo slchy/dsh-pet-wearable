@@ -339,6 +339,18 @@ export interface TransportOptions {
    * 多设备时改 false 并把连接表交给业务层 —— 这正是把这层独立出来的原因之一。
    */
   readonly singleConnection?: boolean;
+  /**
+   * 监听成功：交出**真实端口**（`port: 0` 时）和**外部停机入口**。
+   *
+   * 两件事都是给「进程内起栈」的宿主（dsh 插件）准备的：
+   * - `port: 0` 时没人知道绑到了哪个口，外面的桥接不上去；
+   * - `singleConnection: false` 时**没有任何事件会结束本函数** —— 没有这个 `stop()`，
+   *   宿主卸载插件时监听关不掉，进程里会一直留着一条 TCP 监听（以及它背后的
+   *   控制口、侧车等一切）。这是泄漏，不是便利问题。
+   *
+   * CLI 不用它：单设备模式靠连接结束收尾，进程退出即释放。
+   */
+  readonly onListening?: (info: { readonly port: number; readonly stop: () => void }) => void;
   readonly log: (line: string) => void;
   /** 连接建立：在这里 `conn.bind(...)` 登记业务回调。 */
   onConnection(conn: Connection): void;
@@ -364,6 +376,12 @@ export async function runTransport(options: TransportOptions): Promise<number> {
   return await new Promise<number>((resolve) => {
     let server: Server;
     let finished = false;
+    /**
+     * 已建立的连接。`server.close()` 只是停止收新连接，活着的还得自己断 ——
+     * 否则 `stop()` 之后监听虽然关了，连接和它们的业务对象（ASR/TTS/侧车）
+     * 仍挂在进程里。
+     */
+    const sockets = new Set<Socket>();
 
     const finish = (code: number): void => {
       if (finished) {
@@ -371,10 +389,19 @@ export async function runTransport(options: TransportOptions): Promise<number> {
       }
       finished = true;
       server.close();
-      resolve(code);
+      const live = [...sockets];
+      sockets.clear();
+      for (const socket of live) {
+        socket.destroy();
+      }
+      // 等一 tick 再 resolve：`Connection` 的 `onClose`（档案收尾、ASR/TTS 关闭）挂在
+      // socket 的 `'close'` 事件上，先让它跑完，调用方再去拆控制口 / 卸载插件。
+      setImmediate(() => { resolve(code); });
     };
 
     const onConnection = (socket: Socket): void => {
+      sockets.add(socket);
+      socket.once('close', () => { sockets.delete(socket); });
       const conn = new Connection(
         socket,
         options.log,
@@ -402,12 +429,16 @@ export async function runTransport(options: TransportOptions): Promise<number> {
     });
 
     server.listen(options.port, host, () => {
+      // `port: 0` 时真实端口只在这里看得到 —— 日志和宿主都要用它，不是 `options.port`
+      const address = server.address();
+      const port = typeof address === 'object' && address !== null ? address.port : options.port;
       const scheme = options.tls ? 'tls' : 'tcp';
       const auth = options.authenticate ? '需要 Hello 鉴权' : '不鉴权';
-      options.log(`监听 ${scheme}://${host}:${options.port}（${auth}）`);
+      options.log(`监听 ${scheme}://${host}:${port}（${auth}）`);
       if (host === '127.0.0.1') {
-        options.log(`手机侧先执行： adb reverse tcp:${options.port} tcp:${options.port}`);
+        options.log(`手机侧先执行： adb reverse tcp:${port} tcp:${port}`);
       }
+      options.onListening?.({ port, stop: () => { finish(0); } });
     });
   });
 }
