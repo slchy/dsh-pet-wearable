@@ -617,6 +617,7 @@ test('dsh 起跑要报「距开轮多久」—— 那 6.5 秒的空洞靠它切'
   await agent.reply('帮我看看今天天气怎么样');
   const line = logs.find((l) => l.includes('dsh 起跑'));
   assert.ok(line !== undefined, `必须报 dsh 起跑时刻，实际：${JSON.stringify(logs)}`);
-  assert.match(line, /距开轮 \d+ ms/, '要带距开轮的毫秒数');
-  assert.match(line, /距开轮 [0-9] ms|距开轮 [1-9]?0 ms/, `开轮即起跑时应当接近 0，实际：${line}`);
+  const match = /距开轮 (\d+) ms/.exec(line);
+  assert.ok(match !== null, `要带距开轮的毫秒数，实际：${line}`);
+  assert.ok(Number(match[1]) < 100, `开轮即起跑时应当接近 0，实际：${line}`);
 });

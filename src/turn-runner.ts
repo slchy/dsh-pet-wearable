@@ -566,6 +566,12 @@ export class TurnRunner {
     ) {
       await this.wait(PLAYBACK_POLL_MS);
     }
+    // 回执已经自然播完（或连接关闭）：摘掉当前引用，否则几秒后正式回答到达时
+    // 还会误判「回执还在念」并多发一条无意义的 audio.stop。
+    // 只在 `this.receipt === current` 时清，防止悬空的旧回执误清下一轮。
+    if (this.receipt === current) {
+      this.receipt = null;
+    }
     // 回执这一段结束了：状态回到 `thinking`（答案还在路上）。
     // 被顶掉、或本轮已经 audioDone 清掉 receiptOnly 时，再调也是空操作。
     this.options.fsm.receiptEnded(receiptTicket);
@@ -824,6 +830,7 @@ export class TurnRunner {
           // 回执还在念：先清掉设备缓冲再发这一块，否则两句会叠在一起
           if (this.receipt !== null && !this.receipt.cancelled) {
             this.receipt.cancelled = true;
+            this.receipt = null;
             this.log('  回执    被正式回答顶掉');
             this.options.sendCall?.({ op: 'audio.stop' });
             // 回执那段 `speaking` 到此为止；紧接着 `audioStarted` 会重新进入 speaking

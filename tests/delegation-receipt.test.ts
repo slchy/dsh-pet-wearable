@@ -259,6 +259,22 @@ test('回执自然播完：退回 thinking，不推进轮次', async () => {
       false,
       '回执结束标志要清掉',
     );
+
+    // 等正式回答落盘：回执早就自然播完了，正式回答不该再发多余的 audio.stop
+    for (let i = 0; i < 60 && !r.payloads.some((p) => p.name === 'turn.end'); i += 1) {
+      await wait(50);
+    }
+    assert.ok(r.payloads.some((p) => p.name === 'turn.end'), '正式回答应当正常收尾');
+    assert.equal(
+      r.calls.includes('audio.stop'),
+      false,
+      `回执已自然播完后正式回答不该再发 audio.stop，实际：${JSON.stringify(r.calls)}`,
+    );
+    assert.equal(
+      r.logs.some((line) => line.includes('被正式回答顶掉')),
+      false,
+      `回执已自然播完不应误记「被正式回答顶掉」：${JSON.stringify(r.logs)}`,
+    );
   } finally {
     r.dispose();
   }

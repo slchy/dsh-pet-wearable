@@ -684,7 +684,14 @@ describe('VoiceConnection 本地回环', { concurrency: false }, () => {
   test('级联：真上行出声，电量与佩戴进 dsh 注记，played 接进 TurnRunner', async () => {
     const stt = new ScriptedStt();
     const ttsTexts: string[] = [];
-    const dsh = makeDsh(async () => ({ text: '还剩百分之七十七。', speech: '还剩百分之七十七。' }));
+    // 用闸门先扣住第二轮 dsh 答复：否则 0 ms 返回的正式回答会立刻顶掉第二轮自己的回执并下发
+    // audio.stop，和 waitFor('dsh') 10 ms 轮询赛跑，导致下面那条「第一轮未被打断」的断言偶发红。
+    const gate = { release: (): void => {} };
+    const dshGate = new Promise<void>((resolve) => { gate.release = resolve; });
+    const dsh = makeDsh(async () => {
+      await dshGate;
+      return { text: '还剩百分之七十七。', speech: '还剩百分之七十七。' };
+    });
     const session = await boot(wireCascade(dsh.agent, makeTts(ttsTexts, false), stt));
     try {
       session.client.sendEvent({ kind: 'power', percent: 77, charging: true });
@@ -698,16 +705,24 @@ describe('VoiceConnection 本地回环', { concurrency: false }, () => {
       assert.ok(ttsTexts.length > 0);
       session.client.sendPlayed();
       await delay(400);
+      const audioBeforeSecond = session.client.audioBytes();
       await userSays(stt, session.client, '帮我查一下电量');
       await waitFor('dsh', () => dsh.calls.length === 1, 1_500);
+      // 回执音频经同一条 TCP 到达：按 TCP 先进先出，若第一轮因 played 没接上而被第二句打断，
+      // 那条 audio.stop 必然先于回执音频落进 client.calls；同时 dshGate 扣着正式回答，不会提前顶掉回执。
+      await waitFor('回执下行', () => session.client.audioBytes() > audioBeforeSecond, 1_500);
       const note = dsh.calls[0]?.note ?? '';
       assert.ok(note.includes('电量 77%'), note);
       assert.ok(note.includes('充电中'), note);
       assert.ok(note.includes('戴着'), note);
       assert.equal(session.client.countOp('audio.stop'), 0, 'played 没接上时第二句会打断');
+      const audioBeforeAnswer = session.client.audioBytes();
+      gate.release();
+      await waitFor('dsh 正式回答下行', () => session.client.audioBytes() > audioBeforeAnswer, 1_500);
       session.client.sendPlayed();
       await delay(200);
     } finally {
+      gate.release();
       await session.stop();
     }
   });
