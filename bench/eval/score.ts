@@ -403,10 +403,34 @@ function utteranceMatchScore(queryNorm: string, candidateNorm: string): number {
   return hits / total;
 }
 
-function caseQueryScore(queryNorm: string, item: PreparedCase): number {
+/**
+ * `live-orchestrator` / `agent-engine-adapter` 在 Omni 走 `tool_call` 改写委派时，
+ * 会把 query 拼成 `${rewrittenQuery}\n用户原话：「${turn.text}」`。
+ * 归属评分同时比对提取出的原话与整串，取高分，避免改写前缀把包含比压到阈值以下。
+ */
+const RAW_UTTERANCE_RE = /用户原话：「([^」]+)」/;
+
+function queryCandidates(query: string): readonly string[] {
+  const full = normalizeDigitsForMatch(normalizeText(query));
+  const out: string[] = [];
+  const rawMatch = RAW_UTTERANCE_RE.exec(query);
+  if (rawMatch?.[1] !== undefined) {
+    const raw = normalizeDigitsForMatch(normalizeText(rawMatch[1]));
+    if (raw.length >= 4) out.push(raw);
+  }
+  if (full.length >= 4 && !out.includes(full)) out.push(full);
+  return out;
+}
+
+function caseQueryScore(queries: readonly string[], item: PreparedCase): number {
   const asr = normalizeDigitsForMatch(normalizeText(item.asrJoined));
   const spec = normalizeDigitsForMatch(normalizeText(item.spec.text));
-  return Math.max(utteranceMatchScore(queryNorm, asr), utteranceMatchScore(queryNorm, spec));
+  let best = 0;
+  for (const q of queries) {
+    const score = Math.max(utteranceMatchScore(q, asr), utteranceMatchScore(q, spec));
+    if (score > best) best = score;
+  }
+  return best;
 }
 
 /** 覆盖度够高、且明显高于次优，才算「明确匹配」到这一条。 */
@@ -414,13 +438,13 @@ const QUERY_MATCH_MIN = 0.6;
 const QUERY_MATCH_MARGIN = 0.15;
 
 function clearQueryOwner(query: string, cases: readonly PreparedCase[]): string | null {
-  const q = normalizeDigitsForMatch(normalizeText(query));
-  if (q.length < 4) return null;
+  const candidates = queryCandidates(query);
+  if (candidates.length === 0) return null;
   let bestId: string | null = null;
   let best = 0;
   let second = 0;
   for (const item of cases) {
-    const score = caseQueryScore(q, item);
+    const score = caseQueryScore(candidates, item);
     if (score > best) {
       second = best;
       best = score;

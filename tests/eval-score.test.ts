@@ -407,3 +407,62 @@ test('scoreArtifact：双答冲突只在未自委派且前台说了长答案时�
     },
   );
 });
+
+test('scoreArtifact：tool_call 改写后的「rewritten\\n用户原话：「...」」也能准确归属到对应逐字用例', () => {
+  const refund = '帮我查一下那笔退款订单号和回执码。';
+  const port = '帮我查一下语音服务的端口号和版本号。';
+  const cases = [
+    caseSpec({
+      id: 's3_m4_01',
+      suite: 'S3',
+      group: 'verbatim',
+      text: refund,
+      expectVerbatim: true,
+      mustIncludeAny: [['W8665881'], ['904218']],
+    }),
+    caseSpec({
+      id: 's3_m4_02',
+      suite: 'S3',
+      group: 'verbatim',
+      text: port,
+      expectVerbatim: true,
+      mustIncludeAny: [['8766'], ['v2.3.1', '2.3.1']],
+    }),
+  ];
+  const reports: BgReportRecord[] = [
+    {
+      ts: 4_000,
+      kind: 'fallback_spoken',
+      query: `查一下那笔退款订单号和回执码\n用户原话：「${refund}」`,
+      speech: '退款已受理，订单号 W8665881，回执码 904218。',
+      verbatim: true,
+    },
+    {
+      ts: 11_000,
+      kind: 'fallback_spoken',
+      query: `查一下语音服务的端口号和版本号\n用户原话：「${port}」`,
+      speech: '服务跑在端口 8766，当前版本 v2.3.1。',
+      verbatim: true,
+    },
+  ];
+  const report = scoreArtifact(
+    manifestOf(cases),
+    artifactOf({
+      cases: [
+        { id: 's3_m4_01', start: 1_000, end: 5_000 },
+        { id: 's3_m4_02', start: 8_000, end: 12_000 },
+      ],
+    }),
+    [],
+    reports,
+  );
+  const got = byId(report);
+  assert.equal(got.get('s3_m4_01')?.verbatimPass, true);
+  assert.equal(got.get('s3_m4_01')?.memoryOrFactPass, true);
+  assert.equal(got.get('s3_m4_01')?.pass, true);
+  assert.equal(got.get('s3_m4_02')?.verbatimPass, true);
+  assert.equal(got.get('s3_m4_02')?.memoryOrFactPass, true);
+  assert.equal(got.get('s3_m4_02')?.pass, true);
+  assert.equal(report.s3ContextMemory.verbatimPassed, 2);
+  assert.equal(report.s3ContextMemory.verbatimTotal, 2);
+});
