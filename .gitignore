@@ -24,6 +24,9 @@ bench/**/*.json
 !bench/fast_lane/cases.json
 # L3 回放基线也是测试数据：它是**判据**，不是产物。删了就等于回归闸门失效
 !bench/replay/baseline/*.json
+!bench/eval/manifest.json
+!bench/eval/baseline/*.json
+bench/eval/out/
 bench/e2e/out/
 bench/replay/out/
 bench/e2e/mictap/out/
