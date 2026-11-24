@@ -4,7 +4,8 @@
  * 要钉住的是**弱网重连**那条路径上三个静默失效：
  *
  * 1. 新连接接管之后，旧连接的迟到 `onClose()` **不许**去清共享槽
- *    （`attachAudioLane` / `setAnnouncer` / `setAudit` / `ToolControl` / 回执钩子）。
+ *    （`attachAudioLane` / `setAnnouncer` / `setTaskReporter` / `setAudit` /
+ *    `ToolControl` / 回执钩子）。
  *    清掉的后果是「重连之后它不主动说话、不播报、MCP 拍照 503」，而且一条日志都没有。
  * 2. 控制口是**服务级**的：一条连接建一个会在重连时 `EADDRINUSE`，旧 server 还会
  *    把 MCP 的请求路由给已经死掉的连接。
@@ -433,6 +434,97 @@ test('DialogRuntime.dispose 只摘自己的回执钩子', () => {
   assert.equal(typeof hooks.at(-1), 'function', '新连接构造时应当重新挂上自己的钩子');
   owner.dispose();
   assert.equal(hooks.at(-1), null, '自己是当前所有者 → dispose 必须把钩子摘掉');
+});
+
+test('重连接管：旧连接的迟到收尾不许清掉新连接的 setTaskReporter', async () => {
+  const log: string[] = [];
+  let reporter: unknown = null;
+  const agent: AgentProvider = {
+    name: 'fake',
+    reply: async (): Promise<AgentReplyView> => ({ text: '嗯。', speech: '嗯。' }),
+    attachAudioLane: (lane) => { log.push(lane === null ? 'lane:null' : 'lane:set'); },
+    setAnnouncer: (cb) => { log.push(cb === null ? 'announcer:null' : 'announcer:set'); },
+    setDelegateHook: (cb) => { log.push(cb === null ? 'hook:null' : 'hook:set'); },
+    setTaskReporter: (cb) => {
+      reporter = cb;
+      log.push(cb === null ? 'reporter:null' : 'reporter:set');
+    },
+  };
+  const control = startToolControl({ port: 0, photoTimeoutMs: 1_000, handlers: null });
+  await listeningPort(control);
+  const service: VoiceService = { control, activeSlot: { current: null } };
+  const options = makeOptions(agent);
+  const linkA = resolveDeviceLink({ proto: 2, deviceId: 'dev-a', capabilities: CAPS_A });
+  const linkB = resolveDeviceLink({ proto: 2, deviceId: 'dev-b', capabilities: CAPS_B });
+  const a = fakeConnection('dev-a:1');
+  const b = fakeConnection('dev-b:1');
+  try {
+    const connA = new VoiceConnection(a.conn, options, linkA, service);
+    service.activeSlot.current = connA;
+    connA.start();
+    const reporterA = reporter;
+    assert.equal(typeof reporterA, 'function', '第一条连接应当挂上自己的 setTaskReporter');
+
+    const connB = new VoiceConnection(b.conn, options, linkB, service);
+    service.activeSlot.current?.evict();
+    service.activeSlot.current = connB;
+    connB.start();
+    const reporterB = reporter;
+    assert.equal(typeof reporterB, 'function', '新连接应当换上自己的 setTaskReporter');
+    assert.notEqual(reporterB, reporterA, '两条连接的 reporter 不能是同一个闭包');
+
+    const before = log.length;
+    a.close();
+    assert.equal(reporter, reporterB, '旧连接的迟到收尾不许把新连接的 setTaskReporter 清成 null');
+    assert.deepEqual(log.slice(before), [], '旧连接不许再写车道 / 播报器 / 回执钩子 / setTaskReporter');
+    assert.equal(service.activeSlot.current, connB, '旧连接不许清空活跃槽');
+
+    b.close();
+    assert.equal(reporter, null, '当前连接收尾要摘掉自己的 setTaskReporter');
+    assert.ok(
+      log.slice(before).includes('reporter:null'),
+      '当前连接收尾应当调用 setTaskReporter(null)',
+    );
+  } finally {
+    control.close();
+  }
+});
+
+test('cascade 只读影子：pipelineMode=cascade 且 serve=off 时不得把探针挂到 agent', async () => {
+  const lanes: unknown[] = [];
+  const agent: AgentProvider = {
+    name: 'fake',
+    reply: async (): Promise<AgentReplyView> => ({ text: '', speech: '' }),
+    attachAudioLane: (lane) => { lanes.push(lane); },
+  };
+  const control = startToolControl({ port: 0, photoTimeoutMs: 1_000, handlers: null });
+  await listeningPort(control);
+  const service: VoiceService = { control, activeSlot: { current: null } };
+  const options: VoiceSessionOptions = {
+    ...makeOptions(agent),
+    pipelineMode: 'cascade',
+    omniShadow: { apiKey: 'probe-key', serve: 'off' },
+  };
+  const link = resolveDeviceLink({ proto: 2, deviceId: 'dev-probe', capabilities: CAPS_A });
+  const fake = fakeConnection('dev-probe:1');
+  const conn = new VoiceConnection(fake.conn, options, link, service);
+  service.activeSlot.current = conn;
+  try {
+    conn.start();
+    assert.deepEqual(
+      lanes,
+      [],
+      '只读探针与 agent 互斥：启动期间不得调用 attachAudioLane',
+    );
+  } finally {
+    fake.close();
+    control.close();
+  }
+  assert.deepEqual(
+    lanes.filter((lane) => lane !== null),
+    [],
+    '整段生命周期都不得把探针交给 attachAudioLane',
+  );
 });
 
 test('状态机被直接驱动（不经过 dispatch）也要通知 onDialogState', () => {

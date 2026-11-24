@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import {
+  assemblePipelinePlan,
   createAuditSlot,
   shouldCreateFrontedAgent,
   type AuditSink,
@@ -170,4 +171,96 @@ test('`node src/main.ts` 无参仍是「打印用法 + 退出码 2」（isMainMo
   assert.equal(status.error, undefined, `子进程起不来：${status.error?.message ?? ''}`);
   assert.equal(status.status, 2, `无参运行的退出码应当是 2，实际 ${String(status.status)}`);
   assert.match(status.stderr, /用法/u, '应当打印用法（docs/CLOUD-ARCHITECTURE.md §8 的启动自检）');
+});
+
+// ---------------------------------------------------------------- 管道装配
+
+test('assemblePipelinePlan：非法值、live 缺 key、STT 不对，都直接说清楚', () => {
+  assert.throws(
+    () => assemblePipelinePlan(
+      { VOICE_PIPELINE: 'invalid' },
+      { sttName: 'qwen-realtime', strict: true },
+    ),
+    /VOICE_PIPELINE 无效值 "invalid"：只允许 "live" 或 "cascade"/u,
+  );
+  assert.throws(
+    () => assemblePipelinePlan(
+      { VOICE_PIPELINE: 'live' },
+      { sttName: 'qwen-realtime', strict: true },
+    ),
+    /VOICE_PIPELINE=live 需要 OMNI_API_KEY 或 DASHSCOPE_API_KEY/u,
+  );
+  assert.throws(
+    () => assemblePipelinePlan(
+      { VOICE_PIPELINE: 'live', DASHSCOPE_API_KEY: 'sk-test' },
+      { sttName: 'aliyun', strict: true },
+    ),
+    /VOICE_PIPELINE=live 需要 --stt qwen-realtime（当前是 aliyun）/u,
+  );
+  // 不读 process.env：调用方没给的 key 不能从外部环境漏进来
+  const isolated = assemblePipelinePlan(
+    { VOICE_PIPELINE: 'cascade', FAST_LANE_API_KEY: 'sk-fast' },
+    { sttName: 'qwen-realtime', strict: true },
+  );
+  assert.equal(isolated.mode, 'cascade');
+  assert.equal(isolated.useCascadeFastLane, true);
+  assert.equal(isolated.cascadeKey, 'sk-fast');
+  assert.equal(isolated.useOmniPlayback, false);
+});
+
+test('main.ts 按 VOICE_PIPELINE 互斥装配 live / cascade，不把两副脑子焊在一起', () => {
+  const source = readFileSync(MAIN_TS, 'utf8');
+  assert.match(source, /assemblePipelinePlan\(process\.env/u);
+  assert.match(source, /resolveVoicePipelineFromEnv/u);
+  assert.match(source, /Pure Live（Omni 单前台 \+ dsh 纯异步后台）/u);
+  assert.match(source, /Pure Cascade（ASR \+ 级联快车道\/dsh \+ TTS）/u);
+  assert.match(source, /\[VOICE_PIPELINE\]/u);
+  assert.match(source, /\[兼容推断\]/u);
+  assert.match(source, /pipelineMode: plan\.mode/u);
+  assert.match(source, /speakBackgroundReport/u);
+  assert.match(source, /cancelBackgroundSpeech/u);
+  assert.match(source, /noteFallbackAnnounceSpoken/u);
+  assert.match(source, /serve: 'full'/u);
+  assert.match(source, /useOmniProbeOnly/u);
+  assert.equal(
+    /from\s+['"][^'"]*fast-llm-client\.ts['"]/u.test(source),
+    false,
+    'main.ts 不要自己 import FastLlmClient：live 不该加载它，cascade 只在 CascadeAgent 里面用',
+  );
+
+  const live = source.split('// pure-live-assembly')[1]?.split('// pure-cascade-assembly')[0] ?? '';
+  const cascade = source.split('// pure-cascade-assembly')[1]?.split('// legacy-fronted-assembly')[0] ?? '';
+  assert.notEqual(live, '', '找不到 pure-live-assembly 标记');
+  assert.notEqual(cascade, '', '找不到 pure-cascade-assembly 标记');
+
+  assert.match(live, /new LiveOrchestrator\(/u);
+  assert.match(live, /\.toEngine\(\)/u);
+  assert.equal(/new CascadeAgent\(|new FrontedAgent\(|FastLlmClient|toEngine\(tts/u.test(live), false);
+
+  assert.match(cascade, /new CascadeAgent\(/u);
+  assert.match(cascade, /\.toEngine\(tts/u);
+  assert.equal(/new LiveOrchestrator\(|new FrontedAgent\(/u.test(cascade), false);
+
+  // 非流式旧路径还在，回放 / 识图不会被热路径替换掉
+  assert.match(source, /new FrontedAgent\(/u);
+});
+
+test('VOICE_PIPELINE=invalid 在 dsh 流式装配上直接失败，不藏进用法横幅', () => {
+  const status = spawnSync(process.execPath, [
+    MAIN_TS,
+    '--agent', 'dsh',
+    '--stt', 'qwen-realtime',
+    '--listen', '0',
+  ], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    timeout: 30_000,
+    env: { ...process.env, VOICE_PIPELINE: 'invalid' },
+  });
+  assert.equal(status.error, undefined, `子进程起不来：${status.error?.message ?? ''}`);
+  assert.equal(status.status, 2, `退出码应当是 2，实际 ${String(status.status)}\n${status.stderr}`);
+  assert.match(
+    status.stderr,
+    /VOICE_PIPELINE 无效值 "invalid"：只允许 "live" 或 "cascade"/u,
+  );
 });

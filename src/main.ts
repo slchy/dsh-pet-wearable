@@ -34,13 +34,17 @@ import {
   noopStt,
   silentTts,
   type AgentProvider,
+  type BackgroundTaskReport,
   type SttProvider,
   type TtsProvider,
 } from './providers.ts';
 import { DshSession } from './session.ts';
 import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity } from './keepalive.ts';
+import type { EngineEvent, FastVoiceEngine } from './engine-contract.ts';
 import { FrontedAgent } from './fronted-agent.ts';
 import { MemoryFile } from './memory-file.ts';
+import { resolveVoicePipelineFromEnv, type PipelinePlan } from './pipeline-mode.ts';
+import { CascadeAgent, LiveOrchestrator } from './pipelines/index.ts';
 import { expiryWarning } from './tls-cert.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 import { TurnJudge } from './turn-judge.ts';
@@ -585,6 +589,99 @@ export function shouldCreateFrontedAgent(input: {
   return { create: false, cascadeKey: '', why: input.fastOff ? 'off' : 'no-key' };
 }
 
+/**
+ * 启动期管道计划。纯函数：只看传入的 `env`，不读 `process.env`。
+ *
+ * `main()` 在 `--agent dsh` 的流式装配上调用它；非法值、live 缺 key、
+ * live 的 STT 不是 `qwen-realtime` 都从这里抛出去，由调用方打印后退出。
+ */
+export function assemblePipelinePlan(
+  env: Record<string, string | undefined>,
+  opts?: { readonly sttName?: string; readonly strict?: boolean },
+): PipelinePlan {
+  return resolveVoicePipelineFromEnv(env, opts);
+}
+
+/**
+ * 热路径引擎的 `respond()` 不经过 `trackActivity` 包过的 `reply()`
+ * （`toEngine()` 拿的是装饰器自己的 `this`）。
+ *
+ * 不在这里记账的话，空闲时钟停在进程启动那一刻：用户一直在说话，
+ * 保活仍会在 180 分钟后往 dsh 打一枪。
+ */
+function watchEngineActivity(
+  engine: FastVoiceEngine,
+  state: { inflight: number; last: number },
+): FastVoiceEngine {
+  const respond: FastVoiceEngine['respond'] = (turn, signal) => {
+    state.inflight += 1;
+    let gen: AsyncIterable<EngineEvent>;
+    try {
+      gen = engine.respond(turn, signal);
+    } catch (error) {
+      state.inflight -= 1;
+      state.last = Date.now();
+      throw error;
+    }
+    return (async function* () {
+      try {
+        yield* gen;
+      } finally {
+        state.inflight -= 1;
+        state.last = Date.now();
+      }
+    })();
+  };
+  return new Proxy(engine, {
+    get(target, prop) {
+      if (prop === 'respond') return respond;
+      if (prop === 'constructor') return Reflect.get(target, prop, target);
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
+ * 纯 live 的离线兜底。
+ *
+ * `VoiceAgent` 自己会在播报出口为空时写入 `announceStore`。`LiveOrchestrator`
+ * 构造时把那条出口换成了任务总线，断线后再 `setTaskReporter(null)` 结论就丢了。
+ * 这里在「还没有连接」和「连接把出口摘成 null」两种情况下都写回同一份队列。
+ */
+function armLiveOfflineAnnounce(
+  orch: LiveOrchestrator,
+  store: AnnounceStore | null,
+): LiveOrchestrator {
+  const persist = (speech: string, emotion?: string): void => {
+    const pending = store?.push(speech, emotion) ?? 0;
+    console.log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
+  };
+  const fallbackAnnouncer = (speech: string, emotion?: string): void => {
+    persist(speech, emotion);
+  };
+  const fallbackReport = (report: BackgroundTaskReport): void => {
+    persist(report.verbatim ?? report.summary, report.emotion);
+  };
+  orch.setAnnouncer(fallbackAnnouncer);
+  orch.setTaskReporter(fallbackReport);
+  const setAnnouncer = (cb: ((speech: string, emotion?: string) => void) | null): void => {
+    orch.setAnnouncer(cb ?? fallbackAnnouncer);
+  };
+  const setTaskReporter = (cb: ((report: BackgroundTaskReport) => void) | null): void => {
+    orch.setTaskReporter(cb ?? fallbackReport);
+  };
+  return new Proxy(orch, {
+    get(target, prop) {
+      if (prop === 'setAnnouncer') return setAnnouncer;
+      if (prop === 'setTaskReporter') return setTaskReporter;
+      if (prop === 'constructor') return Reflect.get(target, prop, target);
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as LiveOrchestrator;
+}
+
 async function main(): Promise<void> {
   installLogClock();
   loadDotEnv();
@@ -634,23 +731,54 @@ async function main(): Promise<void> {
     : agentSpec === 'echo' ? 'echo' : 'none';
 
   /**
-   * STT 选型与 omni 车道的**前置条件**必须在这里就定下来（不是等走到流式分支）。
+   * STT 选型必须在这里就定下来（不是等走到流式分支）。
    *
-   * 原因：omni 是挂在 `FrontedAgent` 上的可选能力（`attachAudioLane` / `willServeAudio`），
-   * 没有 `FrontedAgent` 就没有那条车道。而要不要造 `FrontedAgent`，以前只看
-   * `FAST_LANE_API_KEY` —— 于是「删掉 qwen-flash 的 key」顺手把 omni 也删了：
-   * 音频直出整条失效，日志里只看到「快车道 关」，没有任何一行提到 omni。
+   * `--agent dsh` 的流式热路径由 {@link assemblePipelinePlan} 二选一，不再把
+   * omni 和文本快车道装在同一个 `FrontedAgent` 上。`omniWillEnable` 只留给
+   * **非流式**（回放 / 旧监听 / 识图冒烟）那条旧装配。
    *
-   * omni 的硬前提是 `qwen-realtime` STT：车道的起跑线是 `onCommit`（我们主动封段
-   * 那一刻），而 NLS 的 `commitMs` 是 0 —— 没有这个回调，车道会**一条数据都不出**
-   * 却不报错。这种静默失效比直接报错难查得多，所以判据也提前。
+   * omni 的硬前提仍是 `qwen-realtime`：车道的起跑线是 `onCommit`，NLS 的
+   * `commitMs` 是 0。没有这个回调，车道会一条数据都不出却不报错，所以 live
+   * 在 `strict` 下直接拒绝别的 STT。
    */
   const asrBackend = opt('--asr', 'mimo');
   const resolvedStt = sttSpec === '' ? (asrBackend === 'aliyun' ? 'aliyun' : '') : sttSpec;
   const omniWanted = envString('OMNI_SHADOW') === '1';
   const omniKey = process.env['DASHSCOPE_API_KEY'] ?? '';
-  /** omni 车道**真的**会挂上（三件事同时成立）。装配层据此决定要不要造 `FrontedAgent`。 */
+  /** 非流式旧装配：omni 车道真的会挂上（三件事同时成立）才造 `FrontedAgent`。 */
   const omniWillEnable = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime';
+
+  let pipelinePlan: PipelinePlan | null = null;
+  let liveOrch: LiveOrchestrator | null = null;
+  /**
+   * TTS 造出来之后才挂得上热路径引擎（live 的编排器要它，cascade 的 `toEngine` 也要）。
+   * 返回值走直线赋值：闭包里写的 `let` 出了函数，类型收窄看不见。
+   */
+  let finishPipeline: ((tts: TtsProvider) => {
+    readonly orchestrator: LiveOrchestrator | null;
+    readonly engine: FastVoiceEngine | undefined;
+  }) | null = null;
+
+  // `--listen 0` 仍然点名了这条装配。非法 `VOICE_PIPELINE` 必须在用法横幅之前失败，
+  // 否则 `node src/main.ts --agent dsh --stt qwen-realtime --listen 0` 只会打印用法。
+  const enteringVoicePipeline = agentSpec === 'dsh'
+    && resolvedStt !== ''
+    && (listen > 0 || argv.includes('--listen') || argv.includes('--stt'));
+  if (enteringVoicePipeline) {
+    let resolvedPlan: PipelinePlan;
+    try {
+      resolvedPlan = assemblePipelinePlan(process.env, { sttName: resolvedStt, strict: true });
+    } catch (error) {
+      fail((error as Error).message);
+    }
+    pipelinePlan = resolvedPlan;
+    console.log(
+      `管道      ${pipelinePlan.mode === 'live' ? 'Pure Live（Omni 单前台 + dsh 纯异步后台）' : 'Pure Cascade（ASR + 级联快车道/dsh + TTS）'}${pipelinePlan.explicit ? ' [VOICE_PIPELINE]' : ' [兼容推断]'}`,
+    );
+    for (const note of pipelinePlan.notes) {
+      console.log(`          ${note}`);
+    }
+  }
 
   if (!replay && !listen && !askImage) {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
@@ -707,133 +835,180 @@ async function main(): Promise<void> {
   let stopKeepalive: () => void = () => {};
   if (dshSession && agent) {
     /**
-     * 保活专线：**在包 `FrontedAgent` 之前**把内层（纯 `VoiceAgent`）存下来。
+     * 保活专线：内层纯 `VoiceAgent` 单独留着。
      *
-     * 保活要焐热的是 **dsh 那一侧**的前缀缓存。走 `FrontedAgent` 就变成先由它判一遍
-     * 快车道 —— 「（保活信号，不需要回应）」是短句、没有数字，妥妥被 qwen-flash 认领：
-     * dsh 一次都没被叫到（前缀照样凉），还往快车道的账本和历史里塞了一条用户从没
-     * 说过的话（下一轮委派时它会跟着进 dsh 的上下文）。
+     * 保活要焐热的是 **dsh 那一侧**的前缀缓存。走快车道或直播编排的 `reply()`
+     * 都会先被短句认领 —— 「（保活信号，不需要回应）」进不了 dsh，前缀照样凉，
+     * 还会往账本里塞一条用户从没说过的话。保活始终直连 `dshAgent`。
      */
     const dshAgent = agent;
+    const session = dshSession;
 
-    // 快车道：短句纯闲聊直接答，其余零开销交给 dsh。放在 `trackActivity` **里面**，
-    // 这样快车道答的那几轮也算「有活动」，不会在用户一直闲聊时被判空闲。
     const fastKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
     const fastOff = process.env['FAST_LANE'] === '0';
     const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md');
     const memoryFile = new MemoryFile(memoryPath);
+    const activity = newActivityState(Date.now());
+    const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
+    /**
+     * 委派默认**关**（跟随线上）。`FAST_LANE_DELEGATE=1` 才打开。
+     *
+     * 保留 `!== '0'` 那个写法会让「什么都没设」变成打开 —— 而线上一直是关的。
+     */
+    const delegateEnabled = (process.env['FAST_LANE_DELEGATE'] ?? '0') !== '0';
+    const fastModel = process.env['FAST_LANE_MODEL'] ?? 'qwen-flash';
+    const cancelMode = ((): 'rpc' | 'interrupt' | 'off' => {
+      const mode = process.env['FAST_LANE_CANCEL'];
+      return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
+    })();
+    const fastBaseUrl = process.env['FAST_LANE_BASE_URL'] === undefined
+      ? {}
+      : { baseUrl: process.env['FAST_LANE_BASE_URL'] };
 
     // **投机的前置条件**：宿主得能取消在途那一轮。
     // 没有 `session/cancel` 时，快车道命中会在 dsh 那边留下一轮「用户没听过的回答」
     // （白花钱 + 幽灵历史），所以探测失败就退回串行 —— 串行压根不提前发 dsh。
-    const wantSpeculate = process.env['FAST_LANE_SPECULATE'] !== '0';
-    let canCancel = false;
-    if (wantSpeculate) {
-      canCancel = await dshSession.probeCancelSupport(20_000);
+    const resolveSpeculate = async (): Promise<boolean> => {
+      const wantSpeculate = process.env['FAST_LANE_SPECULATE'] !== '0';
+      if (!wantSpeculate) return false;
+      const canCancel = await session.probeCancelSupport(20_000);
       console.log(canCancel
         ? '快车道    投机=开（宿主支持 session/cancel，命中时可作废在途那一轮）'
         : '快车道    投机=关 → 退回串行（宿主没有 session/cancel，作废不了在途那一轮）');
-    }
-    const speculate = wantSpeculate && canCancel;
+      return canCancel;
+    };
 
-    // 造不造这个装饰器由纯判据决定（见 `shouldCreateFrontedAgent` 的注释：
-    // omni 车道的挂载点也在它身上，不能因为「没有 qwen-flash key」就不造）。
-    const fronted = shouldCreateFrontedAgent({ fastOff, fastKey, omniEnabled: omniWillEnable });
-    if (!fronted.create) {
-      console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
-    } else {
-      /**
-       * 委派默认**关**（跟随线上）。`FAST_LANE_DELEGATE=1` 才打开。
-       *
-       * 保留 `!== '0'` 那个写法会让「什么都没设」变成打开 —— 而线上一直是关的，
-       * 于是本地跑出来的行为和生产不一样，`[[DELEGATE]]` 在本地还生效。
-       */
-      const delegateEnabled = (process.env['FAST_LANE_DELEGATE'] ?? '0') !== '0';
-      const fastModel = process.env['FAST_LANE_MODEL'] ?? 'qwen-flash';
-      agent = new FrontedAgent({
-        inner: agent,
-        // `''` = 级联文本模型关（omni-only 装配）：`FrontedAgent` 内部按
-        // `apiKey !== ''` 报 `cascade: false`，`routeTurn()` 于是只可能给 `live` 或 `dsh`
-        apiKey: fronted.cascadeKey,
-        model: fastModel,
-        ...(process.env['FAST_LANE_BASE_URL'] === undefined
-          ? {}
-          : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
-        timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
-        // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
-        // 前置条件：宿主必须能取消在途那一轮（启动时探测，见上面的 `canCancel`）。
-        speculate,
-        // 胜出后怎么处置在途的慢车道那一轮：rpc（默认，当前 SDK 运行时未放行）/
-        // interrupt（SIGINT，会重启，多花 ~2 s）/ off
-        cancelMode: ((): 'rpc' | 'interrupt' | 'off' => {
-          const mode = process.env['FAST_LANE_CANCEL'];
-          return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
-        })(),
-        maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
-        // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
-        prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
-        // 中间结果投机：比定稿再往前提 p50 731 ms，但文本是猜的（定稿确认是前缀才认领）
-        partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
-        // 投机的最小字数：默认 6。2026-11-18 试过降到 2，请求涨 2.5 倍、端到端 p50 没动
-        // （14 场回放，见 OPS-RECORD §12.8），已退回。这里留旋钮不再改代码。
-        specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
-        // 窗口越小首字越快（快车道只答短句）
-        windowChars: envNumber('FAST_LANE_WINDOW_CHARS', 800),
-        // 攒几轮快车道对话就强制委派一次「顺便刷 dsh 上下文」。
-        // **设 0 = 永不因计数转交**：那几轮会在下一次真正需要 dsh 的轮次一并注入
-        // （`startInner` 的 `pending` 逻辑），用户不用为刷上下文白等一次完整 agent 往返。
-        // 纯聊天模式建议 0 —— 那时 dsh 不参与，强制转交只是让「可以。」这种话等 6 秒。
-        keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 0),
-        // 对冲份数：同一句并发发 N 份取最先回来的（首字方差全在服务端排队，
-        // 见 `FAST_LANE_TRACE` 的分解）。落败的在拿到响应头前就被掐掉。
-        hedge: envNumber('FAST_LANE_HEDGE', 2),
-        // 委派能力：`0` = 快车道只当聊天模型（提示词换成纯聊天版，`[[DELEGATE]]` 不再生效）。
-        // 关掉之后「哪些句子根本不进快车道」必须由上游决定 —— 它不会自己让路。
-        //
-        // **默认关，跟随线上**。打开要显式 `FAST_LANE_DELEGATE=1`：写反了的话
-        // 快车道会以为自己能委派，但上游没按那条线分流，`[[DELEGATE]]` 就只落在
-        // 提示词里、没人执行。
-        delegateEnabled,
-        // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
-        taskStatus: () => dshSession.taskStatus(),
-        // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里），
-        // 按这句话挑几条进提示词，不全塞（4 KB ≈ 1.5k token）
-        memory: (text: string) => memoryFile.relevant(text),
-        log: (line) => { console.log(line); },
-        // 全量审计：每次请求的 messages、模型的原文、以及被作废的那几趟
-        audit: (name, data) => { auditSlot.emit(name, data); },
-      });
-      if (fronted.why === 'omni-only') {
-        // 这一行必须说清「为什么还有 FrontedAgent，但 qwen-flash 不会响」：
-        // 否则日志上看到的是「快车道 关」，而装配自检里又冒出个 FrontedAgent。
-        console.log(
-          '快车道    仅启用 omni 音频车道（级联文本模型已关：'
-          + `${fastOff ? 'FAST_LANE=0' : '没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY'}）`
-          + '；闲聊/长句走 omni 或 dsh',
-        );
+    const logFastLaneOn = (): void => {
+      console.log(
+        `快车道    开（${delegateEnabled ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
+        + `model=${fastModel}`
+        // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
+        + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
+        + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
+        + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
+        + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
+        + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
+        + ` delegate=${delegateEnabled ? 'on' : 'OFF（纯聊天）'}`,
+      );
+      // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
+      // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
+      console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
+    };
+
+    if (pipelinePlan !== null && pipelinePlan.mode === 'live') {
+      // pure-live-assembly：只要直播编排。文本级联不装。
+      console.log('快车道    关（纯 live：不加载文本级联快车道）');
+      finishPipeline = (tts) => {
+        const orch = new LiveOrchestrator({
+          inner: dshAgent,
+          tts,
+          // 编排器要的是一整段注记；记忆文件返回的是几条。
+          memory: (text) => memoryFile.relevant(text).join('\n'),
+          log: (line) => { console.log(line); },
+        });
+        const surfaced = armLiveOfflineAnnounce(orch, announceStore);
+        liveOrch = orch;
+        agent = trackActivity(surfaced, activity);
+        const rawEngine = orch.toEngine();
+        return { orchestrator: orch, engine: watchEngineActivity(rawEngine, activity) };
+      };
+    } else if (pipelinePlan !== null && pipelinePlan.mode === 'cascade') {
+      // pure-cascade-assembly：只要级联，或关掉快车道后的直连 dsh。不接 omni 发声。
+      if (pipelinePlan.useCascadeFastLane) {
+        const speculate = await resolveSpeculate();
+        const cascadeAgent = new CascadeAgent({
+          inner: dshAgent,
+          apiKey: pipelinePlan.cascadeKey,
+          model: fastModel,
+          ...fastBaseUrl,
+          timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
+          speculate,
+          cancelMode,
+          maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
+          prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
+          partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
+          specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
+          windowChars: envNumber('FAST_LANE_WINDOW_CHARS', 800),
+          keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 0),
+          hedge: envNumber('FAST_LANE_HEDGE', 2),
+          delegateEnabled,
+          taskStatus: () => session.taskStatus(),
+          memory: (text) => memoryFile.relevant(text),
+          log: (line) => { console.log(line); },
+          audit: (name, data) => { auditSlot.emit(name, data); },
+        });
+        agent = trackActivity(cascadeAgent, activity);
+        logFastLaneOn();
+        finishPipeline = (tts) => {
+          // `CascadeEngineOptions` 只有时钟。流式增量由引擎自己 `attachLiveSink`，
+          // 这里再传 onLiveAvailable 对不上签名，也会和引擎内部那一次挂载叠在一起。
+          const rawEngine = cascadeAgent.toEngine(tts);
+          return { orchestrator: null, engine: watchEngineActivity(rawEngine, activity) };
+        };
       } else {
-        console.log(
-          `快车道    开（${delegateEnabled ? '短句闲聊直答，其余交给 dsh' : '纯聊天模型，不委派'}；FAST_LANE=0 关闭）  `
-          + `model=${fastModel}`
-          // 这几个都是「改了没生效」的高发项（.env 没重启 / 名字打错），打出来一眼能对
-          + ` hedge=${envNumber('FAST_LANE_HEDGE', 2)}`
-          + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
-          + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
-          + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
-          + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
-          + ` delegate=${delegateEnabled ? 'on' : 'OFF（纯聊天）'}`,
-        );
-        // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
-        // （探针一律用 `MEMORY_FILE=/tmp/...`，见 docs/OPS-RECORD.md §9.3）
-        // 只在级联真会用到它时打：omni-only 装配下没人读这份记忆
-        console.log(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`);
+        console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
+        agent = trackActivity(dshAgent, activity);
+        // 不挂热路径引擎：TurnRunner 用 AgentEngineAdapter 包这份 dsh。
       }
+    } else {
+      // legacy-fronted-assembly：回放 / 旧监听 / 识图。流式热路径不进这里。
+      const speculate = await resolveSpeculate();
+      const fronted = shouldCreateFrontedAgent({ fastOff, fastKey, omniEnabled: omniWillEnable });
+      if (!fronted.create) {
+        console.log(`快车道    ${fastOff ? '关（FAST_LANE=0）' : '关（没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY）'}`);
+      } else {
+        agent = new FrontedAgent({
+          inner: dshAgent,
+          // `''` = 级联文本模型关（omni-only 装配）：`FrontedAgent` 内部按
+          // `apiKey !== ''` 报 `cascade: false`，`routeTurn()` 于是只可能给 `live` 或 `dsh`
+          apiKey: fronted.cascadeKey,
+          model: fastModel,
+          ...fastBaseUrl,
+          timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
+          // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
+          // 前置条件：宿主必须能取消在途那一轮（启动时探测，见 `resolveSpeculate`）。
+          speculate,
+          // 胜出后怎么处置在途的慢车道那一轮：rpc（默认）/ interrupt / off
+          cancelMode,
+          maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
+          // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
+          prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
+          // 中间结果投机：比定稿再往前提，但文本是猜的（定稿确认是前缀才认领）
+          partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
+          // 投机的最小字数：默认 6。2026-11-18 试过降到 2，请求涨 2.5 倍、端到端 p50 没动
+          // （14 场回放，见 OPS-RECORD §12.8），已退回。这里留旋钮不再改代码。
+          specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
+          // 窗口越小首字越快（快车道只答短句）
+          windowChars: envNumber('FAST_LANE_WINDOW_CHARS', 800),
+          // 攒几轮快车道对话就强制委派一次「顺便刷 dsh 上下文」。
+          // **设 0 = 永不因计数转交**：那几轮会在下一次真正需要 dsh 的轮次一并注入。
+          keepTurns: envNumber('FAST_LANE_KEEP_TURNS', 0),
+          // 对冲份数：同一句并发发 N 份取最先回来的。落败的在拿到响应头前就被掐掉。
+          hedge: envNumber('FAST_LANE_HEDGE', 2),
+          delegateEnabled,
+          // 后台任务事实来自 dsh 自己的事件，不发请求 —— 「好了吗」能照实答，不用等一轮 dsh
+          taskStatus: () => session.taskStatus(),
+          // 长期记忆：只读同一个 MEMORY.md（写权限在 dsh 的 remember 工具手里）
+          memory: (text: string) => memoryFile.relevant(text),
+          log: (line) => { console.log(line); },
+          // 全量审计：每次请求的 messages、模型的原文、以及被作废的那几趟
+          audit: (name, data) => { auditSlot.emit(name, data); },
+        });
+        if (fronted.why === 'omni-only') {
+          // 这一行必须说清「为什么还有 FrontedAgent，但 qwen-flash 不会响」：
+          // 否则日志上看到的是「快车道 关」，而装配自检里又冒出个 FrontedAgent。
+          console.log(
+            '快车道    仅启用 omni 音频车道（级联文本模型已关：'
+            + `${fastOff ? 'FAST_LANE=0' : '没有 FAST_LANE_API_KEY / DEEPSEEK_API_KEY'}）`
+            + '；闲聊/长句走 omni 或 dsh',
+          );
+        } else {
+          logFastLaneOn();
+        }
+      }
+      // 包在最外层：真对话走 `reply()` 记账。保活不走这里，它直连 `dshAgent`。
+      agent = trackActivity(agent, activity);
     }
-    const keepaliveMinutes = envNumber('KEEPALIVE_MINUTES', 180);
-    const activity = newActivityState(Date.now());
-    // 包在最外层（`FrontedAgent` 已在上一步换进 `agent`）：真对话走 `reply()` 记账。
-    // 保活不走这里 —— 它直连 `dshAgent` 并自己记（见 `ping`）。
-    agent = trackActivity(agent, activity);
     console.log(keepaliveMinutes > 0
       ? `保活      空闲 ${keepaliveMinutes} 分钟发一次前缀保活（KEEPALIVE_MINUTES=0 关闭）\n`
       : '保活      关（KEEPALIVE_MINUTES=0）\n');
@@ -844,8 +1019,8 @@ async function main(): Promise<void> {
       isBusy: () => activity.inflight > 0,
       ping: async () => {
         const started = Date.now();
-        // **直连 dsh 那一层**（见上面 `dshAgent`）：不经过 `FrontedAgent`，
-        // 否则快车道会认领这条短句，dsh 根本没被叫到，前缀照样凉。
+        // **直连 dsh 那一层**（见上面 `dshAgent`）：不经过快车道或直播编排，
+        // 否则短句会被认领，dsh 根本没被叫到，前缀照样凉。
         // 活动账自己记：`inflight` 让「有人在飞」对下一次真对话、下一个保活周期
         // 都成立；`last` 要在这里刷新，否则 `idleFor()` 永远停在上一轮真对话的时刻。
         activity.inflight += 1;
@@ -859,7 +1034,10 @@ async function main(): Promise<void> {
       },
       log: (line) => { console.log(line); },
     });
-    process.on('exit', () => { stopKeepalive(); });
+    process.on('exit', () => {
+      stopKeepalive();
+      liveOrch?.dispose();
+    });
   }
 
   // ---------------------------------------------------------------- 图片 -> dsh 冒烟
@@ -931,6 +1109,8 @@ async function main(): Promise<void> {
     });
     const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
+    // live 的编排器和 cascade 的热路径都要这份 TTS。非 dsh 流式这里是空装配。
+    const pipelineHooks = finishPipeline?.(tts) ?? { orchestrator: null, engine: undefined };
 
     const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
     const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
@@ -938,46 +1118,74 @@ async function main(): Promise<void> {
       && turnJudgePython !== '' && turnJudgeScript !== '';
 
     /**
-     * omni 一体化车道。默认关。
+     * omni 怎么接。
      *
-     * 硬前提（`omniWillEnable`）在参数解析后就判过了 —— 这里只把它变成实际配置。
-     * 原因见那一段：`FrontedAgent` 要先造出来，车道才挂得上。
+     * - `live`：前台发声，`serve` 恒为 `full`。`clip` 档已经删了，显式请求时仍按 full 出声。
+     * - `cascade`：不发声。只有 `useOmniProbeOnly`（`OMNI_SHADOW=1` 且 `OMNI_ANSWER=off`）
+     *   才挂一只只读探针。
+     * - 没有管道计划（echo 等）：沿用旧的 `omniWillEnable` + `OMNI_ANSWER`。
      */
     const omniModel = envString('OMNI_SHADOW_MODEL');
-    /**
-     * `OMNI_ANSWER`：让 omni 真的答，而不只是量。
-     *
-     * - `off`（默认）/ 未设：纯影子，一个字节都不播（只用来量）
-     * - `full`：与文本快车道同口径（含 omni 自己的 `tool_call` 转交、并段轮）
-     *
-     * 有过一个 `clip`（只答单段轮）的中间档，真机两场之后砍掉了 —— 它拒掉的并段轮
-     * 回答质量与全量无差别，真正要担心的「掐半句」22 轮里只出现 3 次、全是用户
-     * 自己插话。留着中间态只会让「线上到底是哪一档」变成一件要记的事。
-     */
-    const omniAnswer = envString('OMNI_ANSWER') ?? 'off';
-    if (!['off', 'full'].includes(omniAnswer)) {
-      console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|full）`);
-      process.exit(2);
-    }
-    const omniShadow = omniWillEnable
-      ? {
-        apiKey: omniKey,
-        serve: omniAnswer as 'off' | 'full',
-        ...(omniModel === undefined ? {} : { model: omniModel }),
+    const modelOpt = omniModel === undefined ? {} : { model: omniModel };
+    const pipelineOmniKey = (process.env['OMNI_API_KEY'] ?? process.env['DASHSCOPE_API_KEY'] ?? '').trim();
+    let omniShadow: {
+      readonly apiKey: string;
+      readonly model?: string;
+      readonly serve: 'off' | 'full';
+    } | undefined;
+    if (pipelinePlan !== null && pipelinePlan.mode === 'live') {
+      const requested = (envString('OMNI_ANSWER') ?? '').trim().toLowerCase();
+      if (requested !== '' && requested !== 'off' && requested !== 'full' && requested !== 'clip') {
+        fail(`OMNI_ANSWER=${requested} 不合法（off|full；clip 已并入 full）`);
       }
-      : undefined;
-    if (omniWanted && omniShadow === undefined) {
+      if (requested === 'clip') {
+        console.log('管道      OMNI_ANSWER=clip 已取消，纯 live 按 full 出声');
+      }
+      omniShadow = { apiKey: pipelineOmniKey, serve: 'full', ...modelOpt };
       console.log(
-        '影子    OMNI_SHADOW=1 但没启用：'
-        + (omniKey === '' ? 'DASHSCOPE_API_KEY 为空' : `STT=${resolvedStt}（需要 qwen-realtime）`)
-        + '\n',
+        `影子    omni 前台开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
+        + `**会出声** serve=${omniShadow.serve}）\n`,
       );
-    } else if (omniShadow !== undefined) {
-      console.log(
-        `影子    omni 旁路开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
-        + (omniShadow.serve === 'off' ? '只量不发声' : `**会出声** serve=${omniShadow.serve}`)
-        + '）\n',
-      );
+    } else if (pipelinePlan !== null && pipelinePlan.mode === 'cascade') {
+      if (pipelinePlan.useOmniProbeOnly) {
+        omniShadow = { apiKey: pipelineOmniKey, serve: 'off', ...modelOpt };
+        console.log(
+          `影子    omni 只读探针（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`,
+        );
+      } else if (omniWanted) {
+        const why = pipelineOmniKey === ''
+          ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
+          : resolvedStt !== 'qwen-realtime'
+            ? `STT=${resolvedStt}（需要 qwen-realtime）`
+            : 'OMNI_ANSWER 不是 off（只读探针要求 off，cascade 不接管发声）';
+        console.log(`影子    OMNI_SHADOW=1 但没启用只读探针：${why}\n`);
+      }
+    } else {
+      const omniAnswer = envString('OMNI_ANSWER') ?? 'off';
+      if (!['off', 'full'].includes(omniAnswer)) {
+        console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|full）`);
+        process.exit(2);
+      }
+      omniShadow = omniWillEnable
+        ? {
+          apiKey: omniKey,
+          serve: omniAnswer as 'off' | 'full',
+          ...modelOpt,
+        }
+        : undefined;
+      if (omniWanted && omniShadow === undefined) {
+        console.log(
+          '影子    OMNI_SHADOW=1 但没启用：'
+          + (omniKey === '' ? 'DASHSCOPE_API_KEY 为空' : `STT=${resolvedStt}（需要 qwen-realtime）`)
+          + '\n',
+        );
+      } else if (omniShadow !== undefined) {
+        console.log(
+          `影子    omni 旁路开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
+          + (omniShadow.serve === 'off' ? '只量不发声' : `**会出声** serve=${omniShadow.serve}`)
+          + '）\n',
+        );
+      }
     }
 
     /**
@@ -1082,6 +1290,9 @@ async function main(): Promise<void> {
       `  装配    agent=${agent?.constructor?.name ?? '?'}`
       + ` attach=${typeof agent?.attachAudioLane} will=${typeof agent?.willServeAudio}`,
     );
+    const plan = pipelinePlan;
+    const engine = pipelineHooks.engine;
+    const orchestrator = pipelineHooks.orchestrator;
     const code = await runVoiceServer({
       port: listen,
       host: opt('--host', '127.0.0.1'),
@@ -1090,6 +1301,17 @@ async function main(): Promise<void> {
       agent,
       stt,
       tts,
+      ...(plan === null ? {} : { pipelineMode: plan.mode }),
+      ...(engine === undefined ? {} : { engine }),
+      ...(orchestrator === null
+        ? {}
+        : {
+          speakAnnounce: (item, playAudio) => orchestrator.speakBackgroundReport(item, playAudio),
+          cancelAnnounce: () => { orchestrator.cancelBackgroundSpeech(); },
+          onFallbackAnnounceSpoken: (item, interrupted) => {
+            orchestrator.noteFallbackAnnounceSpoken(item, interrupted);
+          },
+        }),
       // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
       ...(omniShadow === undefined ? {} : { omniShadow }),
       turnJudge: turnJudgeEnabled

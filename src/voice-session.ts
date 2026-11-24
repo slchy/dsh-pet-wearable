@@ -38,8 +38,10 @@ import {
   type V1Session,
 } from './devices/index.ts';
 import { AppSession } from './app/session.ts';
-import { DialogRuntime } from './app/dialog.ts';
+import { DialogRuntime, type AnnounceItem } from './app/dialog.ts';
 import { SystemClock, type Clock } from './app/clock.ts';
+import type { FastVoiceEngine } from './engine-contract.ts';
+import type { VoicePipelineMode } from './pipeline-mode.ts';
 import { DEFAULT_PET_PARAMS, type PetParams } from './pet/brain/registry.ts';
 import { summarizePetEvent } from './pet/brain/session.ts';
 import type { PetReply } from './pet/brain/types.ts';
@@ -51,7 +53,14 @@ import {
   type CaptureRequest,
   type PhotoOutcome,
 } from './photo-inbox.ts';
-import type { AgentProvider, SttProvider, SttSession, TtsProvider } from './providers.ts';
+import type {
+  AgentAudioAnswer,
+  AgentProvider,
+  BackgroundTaskReport,
+  SttProvider,
+  SttSession,
+  TtsProvider,
+} from './providers.ts';
 import type { SessionCore } from './session-core.ts';
 import type { ImageAttachment } from './session.ts';
 import { TurnJudge } from './turn-judge.ts';
@@ -237,6 +246,28 @@ export interface VoiceSessionOptions {
     /** 认领模式：`off`（只量）/ `full`（真答）。缺省 `off` */
     readonly serve?: 'off' | 'full';
   };
+  /** 显式管道模式（'live' | 'cascade'）。未设时兼容旧推断。 */
+  readonly pipelineMode?: VoicePipelineMode;
+  /**
+   * 生产热路径语音引擎（`LiveOrchestrator.toEngine()` 或 `CascadeAgent.toEngine(...)`）。
+   * 传入后 `TurnRunner` 走统一单泵；缺省时由 `TurnRunner` 自动用 `AgentEngineAdapter` 兼容包装。
+   */
+  readonly engine?: FastVoiceEngine;
+  /**
+   * Pure Live 模式下把后台汇报交给 Omni 同嗓子播报（委托给 `TurnRunner.speakAudioAnswer`）。
+   */
+  readonly speakAnnounce?: (
+    item: AnnounceItem,
+    playAudio: (answer: AgentAudioAnswer) => Promise<{
+      readonly spokenBytes: number;
+      readonly interrupted: boolean;
+      readonly transcript: string;
+    }>,
+  ) => Promise<'spoken' | 'defer' | 'fallback'>;
+  /** 插话/双击时同步掐断正在播的 Omni 后台汇报 */
+  readonly cancelAnnounce?: () => void;
+  /** 当某条后台汇报退回 TTS 播完后通知上层（用于静默回注 Omni 上下文） */
+  readonly onFallbackAnnounceSpoken?: (item: AnnounceItem, interrupted: boolean) => void;
   /** 上行增益（喂给 STT 前放大；眼镜 mic 电平偏低） */
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
@@ -681,6 +712,17 @@ export class VoiceConnection {
         onDialogState: (state) => { this.app?.onDialogState(state); },
       },
       log,
+      ...(options.engine === undefined ? {} : { engine: options.engine }),
+      ...(options.speakAnnounce === undefined
+        ? {}
+        : {
+            speakAnnounce: (item: AnnounceItem) => options.speakAnnounce!(
+              item,
+              (answer) => this.runner.speakAudioAnswer(answer),
+            ),
+            cancelAnnounce: options.cancelAnnounce,
+            onFallbackAnnounceSpoken: options.onFallbackAnnounceSpoken,
+          }),
     });
     // 应用层**总是**要建：话筒（user / reply / announce）必须在同一张表里仲裁，
     // 没有宠物也要（ADR-0001 §6）。宠物只是这套应用层里的一个子系统。
@@ -979,16 +1021,28 @@ export class VoiceConnection {
     );
     this.archive?.event(EVENTS.deviceLink, { proto: this.link.proto, label: this.link.label });
 
-    // 影子握手（实测 ~1.3 s）与设备握手并行，不占关键路径
+    // 影子握手（实测 ~1.3 s）与设备握手并行，不占关键路径。
+    // 挂到 agent 上才会发声：显式 `live`，或没写管道模式且 `serve !== 'off'`
+    // （旧的认领推断）。`cascade` 里影子只测量，`start()` 照跑，但不挂车道。
+    const omniServesPlayback = this.options.pipelineMode === 'live'
+      || (
+        this.options.pipelineMode === undefined
+        && this.options.omniShadow !== undefined
+        && this.options.omniShadow.serve !== 'off'
+      );
     this.omni?.start();
     // 车道照连接挂：这一条连接答完/断开时必须摘掉，否则下一条连接会认领到
     // 一条已经死了的 WS（它的 response 永远不会 done）
-    if (this.omni !== null) {
+    if (this.omni !== null && omniServesPlayback) {
       this.options.agent.attachAudioLane?.(this.omni);
     }
 
     // 后台任务完成后的播报落在这条连接上
     this.options.agent.setAnnouncer?.((speech, emotion) => { this.onAnnounce(speech, emotion); });
+    // Pure Live：`BackgroundTaskReport` 进播报空窗。没这个口的 agent 是空操作。
+    this.options.agent.setTaskReporter?.((report) => {
+      this.onTaskReport(report);
+    });
 
     // 上次离线期间攒下的汇报：连上就补播（旧的先播）
     const backlog = this.options.announceStore?.drain() ?? [];
@@ -1371,6 +1425,28 @@ export class VoiceConnection {
   }
 
   /**
+   * Pure Live 后台任务完成 → 播报空窗。
+   *
+   * 有 `verbatim` 时必须逐字念（精确数字 / 端口 / 长报告），否则念 `summary`。
+   */
+  private onTaskReport(report: BackgroundTaskReport): void {
+    this.archive?.event(EVENTS.announce, {
+      len: report.summary.length,
+      emotion: report.emotion,
+      source: report.source,
+      verbatim: report.verbatim !== undefined,
+    });
+    this.dialog.enqueueAnnounce({
+      speech: report.verbatim ?? report.summary,
+      emotion: report.emotion,
+      taskId: report.taskId,
+      query: report.query,
+      verbatim: report.verbatim !== undefined,
+      needsConfirm: report.needsConfirm,
+    });
+  }
+
+  /**
    * 被新连接顶掉：主动断开自己。
    *
    * 只 `end()` 连接，**不直接跑收尾** —— 收尾要等对端真的关（`onClose`），
@@ -1386,7 +1462,8 @@ export class VoiceConnection {
    *
    * 判据只有一条：服务级活跃槽里是不是自己。旧连接被顶掉之后仍要走完自己的收尾
    * （TTS / ASR / 档案都要关），但**不许动共享槽** —— `attachAudioLane` /
-   * `setAnnouncer` / `setDelegateHook` / `setAudit` / `ToolControl` 此刻都归新连接。
+   * `setAnnouncer` / `setTaskReporter` / `setDelegateHook` / `setAudit` /
+   * `ToolControl` 此刻都归新连接。
    * 弱网重连时「旧连接晚于新连接断开」是常态，不判所有权就会把新连接的东西摘掉。
    */
   private isActiveOwner(): boolean {
@@ -1412,9 +1489,11 @@ export class VoiceConnection {
     this.app?.close();
     this.app?.dispose();
     console.log(`\n连接结束，${this.core.turn} 轮`);
-    // 连接没了，后台任务的播报就没有出口了（结果仍会在 dsh 会话里，下次连上可追问）
+    // 连接没了，后台任务的播报就没有出口了（结果仍会在 dsh 会话里，下次连上可追问）。
+    // `setTaskReporter` 与 `setAnnouncer` 同一条所有权：旧连接迟到收尾不许摘新连接的。
     if (owner) {
       this.options.agent.setAnnouncer?.(null);
+      this.options.agent.setTaskReporter?.(null);
     }
     this.dialog.dispatch({ type: 'closed' });
     // 收件箱里还有等待者的话，定时器会拖住进程（不必再下发 hq_cancel：连接都断了）
