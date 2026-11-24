@@ -1,12 +1,13 @@
 /**
- * 快车道引擎的**唯一出口**：Live（omni 直出音频）与 Cascade（LLM → TTS）。
+ * 快车道引擎的**唯一出口**。
  *
- * 别处一律从这里 `import`，不要伸进具体文件 —— 换实现、加第三种模式都只改这一行。
- * 内核只认 `engine-contract.ts` 的 `FastVoiceEngine`，这两个类只是它的两份实现。
+ * - `LiveVoiceEngine`：omni 直出音频
+ * - `CascadeVoiceEngine`：LLM → TTS
+ * - `AgentEngineAdapter`：把现有 `AgentProvider` 的 omni / stream / pump 收成同一条事件流
  *
- * **状态：就绪契约实现**，目前由 `tests/fast-voice-engine.test.ts` 覆盖，
- * **尚未切入 `TurnRunner` 生产热路径**（那里仍按 `omni` / `stream` / `pump` 三分支
- * 调 `AgentProvider`）；阶段边界与理由见 `engine-contract.ts` 顶部的「当前阶段边界」。
+ * 别处一律从这里 `import`，不要伸进具体文件。内核只认 `engine-contract.ts` 的
+ * `FastVoiceEngine`。`TurnRunner` 仍按三分支直接调 `AgentProvider`，换泵是下一阶段；
+ * 适配器先把那三条分支的行为收齐，避免一切过去就静默丢掉流式回落和转交垫话。
  */
 export { LiveVoiceEngine, type LiveAudioLane } from './live-voice-engine.ts';
 export {
@@ -14,3 +15,7 @@ export {
   type CascadeAnswer,
   type CascadeEnginePorts,
 } from './cascade-voice-engine.ts';
+export {
+  AgentEngineAdapter,
+  type AgentEngineAdapterOptions,
+} from './agent-engine-adapter.ts';

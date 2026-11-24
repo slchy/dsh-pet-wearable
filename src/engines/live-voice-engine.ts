@@ -88,6 +88,8 @@ export class LiveVoiceEngine implements FastVoiceEngine {
       yield { type: 'done', fullText: '' };
       return;
     }
+    // 认领成功才报路径：内核不用再看引擎类型，就知道这轮是 omni 直出
+    yield { type: 'meta', path: 'omni' };
 
     const gate = abortGate(signal);
     let said = 0;
@@ -107,7 +109,7 @@ export class LiveVoiceEngine implements FastVoiceEngine {
         if (winner.done === true) {
           break;
         }
-        yield { type: 'audio', pcm: winner.value };
+        yield { type: 'audio', pcm: winner.value, sampleRate: answer.sampleRate };
         // 转写是**活的**：随音频流增长。增长了多少就补多少文本增量。
         const text = answer.transcript();
         if (text.length > said) {
@@ -128,7 +130,8 @@ export class LiveVoiceEngine implements FastVoiceEngine {
     if (reason !== null) {
       yield { type: 'delegate', reason, rewrittenQuery: answer.delegateText?.() ?? null };
     }
-    yield { type: 'done', fullText: answer.transcript() };
+    const finalText = answer.transcript();
+    yield { type: 'done', fullText: finalText, speech: finalText };
   }
 
   abortSpeculation(reason: 'delegated' | 'superseded' | 'barge_in'): void {
