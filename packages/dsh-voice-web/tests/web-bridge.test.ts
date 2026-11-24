@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 
-import { startWebBridge } from '../packages/dsh-voice-web/src/bridge.ts';
+import { startWebBridge } from '../src/bridge.ts';
 
 const dirs: string[] = [];
 function tempDir(): string {

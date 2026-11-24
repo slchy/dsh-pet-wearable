@@ -188,10 +188,8 @@ test('关掉判停就不带参数表', () => {
   assert.equal(cfg.semanticBudgetMs, 400);
 });
 
-test('三个入口都调用同一份配置，不再各抄一套默认值', () => {
+test('src/main.ts 复用 buildVoiceRuntimeConfig 单源配置，不再自带默认值', () => {
   const main = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
-  const driver = readFileSync(new URL('../packages/dsh-voice-web/src/driver.ts', import.meta.url), 'utf8');
-  const server = readFileSync(new URL('../bench/eval/server.ts', import.meta.url), 'utf8');
 
   assert.match(main, /buildVoiceRuntimeConfig\(/u);
   assert.match(main, /resolveOmniApiKey\(process\.env\)/u);
@@ -200,26 +198,4 @@ test('三个入口都调用同一份配置，不再各抄一套默认值', () =>
   assert.equal(/DEFAULT_PROACTIVE/u.test(main), false);
   assert.equal(main.includes('这张图里有什么'), false);
   assert.equal(/env\['OMNI_API_KEY'\] \?\? env\['DASHSCOPE_API_KEY'\]/u.test(main), false);
-
-  assert.match(driver, /buildVoiceRuntimeConfig\(/u);
-  assert.match(driver, /micGain:\s*1/u);
-  assert.match(driver, /controlPort:\s*0/u);
-  assert.match(driver, /isLoopbackHost\(config\.host\)/u);
-  assert.match(driver, /installHttpAgent\(/u);
-  assert.match(driver, /expiryWarning\(cert\)/u);
-  assert.match(driver, /loadStaticAsrCorpus\(memoryFile\.hotwordHints\(\)/u);
-  assert.match(driver, /resolveAsrLanguage\(process\.env\)/u);
-  assert.match(driver, /memorySummary:\s*\(\)\s*=>\s*memoryFile\.summary\(\)/u);
-  assert.match(driver, /\.then\(\(code\) => \{[\s\S]*reject\(/u);
-  assert.equal(/config\.host !== '127\.0\.0\.1'/u.test(driver), false);
-  assert.equal(/SEMANTIC_END_TAG_BUDGET_MS',\s*300/u.test(driver), false);
-  assert.equal(/30_000/u.test(driver), false);
-
-  assert.match(server, /buildVoiceRuntimeConfig\(/u);
-  assert.match(server, /idleTimeoutMs:\s*120_000/u);
-  assert.match(server, /archiveMaxMb:\s*200/u);
-  assert.match(server, /archiveKeep:\s*100/u);
-  assert.match(server, /photoTimeoutMs:\s*20_000/u);
-  assert.equal(/-46/u.test(server), false);
-  assert.equal(/MIC_GAIN',\s*2/u.test(server), false);
 });

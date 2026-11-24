@@ -15,14 +15,14 @@ import {
   renderMarkdown,
   scoreArtifact,
   type EvalSummaryReport,
-} from '../bench/eval/score.ts';
+} from './score.ts';
 import type {
   BgReportRecord,
   DshCallRecord,
   EvalCase,
   EvalManifest,
   EvalRunArtifact,
-} from '../bench/eval/types.ts';
+} from './types.ts';
 
 const ARCHIVE_STARTED_AT = '2026-11-24T00:00:00.000Z';
 const ARCHIVE_EPOCH_MS = Date.parse(ARCHIVE_STARTED_AT);

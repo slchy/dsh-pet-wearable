@@ -51,9 +51,10 @@
     "build:browser-types": "tsc -p tsconfig.browser-types.json",
     "build": "npm run sync:voice && npm run build:node && npm run build:browser && npm run build:browser-types && npm run demo:build",
     "typecheck": "npm run sync:voice && tsc --noEmit && tsc --noEmit -p tsconfig.browser.json",
+    "test": "npm run sync:voice && node --test tests/*.test.ts",
     "demo:build": "esbuild demo/main.ts --bundle --format=esm --outfile=demo/main.js",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.19.0",
