@@ -255,8 +255,14 @@ export type KernelEvent =
   }
   | { readonly type: 'beginAwaitShot' }
   | { readonly type: 'abortAwaitShot'; readonly why: string }
-  | { readonly type: 'receiptStarted' }
-  | { readonly type: 'receiptEnded' }
+  /**
+   * 回执开始出声。`ticket` 可选：带了就必须仍是当前轮
+   * （`dialog.ticket !== null` 且 `{no, gen}` 都对得上），过期票是空操作。
+   * 不带时保持旧的无参口径。
+   */
+  | { readonly type: 'receiptStarted'; readonly ticket?: TurnTicket }
+  /** 回执这段 `speaking` 结束。票据规则与 {@link receiptStarted} 相同；过期票必为空操作 */
+  | { readonly type: 'receiptEnded'; readonly ticket?: TurnTicket }
   | { readonly type: 'audioStarted'; readonly ticket: TurnTicket }
   | { readonly type: 'audioDone'; readonly ticket: TurnTicket }
   | { readonly type: 'requestEnd' }
@@ -485,6 +491,19 @@ function ticketMatches(dialog: DialogRegion, ticket: TurnTicket): boolean {
 }
 
 /**
+ * 回执事件带了票据时，必须仍是当前这一轮。
+ *
+ * 判据就是 `dialog.ticket !== null && !isStaleTicket(dialog.ticket, ticket)`：
+ * 票被插话清掉、被新轮顶掉，都不许再改相位。不带票据则保持旧的无参口径。
+ */
+function acceptsReceiptTicket(dialog: DialogRegion, ticket: TurnTicket | undefined): boolean {
+  if (ticket === undefined) {
+    return true;
+  }
+  return dialog.ticket !== null && !isStaleTicket(dialog.ticket, ticket);
+}
+
+/**
  * 开一轮的共同部分：结算被顶掉的上一轮（如果它还在播放区里），再开新的一轮。
  *
  * 真机 `20261123-002440` 第 3 轮：19.44 s 音频正好播完、用户 26 ms 后开口，
@@ -513,6 +532,8 @@ function startTurn(
         turn: ticket.no,
         gen: ticket.gen,
         endAfterSpeech: false,
+        // 上一轮的回执标志不能带进新轮，否则新轮的 audioDone 会把它当成回执直接返回。
+        receiptOnly: false,
         ticket,
         lastWhy: why,
       },
@@ -721,13 +742,12 @@ function stepPlayback(state: KernelState, event: PlaybackKernelEvent): [KernelSt
         ? state.playback
         : { ...state.playback, ticket: event.ticket, sentMediaMs: 0, firstAudioAtMs: null };
       const effect = settle(playback, event.ticket, event.atMs, stale, state.ledger.lastLane);
+      // 只结算播放区与账本。相位的出口是 `audioDone`：在这里把 `dialog.phase`
+      // 写成 `listening` 会盖掉 `endAfterSpeech` 通往 `ending` 的路，或在回执
+      // 期间留下 `listening + receiptOnly`。`ending` / `receiptOnly` 都保持原样。
       return [
         {
           ...state,
-          // `closed` 是吸收态：这里只结算账本，不把相位拉回 `listening`
-          dialog: stale || state.dialog.phase === 'closed'
-            ? state.dialog
-            : { ...state.dialog, phase: 'listening', ticket: null },
           playback: { ...state.playback, ticket: null, firstAudioAtMs: null, sentMediaMs: 0 },
           ledger: { ...recordSettle(state.ledger, effect), lastAnsweredAtMs: event.atMs },
         },
@@ -818,8 +838,9 @@ function stepDialog(state: KernelState, event: DialogKernelEvent): [KernelState,
 
     case 'receiptStarted': {
       const dialog = state.dialog;
-      // 进不去说明这一轮已经不在等答案（被插话作废 / 已收尾）—— 别出声
-      if (dialog.phase !== 'thinking') {
+      // 进不去说明这一轮已经不在等答案（被插话作废 / 已收尾）—— 别出声。
+      // 带了票据还得是当前这一轮：过期票不许把新轮推进 speaking。
+      if (dialog.phase !== 'thinking' || !acceptsReceiptTicket(dialog, event.ticket)) {
         return [state, []];
       }
       return [
@@ -838,7 +859,8 @@ function stepDialog(state: KernelState, event: DialogKernelEvent): [KernelState,
 
     case 'receiptEnded': {
       const dialog = state.dialog;
-      if (!dialog.receiptOnly) {
+      // 过期票据必为空操作：不能把新轮的回执打回 thinking，也不能清掉它的 receiptOnly。
+      if (!acceptsReceiptTicket(dialog, event.ticket) || !dialog.receiptOnly) {
         return [state, []];
       }
       const backToThinking = dialog.phase === 'speaking';
@@ -884,16 +906,24 @@ function stepDialog(state: KernelState, event: DialogKernelEvent): [KernelState,
       if (!ticketMatches(dialog, event.ticket)) {
         return [state, []];
       }
-      // 回执那段 `speaking` 不是本轮音频，别拿它的结束去推进轮次
-      if (dialog.receiptOnly) {
-        return [state, []];
-      }
+      // 本轮收尾的唯一相位出口。回执还占着 `speaking` 时也要离开：
+      // 清掉 `receiptOnly`，落点仍只由 `endAfterSpeech` 决定。
+      // 回执自己播完走 `receiptEnded`（回 `thinking`）；轮次已经结束就不能再停在 speaking，
+      // 否则 `endAfterSpeech` 到不了 `ending`。
       const phase: DialogState = dialog.endAfterSpeech ? 'ending' : 'listening';
-      if (phase === dialog.phase) {
+      if (phase === dialog.phase && !dialog.receiptOnly) {
         return [state, []];
       }
       return [
-        { ...state, dialog: { ...dialog, phase, lastWhy: '本轮音频结束' } },
+        {
+          ...state,
+          dialog: {
+            ...dialog,
+            phase,
+            receiptOnly: false,
+            ...(phase === dialog.phase ? {} : { lastWhy: '本轮音频结束' }),
+          },
+        },
         [],
       ];
     }

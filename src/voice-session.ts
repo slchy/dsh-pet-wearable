@@ -180,6 +180,77 @@ export function shouldWakeOnReady(input: {
 }
 
 /**
+ * 一条连接上的开麦相位。
+ *
+ * 以前是散落的 `micPending` 布尔：`listen.start` 还没发出去就先置位，
+ * 发送失败就永远停在「正在开」，`onClose` 也不叫醒等麦的人。
+ * 现在只许经 {@link VoiceConnection} 的 `enterMic` 迁移。
+ *
+ * - `idle` 还没开始等设备推流
+ * - `watching` 宽限期内看设备是不是已经在采集
+ * - `opening` `listen.start` **已经发出去**，在等首帧上行
+ * - `open` 看到了有效上行音频
+ * - `closed` 吸收态：连接收尾，不再出来
+ */
+export type MicPhase = 'idle' | 'watching' | 'opening' | 'open' | 'closed';
+
+function canEnterMic(from: MicPhase, to: MicPhase): boolean {
+  if (from === to) {
+    return true;
+  }
+  if (to === 'closed') {
+    return true;
+  }
+  switch (from) {
+    case 'idle':
+      return to === 'watching' || to === 'opening';
+    case 'watching':
+      return to === 'opening' || to === 'open';
+    case 'opening':
+      return to === 'open' || to === 'idle';
+    case 'open':
+      return to === 'opening';
+    case 'closed':
+      return false;
+    default:
+      return false;
+  }
+}
+
+/**
+ * 能量门上的静音提前量 → 装配器选项。
+ *
+ * `0` 是「关掉这一路」，必须原样传下去。缺字段（`undefined`）才表示没配置，
+ * 由 `SilenceTriggers` 用默认 200 / 100。以前 `<= 0` 把 `0` 删掉，
+ * 关闭开关静默失效，变回默认值。
+ */
+export function assemblerSilenceFromGate(gate: {
+  readonly pauseDetectMs?: number;
+  readonly speculateMs?: number;
+}): { readonly silencePauseMs?: number; readonly speculateMs?: number } {
+  return {
+    ...(gate.pauseDetectMs !== undefined ? { silencePauseMs: gate.pauseDetectMs } : {}),
+    ...(gate.speculateMs !== undefined ? { speculateMs: gate.speculateMs } : {}),
+  };
+}
+
+/**
+ * 电量帧合并。
+ *
+ * 只在字段**真有值**时更新。`undefined` 是没带这个字段；线上 `parseV2Event`
+ * 还会把缺字段收成 `null`。两种空都不能盖掉上一次已经记下的电量 / 充电。
+ */
+export function mergePowerReading(
+  current: { readonly percent: number | null; readonly charging: boolean | null },
+  event: { readonly percent?: number | null; readonly charging?: boolean | null },
+): { readonly percent: number | null; readonly charging: boolean | null } {
+  return {
+    percent: event.percent !== undefined && event.percent !== null ? event.percent : current.percent,
+    charging: event.charging !== undefined && event.charging !== null ? event.charging : current.charging,
+  };
+}
+
+/**
  * 送给判停器的「最近音频」上限（秒）。
  *
  * 判停器要听到整句话的尾巴才能判「说完了」，8 s 足够覆盖常见的一句话，
@@ -779,8 +850,23 @@ export class VoiceConnection {
         //
         // 延迟关闭是给控制串留出发出去 + App 读线程处理的时间（它收到就置位，不再重连）。
         end: () => {
+          // 从这一刻起就是「正在关」：宽限期内的 listen.start 必须拒绝，
+          // 不能在告别的 250 ms 里再把麦打开。
+          this.linkClosing = true;
           this.conn.sendControl('end_session');
-          setTimeout(() => { this.conn.end(); }, 250).unref?.();
+          this.clearEndSessionTimer();
+          const timer = setTimeout(() => {
+            if (this.endSessionTimer !== timer) {
+              return;
+            }
+            this.endSessionTimer = null;
+            if (this.micPhase === 'closed' || this.conn.isClosed) {
+              return;
+            }
+            this.conn.end();
+          }, 250);
+          timer.unref?.();
+          this.endSessionTimer = timer;
         },
         forget: (id) => { this.v1?.forget(id); },
         ...(this.caps.listenStart
@@ -920,13 +1006,8 @@ export class VoiceConnection {
       // （见 `barge-voicing.ts`）。默认是 `Date.now()`（≈1.76e12），而 `SystemClock`
       // 是进程启动后的单调毫秒（≈2e4）—— 接错的那一版闸恒放行且毫无日志。
       now: this.assemblerNow,
-      ...(options.gate.pauseDetectMs === undefined || options.gate.pauseDetectMs <= 0
-        ? {}
-        : { silencePauseMs: options.gate.pauseDetectMs }),
-      // 投机比判停更早（默认 100 ms）：猜错了作废就是，问晚了白等
-      ...(options.gate.speculateMs === undefined || options.gate.speculateMs <= 0
-        ? {}
-        : { speculateMs: options.gate.speculateMs }),
+      // `0` 原样透传（关闭预判停 / 投机）。删掉字段会让 SilenceTriggers 用回 200 / 100。
+      ...assemblerSilenceFromGate(options.gate),
       // 端点归我们把控的 ASR（qwen realtime）：静音到点就封段，解码那 ~260 ms
       // 与判停那一拍并行跑。`commitMs` 为 0 就不接（NLS 自己判句，别插嘴）。
       ...(options.gate.commitMs === undefined || options.gate.commitMs <= 0
@@ -1201,14 +1282,7 @@ export class VoiceConnection {
   private onFrame(type: number, payload: Buffer): void {
     switch (type) {
       case UpstreamFrameType.Audio:
-        // 有上行音频 = 设备确实在采集，不需要（再）唤醒它
-        if (this.captureWatch !== null) {
-          clearTimeout(this.captureWatch);
-          this.captureWatch = null;
-          console.log('  开麦    设备已在推流 → 不主动唤醒');
-        }
-        // 首帧上行 = 麦真的开了（不用手机回执：ACK 只证明命令进了队列）
-        this.onMicOpened();
+        this.noteUplinkAudio(payload);
         // `uplink.sbc` 只存压缩帧；PCM 上行由 pipeline 的 onRawPcm 写 `uplink.pcm`
         if (this.uplinkCodec === 'msbc') {
           this.archive?.sbc(payload);
@@ -1319,7 +1393,8 @@ export class VoiceConnection {
   }
 
   /** 一条原语事件：拍照的归收件箱，佩戴 / 电量 / 招呼归宠物环。 */
-  private onDeviceEvent(event: DeviceEvent): void {    switch (event.kind) {
+  private onDeviceEvent(event: DeviceEvent): void {
+    switch (event.kind) {
       case 'capture.waiting':
       case 'capture.failed': {
         const say = this.photos.onEvent(event);
@@ -1334,11 +1409,17 @@ export class VoiceConnection {
         // 「事件后补 tick」在 AppSession 里（ADR-0002 §3.1）
         this.app?.deviceEvent(event);
         return;
-      case 'power':
-        this.powerPercent = event.percent;
-        this.charging = event.charging;
-        this.app?.deviceEvent(event);
+      case 'power': {
+        const next = mergePowerReading(
+          { percent: this.powerPercent, charging: this.charging },
+          event,
+        );
+        this.powerPercent = next.percent;
+        this.charging = next.charging;
+        // 宠物只认电量。缺 percent 时传留下的值，避免 null 把宠物侧也清掉。
+        this.app?.deviceEvent({ kind: 'power', percent: this.powerPercent });
         return;
+      }
       case 'summon':
         this.app?.deviceEvent(event);
         return;
@@ -1359,12 +1440,12 @@ export class VoiceConnection {
    * - v1 连接经垫片翻成控制串；v1 表达不了的（如 `listen.start`）明确记日志跳过
    */
   private sendCall(call: DeviceCall): boolean {
-    // 开麦之后要等首帧上行才算"麦真的开了"（ADR-0001 §5.4）
-    if (call.op === 'listen.start') {
-      this.micPending = true;
-    } else if (call.op === 'listen.stop') {
-      this.micPending = false;
-      this.resolveMicWaiters();
+    // 关麦 / 已关：拒绝再发 listen.start。失败也不能先进入 opening，
+    // 否则等首帧的人会一直耗到 micOpenTimeoutMs。
+    if (call.op === 'listen.start' && this.listenStartBlocked()) {
+      this.archive?.event(EVENTS.ctlSkip, { op: call.op, why: 'closing' });
+      console.log('  控制    ✗ 连接正在关闭，拒绝 listen.start');
+      return false;
     }
     if (!supportsCall(this.caps, call)) {
       this.archive?.event(EVENTS.ctlSkip, { op: call.op, why: 'unsupported' });
@@ -1375,16 +1456,42 @@ export class VoiceConnection {
       const json = encodeV2Call(call);
       this.archive?.event(EVENTS.callSend, { json });
       this.conn.sendCall(json);
-      return true;
+    } else {
+      const text = this.v1.encode(call);
+      if (text === null) {
+        this.archive?.event(EVENTS.ctlSkip, { op: call.op, why: 'v1-cannot-express' });
+        console.log(`  控制    ✗ v1 无法表达 ${call.op}，已跳过`);
+        return false;
+      }
+      this.sendControl(text);
     }
-    const text = this.v1.encode(call);
-    if (text === null) {
-      this.archive?.event(EVENTS.ctlSkip, { op: call.op, why: 'v1-cannot-express' });
-      console.log(`  控制    ✗ v1 无法表达 ${call.op}，已跳过`);
-      return false;
-    }
-    this.sendControl(text);
+    this.noteListenSent(call);
     return true;
+  }
+
+  /** `closing` / `closed`：半关、对端已关、或开麦相位已经吸收。 */
+  private listenStartBlocked(): boolean {
+    return this.linkClosing || this.micPhase === 'closed' || this.conn.isClosed;
+  }
+
+  /**
+   * `listen.start` / `listen.stop` 只有在字节真的交出去之后才改相位。
+   *
+   * 开麦成功 → `opening`（等首帧）。关麦成功且还在等首帧 → 回到 `idle`，
+   * 并把等待者按「这次开麦结束」放开，避免再耗满超时。
+   */
+  private noteListenSent(call: DeviceCall): void {
+    if (call.op === 'listen.start') {
+      this.enterMic('opening');
+      return;
+    }
+    if (call.op !== 'listen.stop' || this.micPhase === 'closed') {
+      return;
+    }
+    if (this.micPhase === 'opening') {
+      this.enterMic('idle');
+    }
+    this.resolveMicWaiters(true);
   }
 
   /** 下发控制串并记进档案：每次下发都能在时间线上对到当时的音频位置 */
@@ -1395,10 +1502,19 @@ export class VoiceConnection {
 
   // ------------------------------------------------------------------ 开麦
 
-  /** 已经发过 `listen.start`，还没收到首帧上行音频 */
-  private micPending = false;
-  /** 等首帧上行的人（播报用；宠物走 `AppSession.micOpened()`） */
-  private micWaiters: Array<() => void> = [];
+  /** 开麦相位。唯一写入点是 {@link enterMic}。 */
+  private micPhase: MicPhase = 'idle';
+  /**
+   * 相位代次。每次真正迁出一格就 +1。
+   *
+   * 宽限定时器和等麦超时都抓住自己登记时的代次：恢复时对不上，
+   * 或已经停在 `closed`，这次回调作废。
+   */
+  private micEpoch = 0;
+  /** `end_session` 已发出、socket 还没关。这段时间拒绝 `listen.start`。 */
+  private linkClosing = false;
+  /** 等首帧上行的人。参数是「麦开了没有」。 */
+  private micWaiters: Array<(opened: boolean) => void> = [];
 
   /**
    * 连接就绪后观察「设备到底在不在采集」的定时器。
@@ -1407,6 +1523,36 @@ export class VoiceConnection {
    * （说明设备已经在推流，不需要唤醒 —— 重连场景多半是这样）。
    */
   private captureWatch: NodeJS.Timeout | null = null;
+  /** `end_session` 之后那 250 ms 的延迟关闭。`onClose` 必须清掉，不能悬空。 */
+  private endSessionTimer: NodeJS.Timeout | null = null;
+
+  /** 开麦相位的唯一写入点。非法迁移打日志并保持原状。`closed` 是吸收态。 */
+  private enterMic(next: MicPhase): boolean {
+    if (this.micPhase === next) {
+      return true;
+    }
+    if (!canEnterMic(this.micPhase, next)) {
+      console.error(`  开麦    拒绝 ${this.micPhase} → ${next}`);
+      return false;
+    }
+    this.micPhase = next;
+    this.micEpoch += 1;
+    return true;
+  }
+
+  private clearCaptureWatch(): void {
+    if (this.captureWatch !== null) {
+      clearTimeout(this.captureWatch);
+      this.captureWatch = null;
+    }
+  }
+
+  private clearEndSessionTimer(): void {
+    if (this.endSessionTimer !== null) {
+      clearTimeout(this.endSessionTimer);
+      this.endSessionTimer = null;
+    }
+  }
 
   /**
    * 开始等设备的第一帧上行音频。
@@ -1421,14 +1567,23 @@ export class VoiceConnection {
    * 到期要不要开麦交给 {@link shouldWakeOnReady}（它还看佩戴）。
    */
   private armCaptureWatch(resumed: boolean): void {
+    if (this.listenStartBlocked() || !this.enterMic('watching')) {
+      return;
+    }
+    const epoch = this.micEpoch;
     const why = resumed ? '自动重连' : '连接就绪';
     this.captureWatch = setTimeout(() => {
       this.captureWatch = null;
+      // 代次或相位变了（已开、已关、已经在开）就别再补一发 listen.start
+      if (this.micEpoch !== epoch || this.micPhase !== 'watching' || this.listenStartBlocked()) {
+        return;
+      }
       if (!shouldWakeOnReady({
         hasAudio: false, // 收到帧时 watch 已被 onFrame 取消，走到这里就是没帧
         wearing: this.wearing,
-        closed: this.conn.isClosed,
-        micPending: this.micPending,
+        closed: this.conn.isClosed || this.linkClosing,
+        // 能走到这里相位仍是 watching；opening 已在上面返回
+        micPending: false,
       })) {
         if (this.wearing === false) {
           console.log(`  开麦    ${why}且 ${CAPTURE_GRACE_MS} ms 无上行音频，但设备未佩戴 → 不唤醒`);
@@ -1441,33 +1596,51 @@ export class VoiceConnection {
     this.captureWatch.unref?.();
   }
 
-  /** 发一次 `listen.start` 并进入等首帧的状态。 */
+  /**
+   * 发一次 `listen.start`。
+   *
+   * 只有 {@link sendCall} 返回 true 才进入 `opening`。发送失败留在原相位，
+   * 不能卡死在 `opening`。
+   */
   private sendListenStart(): void {
-    this.micPending = true;
+    if (this.listenStartBlocked()) {
+      return;
+    }
     this.sendCall({ op: 'listen.start', maxMs: INITIAL_LISTEN_MS });
   }
 
-  private resolveMicWaiters(): void {
+  private resolveMicWaiters(opened: boolean): void {
     const waiters = this.micWaiters;
     this.micWaiters = [];
     for (const resolve of waiters) {
-      resolve();
+      resolve(opened);
     }
   }
 
   /**
-   * 麦开的证据到了。
+   * 有效上行音频。
    *
-   * 只在 `micPending` 时算一次：`listen.stop` 之后再来的音频属于对话层，
-   * 不该再被当成"宠物这一轮开麦成功"。
+   * 只在 `watching` / `opening` 时算一次：已经 `open` 的后续帧属于对话层，
+   * `listen.stop` 回到 `idle` 之后再来的音频也不算「这一轮开麦成功」。
+   * 空载荷不是证据。
    */
-  private onMicOpened(): void {
-    if (!this.micPending) {
+  private noteUplinkAudio(payload: Buffer): void {
+    if (payload.length === 0) {
       return;
     }
-    this.micPending = false;
+    if (this.micPhase !== 'watching' && this.micPhase !== 'opening') {
+      return;
+    }
+    const armed = this.captureWatch !== null;
+    this.clearCaptureWatch();
+    if (armed) {
+      console.log('  开麦    设备已在推流 → 不主动唤醒');
+    }
+    if (!this.enterMic('open')) {
+      return;
+    }
     this.archive?.event(EVENTS.micOpened);
-    this.resolveMicWaiters();
+    this.resolveMicWaiters(true);
     this.app?.micOpened();
   }
 
@@ -1475,12 +1648,17 @@ export class VoiceConnection {
    * 等麦开，最多 `timeoutMs`。
    *
    * 播报用（ADR-0001 §6）：设备支持 `listen.start` 时，播报也先开麦再开口，
-   * 这样播报一开口就能被插话；超时照播。
+   * 这样播报一开口就能被插话；超时照播。连接收尾时立刻以 `false` 醒来，
+   * 不再耗满 `micOpenTimeoutMs`。
    */
   private awaitMicOpen(timeoutMs: number): Promise<boolean> {
-    if (!this.micPending) {
+    if (this.micPhase === 'open') {
+      return Promise.resolve(true);
+    }
+    if (this.micPhase !== 'opening') {
       return Promise.resolve(false);
     }
+    const epoch = this.micEpoch;
     return new Promise<boolean>((resolve) => {
       let settled = false;
       const finish = (opened: boolean): void => {
@@ -1491,8 +1669,20 @@ export class VoiceConnection {
         cancel();
         resolve(opened);
       };
-      const cancel = this.clock.after(timeoutMs, () => { finish(false); });
-      this.micWaiters.push(() => { finish(true); });
+      const cancel = this.clock.after(timeoutMs, () => {
+        // 成功由 noteUplinkAudio 同步叫醒并取消这个定时器。
+        // 走到这里只有两种情况，都是「这次没开成」：
+        // 代次已经离开当时那次 opening，或者还停在 opening 但等到了超时。
+        if (this.micEpoch !== epoch || this.micPhase !== 'opening') {
+          finish(false);
+          return;
+        }
+        finish(false);
+      });
+      this.micWaiters.push((opened) => {
+        // 显式叫醒以参数为准。closed 是吸收态，迟到的 true 也不许报开麦成功。
+        finish(this.micPhase === 'closed' ? false : opened);
+      });
     });
   }
 
@@ -1556,6 +1746,7 @@ export class VoiceConnection {
    * 那时才能保证「先断开、再清槽」的顺序；这里直接清槽会让新旧两条交叠。
    */
   evict(): void {
+    this.linkClosing = true;
     console.log(`  连接    被新连接接管，断开旧连接 ${this.conn.remote}`);
     this.conn.end();
   }
@@ -1574,6 +1765,13 @@ export class VoiceConnection {
   }
 
   private onClose(): void {
+    // 立刻吸收开麦：不等宽限、也不等 micOpenTimeoutMs。等麦的人拿到 false。
+    this.linkClosing = true;
+    this.enterMic('closed');
+    this.clearCaptureWatch();
+    this.clearEndSessionTimer();
+    this.resolveMicWaiters(false);
+
     // 这条连接还是不是「当前那条」——**整段收尾**都按这一份快照判断。
     // 活跃槽要等收尾结束才清：`DialogRuntime.dispose()`（在 `app.dispose()` 里）
     // 也要拿 `isActiveOwner()` 决定摘不摘回执钩子，提前清掉它就变成「旧连接」了。
@@ -1583,34 +1781,32 @@ export class VoiceConnection {
     if (this.toolHandlers !== null) {
       this.service.control.setHandlers(null, this.toolHandlers);
     }
-    // 先摘车道：`attachAudioLane` 是进程级 agent 上的一个槽，留一条死连接在上面
-    // 会让下一条连接认领到永远不会完成的 response。但**只摘自己的**。
+    // 先摘车道和播报出口：留一条死连接在上面会让下一条认领到永远不会完成的 response。
+    // 但**只摘自己的**。旧连接迟到收尾不许摘新连接的。
     if (owner) {
       this.options.agent.attachAudioLane?.(null);
-    }
-    // 有在途开口就记 aborted，然后丢掉执行器手里的计时器
-    this.app?.close();
-    this.app?.dispose();
-    console.log(`\n连接结束，${this.core.turn} 轮`);
-    // 连接没了，后台任务的播报就没有出口了（结果仍会在 dsh 会话里，下次连上可追问）。
-    // `setTaskReporter` 与 `setAnnouncer` 同一条所有权：旧连接迟到收尾不许摘新连接的。
-    if (owner) {
       this.options.agent.setAnnouncer?.(null);
       this.options.agent.setTaskReporter?.(null);
     }
+    // 吸收序：先停上行，再拆还在吃音频的人。`closed` 必须在 `app.dispose()`
+    // 之后仍能发出（端口不许在 dispose 里摘掉），所以 dispatch 放在这六步之后。
+    this.uplink.end();
+    this.assembler.dispose();
+    this.app?.close();
+    this.app?.dispose();
+    this.omni?.stop();
+    this.stt.close();
+    console.log(`\n连接结束，${this.core.turn} 轮`);
     this.dialog.dispatch({ type: 'closed' });
     // 收件箱里还有等待者的话，定时器会拖住进程（不必再下发 hq_cancel：连接都断了）
     // 这里的 `dispose()` 已经是个 no-op（`app.dispose()` 里调过一次），回执钩子那一步
     // 同样走 `isActiveOwner()` 守卫。
     this.dialog.dispose();
-    this.assembler.dispose();
     // 只有自己建的那份才销毁：共享侧车由进程持有，断开就 stop 等于每次重连都
     // 重新加载 ONNX（实测 ~300 ms，第一句白吃）
     if (this.ownsTurnJudge) {
       this.turnJudge?.stop();
     }
-    // 影子最后关：正常断开**不落事件**（`stop()` 不 emit），只有异常才留 `broken`
-    this.omni?.stop();
     // 先摘审计出口再关档案：否则最后一批 `agent.done` 会写进已关闭的档案。
     // 两道保护都要：令牌让**槽**认出「这是我挂的那份」，`owner` 让**旧连接根本不发**
     // 这趟调用 —— 装配方（`main.ts`）若还是 1 参回调、把令牌丢了，无令牌的 `null`
@@ -1619,8 +1815,6 @@ export class VoiceConnection {
       this.options.setAudit?.(null, this.auditSink);
     }
     this.archive?.close();
-    this.stt.close();
-    this.uplink.end();
     // **最后**才清槽；旧连接的迟到收尾走到这里时槽里已经是新连接，不动它。
     if (owner) {
       this.service.activeSlot.current = null;
@@ -1852,12 +2046,4 @@ export class VoiceConnection {
     });
   }
 
-  // ------------------------------------------------------------------ 档案
-  // ------------------------------------------------------------------ 档案
-
-  /**
-   * 档案已经在 `close()` 里收尾（`archive.close()`），这里不再单独落盘 ——
-   * 旧的按轮次 `down_<turn>.pcm` 落盘已删掉：它只覆盖播放期，恰好漏掉
-   * 「用户说话但没成句」这种最需要事后查的场景，而且同名文件会被下一条连接覆盖。
-   */
 }

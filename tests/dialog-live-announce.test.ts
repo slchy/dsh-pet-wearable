@@ -44,6 +44,10 @@ interface RigOptions {
   readonly engine?: FastVoiceEngine;
   readonly drop?: (why: string) => void;
   readonly mic?: boolean;
+  /** 替换默认的「立刻开麦」。用来把 partial / dispose 插进 awaitMicOpen 的恢复点。 */
+  readonly awaitMicOpen?: () => Promise<boolean>;
+  /** 设备有 `detail` 拍照档，用来把 capture 排进串行队列。 */
+  readonly captureDetail?: boolean;
 }
 
 interface Rig {
@@ -100,9 +104,12 @@ function rig(options: RigOptions = {}): Rig {
     ...(options.drop === undefined ? {} : { dropPrefetch: options.drop }),
   };
 
+  const caps = CAPS(options.mic === true);
   const runtime = new DialogRuntime({
     clock,
-    caps: CAPS(options.mic === true),
+    caps: options.captureDetail === true
+      ? { ...caps, capture: { detail: { needsUser: false } } }
+      : caps,
     agent,
     tts,
     ...(options.engine === undefined ? {} : { engine: options.engine }),
@@ -136,7 +143,7 @@ function rig(options: RigOptions = {}): Rig {
             micOpenTimeoutMs: 1_500,
             listenMs: 3_000,
             call: () => {},
-            awaitMicOpen: async () => true,
+            awaitMicOpen: options.awaitMicOpen ?? (async () => true),
           },
         }
         : {}),
@@ -146,6 +153,16 @@ function rig(options: RigOptions = {}): Rig {
 
   return {
     clock, runtime, speeches, items, synth, announces, logs, notes, asked, fallbacks, replies, counters,
+  };
+}
+
+/** 测试里把一次 await 停住。闭包赋值不进 CFA，所以 resolve 的类型保持可调用。 */
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => { throw new Error('deferred 尚未挂上'); };
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return {
+    promise,
+    resolve: (value) => { resolve(value); },
   };
 }
 
@@ -425,5 +442,126 @@ test('有引擎时 abortEngine 只调用 abortSpeculation；没有引擎时仍�
   } finally {
     wired.runtime.dispose();
     bare.runtime.dispose();
+  }
+});
+
+test('dispose 会掐掉正在念的旁白', () => {
+  const r = rig();
+  let calls = 0;
+  const original = r.runtime.runner.cancelCanned.bind(r.runtime.runner);
+  r.runtime.runner.cancelCanned = (): void => {
+    calls += 1;
+    original();
+  };
+  r.runtime.dispose();
+  assert.equal(calls, 1);
+  r.runtime.dispose();
+  assert.equal(calls, 1, '重复 dispose 不再掐一次');
+});
+
+test('dispose 或 closed 之后，排队的轮次不再开跑', async () => {
+  const replyGate = deferred<AgentReplyView>();
+  const r = rig({
+    reply: () => replyGate.promise,
+  });
+  try {
+    r.runtime.dispatch({ type: 'utterance', text: '第一句' });
+    await r.clock.drain();
+    assert.equal(r.replies.n, 1);
+    r.runtime.dispatch({ type: 'utterance', text: '第二句' });
+    r.runtime.dispose();
+    replyGate.resolve({ text: '好', speech: '好' });
+    await r.clock.drain();
+    assert.equal(r.replies.n, 1, '连接已经 dispose，排队的下一轮不该再问模型');
+  } finally {
+    r.runtime.dispose();
+  }
+});
+
+test('closed 之后排队的拍照不再下发', async () => {
+  const replyGate = deferred<AgentReplyView>();
+  const r = rig({
+    captureDetail: true,
+    reply: () => replyGate.promise,
+  });
+  try {
+    r.runtime.dispatch({ type: 'utterance', text: '你好' });
+    r.runtime.dispatch({ type: 'utterance', text: '看清这个标签' });
+    await r.clock.drain();
+    assert.equal(r.replies.n, 1);
+    r.runtime.core.fsm.close();
+    replyGate.resolve({ text: '好', speech: '好' });
+    await r.clock.drain();
+    await r.clock.runUntil(r.clock.now() + 500);
+    assert.equal(r.replies.n, 1);
+    assert.equal(
+      r.logs.some((line) => line.includes('已下发')),
+      false,
+      `关闭后不该再武装拍照，实际 ${JSON.stringify(r.logs)}`,
+    );
+    assert.equal(r.clock.pending, 0, '拍照兜底定时器不该再挂着');
+  } finally {
+    r.runtime.dispose();
+  }
+});
+
+test('awaitMicOpen 恢复后：连接已 dispose 就不念', async () => {
+  const micGate = deferred<boolean>();
+  const r = rig({
+    mic: true,
+    synthesize: oneChunk,
+    awaitMicOpen: () => micGate.promise,
+  });
+  try {
+    r.runtime.enqueueAnnounce('汇报一句');
+    await r.clock.drain();
+    r.runtime.dispose();
+    micGate.resolve(true);
+    await r.clock.drain();
+    assert.equal(r.speeches.length, 0);
+    assert.equal(r.synth.length, 0);
+  } finally {
+    r.runtime.dispose();
+  }
+});
+
+test('awaitMicOpen 恢复后：相位已离开 listening 就不念', async () => {
+  const micGate = deferred<boolean>();
+  const r = rig({
+    mic: true,
+    synthesize: oneChunk,
+    awaitMicOpen: () => micGate.promise,
+  });
+  try {
+    r.runtime.enqueueAnnounce('汇报一句');
+    await r.clock.drain();
+    assert.ok(r.runtime.core.fsm.beginTurn());
+    micGate.resolve(true);
+    await r.clock.drain();
+    assert.equal(r.speeches.length, 0);
+    assert.equal(r.synth.length, 0);
+    assert.equal(r.runtime.core.fsm.state, 'thinking');
+  } finally {
+    r.runtime.dispose();
+  }
+});
+
+test('awaitMicOpen 恢复后：已经 dispose 就不念', async () => {
+  const micGate = deferred<boolean>();
+  const r = rig({
+    mic: true,
+    synthesize: oneChunk,
+    awaitMicOpen: () => micGate.promise,
+  });
+  try {
+    r.runtime.enqueueAnnounce('汇报一句');
+    await r.clock.drain();
+    r.runtime.dispose();
+    micGate.resolve(true);
+    await r.clock.drain();
+    assert.equal(r.speeches.length, 0);
+    assert.equal(r.synth.length, 0);
+  } finally {
+    r.runtime.dispose();
   }
 });

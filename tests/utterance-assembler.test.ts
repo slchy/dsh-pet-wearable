@@ -9,12 +9,19 @@
  * 修法是机械的：短碎片 + 紧跟上一轮 = 再等一拍看有没有后续。
  */
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
+import type * as ort from 'onnxruntime-node';
 
 import { UtteranceAssembler, looksUnfinished, type UtteranceAssemblerOptions } from '../src/utterance-assembler.ts';
 import type { AudioFrame } from '../src/engine-contract.ts';
+import { SilenceTriggers } from '../src/silence-triggers.ts';
+import { TurnJudge } from '../src/turn-judge.ts';
 import { UplinkPipeline } from '../src/uplink-pipeline.ts';
+import { SileroVad } from '../src/vad.ts';
 
 interface Harness {
   assembler: UtteranceAssembler;
@@ -262,7 +269,8 @@ test('判停说没说完时，后半句照样并进同一轮', async () => {
 
   // 用户喘了口气继续说 —— 上一句还没定稿，应当并成一轮
   assembler.addSentence('5881。');
-  await delay(500);
+  // 新段把拍数清零，unsure 要重新走满 maxUnsureExtensions（3 × 200 ms）才收下。
+  await delay(800);
 
   assert.equal(utterances.length, 1);
   assert.equal(utterances[0]?.text, '订单号是井号W8665881。', '订单号不能被切成两轮');
@@ -1756,9 +1764,9 @@ test('语义判停缓存只留最近 8 条：陈旧的前缀判定不许复用�
 // 1. 预算耗尽（`overBudget`）只限制「安静时多等几拍」，绝不能盖过「人此刻正在说话」：
 //    缓冲句非空期间收到去抖后的真实新语音，必迁入 `speaking_more` 并取消在途定时器。
 // 2. 任何异步恢复点（`takeProbability` / `awaitSemantics` / `awaitDecode`）醒来见到
-//    `speaking_more` 或 `seq` 变更都必须让位，绝不拿旧判定冲掉新句或截断说话。
-// 3. 活性保证：清嗓子/空解码在静音达标后退出 `speaking_more` 并先等在途解码再收口；
-//    彻底停帧也有兜底定时器；`disposed` 为吸收态。
+//    `speaking_more`、`seq` 变更或 `evalEpoch` 过期都必须让位，绝不拿旧判定冲掉新句。
+// 3. 活性保证：清嗓子/空解码在静音达标后先进入 `rearming`（不是 `judging`），
+//    等在途解码再收口；彻底停帧也有兜底定时器；`disposed` 为吸收态。
 
 test('FSM 不变量 1a（s1_act_01/s2_asr_04 复现）：静音闸耗光预算后用户仍在说话，绝不中途截断', async () => {
   let clock = 1_000;
@@ -1842,7 +1850,8 @@ test('FSM 不变量 1b（s4_p_300 复现）：semantic=more 续等期间用户�
       assembler.addAudio(silent(20));
     }
     assembler.addSentence('最后还是得靠自己。');
-    await delay(100);
+    // 新段把拍数清零，要重新走完 unsure 一拍 + 语义 MORE 一拍才收下。
+    await delay(180);
     assert.deepEqual(utterances.map((u) => u.text), ['我觉得这件事吧。最后还是得靠自己。']);
   } finally {
     assembler.dispose();
@@ -2119,4 +2128,284 @@ test('FSM 吸收态：dispose 之后任何输入均不可离开 disposed 或再�
   await delay(50);
   assert.equal(assembler.phase, 'disposed');
   assert.equal(utterances.length, 0);
+});
+
+test('并入新定稿时拍数从零起算，前一段耗尽的额度不带走后一段', async () => {
+  const { assembler, utterances } = makeAssembler({
+    quietMs: 0,
+    extendMs: 40,
+    maxExtensions: 1,
+    maxUnsureExtensions: 1,
+    predict: async () => 0.01,
+  });
+  try {
+    assembler.addSentence('前半句');
+    await delay(10);
+    assembler.addSentence('后半句');
+    await delay(10);
+    assert.equal(utterances.length, 0, '新段的拍数已清零，低分还要再等一拍');
+    await delay(80);
+    assert.deepEqual(utterances.map((u) => u.text), ['前半句后半句']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('A2 P0：旧 evaluate 在 rearming 醒来时因 evalEpoch 过期必须放弃', async () => {
+  let clock = 10_000;
+  let releaseSemantic: (verdict: 'end') => void = () => {};
+  let releaseDecode: () => void = () => {};
+  let decoding = false;
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    quietMs: 0,
+    extendMs: 20,
+    maxExtensions: 2,
+    decodeWaitMs: 200,
+    now: () => clock,
+    // 0.60：高于声学阈值所以会走向收下，又低于 0.80，完整句必须等语义。
+    predict: async () => 0.6,
+    semanticEndpoint: () => new Promise<'end'>((resolve) => { releaseSemantic = resolve; }),
+    awaitDecode: () => (decoding ? new Promise<void>((resolve) => { releaseDecode = resolve; }) : null),
+  });
+  const epochOf = (): number => (assembler as unknown as { evalEpoch: number }).evalEpoch;
+  try {
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addSentence('今天天气不错。');
+    const born = epochOf();
+    await delay(15);
+    assert.equal(assembler.phase, 'judging', '应挂在 awaitSemantics');
+
+    clock += 20;
+    assembler.addAudio(voiced());
+    clock += 20;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.phase, 'speaking_more');
+    assert.ok(epochOf() > born, '重新开口必须推进 evalEpoch');
+
+    decoding = true;
+    for (let i = 0; i < 6; i += 1) {
+      clock += 20;
+      assembler.addAudio(silent(20));
+    }
+    await delay(15);
+    assert.equal(assembler.phase, 'rearming', '退出 speaking_more 必须先进入 rearming');
+    const latched = epochOf();
+    assert.ok(latched > born);
+
+    // 旧协程在 rearming 醒来。相位不是 speaking_more / idle / disposed，seq 也没变，
+    // 只有代次能拦住它。
+    releaseSemantic('end');
+    await delay(20);
+    assert.equal(utterances.length, 0, '过期的 evaluate 不许在 rearming 里提交');
+    assert.equal(assembler.phase, 'rearming');
+    assert.equal(epochOf(), latched, '放弃旧判定时不能再改代次');
+
+    decoding = false;
+    releaseDecode();
+    await delay(40);
+    assert.deepEqual(utterances.map((u) => u.text), ['今天天气不错。']);
+    assert.equal(assembler.phase, 'idle');
+  } finally {
+    releaseDecode();
+    assembler.dispose();
+  }
+});
+
+test('disposed 吸收 addFrame / addAudio：尾帧不得再封段或投机', () => {
+  let clock = 9_000;
+  const commits: number[] = [];
+  const partials: string[] = [];
+  const predicts: number[] = [];
+  const { assembler } = makeAssembler({
+    silenceDb: -40,
+    commitAfterMs: 40,
+    speculateMs: 40,
+    silencePauseMs: 40,
+    now: () => clock,
+    predict: async () => { predicts.push(1); return 0.2; },
+    onCommit: (ms) => { commits.push(ms); },
+    onPartial: (text) => { partials.push(text); return true; },
+  });
+  assembler.addFrame(frameAt(clock, true, voiced()));
+  clock += 20;
+  assembler.addFrame(frameAt(clock, true, voiced()));
+  assembler.notePartial('你好');
+  const voicedAt = assembler.lastVoicedAtMs;
+  assembler.addSentence('你好');
+  assembler.dispose();
+  assert.equal(assembler.phase, 'disposed');
+
+  for (let i = 0; i < 8; i += 1) {
+    clock += 20;
+    const pcm = i < 2 ? voiced() : silent(20);
+    assembler.addFrame(frameAt(clock, i < 2, pcm));
+    assembler.addAudio(pcm);
+    assembler.notePartial('尾巴');
+  }
+  assembler.addSentence('不该再收');
+  assembler.flush();
+  assert.equal(assembler.phase, 'disposed');
+  assert.equal(assembler.lastVoicedAtMs, voicedAt, '吸收态不得再 noteFrame');
+  assert.deepEqual(commits, [], '吸收态不得封段');
+  assert.deepEqual(partials, [], '吸收态不得投机');
+  assert.deepEqual(predicts, [], '吸收态不得预跑判停');
+});
+
+test('UplinkPipeline.closed 吸收 push 与 onPcm，断连后的尾包不再进门', () => {
+  let pcmCount = 0;
+  let frameCount = 0;
+  const pipeline = new UplinkPipeline({
+    ffmpegPath: 'ffmpeg',
+    codec: 'pcm16',
+    sampleRate: 16_000,
+    gate: { thresholdDbfs: -40, holdMs: 2_000, prerollMs: 800 },
+    log: () => {},
+    onError: () => {},
+    onPcm: () => { pcmCount += 1; },
+    onSpeechOpen: () => {},
+    onFrame: () => { frameCount += 1; },
+    onSpeechClose: () => {},
+  });
+  pipeline.push(voiced());
+  pipeline.push(voiced());
+  const pcmBefore = pcmCount;
+  const framesBefore = frameCount;
+  assert.ok(pcmBefore > 0, '关闭前的音频要进管道');
+  pipeline.end();
+  pipeline.push(voiced());
+  (pipeline as unknown as { onPcm(raw: Buffer): void }).onPcm(voiced());
+  assert.equal(pcmCount, pcmBefore, 'closed 之后 push / ffmpeg 尾包都不得再回调 onPcm');
+  assert.equal(frameCount, framesBefore, 'closed 之后不得再吐 AudioFrame');
+});
+
+test('SilenceTriggers 传 0 彻底关闭预跑和投机，不传则仍用 100/200', () => {
+  const host = (events: { predicts: number; partials: number }) => ({
+    pendingText: () => '',
+    lastUtteranceAt: () => Number.NEGATIVE_INFINITY,
+    lastPartialAt: () => 1_000,
+    lastPartialText: () => '你好呀',
+    hasPredictor: () => true,
+    predictionPending: () => false,
+    startUpcomingPrediction: () => { events.predicts += 1; },
+    onVoiced: () => {},
+  });
+
+  const closed = { predicts: 0, partials: 0 };
+  const off = new SilenceTriggers({
+    silencePauseMs: 0,
+    speculateMs: 0,
+    log: () => {},
+    onPartial: () => { closed.partials += 1; return true; },
+  }, host(closed));
+  off.noteFrame(true, 1_000);
+  off.noteFrame(true, 1_020);
+  off.noteFrame(false, 1_040);
+  off.noteFrame(false, 2_000);
+  off.noteFrame(false, 5_000);
+  assert.equal(closed.predicts, 0, 'silencePauseMs=0 不能在静音差值为 0 时立刻预跑');
+  assert.equal(closed.partials, 0, 'speculateMs=0 不能在静音一到就投机');
+
+  const opened = { predicts: 0, partials: 0 };
+  const on = new SilenceTriggers({
+    log: () => {},
+    onPartial: () => { opened.partials += 1; return true; },
+  }, host(opened));
+  on.noteFrame(true, 1_000);
+  on.noteFrame(true, 1_020);
+  on.noteFrame(false, 1_110);
+  assert.equal(opened.partials, 0, '默认投机门槛是 100 ms');
+  assert.equal(opened.predicts, 0, '默认预跑门槛是 200 ms');
+  on.noteFrame(false, 1_120);
+  assert.equal(opened.partials, 1, '不传 speculateMs 时静音 100 ms 要投机');
+  assert.equal(opened.predicts, 0);
+  on.noteFrame(false, 1_220);
+  assert.equal(opened.predicts, 1, '不传 silencePauseMs 时静音 200 ms 要预跑');
+});
+
+test('TurnJudge 按时回来的 f64 交给当前 pending', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tj-fast-'));
+  const script = join(dir, 'sidecar.cjs');
+  writeFileSync(script, `
+'use strict';
+let buf = Buffer.alloc(0);
+process.stdin.on('data', (chunk) => {
+  buf = Buffer.concat([buf, chunk]);
+  for (;;) {
+    if (buf.length < 4) return;
+    const len = buf.readUInt32LE(0);
+    if (buf.length < 4 + len) return;
+    buf = buf.subarray(4 + len);
+    const out = Buffer.alloc(8);
+    out.writeDoubleLE(0.42, 0);
+    process.stdout.write(out);
+  }
+});
+`);
+  const judge = new TurnJudge({ python: process.execPath, script });
+  try {
+    const p = await judge.predict(Buffer.alloc(320, 1));
+    assert.equal(p, 0.42);
+  } finally {
+    judge.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('TurnJudge 超时后的迟到 f64 丢弃，不串到下一发', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tj-late-'));
+  const script = join(dir, 'sidecar.cjs');
+  // 第一发故意不回。父进程 5s 超时后才发第二发；侧车这时先补迟到的 0.11，再给 0.77。
+  writeFileSync(script, `
+'use strict';
+let buf = Buffer.alloc(0);
+let n = 0;
+process.stdin.on('data', (chunk) => {
+  buf = Buffer.concat([buf, chunk]);
+  for (;;) {
+    if (buf.length < 4) return;
+    const len = buf.readUInt32LE(0);
+    if (buf.length < 4 + len) return;
+    buf = buf.subarray(4 + len);
+    n += 1;
+    if (n === 2) {
+      const late = Buffer.alloc(8);
+      late.writeDoubleLE(0.11, 0);
+      const fresh = Buffer.alloc(8);
+      fresh.writeDoubleLE(0.77, 0);
+      process.stdout.write(late);
+      process.stdout.write(fresh);
+    }
+  }
+});
+`);
+  const judge = new TurnJudge({ python: process.execPath, script });
+  try {
+    const pcm = Buffer.alloc(320, 1);
+    assert.equal(await judge.predict(pcm), -1, '5s 超时要按不可用返回');
+    assert.equal(await judge.predict(pcm), 0.77, '迟到的 0.11 必须丢掉，不能配给下一发');
+  } finally {
+    judge.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SileroVad.reset() 无参清零复用已 init 的 state，不退回未就绪', async () => {
+  const fresh = new SileroVad();
+  fresh.reset();
+  assert.equal((fresh as unknown as { state: unknown }).state, null, '还没 init 时无参 reset 保持未就绪');
+
+  const ortMod = await import('onnxruntime-node') as typeof ort;
+  const vad = new SileroVad();
+  vad.reset(ortMod);
+  const internal = vad as unknown as { state: { data: Float32Array } | null };
+  const state = internal.state;
+  assert.ok(state, 'reset(ort) 要建出合法 Tensor');
+  state.data[0] = 1;
+  vad.reset();
+  assert.equal(internal.state, state, '无参 reset 必须留着原来的 Tensor');
+  assert.equal(state.data[0], 0, 'state.data 要清零复用');
 });

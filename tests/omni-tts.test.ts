@@ -244,3 +244,81 @@ test('空文本不发任何请求', async () => {
   assert.equal(got.length, 0);
   assert.deepEqual(socket.types(), [], '连连接都不该建');
 });
+
+test('握手超时关掉旧 socket，迟到的 session.updated 不能放行新连接', { timeout: 3000 }, async () => {
+  const sockets: FakeSocket[] = [];
+  const tts = omniTts({
+    apiKey: 'k',
+    connectTimeoutMs: 30,
+    log: () => {},
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket as unknown as RealtimeLike;
+    },
+  });
+  const first = tts.synthesize('你好')[Symbol.asyncIterator]().next();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(sockets.length, 1);
+  sockets[0]!.open();
+  await assert.rejects(first, /握手超时/);
+  assert.equal(sockets[0]!.readyState, 3);
+
+  sockets[0]!.message({ type: 'session.updated' });
+  const second = tts.synthesize('第二句')[Symbol.asyncIterator]();
+  const pending = second.next();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(sockets.length, 2);
+  sockets[1]!.open();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  sockets[0]!.message({ type: 'session.updated' });
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(
+    sockets[1]!.types().filter((type) => type === 'conversation.item.create').length,
+    0,
+  );
+  sockets[1]!.message({ type: 'session.updated' });
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(
+    sockets[1]!.types().filter((type) => type === 'conversation.item.create').length,
+    1,
+  );
+  sockets[1]!.message({ type: 'response.done', response: { status: 'completed' } });
+  await pending;
+});
+
+test('take 超时清掉自己的 wake，迟到的音频帧不会被吞', { timeout: 3000 }, async () => {
+  const { socket, tts } = make();
+  const real = globalThis.setTimeout;
+  const audio = Buffer.alloc(480, 4);
+  let armed = false;
+  const wrapped = (fn: (...handlerArgs: unknown[]) => void, ms?: number, ...args: unknown[]): ReturnType<typeof setTimeout> => {
+    if (ms === 1_000 && !armed) {
+      armed = true;
+      return real(() => {
+        fn(...args);
+        socket.message({ type: 'response.audio.delta', delta: audio.toString('base64') });
+        socket.message({ type: 'response.done', response: { status: 'completed' } });
+      }, ms);
+    }
+    return real(fn as (...handlerArgs: unknown[]) => void, ms, ...(args as []));
+  };
+  globalThis.setTimeout = wrapped as typeof setTimeout;
+  try {
+    const iter = tts.synthesize('你好。')[Symbol.asyncIterator]();
+    const pending = iter.next();
+    await new Promise((resolve) => { setImmediate(resolve); });
+    socket.open();
+    await new Promise((resolve) => { setImmediate(resolve); });
+    socket.message({ type: 'session.updated' });
+    const first = await pending;
+    assert.equal(armed, true);
+    assert.equal(first.done, false);
+    assert.equal((first.value as Buffer).length, 480);
+    assert.equal((first.value as Buffer)[0], 4);
+    const end = await iter.next();
+    assert.equal(end.done, true);
+  } finally {
+    globalThis.setTimeout = real;
+  }
+});

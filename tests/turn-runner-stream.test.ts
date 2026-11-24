@@ -10,7 +10,9 @@ import { test } from 'node:test';
 
 import type { Cancel, Clock } from '../src/app/clock.ts';
 import { DialogFsm } from '../src/dialog-fsm.ts';
+import type { FastVoiceEngine } from '../src/engine-contract.ts';
 import { CascadeVoiceEngine, LiveVoiceEngine } from '../src/engines/index.ts';
+import { VirtualClock } from '../src/pet/sim/clock.ts';
 import type {
   AgentAudioAnswer,
   AgentProvider,
@@ -192,6 +194,16 @@ function rig(options: {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/** 测试里把一次 await 停住。闭包赋值不进 CFA，所以 resolve 的类型保持可调用。 */
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => { throw new Error('deferred 尚未挂上'); };
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return {
+    promise,
+    resolve: (value) => { resolve(value); },
+  };
+}
 
 /** 起一轮，`atMs` 之后插话 —— 用来造「音频发完了、用户才开口」的边界 */
 async function runWithBargeIn(atMs: number) {
@@ -783,4 +795,145 @@ test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻停�
     `残句应当是原文的一段，实际「${residue.text}」`,
   );
   assert.equal(runner.takeCannedResidue(), null, '取一次就没了');
+});
+
+test('thinking→thinking 顶掉旧轮后，旧轮恢复时不再下发音频', async () => {
+  const vclock = new VirtualClock();
+  const sent: number[] = [];
+  const gate = deferred<void>();
+  const engine: FastVoiceEngine = {
+    mode: 'cascade',
+    isHealthy: () => true,
+    abortSpeculation: () => {},
+    async *respond() {
+      yield { type: 'audio', pcm: Buffer.alloc(480, 1), sampleRate: 24_000 };
+      await gate.promise;
+      yield { type: 'audio', pcm: Buffer.alloc(480, 1), sampleRate: 24_000 };
+    },
+  };
+  const fsm = new DialogFsm(() => {}, { now: () => vclock.now() });
+  const runner = new TurnRunner({
+    clock: vclock,
+    agent: unusedAgent(),
+    tts: stubTts,
+    downlink: {
+      sendAudio: (pcm) => { sent.push(pcm.length); },
+      sendControl: () => {},
+    },
+    fsm,
+    playbackTailMs: 0,
+    engine,
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+
+  const pending = runner.run('你好');
+  await vclock.drain();
+  assert.equal(sent.length, 1, '顶掉之前的第一块可以下发');
+  const superseded = fsm.beginTurn();
+  assert.ok(superseded);
+  assert.equal(superseded.no, 2);
+  assert.equal(fsm.isCurrent({ no: 1, gen: 0 }), false);
+  gate.resolve(undefined);
+  await vclock.drain();
+  await vclock.runUntil(vclock.now() + 500);
+  const result = await pending;
+
+  assert.equal(sent.length, 1, '旧轮不得再下发第二块');
+  assert.equal(result?.interrupted, true);
+  assert.equal(fsm.state, 'thinking', '旧轮的 audioDone 不能把新轮踢出 thinking');
+  assert.equal(fsm.turn, 2);
+});
+
+test('run() 结束先取消回执；过期 receiptEnded 不改下一轮的回执', async () => {
+  const vclock = new VirtualClock();
+  const sent: number[] = [];
+  const gate = deferred<void>();
+  const engine: FastVoiceEngine = {
+    mode: 'cascade',
+    isHealthy: () => true,
+    abortSpeculation: () => {},
+    async *respond() {
+      await gate.promise;
+    },
+  };
+  const fsm = new DialogFsm(() => {}, { now: () => vclock.now() });
+  const runner = new TurnRunner({
+    clock: vclock,
+    agent: unusedAgent(),
+    tts: {
+      name: 'fake',
+      sampleRate: 24_000,
+      async *synthesize() {
+        yield Buffer.alloc(48_000, 1);
+      },
+    },
+    downlink: {
+      sendAudio: (pcm) => { sent.push(pcm.length); },
+      sendControl: () => {},
+    },
+    fsm,
+    playbackTailMs: 0,
+    engine,
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+
+  const pending = runner.run('查一下');
+  await vclock.drain();
+  assert.equal(runner.speakReceipt('我看看。'), true);
+  await vclock.drain();
+  assert.equal(fsm.state, 'speaking');
+  assert.equal(fsm.speakingIsReceiptOnly, true);
+  const before = sent.length;
+  assert.ok(before > 0, '回执应当已经下发');
+
+  gate.resolve(undefined);
+  await vclock.drain();
+  await pending;
+  assert.equal(fsm.state, 'listening', '本轮 audioDone 要离开回执的 speaking');
+  assert.equal(sent.length, before, '轮次结束后回执不得再往下发');
+
+  const next = fsm.beginTurn();
+  assert.ok(next);
+  assert.equal(runner.speakReceipt('我查查。'), true);
+  assert.equal(fsm.state, 'speaking');
+  assert.equal(fsm.turn, next.no);
+  await vclock.runUntil(vclock.now() + 200);
+  assert.equal(fsm.state, 'speaking', '上一轮 holdReceipt 醒来不得把新回执打回 thinking');
+  assert.equal(fsm.speakingIsReceiptOnly, true);
+  assert.equal(fsm.turn, next.no);
+});
+
+test('speakCanned 的播放等遇到 closed 立即停', async () => {
+  const vclock = new VirtualClock();
+  const fsm = new DialogFsm(() => {}, { now: () => vclock.now() });
+  let chunks = 0;
+  const runner = new TurnRunner({
+    clock: vclock,
+    agent: unusedAgent(),
+    tts: {
+      name: 'fake',
+      sampleRate: 24_000,
+      async *synthesize() {
+        chunks += 1;
+        yield Buffer.alloc(48_000, 1);
+        chunks += 1;
+        yield Buffer.alloc(48_000, 1);
+      },
+    },
+    downlink: { sendAudio: () => {}, sendControl: () => {} },
+    fsm,
+    playbackTailMs: 5_000,
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+
+  const pending = runner.speakCanned('旁白一句');
+  await vclock.drain();
+  assert.equal(chunks, 2, '合成先跑完，后面才是播放等待');
+  fsm.close();
+  await vclock.runUntil(vclock.now() + 150);
+  await pending;
+  assert.ok(vclock.now() < 1_000, `关闭后不该把整段播放等完，实际 ${vclock.now()}`);
 });

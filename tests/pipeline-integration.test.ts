@@ -659,6 +659,48 @@ test('逐字汇报：TTS 原文朗读，绕开 speakFromText，并按 spoken 回
   }
 });
 
+test('动作轮空闲总线：omni 的 rewrittenQuery 原样进 dsh', async () => {
+  const h = openLive();
+  try {
+    h.dsh.hold();
+    await completeUserTurn(h, '查一下订单', {
+      transcript: '我查查。',
+      tool: '订单现在到哪了',
+    });
+    assert.equal(h.dsh.calls.length, 1);
+    const query = h.dsh.calls[0]?.text ?? '';
+    assert.match(query, /订单现在到哪了/);
+    assert.match(query, /查一下订单/);
+    assert.equal(query.startsWith('订单现在到哪了'), true);
+  } finally {
+    closeLive(h);
+  }
+});
+
+test('fallback 播报确认没声之后仍按 spoken 回注', async () => {
+  const h = openLive();
+  try {
+    const outcome = await h.live.speakBackgroundReport(
+      { speech: '港口结论', taskId: 'port-1', query: '港口到了吗' },
+      async () => ({ spokenBytes: 0, interrupted: false, transcript: '' }),
+    );
+    assert.equal(outcome, 'fallback');
+    h.live.noteFallbackAnnounceSpoken(
+      { speech: '港口结论', taskId: 'port-1', query: '港口到了吗' },
+      false,
+    );
+    const injected = userItemTexts(h.socket).find((text) => text.includes('已经用语音把下面这段念给他了'));
+    const logged = h.logs.some((line) => line.includes('回注') && line.includes('已播完') && line.includes('港口结论'));
+    assert.equal(injected !== undefined || logged, true, '没声的 fallback 仍要 spoken 回注');
+    if (injected !== undefined) {
+      assert.match(injected, /港口结论/);
+      assert.match(injected, /港口到了吗/);
+    }
+  } finally {
+    closeLive(h);
+  }
+});
+
 test('纯级联：快车道流式、动作轮走 dsh 并回落整段 TTS，没有 omni 车道', async () => {
   const clock = new VirtualClock();
   const dsh = mockDsh();

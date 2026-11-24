@@ -15,7 +15,7 @@ import {
   computeBackgroundTurnarounds,
   formatAttribution,
 } from '../scripts/latency-attribution.ts';
-import { percentile } from '../src/latency-report.ts';
+import { FIRST_WORD_BUDGET_MS, percentile } from '../src/latency-report.ts';
 
 interface RawEvent {
   readonly t: number;
@@ -261,6 +261,21 @@ test('窗口、dsh_background 不占名额，其它来源按认领规则配对',
   assert.equal(silentRows[0]?.matchedTurn, null);
   assert.equal(silentRows[1]?.matchedTurn, 1);
   assert.equal(silentRows[1]?.turnaroundMs, 2000);
+});
+
+test('按路径拆读这一轮的 path，预算不另写死', () => {
+  // turn.end 与 turn.start 同一时刻。按 t > start 再扫一遍会把它看成「没记 path」。
+  const report = formatAttribution([
+    { t: 180, ev: 'asr.sentence', text: '甲' },
+    { t: 200, ev: 'turn.start' },
+    { t: 200, ev: 'turn.end', path: 'live' },
+    { t: 220, ev: 'gate.close', gapMs: 40 },
+    { t: 400, ev: 'tts.first' },
+  ], 'same-stamp');
+  assert.match(report, /\*\*live\*\*/);
+  assert.doesNotMatch(report, /未记 path/);
+  assert.match(report, new RegExp(`预算 ${FIRST_WORD_BUDGET_MS}`));
+  assert.match(report, new RegExp(`> ${FIRST_WORD_BUDGET_MS} ms`));
 });
 
 test('events.jsonl 上的 source / delegate 穿过 parseEvents 后仍能归因', { timeout: 60_000 }, () => {

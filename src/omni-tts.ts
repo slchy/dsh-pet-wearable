@@ -100,6 +100,13 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
    * 下一条请求首块 1 ms、拿到 3.52 s 残留。
    */
   let inflight = false;
+  /** 每条连接加一。旧 socket 的 message/close/error 看见代次不对就直接返回。 */
+  let wsGen = 0;
+  /**
+   * 套接字还在等 open 时，`close()` 用它解开 `await`。
+   * 代次失效的回调会直接 return，不解开的话这次建连挂死。
+   */
+  let connectSettle: (() => void) | null = null;
   /**
    * 第几次 `response.create`。放弃那条要等的是**自己这一代**的 `response.done`：
    * 只看 `inflight` 会等错——放行之后下一条会立刻把它置回 true，于是老的那条
@@ -119,17 +126,24 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
     }
     return new Promise((resolve) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
+      const onWake = (): void => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (wake === onWake) wake = null;
+        resolve(queue.shift() ?? null);
+      };
       const done = (): void => {
-        if (timer !== null) clearTimeout(timer);
-        if (wake === done) wake = null;
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (wake === onWake) wake = null;
         resolve(null);
       };
       timer = setTimeout(done, ms);
-      wake = () => {
-        if (timer !== null) clearTimeout(timer);
-        timer = null;
-        resolve(queue.shift() ?? null);
-      };
+      wake = onWake;
     });
   };
   const push = (ev: ServerEvent): void => {
@@ -181,6 +195,7 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
       return;
     }
     connecting = (async () => {
+      const myGen = ++wsGen;
       const factory = options.socketFactory
         ?? ((url, apiKey) => new WebSocket(url, {
           headers: { Authorization: `Bearer ${apiKey}` },
@@ -192,13 +207,24 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
       ready = false;
       queue = [];
       wake = null;
+      const stale = (): boolean => myGen !== wsGen || ws !== socket;
       await new Promise<void>((resolve, reject) => {
-        socket.on('open', () => { resolve(); });
+        connectSettle = resolve;
+        socket.on('open', () => {
+          if (stale()) return;
+          resolve();
+        });
         socket.on('error', (...args: never[]) => {
+          if (stale()) return;
           reject(new Error(`连接失败: ${String(args[0])}`));
         });
       });
+      connectSettle = null;
+      if (stale()) {
+        throw new Error('连接已被取代');
+      }
       socket.on('message', (...args: never[]) => {
+        if (stale()) return;
         let ev: ServerEvent;
         try {
           ev = JSON.parse(String(args[0])) as ServerEvent;
@@ -226,8 +252,12 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
         }
         push(ev);
       });
+      socket.on('error', (...args: never[]) => {
+        if (stale()) return;
+        log(`[omni-tts] socket error: ${String(args[0])}`);
+      });
       socket.on('close', () => {
-        if (ws !== socket) return;
+        if (stale()) return;
         log('[omni-tts] 连接关闭');
         ws = null;
         ready = false;
@@ -260,7 +290,12 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
       });
       const deadline = Date.now() + (options.connectTimeoutMs ?? 15_000);
       while (!ready) {
+        if (stale()) {
+          throw new Error('连接已被取代');
+        }
         if (Date.now() > deadline) {
+          // 先作废这一代再关：迟到的 session.updated 不能把下一条连接标成就绪。
+          close();
           throw new Error('握手超时');
         }
         const ev = await take(500);
@@ -393,6 +428,7 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
   }
 
   function close(): void {
+    wsGen += 1;
     const socket = ws;
     ws = null;
     ready = false;
@@ -401,6 +437,9 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
     garbage = [];
     inflight = false;
     abandoned = false;
+    const settle = connectSettle;
+    connectSettle = null;
+    settle?.();
     releaseIdle();
     try {
       socket?.close();

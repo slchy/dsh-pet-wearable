@@ -102,6 +102,11 @@ export class Connection {
   /** `end()` 已调用但 'close' 还没来 —— 这期间必须停止收发。 */
   private closing = false;
   private closed = false;
+  /**
+   * `end()` 半关之后的强拆。必须记在连接上：`finish()` 到来时清掉，
+   * 连调两次 `end()` 也不能再挂第二只。
+   */
+  private forceCloseTimer: NodeJS.Timeout | null = null;
 
   constructor(
     socket: Socket,
@@ -197,6 +202,10 @@ export class Connection {
   }
 
   end(): void {
+    // 半关之后再 end 一次只会再挂一只 5 秒强拆，对端真正关掉时谁也清不掉。
+    if (this.closing || this.closed) {
+      return;
+    }
     this.closing = true;
     // 立刻停掉空闲看门狗：半关之后 `finish()` 要等对端真的关，
     // 那段时间里定时器还会继续判「无数据」，日志和 `socket.end()` 都会重复。
@@ -204,14 +213,19 @@ export class Connection {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
     }
-    if (!this.socket.destroyed) {
-      this.socket.end();
-      // `end()` 只是半关，真正的 `close` 要等对端也发 FIN。看门狗已经停了，
-      // 所以碰到不配合的对端（尤其被我们主动踢掉的）这条连接会一直挂着占 fd。
-      // 给个兜底：5 秒还没关就强制 destroy。
-      const force = setTimeout(() => { this.destroy(); }, 5_000);
-      force.unref();
+    if (this.socket.destroyed) {
+      return;
     }
+    // 先挂上强拆再 half-close。对端若在 `socket.end()` 里同步关掉，
+    // `finish()` 看得到这只定时器并清掉，不会等 5 秒再 destroy 一次。
+    // `end()` 只是半关，真正的 `close` 要等对端也发 FIN。看门狗已经停了，
+    // 所以碰到不配合的对端（尤其被我们主动踢掉的）这条连接会一直挂着占 fd。
+    this.forceCloseTimer = setTimeout(() => {
+      this.forceCloseTimer = null;
+      this.destroy();
+    }, 5_000);
+    this.forceCloseTimer.unref();
+    this.socket.end();
   }
 
   destroy(): void {
@@ -314,6 +328,10 @@ export class Connection {
     if (this.idleTimer) {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
+    }
+    if (this.forceCloseTimer) {
+      clearTimeout(this.forceCloseTimer);
+      this.forceCloseTimer = null;
     }
     this.handlers?.onClose(reason);
     this.onClosed?.();

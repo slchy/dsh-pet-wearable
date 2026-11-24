@@ -207,9 +207,17 @@ export const EVENTS = {
   announce: 'announce',
   /** 补播：连上时把离线期间攒下的汇报一次性放出来 */
   announceReplay: 'announce.replay',
+  /** 敲击撤掉了正在排队的后台汇报（不是一次主动开口） */
+  announceDismissed: 'announce.dismissed',
 
   // ---- 宠物 ----
   petIn: 'pet.in',
+  /** 状态机产出的意图（`phase.enter` / `end` / …） */
+  petOut: 'pet.out',
+  /** 一次主动开口的结局 */
+  petOutcome: 'pet.outcome',
+  /** 宠物开始朗读（还没出声；失败与打断都不会另造一条） */
+  petSpeak: 'pet.speak',
 } as const;
 
 /** 任一事件名（值是上面那些字符串之一）。 */

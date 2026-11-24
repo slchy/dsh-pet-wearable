@@ -354,20 +354,33 @@ export class DialogFsm {
    * 它和真正的回答音频共用 `speaking`，靠 `receiptOnly` 区分：
    * 回执自然播完回 `thinking`（答案还在路上），被音频接管则由 `audioStarted` 清标志。
    *
+   * @param ticket 出声那一刻锁存的票据。带了就由内核核对 `{no, gen}`；
+   *   过期票不会进入 `speaking`。不传则保持旧的无参口径。
    * @returns 有没有真的进 `speaking`；`false` = 这一轮已经不在等答案（被插话作废 /
-   *   已收尾），这时候不该出声
+   *   已收尾 / 票据过期），这时候不该出声
    */
-  receiptStarted(): boolean {
+  receiptStarted(ticket?: TurnTicket): boolean {
     if (this.runtime.state.dialog.phase !== 'thinking') {
       return false;
     }
-    this.send({ type: 'receiptStarted' });
-    return true;
+    this.send(ticket === undefined
+      ? { type: 'receiptStarted' }
+      : { type: 'receiptStarted', ticket });
+    // 成功时内核同时把相位改成 speaking 并置 receiptOnly。
+    // 不拿 phase 跟 'speaking' 比：进函数时的收窄会让 TS 以为 send() 之后仍是 thinking。
+    return this.runtime.state.dialog.receiptOnly;
   }
 
-  /** 回执这段 `speaking` 结束：回 `thinking` 继续等答案。不动代次。 */
-  receiptEnded(): void {
-    this.send({ type: 'receiptEnded' });
+  /**
+   * 回执这段 `speaking` 结束：回 `thinking` 继续等答案。不动代次。
+   *
+   * @param ticket 与 {@link receiptStarted} 同一张。过期票是空操作，
+   *   不会把已经开了的下一轮打回 `thinking`。
+   */
+  receiptEnded(ticket?: TurnTicket): void {
+    this.send(ticket === undefined
+      ? { type: 'receiptEnded' }
+      : { type: 'receiptEnded', ticket });
   }
 
   /** 这段 `speaking` 是不是只有回执（真音频还没开始） */

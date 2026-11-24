@@ -78,13 +78,15 @@ test('没人等时收到不属于任何请求的图：返回 false，交给调�
 });
 
 test('下发的 capture 带 id / 意图 / 兜底时长', () => {
-  const { inbox, sent } = newInbox({ timeoutMs: 111, confirmTimeoutMs: 222 });
-  void inbox.request(detail());
-  assert.deepEqual(sent[0], { op: 'capture', id: 'c1', intent: 'detail', deadlineMs: 222 });
-  inbox.dispose();
-  void inbox.request(glance());
-  assert.deepEqual(sent[1], { op: 'capture', id: 'g1', intent: 'glance', deadlineMs: 111 });
-  inbox.dispose();
+  const first = newInbox({ timeoutMs: 111, confirmTimeoutMs: 222 });
+  void first.inbox.request(detail());
+  assert.deepEqual(first.sent[0], { op: 'capture', id: 'c1', intent: 'detail', deadlineMs: 222 });
+  first.inbox.dispose();
+
+  const second = newInbox({ timeoutMs: 111, confirmTimeoutMs: 222 });
+  void second.inbox.request(glance());
+  assert.deepEqual(second.sent[0], { op: 'capture', id: 'g1', intent: 'glance', deadlineMs: 111 });
+  second.inbox.dispose();
 });
 
 test('设备表达不了这次 capture：立刻 unsupported', async () => {

@@ -70,6 +70,8 @@ interface Waiter {
 export class PhotoInbox {
   private readonly options: PhotoInboxOptions;
   private waiter: Waiter | null = null;
+  /** 吸收态：`dispose()` 之后不再接新请求，也不再武装定时器 */
+  private disposed = false;
 
   constructor(options: PhotoInboxOptions) {
     this.options = options;
@@ -95,6 +97,9 @@ export class PhotoInbox {
    * 已经有请求在等时立刻返回 `busy`（不排队，避免两次请求抢一张图）。
    */
   request(request: CaptureRequest): Promise<PhotoOutcome> {
+    if (this.disposed) {
+      return Promise.resolve({ ok: false, failure: { code: 'cancelled' } });
+    }
     if (this.waiter !== null) {
       this.options.log('  拍照    ⚠ 已有请求在等图，本次拒绝（busy）');
       return Promise.resolve({ ok: false, failure: { code: 'busy' } });
@@ -190,8 +195,9 @@ export class PhotoInbox {
     return false;
   }
 
-  /** 连接结束时清干净：否则定时器会拖住进程 */
+  /** 连接结束时清干净：否则定时器会拖住进程。置位之后 `request` 不再武装定时器。 */
   dispose(): void {
+    this.disposed = true;
     this.settle({ ok: false, failure: { code: 'cancelled' } });
   }
 

@@ -350,8 +350,12 @@ export class TurnRunner {
       const startedAt = this.options.clock.now();
       let firstChunkAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(text, emotion)) {
-        if (current.cancelled) {
-          this.log(ephemeral ? '  回执    被正式回答顶掉，停止下发' : '  旁白    被打断，停止下发');
+        if (current.cancelled || this.options.fsm.state === 'closed') {
+          if (current.cancelled) {
+            this.log(ephemeral ? '  回执    被正式回答顶掉，停止下发' : '  旁白    被打断，停止下发');
+          } else {
+            this.log(ephemeral ? '  回执    连接已关闭，停止下发' : '  旁白    连接已关闭，停止下发');
+          }
           return;
         }
         if (firstChunkAtMs < 0) {
@@ -369,7 +373,11 @@ export class TurnRunner {
       );
       // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
       const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
-      while (this.options.clock.now() < until && !current.cancelled) {
+      while (
+        this.options.clock.now() < until
+        && !current.cancelled
+        && this.options.fsm.state !== 'closed'
+      ) {
         await this.wait(PLAYBACK_POLL_MS);
       }
     };
@@ -474,9 +482,12 @@ export class TurnRunner {
     if (this.receiptPlaying || this.canned !== null || this.firstAudioSeen) {
       return false;
     }
+    // 出声前锁存票据：`holdReceipt` 在 await 之后回来时拿这张票调 `receiptEnded`，
+    // 过期票是空操作，不会把下一轮的回执打回 thinking。
+    const receiptTicket = this.options.fsm.ticket();
     // 回执是真出声：状态进 `speaking`，用户这时开口才算插话（见 DialogFsm.receiptStarted）。
-    // 进不去说明这一轮已经不在等答案（被插话作废 / 已收尾）—— 那就别出声了。
-    if (!this.options.fsm.receiptStarted()) {
+    // 进不去说明这一轮已经不在等答案（被插话作废 / 已收尾 / 票据过期）—— 那就别出声了。
+    if (!this.options.fsm.receiptStarted(receiptTicket)) {
       return false;
     }
     // 立刻通知：档案要记下这段 `speaking`，话筒归属也别等下一帧才对齐
@@ -497,7 +508,7 @@ export class TurnRunner {
         this.options.onDownlinkChunk?.(chunk);
         this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
       }
-      void this.holdReceipt(current);
+      void this.holdReceipt(current, receiptTicket);
       return true;
     }
     this.log(`  回执    ${JSON.stringify(text)}`);
@@ -531,22 +542,62 @@ export class TurnRunner {
         `  回执    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
         + `（首块 ${firstChunkAtMs < 0 ? '—' : `${Math.round(firstChunkAtMs)}ms`}）`,
       );
-      await this.holdReceipt(current);
+      await this.holdReceipt(current, receiptTicket);
     })();
     return true;
   }
 
-  /** 回执下发完之后，按音频时长占住「还在说」的状态，直到播完或被顶掉。 */
-  private async holdReceipt(current: { sentBytes: number; cancelled: boolean }): Promise<void> {
+  /**
+   * 回执下发完之后，按音频时长占住「还在说」的状态，直到播完或被顶掉。
+   *
+   * `receiptTicket` 是出声时锁存的那张。await 回来再调 `receiptEnded`，
+   * 内核按 `{no, gen}` 丢弃过期票，避免悬空等待把下一轮打回 thinking。
+   */
+  private async holdReceipt(
+    current: { sentBytes: number; cancelled: boolean },
+    receiptTicket: TurnTicket,
+  ): Promise<void> {
     const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
     const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
-    while (this.options.clock.now() < until && !current.cancelled) {
+    while (
+      this.options.clock.now() < until
+      && !current.cancelled
+      && this.options.fsm.state !== 'closed'
+    ) {
       await this.wait(PLAYBACK_POLL_MS);
     }
     // 回执这一段结束了：状态回到 `thinking`（答案还在路上）。
-    // 被顶掉时上面已经调过一次，这里再调也是幂等的。
-    this.options.fsm.receiptEnded();
+    // 被顶掉、或本轮已经 audioDone 清掉 receiptOnly 时，再调也是空操作。
+    this.options.fsm.receiptEnded(receiptTicket);
     this.options.onState?.();
+  }
+
+  /**
+   * 掐掉还在念的回执。
+   *
+   * 单独一个方法：`run()` 开头把 `this.receipt` 置空之后，TS 会把这个字段
+   * 在整个方法里收窄成 `null`，`finally` 里再写 `cancelled = true` 就编不过。
+   * 回执是在 await 期间由 `speakReceipt` 挂上的，这里按字段的声明类型读。
+   */
+  private cancelActiveReceipt(): void {
+    const receipt = this.receipt;
+    if (receipt === null) {
+      return;
+    }
+    receipt.cancelled = true;
+    this.receipt = null;
+    this.receiptPlaying = false;
+  }
+
+  /**
+   * 这张票已经不是当前轮。
+   *
+   * `isStale` 只看代次（插话），`isCurrent` 只看轮次号。`thinking → thinking`
+   * 的吸收窗口不推进代次，只把 `no` +1 —— 两个都要看，否则旧轮还会往下发音频。
+   */
+  private isTurnDead(ticket: TurnTicket): boolean {
+    const fsm = this.options.fsm;
+    return fsm.isStale(ticket) || !fsm.isCurrent(ticket);
   }
 
   /**
@@ -760,6 +811,11 @@ export class TurnRunner {
        */
       let firstChunkSeen = false;
       const emit = (chunk: Buffer): void => {
+        // await 恢复后旧轮可能已被新轮顶掉（no）或插话作废（gen），或连接已关。
+        // 这里是下发点：死了的轮次不许再把音频送出去。
+        if (this.isTurnDead(ticket) || fsm.state === 'closed') {
+          return;
+        }
         if (!firstChunkSeen) {
           firstChunkSeen = true;
           firstChunkAtMs = firstSynthAt === 0 ? 0 : this.options.clock.now() - firstSynthAt;
@@ -771,7 +827,7 @@ export class TurnRunner {
             this.log('  回执    被正式回答顶掉');
             this.options.sendCall?.({ op: 'audio.stop' });
             // 回执那段 `speaking` 到此为止；紧接着 `audioStarted` 会重新进入 speaking
-            fsm.receiptEnded();
+            fsm.receiptEnded(ticket);
           }
           fsm.audioStarted(ticket);
           this.options.onState?.();
@@ -813,7 +869,7 @@ export class TurnRunner {
         ticket,
       };
       for await (const ev of this.engine.respond(turnInput, turnAbort.signal)) {
-        if (fsm.isStale(ticket)) {
+        if (this.isTurnDead(ticket) || fsm.state === 'closed') {
           break;
         }
         switch (ev.type) {
@@ -871,7 +927,7 @@ export class TurnRunner {
         + JSON.stringify(speech.slice(0, 120)),
       );
 
-      interrupted = interrupted || fsm.isStale(ticket);
+      interrupted = interrupted || this.isTurnDead(ticket);
       const audioSeconds = pcm16DurationMs(audioBytes, audioRate) / 1000;
       this.log(
         `  回放    ${audioBytes} 字节  ${audioSeconds.toFixed(2)} s`
@@ -902,14 +958,19 @@ export class TurnRunner {
           ? Math.max(this.options.playbackTailMs, this.options.playedGraceMs ?? PLAYED_GRACE_MS)
           : this.options.playbackTailMs;
         const capAt = estimateAt + graceMs;
-        // 断连时 `close()` 不推进代次（它不动 `gen`），只看 `isStale` 会一直空等到上限
-        while (!fsm.isStale(ticket) && fsm.state !== 'closed' && this.options.clock.now() < capAt) {
+        // 断连时 `close()` 不推进代次（它不动 `gen`），只看票据会一直空等到上限。
+        // `isTurnDead` 同时核对 no 与 gen：吸收窗口开了新轮也要立刻停。
+        while (
+          !this.isTurnDead(ticket)
+          && fsm.state !== 'closed'
+          && this.options.clock.now() < capAt
+        ) {
           if (this.playedSeen && this.options.clock.now() >= estimateAt) {
             break;
           }
           await this.wait(PLAYBACK_POLL_MS);
         }
-        interrupted = fsm.isStale(ticket);
+        interrupted = this.isTurnDead(ticket);
       }
 
       // 用户听到多少、这一轮该不该记账 —— **判定交给内核**（`kernel.ts` 的纯函数）。
@@ -920,7 +981,7 @@ export class TurnRunner {
       // （内容面，媒体游标）以前在 `run()` 里各算一遍，一旦某处改了尺子就静默漂移。
       // 现在两者都在内核里，且**分属不同正交区域**；插话当场结算过的那一轮，
       // 这里拿到的也是同一份结算（内核按 `lastSettled` 幂等重述），不会重算成"听全了"。
-      if (fsm.isStale(ticket)) {
+      if (this.isTurnDead(ticket)) {
         this.feed({ type: 'ticketInvalidated', ticket });
       }
       const settleEffects = this.feed({
@@ -1066,6 +1127,9 @@ export class TurnRunner {
       // （或者已经没有在途轮次），严格票据比对会把它丢掉。
       this.activeTurn = null;
       this.playingTicket = null;
+      // 先取消本轮回执，再 audioDone。悬空的 holdReceipt 若在下一轮开了之后
+      // 才醒来，只能拿锁存的旧票去 receiptEnded —— 过期票是空操作。
+      this.cancelActiveReceipt();
       fsm.audioDone(ticket);
       this.options.onState?.();
       this.options.onTurnFinished();

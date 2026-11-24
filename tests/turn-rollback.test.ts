@@ -109,6 +109,23 @@ test('透明化会话的清单：全部在保留期内时一条都不删', () =>
   assert.equal(keep.length, 1);
 });
 
+test('透明化清单：反斜杠路径也按 sessions 根来认', () => {
+  const root = 'C:\\Users\\u\\.dsh\\sessions';
+  const now = Date.parse('2026-11-18T00:00:00Z');
+  const day = 24 * 60 * 60 * 1_000;
+  const { drop, keep, bad } = splitSuperseded([
+    { id: 'session-old', at: now - 8 * day, dir: `${root}\\ws\\session-old` },
+    { id: 'session-fresh', at: now - day, dir: 'C:/Users/u/.dsh/sessions/ws/session-fresh' },
+    { id: 'session-evil', at: now - 30 * day, dir: 'C:\\Users\\u\\.dsh\\sessions-evil\\session-evil' },
+    { id: 'session-mismatch', at: now - 30 * day, dir: `${root}\\ws\\session-other` },
+  ], now, root);
+
+  assert.deepEqual(drop.map((e) => e.id), ['session-old']);
+  assert.equal(drop[0]?.dir, `${root}\\ws\\session-old`, '比较时规范化，落盘路径保持原样');
+  assert.deepEqual(keep.map((e) => e.id), ['session-fresh']);
+  assert.equal(bad, 2, '越出 sessions 根、目录名对不上 id，都仍是坏记录');
+});
+
 test('入箱的「取出」事件（inserted 为空）不算入箱', () => {
   const led = new RollbackLedger();
   led.observe('agent/inbox/spliced', 10, 1, ticket(1));

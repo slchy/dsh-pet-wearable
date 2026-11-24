@@ -17,6 +17,8 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 
+import { checkBindSafety } from './voice/bind-policy.ts';
+
 export interface WebBridgeOptions {
   /** 浏览器连的端口 */
   readonly port: number;
@@ -62,15 +64,24 @@ const CONTENT_TYPES: Record<string, string> = {
  * `normalize` 之后必须重新校验前缀：`/../..` 这类路径在拼接后会指到目录外，
  * 只判 `startsWith` 而不看规范化结果就漏了。
  */
-function resolveAsset(webDir: string, urlPath: string): string | null {
-  const decoded = decodeURIComponent(urlPath.split('?')[0] ?? '/');
+function resolveAsset(webDir: string, urlPath: string): { readonly file: string } | { readonly status: 400 | 404 } {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(urlPath.split('?')[0] ?? '/');
+  } catch (error) {
+    // `GET /%` 这种非法百分号编码。不接住的话 URIError 会打崩整个桥进程。
+    if (error instanceof URIError) {
+      return { status: 400 };
+    }
+    throw error;
+  }
   const relative = decoded === '/' ? 'index.html' : decoded.replace(/^\/+/, '');
   const full = resolve(join(webDir, normalize(relative)));
   const root = resolve(webDir) + sep;
   if (full !== resolve(webDir) && !full.startsWith(root)) {
-    return null;
+    return { status: 404 };
   }
-  return existsSync(full) && statSync(full).isFile() ? full : null;
+  return existsSync(full) && statSync(full).isFile() ? { file: full } : { status: 404 };
 }
 
 /**
@@ -94,6 +105,19 @@ function originAllowed(origin: string, allowed: readonly string[] | undefined, h
 }
 
 export async function startWebBridge(options: WebBridgeOptions): Promise<WebBridge> {
+  // 桥自己就是对外入口。只在 `driver.apply` 里闸一次的话，直接调这个函数
+  // 仍能在 `0.0.0.0` 上开明文端口。判据复用 `checkBindSafety`，不另写一份。
+  // 桥不读 token 文件：有 TLS 时 `hasAuth` 记为已满足，避免合法 wss 被误拒
+  // （设备 token 仍由里层语音栈把关）。非本机且没有 TLS 时这里拒绝启动。
+  const safety = checkBindSafety({
+    host: options.host,
+    hasTls: options.tls !== undefined,
+    hasAuth: true,
+  });
+  if (!safety.ok) {
+    throw new Error(safety.message);
+  }
+
   const webDir = options.webDir === undefined || options.webDir === '' ? null : resolve(options.webDir);
 
   const serveAsset = (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): void => {
@@ -102,12 +126,13 @@ export async function startWebBridge(options: WebBridgeOptions): Promise<WebBrid
       res.end('只提供 WebSocket。配置 webDir 才会发页面。');
       return;
     }
-    const file = resolveAsset(webDir, req.url ?? '/');
-    if (file === null) {
-      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('没有这个文件');
+    const asset = resolveAsset(webDir, req.url ?? '/');
+    if ('status' in asset) {
+      res.writeHead(asset.status, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end(asset.status === 400 ? '路径编码无效' : '没有这个文件');
       return;
     }
+    const file = asset.file;
     res.writeHead(200, {
       'content-type': CONTENT_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
       // 本地调试：改完刷新就要看到，不留缓存

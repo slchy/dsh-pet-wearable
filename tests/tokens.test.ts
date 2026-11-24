@@ -6,7 +6,7 @@
  * 吊销了但进程还在拿旧表放行。
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -98,6 +98,29 @@ test('appendToken：文件不存在时新建', () => {
   const file = join(tempDir(), 'nested', 'deep', 'tokens.txt');
   const { token } = appendToken(file, null);
   assert.equal(readTokenFile(file).entries[0]!.token, token);
+});
+
+test('appendToken：非 ENOENT 的读错误原样抛出，不覆盖已有凭据', () => {
+  const dir = tempDir();
+  const file = join(dir, 'tokens.txt');
+  const { token } = appendToken(file, 'pixel-9');
+  const before = readFileSync(file, 'utf8');
+
+  // 路径是目录：readFileSync 抛 EISDIR，不是「文件不存在」。
+  const blocked = join(dir, 'blocked');
+  mkdirSync(blocked);
+  assert.throws(
+    () => { appendToken(blocked, 'other'); },
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as NodeJS.ErrnoException).code, 'EISDIR');
+      return true;
+    },
+  );
+  assert.equal(statSync(blocked).isDirectory(), true, '目录不能被换成凭据文件');
+  assert.equal(readFileSync(file, 'utf8'), before, '旁边已有的凭据文件不能被改写');
+  assert.equal(readTokenFile(file).entries[0]!.token, token);
+  assert.equal(readdirSync(dir).some((name) => name.includes('.tmp-')), false, '失败时不该留下半截临时文件');
 });
 
 test('revokeTokens：按 deviceId 与按 token 都能删，删不到就报错', () => {

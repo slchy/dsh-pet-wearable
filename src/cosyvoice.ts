@@ -70,6 +70,9 @@ export const DEFAULT_COSYVOICE_EMOTION_MODE: 'prosody' | 'instruction' = 'prosod
 /** CosyVoice 输出的 PCM16 单声道采样率（与 MiMo 相同，宿主不用改） */
 export const COSYVOICE_SAMPLE_RATE = 24_000;
 
+/** run-task 的音量。三处开 task 共用这一份，避免各写一个 50。 */
+const DEFAULT_VOLUME = 50;
+
 /**
  * 情绪 →（语速, 音调）。**叠加在 instruction 之上的细微区分**。
  *
@@ -328,14 +331,22 @@ class Connection {
   private readonly ready: Promise<void>;
   private closed = false;
   /**
+   * 这条连接已经不能再跑 task。
+   *
+   * `task-failed` 和 `beginTask` 超时都会置上，并且**同步**关掉套接字。
+   * 只等 `close` 事件把 `closed` 写成 true 的话，中间有一段 `isUsable` 仍为真，
+   * 下一次合成会把新 task 送进一条已经废掉的连接。
+   */
+  private failed = false;
+  /**
    * 当前 task 的音频接收回调；空闲时为 null。
    *
    * 二进制音频帧**不带 task_id**（服务端只在 JSON 回执里带），而连接同时又只跑
    * 一个 task，所以这一路仍然是单槽。
    */
   private sink: ((chunk: Buffer) => void) | null = null;
-  /** `task-started` 的等待者，按 task_id 分槽 */
-  private readonly startedWaiters = new Map<string, () => void>();
+  /** `task-started` 的等待者，按 task_id 分槽。`false` = 失败或超时，连接已不可用。 */
+  private readonly startedWaiters = new Map<string, (ok: boolean) => void>();
   /** 等 `task-finished` / `task-failed` 的等待者，按 task_id 分槽 */
   private readonly settleWaiters = new Map<string, (error: Error | null) => void>();
   private failure: Error | null = null;
@@ -516,9 +527,17 @@ class Connection {
         }
         return;
       }
-      const message = JSON.parse(String(data)) as {
+      let message: {
         header?: { event?: string; task_id?: string; error_message?: string; error_code?: string };
       };
+      try {
+        message = JSON.parse(String(data)) as {
+          header?: { event?: string; task_id?: string; error_message?: string; error_code?: string };
+        };
+      } catch {
+        // 坏帧不是任务事件。丢掉，不能让一次解析失败把这条连接的回调打崩。
+        return;
+      }
       const event = message.header?.event;
       // 回执都带 task_id（实测 task-started / result-generated / task-finished 全带）。
       // 万一带不上就退回「settle 掉所有等待者」—— 连接同时又只有一个 task，不会错配。
@@ -537,10 +556,13 @@ class Connection {
       if (event === 'task-failed') {
         const detail = message.header?.error_message ?? message.header?.error_code ?? '未知错误';
         this.failure = new CosyVoiceError(`合成失败: ${detail}`);
+        this.failed = true;
         this.lastFinishedAt = performance.now();
         this.finishedTasks += 1;
         this.sink = null;
         this.settleTask(taskId, this.failure);
+        this.abortStarted();
+        this.close();
       }
     });
   }
@@ -551,13 +573,21 @@ class Connection {
       const waiter = this.startedWaiters.get(taskId);
       if (waiter !== undefined) {
         this.startedWaiters.delete(taskId);
-        waiter();
+        waiter(true);
       }
       return;
     }
-    for (const [id, waiter] of this.startedWaiters) {
+    for (const [id, waiter] of [...this.startedWaiters]) {
       this.startedWaiters.delete(id);
-      waiter();
+      waiter(true);
+    }
+  }
+
+  /** 还在等 `task-started` 的人一并失败。不叫他们的话，`beginTask` 会干等满超时。 */
+  private abortStarted(): void {
+    for (const [id, waiter] of [...this.startedWaiters]) {
+      this.startedWaiters.delete(id);
+      waiter(false);
     }
   }
 
@@ -579,17 +609,15 @@ class Connection {
 
   /** 连接断了：所有等待者一起失败，别留下永远等不到的 promise */
   private failAll(error: Error): void {
-    for (const [id] of this.startedWaiters) {
-      this.startedWaiters.delete(id);
-    }
-    for (const [id, waiter] of this.settleWaiters) {
+    this.abortStarted();
+    for (const [id, waiter] of [...this.settleWaiters]) {
       this.settleWaiters.delete(id);
       waiter(error);
     }
   }
 
   get isUsable(): boolean {
-    return !this.closed && this.ws.readyState === WebSocket.OPEN;
+    return !this.closed && !this.failed && this.ws.readyState === WebSocket.OPEN;
   }
 
   /** 这条连接上能新开一个 task 吗（**不管**有没有预开的等着认领） */
@@ -653,7 +681,7 @@ class Connection {
           voice: opts.voice,
           format: 'pcm',
           sample_rate: opts.sampleRate,
-          volume: 50,
+          volume: DEFAULT_VOLUME,
           rate: EMOTION_PROSODY[opts.emotion].rate,
           pitch: EMOTION_PROSODY[opts.emotion].pitch,
           ...(opts.useInstruction ? { instruction: EMOTION_INSTRUCTIONS[opts.emotion] } : {}),
@@ -666,10 +694,14 @@ class Connection {
     try {
       const started = await new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => { resolve(false); }, 3000);
-        this.startedWaiters.set(taskId, () => { clearTimeout(timer); resolve(true); });
+        this.startedWaiters.set(taskId, (ok) => { clearTimeout(timer); resolve(ok); });
       });
       this.startedWaiters.delete(taskId);
-      if (!started) return false;
+      if (!started || this.failed) {
+        this.failed = true;
+        if (!this.closed) this.close();
+        return false;
+      }
       this.pending = { taskId, sentAt, startedAt: performance.now(), emotion: opts.emotion, conn: this.connSnapshot(sentAt) };
       // 到点没人要：**不能** finish-task（空 task 会被服务端判非法，之后整条连接
       // 静默挂死），只能弃连接。定时器挂在这里而不是工厂里，才不会出现「预开了却
@@ -791,7 +823,7 @@ class Connection {
             voice,
             format: 'pcm',
             sample_rate: sampleRate,
-            volume: 50,
+            volume: DEFAULT_VOLUME,
             rate: prosody.rate,
             pitch: prosody.pitch,
             ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[args.emotion] } : {}),
@@ -919,7 +951,7 @@ class Connection {
             voice,
             format: 'pcm',
             sample_rate: sampleRate,
-            volume: 50,
+            volume: DEFAULT_VOLUME,
             rate: prosody.rate,
             pitch: prosody.pitch,
             ...(useInstruction ? { instruction: EMOTION_INSTRUCTIONS[emotion] } : {}),
@@ -958,14 +990,19 @@ class Connection {
       //
       // 认领了预开的 task 就**不用等** —— 它的 task-started 早就回来了，这正是预热省下的那段。
       if (adopted === null) {
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 3000);
+        const startedOk = await new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => { resolve(true); }, 3000);
           // 按 task_id 注册：回执与正文在同一条连接上先后跑，共用一个槽位会让
           // 前一个 task 的 task-started 落到后一个头上，于是后者在自己的 task
           // 尚未 started 时就送文本，服务端报上面那个错（生产 7 天 2 次）。
-          this.startedWaiters.set(taskId, () => { clearTimeout(timer); resolve(); });
+          this.startedWaiters.set(taskId, (ok) => { clearTimeout(timer); resolve(ok); });
         });
         this.startedWaiters.delete(taskId);
+        if (!startedOk || this.failed) {
+          this.failed = true;
+          if (!this.closed) this.close();
+          throw new CosyVoiceError('task 未能开始');
+        }
       }
       send(first.value);
       for (;;) {
@@ -977,10 +1014,12 @@ class Connection {
       feedError = error instanceof Error ? error : new CosyVoiceError(String(error));
     }
     const finishAt = performance.now();
-    this.ws.send(JSON.stringify({
-      header: { action: 'finish-task', task_id: taskId, streaming: 'duplex' },
-      payload: { input: {} },
-    }));
+    if (!this.closed) {
+      this.ws.send(JSON.stringify({
+        header: { action: 'finish-task', task_id: taskId, streaming: 'duplex' },
+        payload: { input: {} },
+      }));
+    }
 
     const error = await done;
     this.sink = null;
@@ -1185,9 +1224,20 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
     return make;
   };
 
-  const touchIdle = (): void => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(drop, idleCloseMs);
+  const clearIdle = (): void => {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  /** 只在 task 收尾、连接回到空闲时武装。忙的时候这条定时器会把正在跑的 task 掐掉。 */
+  const armIdle = (): void => {
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      drop();
+    }, idleCloseMs);
     idleTimer.unref?.();
   };
 
@@ -1229,6 +1279,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
 
       const connNow = await acquire();
       live = connNow;
+      clearIdle();
       const run = start(connNow, (chunk) => {
         chunks.push(chunk);
         notify?.();
@@ -1276,7 +1327,7 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
       heldSilence.length = 0;
       await run;
       if (failure) throw failure;
-      touchIdle();
+      if (conn === connNow && connNow.isUsable) armIdle();
     } finally {
       // 调用方中途退出（插话 / 旁白被取消：for-await 里 return 或 break）时 task 还挂在
       // 连接上 —— 服务端还在出音频，流式的话文本也没送完。这时放开闸门，下一个 task
@@ -1326,10 +1377,15 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
           // 别插队到正在跑的那一趟前面：等它收尾
           await chain;
           const connNow = await acquire();
+          // 预开也是一条占着连接的 task：空闲定时器在这期间必须拿掉。
+          clearIdle();
           // 到点没人认领的回收（弃连接）在 `Connection` 自己身上，这里不管
-          await connNow.beginTask({
+          const started = await connNow.beginTask({
             sampleRate, model, voice, useInstruction, emotion: 'calm',
           });
+          if (!started && conn === connNow && connNow.isUsable && connNow.isIdle) {
+            armIdle();
+          }
         } catch {
           // 预热失败按懒加载处理：下一次合成自己会建
         } finally {
@@ -1367,8 +1423,8 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         let batch = '';
         let first = true;
         const clean = (raw: string, tail: boolean): string | null => {
-          // 情绪标签 / markdown 不能进 TTS（会被念出来），逐批清洗；首批还要去掉开头的 [xxx]
-          const text = cleanForSpeech(first ? raw.replace(/^\s*\[[^\]]{1,8}\]/, '') : raw);
+          // 情绪标签 / markdown 不能进 TTS（会被念出来）。只走 `cleanForSpeech` 这一份。
+          const text = cleanForSpeech(raw);
           if (text === '') return null;
           // 标志只在**真的送出一批**之后才落下：整批都是标签时不能把它吃掉，
           // 否则下一批就会被当成「后续批次」，开头的标签会漏进 TTS

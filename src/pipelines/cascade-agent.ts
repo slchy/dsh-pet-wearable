@@ -199,6 +199,10 @@ export class CascadeAgent implements AgentProvider {
   private localGen = 0;
   private cancelledKey: string | null = null;
   private turnStartedAt = 0;
+  /** 这一轮已经被插话取消。对得上的 `reply` 不得再 `abandon` / `startInner`。 */
+  private cancelledTicket: TurnTicket | null = null;
+  /** 引擎绑上的本轮中止信号。文本入口不绑，用完必须解绑。 */
+  private turnAbort: AbortSignal | null = null;
 
   constructor(options: CascadeAgentOptions) {
     this.inner = options.inner;
@@ -362,12 +366,21 @@ export class CascadeAgent implements AgentProvider {
     this.speculateStarts = 0;
   }
 
+  /**
+   * 引擎在调用 `reply()` 之前把本轮的 `AbortSignal` 绑上，结束时传 `null` 解绑。
+   * 文本入口不走这里。
+   */
+  bindTurnAbort(signal: AbortSignal | null): void {
+    this.turnAbort = signal;
+  }
+
   cancelTurn(ticket?: TurnTicket): void {
     const current = this.currentTicket;
     if (ticket !== undefined
       && (current === null || current.no !== ticket.no || current.gen !== ticket.gen)) {
       return;
     }
+    if (current !== null) this.cancelledTicket = { no: current.no, gen: current.gen };
     this.llm.abortCurrent(new Error('插话取消'));
     try {
       if (this.delegating) this.inner.detachTurn?.(ticket);
@@ -390,6 +403,8 @@ export class CascadeAgent implements AgentProvider {
     this.currentGen = ticket.gen;
     this.currentTicket = ticket;
     this.innerMode = 'pass';
+    const stopped = this.haltIfCancelled(ticket);
+    if (stopped !== null) return stopped;
     if (turn?.forceDelegate !== undefined) {
       this.log(`  快车道    宿主指定转交（${turn.forceDelegate}）`);
       return await this.delegate(userText, image, note, ticket, turn.forceDelegate, {
@@ -447,6 +462,8 @@ export class CascadeAgent implements AgentProvider {
       this.sink?.(text);
     };
     if (this.speculate) {
+      const stoppedBeforeInner = this.haltIfCancelled(ticket);
+      if (stoppedBeforeInner !== null) return stoppedBeforeInner;
       this.innerMode = 'buffer';
       dsh = this.startInner(userText, image, note, ticket);
       dsh.catch(() => undefined);
@@ -467,6 +484,8 @@ export class CascadeAgent implements AgentProvider {
         });
       }
     } catch (error) {
+      const halted = this.haltIfCancelled(ticket, dsh);
+      if (halted !== null) return halted;
       const why = (error as Error).message;
       if (emitted !== '') {
         this.log(`  快车道    ✗ ${why}（已播出一部分，按现有文本收下）`);
@@ -480,6 +499,8 @@ export class CascadeAgent implements AgentProvider {
       );
     }
 
+    const halted = this.haltIfCancelled(ticket, dsh);
+    if (halted !== null) return halted;
     if (answer.delegated) {
       return await this.abandon(
         dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`, ticket, 'delegate',
@@ -642,6 +663,22 @@ export class CascadeAgent implements AgentProvider {
     }
   }
 
+  /** 这一轮已取消或信号已中止。有在途 dsh 只吞掉它的拒绝，绝不再起一趟。 */
+  private haltIfCancelled(
+    ticket: TurnTicket,
+    dsh: Promise<AgentReplyView> | null = null,
+  ): AgentReplyView | null {
+    if (!this.turnAborted(ticket)) return null;
+    dsh?.catch(() => undefined);
+    return { text: '', speech: '' };
+  }
+
+  private turnAborted(ticket: TurnTicket): boolean {
+    if (this.turnAbort?.aborted === true) return true;
+    const mark = this.cancelledTicket;
+    return mark !== null && mark.no === ticket.no && mark.gen === ticket.gen;
+  }
+
   private async abandon(
     dsh: Promise<AgentReplyView> | null,
     userText: string,
@@ -651,6 +688,8 @@ export class CascadeAgent implements AgentProvider {
     ticket: TurnTicket,
     reason: DelegateReason,
   ): Promise<AgentReplyView> {
+    const halted = this.haltIfCancelled(ticket, dsh);
+    if (halted !== null) return halted;
     this.log(`  快车道    ${why} → 交给 dsh`);
     this.reportDelegate(reason);
     if (dsh !== null) this.log('  dsh 沿用开轮时就起跑的那一趟（不另起）');
@@ -658,7 +697,14 @@ export class CascadeAgent implements AgentProvider {
     this.innerMode = 'pass';
     const held = this.buffered.splice(0);
     for (const text of held) this.sink?.(text);
-    const answer = await promise;
+    let answer: AgentReplyView;
+    try {
+      answer = await promise;
+    } catch (error) {
+      if (this.turnAborted(ticket)) return { text: '', speech: '' };
+      throw error;
+    }
+    if (this.turnAborted(ticket)) return { text: '', speech: '' };
     this.rememberDsh(answer.speech, userText, ticket);
     return { ...answer, path: 'dsh', delegate: reason };
   }
@@ -671,11 +717,20 @@ export class CascadeAgent implements AgentProvider {
     reason: DelegateReason,
     opts?: { silent?: boolean },
   ): Promise<AgentReplyView> {
+    const halted = this.haltIfCancelled(ticket);
+    if (halted !== null) return halted;
     this.innerMode = 'pass';
     if (opts?.silent !== true) this.reportDelegate(reason);
     this.delegating = opts?.silent === true;
     try {
-      const answer = await this.startInner(userText, image, note, ticket);
+      let answer: AgentReplyView;
+      try {
+        answer = await this.startInner(userText, image, note, ticket);
+      } catch (error) {
+        if (this.turnAborted(ticket)) return { text: '', speech: '' };
+        throw error;
+      }
+      if (this.turnAborted(ticket)) return { text: '', speech: '' };
       if (answer.speech !== '') this.rememberDsh(answer.speech, userText, ticket);
       return { ...answer, path: 'dsh', delegate: reason };
     } finally {
@@ -728,6 +783,7 @@ export class CascadeAgent implements AgentProvider {
     note: string | undefined,
     ticket: TurnTicket,
   ): Promise<AgentReplyView> {
+    if (this.turnAborted(ticket)) return Promise.resolve({ text: '', speech: '' });
     this.log(`  dsh 起跑（距开轮 ${Math.max(0, Math.round(this.now() - this.turnStartedAt))} ms）`);
     const blocks: string[] = [];
     if (note !== undefined) blocks.push(note);
@@ -813,11 +869,24 @@ function asBuffer(pcm: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm);
 }
 
-function whenAborted(signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    signal.addEventListener('abort', () => resolve(), { once: true });
+/** 已中止立刻兑现。调用方在 `finally` 里摘掉监听，避免一轮挂一个永久回调。 */
+function whenAborted(signal: AbortSignal): { readonly done: Promise<void>; cancel(): void } {
+  if (signal.aborted) {
+    return { done: Promise.resolve(), cancel() {} };
+  }
+  let onAbort: (() => void) | undefined;
+  const done = new Promise<void>((resolve) => {
+    onAbort = () => {
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
   });
+  return {
+    done,
+    cancel() {
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+    },
+  };
 }
 
 function imageOf(turn: TurnInput): AgentImage | undefined {
@@ -967,6 +1036,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
       })();
 
       let reply: AgentReplyView | null = null;
+      this.agent.bindTurnAbort(signal);
       try {
         reply = await this.agent.reply(
           turn.text,
@@ -978,6 +1048,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
         this.log(`  级联    ✗ ${(error as Error).message}`);
         reply = null;
       } finally {
+        this.agent.bindTurnAbort(null);
         this.agent.attachLiveSink(null);
         tokens.close();
       }
@@ -1039,7 +1110,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
     signal: AbortSignal,
     queue: EventQueue,
   ): Promise<void> {
-    const aborted = whenAborted(signal);
+    const gate = whenAborted(signal);
     const iter = iterable[Symbol.asyncIterator]();
     try {
       for (;;) {
@@ -1050,7 +1121,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
         );
         const winner = await Promise.race([
           guarded.then((value) => ({ kind: 'step' as const, value })),
-          aborted.then(() => ({ kind: 'aborted' as const })),
+          gate.done.then(() => ({ kind: 'aborted' as const })),
         ]);
         if (winner.kind === 'aborted' || signal.aborted) return;
         if (!winner.value.ok) throw winner.value.error;
@@ -1062,6 +1133,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
         });
       }
     } finally {
+      gate.cancel();
       if (signal.aborted) void iter.return?.().catch(() => undefined);
     }
   }

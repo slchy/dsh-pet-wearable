@@ -11,6 +11,7 @@
  * 旧连接卡住的拍照不会把新连接锁在 409。
  */
 import assert from 'node:assert/strict';
+import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 
@@ -257,4 +258,42 @@ test('旧连接的在途拍照：不挡新连接，迟到结算也不清新连�
     assert.equal(bPhoto.status, 200);
     assert.equal((await bPhoto.arrayBuffer()).byteLength, 4);
   });
+});
+
+test('没有设备时控制口 error 打到 console.error，不吞掉端口冲突', async () => {
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const addr = probe.address();
+      const found = typeof addr === 'object' && addr !== null ? addr.port : 0;
+      probe.close(() => { resolve(found); });
+    });
+  });
+  const first = startToolControl({ port, photoTimeoutMs: 200, handlers: null });
+  for (let i = 0; i < 100 && first.port === 0; i += 1) {
+    await delay(5);
+  }
+  assert.equal(first.port, port);
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    lines.push(args.map((part) => String(part)).join(' '));
+  };
+  let second: ToolControl | null = null;
+  try {
+    second = startToolControl({ port, photoTimeoutMs: 200, handlers: null });
+    const deadline = Date.now() + 1_000;
+    while (Date.now() < deadline && !lines.some((line) => line.includes('EADDRINUSE'))) {
+      await delay(10);
+    }
+    assert.ok(
+      lines.some((line) => line.includes('控制口') && line.includes('EADDRINUSE')),
+      `没有设备时端口冲突必须出现在 console.error，实际：${lines.join(' | ') || '（空）'}`,
+    );
+  } finally {
+    console.error = original;
+    second?.close();
+    first.close();
+  }
 });

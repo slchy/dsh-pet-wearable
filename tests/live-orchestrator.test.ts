@@ -8,7 +8,12 @@ import { fileURLToPath } from 'node:url';
 
 import type { AudioFrame, EngineEvent, TurnInput } from '../src/engine-contract.ts';
 import type { LiveAudioLane } from '../src/engines/live-voice-engine.ts';
-import { LiveOrchestrator, type LiveOrchestratorOptions } from '../src/pipelines/live-orchestrator.ts';
+import {
+  LiveOrchestrator,
+  decideLiveTurn,
+  type LiveOrchestratorOptions,
+  type LiveTurnFacts,
+} from '../src/pipelines/live-orchestrator.ts';
 import { LIVE_BACKEND_TASK_DIRECTIVE, buildLiveReportPrompt } from '../src/persona.ts';
 import type {
   AgentAudioAnswer,
@@ -376,7 +381,7 @@ test('omni tool_call 零音频时用 TTS 补「我查查。」', async () => {
   await settle();
 });
 
-test('同一轮 early_rule 和 tool_call 只打一次 dsh', async () => {
+test('空闲总线上 omni 吐出 rewrittenQuery 时，dsh 收到改写查询而不是原话', async () => {
   const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
   dsh.hold();
   const voice = scriptedTts();
@@ -397,7 +402,10 @@ test('同一轮 early_rule 和 tool_call 只打一次 dsh', async () => {
 
   assert.equal(doneOf(events).speech, '行，我去查。');
   assert.equal(dsh.calls.length, 1);
-  assert.equal(must(dsh.calls[0], '唯一一次').text, '查一下天气');
+  assert.equal(
+    must(dsh.calls[0], '唯一一次').text,
+    '把天气查清楚\n用户原话：「查一下天气」',
+  );
   assert.ok(must(dsh.calls[0], '注记').note?.includes('原注'));
   await settle();
   assert.equal(dsh.calls.length, 1);
@@ -406,7 +414,8 @@ test('同一轮 early_rule 和 tool_call 只打一次 dsh', async () => {
   await settle();
   assert.equal(dsh.calls.length, 1);
   assert.equal(reports.length, 1);
-  assert.equal(must(reports[0], '汇报').source, 'early_rule');
+  assert.equal(must(reports[0], '汇报').source, 'tool_call');
+  assert.equal(must(reports[0], '汇报').query, '把天气查清楚\n用户原话：「查一下天气」');
 });
 
 test('像长期事实的话后台静默记，omni 马上答，不发汇报', async () => {
@@ -596,6 +605,8 @@ test('speakBackgroundReport 按车道状态返回 defer / fallback / spoken，�
   assert.equal(spoken, 'spoken');
   assert.equal(must(lane.speaks[0], '提示').prompt, prompt);
   assert.equal(lane.speaks[0]?.taskId, 'task-1');
+  host.noteFallbackAnnounceSpoken({ speech: '明天晴', taskId: 'task-1', query: '天气' }, false);
+  assert.equal(lane.injects.length, 0, 'omni 已经说完的，不再 spoken 回注第二遍');
 
   const dropped = await host.speakBackgroundReport(
     { speech: '没声', taskId: 'task-drop', query: '电量' },
@@ -603,7 +614,8 @@ test('speakBackgroundReport 按车道状态返回 defer / fallback / spoken，�
   );
   assert.equal(dropped, 'fallback');
   host.noteFallbackAnnounceSpoken({ speech: '没声', taskId: 'task-drop', query: '电量' }, false);
-  assert.equal(lane.injects.length, 0, '已经标过注入的，TTS 兜底不再注第二遍');
+  assert.equal(lane.injects.length, 1, 'fallback 还没标记注入，要按 spoken 回注');
+  assert.deepEqual(lane.injects[0], { user: '电量', said: '没声', kind: 'spoken' });
 
   const pushed = dsh.announcer();
   assert.ok(pushed !== null);
@@ -614,22 +626,22 @@ test('speakBackgroundReport 按车道状态返回 defer / fallback / spoken，�
 
   const next = await collect(host.toEngine().respond(turnOf('跑完没'), new AbortController().signal));
   assert.equal(doneOf(next).fullText, '嗯，在的。');
-  assert.equal(lane.injects.length, 1);
-  assert.deepEqual(lane.injects[0], {
+  assert.equal(lane.injects.length, 2);
+  assert.deepEqual(lane.injects[1], {
     user: pending.query,
     said: pending.summary,
     kind: 'unspoken',
   });
 
   await collect(host.toEngine().respond(turnOf('再说一遍'), new AbortController().signal));
-  assert.equal(lane.injects.length, 1, '同一个 taskId 只按 unspoken 回注一次');
+  assert.equal(lane.injects.length, 2, '同一个 taskId 只按 unspoken 回注一次');
 
   host.noteFallbackAnnounceSpoken({ speech: '另一件', query: '日程' }, false);
-  assert.equal(lane.injects.length, 2);
-  assert.equal(lane.injects[1]?.kind, 'spoken');
-  assert.equal(lane.injects[1]?.user, '日程');
+  assert.equal(lane.injects.length, 3);
+  assert.equal(lane.injects[2]?.kind, 'spoken');
+  assert.equal(lane.injects[2]?.user, '日程');
   host.noteFallbackAnnounceSpoken({ speech: '被打断', query: '日程', taskId: 'cut' }, true);
-  assert.equal(lane.injects.length, 2);
+  assert.equal(lane.injects.length, 3);
 
   host.cancelBackgroundSpeech();
   assert.equal(lane.backgroundCancels, 1);
@@ -704,7 +716,7 @@ test('识图：omni 健康时异步派单并应声；坏了就同步问 dsh', as
   const sync = must(dsh.calls[2], '同步识图');
   assert.equal(sync.note, '刚拍的');
   assert.deepEqual(sync.turn, { ticket: { no: 2, gen: 1 } });
-  assert.equal(host.lastLedgerLane(), null);
+  assert.equal(host.lastLedgerLane(), 'dsh');
 
   const down = orch(dsh.agent, voice.tts, null);
   const fallen = await collect(down.toEngine().respond(
@@ -713,6 +725,7 @@ test('识图：omni 健康时异步派单并应声；坏了就同步问 dsh', as
   ));
   assert.deepEqual(metas(fallen), [{ type: 'meta', path: 'dsh' }]);
   assert.equal(doneOf(fallen).speech, '同步看见一只猫');
+  assert.equal(down.lastLedgerLane(), 'dsh');
   assert.equal(down.toEngine().isHealthy(), false);
   assert.equal(down.willServeAudio('在吗'), false);
 });
@@ -963,6 +976,7 @@ test('answerFromText 返回 null 才同步问 dsh', async () => {
   assert.deepEqual(metas(events), [{ type: 'meta', path: 'dsh' }]);
   assert.equal(doneOf(events).speech, '兜底在');
   assert.equal(voice.texts.at(-1), '兜底在');
+  assert.equal(host.lastLedgerLane(), 'dsh');
   assert.equal(dsh.calls.length, 1);
   assert.equal(must(dsh.calls[0], '同步').note, '会话');
   assert.equal(must(dsh.calls[0], '同步').text, '在吗');
@@ -1072,11 +1086,12 @@ test('问时间时车道不可用才同步问 dsh', async () => {
   assert.equal(lane.textAnswers, 0);
   assert.deepEqual(metas(events), [{ type: 'meta', path: 'dsh' }]);
   assert.equal(doneOf(events).speech, '下午四点整');
+  assert.equal(host.lastLedgerLane(), 'dsh');
   assert.equal(dsh.calls.length, 1);
   assert.equal(must(dsh.calls[0], '同步').note, '只此一次');
 });
 
-test('实时事实早派并保留 omni 垫话，闲聊不派', async () => {
+test('实时事实没 delegate 时结束才补派，并保留 omni 垫话，闲聊不派', async () => {
   const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
   const voice = scriptedTts();
   const lane = fakeLane({
@@ -1113,7 +1128,7 @@ test('实时事实早派并保留 omni 垫话，闲聊不派', async () => {
   assert.equal(lane.discards, 0);
 });
 
-test('没封段的实时事实走 answerFromText 垫话，同时早派', async () => {
+test('没封段的实时事实走 answerFromText，结束才用原话补派', async () => {
   const dsh = fakeDsh({ text: '明天有雨', speech: '明天有雨' });
   dsh.hold();
   const voice = scriptedTts();
@@ -1155,4 +1170,113 @@ test('源码不接文本级联、不预跑、不撤回', () => {
   for (const token of ['FastLlmClient', 'PrefetchSlot', 'speculatePartial', 'rollbackTurn', 'prefetch(']) {
     assert.equal(code.includes(token), false, token);
   }
+});
+
+test('decideLiveTurn 把前台分支收成显式种类', () => {
+  const base: LiveTurnFacts = {
+    text: '你好呀',
+    hasImage: false,
+    cancelActive: false,
+    photoHandOff: false,
+    laneCanAnswer: true,
+    willServe: true,
+    canTryText: true,
+  };
+  assert.equal(decideLiveTurn({ ...base, text: '别查了', cancelActive: true }), 'cancel_bg');
+  assert.equal(decideLiveTurn({ ...base, hasImage: true, photoHandOff: true }), 'photo_delegate');
+  assert.equal(decideLiveTurn({ ...base, hasImage: true, photoHandOff: false, willServe: false, canTryText: false, laneCanAnswer: false }), 'fallback_dsh');
+  assert.equal(decideLiveTurn({ ...base, text: '现在几点了' }), 'clock_override');
+  assert.equal(decideLiveTurn({
+    ...base,
+    text: '现在几点了',
+    laneCanAnswer: false,
+    willServe: false,
+    canTryText: true,
+  }), 'fallback_dsh');
+  assert.equal(decideLiveTurn({ ...base, text: '查一下天气' }), 'live_with_bg_guard');
+  assert.equal(decideLiveTurn({ ...base, text: '今天天气怎么样' }), 'live_with_bg_guard');
+  assert.equal(decideLiveTurn({ ...base, text: '股价多少', willServe: false, canTryText: true }), 'live_with_bg_guard');
+  assert.equal(decideLiveTurn({ ...base }), 'live_direct');
+  assert.equal(decideLiveTurn({
+    ...base,
+    text: '查一下天气',
+    willServe: false,
+    canTryText: false,
+    laneCanAnswer: false,
+  }), 'fallback_dsh');
+});
+
+test('动作轮在 delegate 到达前不派单，到达后 100% 用改写查询', async () => {
+  const dsh = fakeDsh({ text: '晴', speech: '晴' });
+  dsh.hold();
+  const voice = scriptedTts();
+  const gate: { release: (() => void) | null } = { release: null };
+  const lane = fakeLane({
+    answer: () => ({
+      sampleRate: 24_000,
+      transcript: () => '我查查。',
+      delegateReason: () => 'delegate' as const,
+      delegateText: () => '改写后的天气',
+      chunks: (async function* waitChunk() {
+        await new Promise<void>((resolve) => {
+          gate.release = resolve;
+        });
+        yield PCM;
+      })(),
+    }),
+  });
+  const host = orch(dsh.agent, voice.tts, lane);
+  const pending = collect(host.toEngine().respond(
+    turnOf('查一下天气', { no: 3 }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(dsh.calls.length, 0, 'delegate 还没到，不得用原话抢跑');
+  const go = gate.release;
+  if (go === null) assert.fail('音频流没有挂起');
+  go();
+  await pending;
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  assert.equal(must(dsh.calls[0], '改写').text, '改写后的天气\n用户原话：「查一下天气」');
+  dsh.release();
+  await settle();
+});
+
+test('同步兜底的取消只认当前票据；dispose 之后不再派单', async () => {
+  const dsh = fakeDsh({ text: '兜底', speech: '兜底一句' });
+  dsh.hold();
+  const voice = scriptedTts();
+  const host = orch(dsh.agent, voice.tts, null);
+  const pending = host.toEngine().respond(
+    turnOf('在吗', { ticket: { no: 1, gen: 2 } }),
+    new AbortController().signal,
+  );
+  const iter = pending[Symbol.asyncIterator]();
+  const first = iter.next();
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  host.cancelTurn({ no: 1, gen: 1 });
+  host.cancelTurn({ no: 9, gen: 2 });
+  assert.equal(dsh.cancelCount(), 0, '票据对不上不得取消这一次兜底');
+  host.cancelTurn({ no: 1, gen: 2 });
+  assert.equal(dsh.cancelCount(), 1);
+  dsh.release();
+  const step = await first;
+  assert.equal(step.done, false);
+  assert.equal(step.value?.type, 'meta');
+  await iter.return?.();
+
+  host.dropPrefetch('barge_in');
+  host.dropPrefetch('delegated');
+  host.dropPrefetch('superseded');
+  host.dispose();
+  const after = await collect(host.toEngine().respond(
+    turnOf('查一下天气'),
+    new AbortController().signal,
+  ));
+  assert.equal(after.length, 0);
+  assert.equal(dsh.calls.length, 1);
+  host.cancelTurn({ no: 1, gen: 2 });
+  assert.equal(dsh.cancelCount(), 1);
 });

@@ -197,6 +197,27 @@ test('宠物 look 没有回图就结束：之后用户拍的图也不被吃掉',
   assert.equal(inbox.deliver(null, Buffer.from([7])), false, '应当起一轮识图');
 });
 
+test('取消 A 后立刻 encode B：旧 hq_image / hq_failed 不串到 B', () => {
+  const lateImage = new V1Session();
+  lateImage.encode(capture('A', 'detail'));
+  lateImage.encode({ op: 'capture.cancel', id: 'A' });
+  lateImage.encode(capture('B', 'glance'));
+  assert.deepEqual(lateImage.status({ ev: 'hq_image' }), { known: true, event: null });
+  assert.equal(lateImage.image(), 'A', '迟到的高清公告仍归已取消的 A');
+  assert.equal(lateImage.image(), 'B', '下一帧才是新的 glance，不能被 A 再吃一次，也不能提前归 B');
+
+  const lateFail = new V1Session();
+  lateFail.encode(capture('A', 'detail'));
+  lateFail.encode({ op: 'capture.cancel', id: 'A' });
+  lateFail.encode(capture('B', 'detail'));
+  const event = lateFail.status({ ev: 'hq_failed', reason: 'timeout' }).event;
+  assert.ok(event && event.kind === 'capture.failed');
+  assert.equal(event.id, 'A');
+  // A 的失败把取消残留清掉之后，B 自己的公告才算数
+  assert.deepEqual(lateFail.status({ ev: 'hq_image' }), { known: true, event: null });
+  assert.equal(lateFail.image(), 'B');
+});
+
 test('v1 失败原因 → 失败码', () => {
   assert.equal(v1FailureCode('cancelled'), 'cancelled');
   assert.equal(v1FailureCode('busy'), 'busy');

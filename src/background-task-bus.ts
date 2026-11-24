@@ -237,6 +237,8 @@ export class BackgroundTaskBus {
     if (this.disposed) return this.deadHandle(req);
     const existing = this.findLive(req);
     if (existing !== undefined) {
+      // 已经 running / completed 的查询冻住。tool_call 的改写只在还排队时生效，
+      // 所以调用方不能先把 early_rule 推进微任务再等 Omni。
       const upgraded = existing.state === 'queued' && req.source === 'tool_call';
       if (upgraded) {
         existing.query = req.query;

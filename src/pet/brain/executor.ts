@@ -8,6 +8,7 @@
  * - 报结果：带 `step`，过期的由状态机丢弃
  * - 收尾：停计时、abort、停播、释放话筒
  */
+import { EVENTS } from '../../events.ts';
 import type {
   AgentPort,
   Cancel,
@@ -33,6 +34,12 @@ export interface PetExecutorDeps {
   readonly floor: FloorArbiter;
   /** 把阶段结果送回状态机 */
   readonly report: (input: PhaseReport | FloorReport) => void;
+  /**
+   * 这条 engagement 是否还是大脑里的当前一轮。
+   *
+   * `phase.enter` 排在微任务里。打断或关机已经把它收掉时，再执行就会抢话筒、开麦。
+   */
+  readonly isLive: (engagementId: string) => boolean;
   /** 一次主动开口结束时的钩子（档案 / 播报队列用） */
   readonly onOutcome?: (record: PetOutcomeRecord, dismiss: boolean) => void;
   /** 用户敲击要关掉正在播的后台汇报 */
@@ -70,6 +77,13 @@ export class PetExecutor {
    * 所以不能挂在阶段级的 {@link Running} 上。
    */
   private micOpenFor: string | null = null;
+  /**
+   * 吸收态。`close` / `dispose` 同步置上。
+   *
+   * 之后的 `phase.enter` 直接丢掉 —— 否则关连接清掉话筒之后，排队中的开麦
+   * 还会把话筒抢回来。`end` 仍要执行：结局和交还话筒在那条意图上。
+   */
+  private sealed = false;
 
   constructor(deps: PetExecutorDeps) {
     this.deps = deps;
@@ -77,6 +91,9 @@ export class PetExecutor {
 
   /** 执行一条意图。返回的 promise 表示这条意图的副作用已经落地。 */
   async run(intent: PetIntent): Promise<void> {
+    if (this.sealed && intent.kind !== 'end') {
+      return;
+    }
     switch (intent.kind) {
       case 'phase.enter':
         await this.enter(intent);
@@ -90,7 +107,7 @@ export class PetExecutor {
         return;
       case 'announce.dismiss':
         // 敲击关播报：这不是一次主动开口，不能伪造一条 pet.outcome
-        this.deps.onEvent?.('announce.dismissed', {});
+        this.deps.onEvent?.(EVENTS.announceDismissed, {});
         this.deps.dismissAnnounce?.();
         return;
       default: {
@@ -101,34 +118,71 @@ export class PetExecutor {
     }
   }
 
-  /** 连接关闭时调用：丢掉在途的计时与朗读。 */
-  dispose(): void {
-    this.teardown();
-    // 连接都没了，麦和话筒都不会留；清掉记录免得下一次 engagement 误判
-    if (this.floorHeldFor !== null) {
-      this.deps.floor.release('pet');
-      this.floorHeldFor = null;
+  /**
+   * 进入吸收态：不再接受新的阶段。
+   *
+   * 必须同步。关连接和拆执行器之间没有空隙让排队中的 `phase.enter` 再抢话筒。
+   */
+  seal(): void {
+    this.sealed = true;
+  }
+
+  /**
+   * 活跃麦立刻 `listen.stop`。
+   *
+   * 调用方是 `PetSession.close` / `dispose`，发生在微任务之前。
+   * 若等 `end` 意图的微任务，`dispose` 会先把 `micOpenFor` 清掉，关麦就丢了。
+   */
+  stopOpenMic(): void {
+    if (this.micOpenFor === null) {
+      return;
     }
+    this.deps.device.call({ op: 'listen.stop' });
     this.micOpenFor = null;
   }
 
+  /** 连接关闭时调用：丢掉在途的计时与朗读。 */
+  dispose(): void {
+    this.seal();
+    this.teardown();
+    this.micOpenFor = null;
+    // 连接都没了，麦和话筒都不会留；清掉记录免得下一次 engagement 误判
+    if (this.floorHeldFor !== null) {
+      const released = this.deps.floor.release('pet');
+      this.floorHeldFor = null;
+      if (released) {
+        this.reportFloor();
+      }
+    }
+  }
+
   private async enter(intent: Extract<PetIntent, { kind: 'phase.enter' }>): Promise<void> {
+    if (this.sealed || !this.deps.isLive(intent.engagementId)) {
+      return;
+    }
     // 上一阶段已经结束；这里只清理计时器与 abort（幂等）
     this.teardown();
 
     if (intent.holdsFloor && this.floorHeldFor !== intent.engagementId) {
       if (!this.deps.floor.acquire('pet')) {
-        // 话筒被别人占着：按 floorTaken 处理，交给状态机决断
-        this.deps.report({ kind: 'floor', busy: true, owner: this.deps.floor.owner });
+        // 话筒被别人占着：按 floorTaken 处理，交给状态机决断。
+        // 即使大脑里的归属已经一致，也要再送一次，否则这次抢麦失败没有输入可决断。
+        this.reportFloor();
         return;
       }
       this.floorHeldFor = intent.engagementId;
+      this.reportFloor();
     }
 
     const controller = new AbortController();
+    let running: Running | null = null;
     const cancelDeadline = intent.deadlineMs === null
       ? null
       : this.deps.clock.after(intent.deadlineMs, () => {
+        // 截止是异步恢复点：阶段已经被换掉或会话已吸收，这次超时不算数。
+        if (this.sealed || running === null || this.running !== running || !this.deps.isLive(intent.engagementId)) {
+          return;
+        }
         this.deps.report({
           kind: 'phaseResult',
           engagementId: intent.engagementId,
@@ -138,7 +192,7 @@ export class PetExecutor {
         });
       });
 
-    this.running = {
+    running = {
       engagementId: intent.engagementId,
       step: intent.step,
       phase: intent.phase,
@@ -147,6 +201,7 @@ export class PetExecutor {
       cancelDeadline,
       controller,
     };
+    this.running = running;
 
     switch (intent.phase) {
       case 'look': {
@@ -163,12 +218,16 @@ export class PetExecutor {
         return;
       }
       case 'compose': {
+        const ticket = this.running;
         try {
           const reply = await this.deps.agent.ask(
             intent.context,
             intent.image,
             { kind: 'pet', reason: intent.context.reason },
           );
+          if (this.sealed || this.running !== ticket || !this.deps.isLive(intent.engagementId)) {
+            return;
+          }
           const text = reply.text.trim();
           if (text === '') {
             // 模型选择不说：这是合法结局，不是错误
@@ -180,6 +239,9 @@ export class PetExecutor {
             ...(reply.emotion === undefined ? {} : { emotion: reply.emotion }),
           });
         } catch (error) {
+          if (this.sealed || this.running !== ticket || !this.deps.isLive(intent.engagementId)) {
+            return;
+          }
           // 端口抛错也要落地成结果，否则这次 engagement 会一直挂着等截止
           this.log(`agent 出错：${String(error)}`);
           this.reportCurrent(intent, 'error');
@@ -193,8 +255,9 @@ export class PetExecutor {
         return;
       }
       case 'speak': {
+        const ticket = this.running;
         try {
-          this.deps.onEvent?.('pet.speak', {
+          this.deps.onEvent?.(EVENTS.petSpeak, {
             engagementId: intent.engagementId,
             step: intent.step,
             text: intent.text ?? '',
@@ -204,10 +267,17 @@ export class PetExecutor {
             intent.emotion,
             controller.signal,
           );
+          if (this.sealed || this.running !== ticket || !this.deps.isLive(intent.engagementId)) {
+            return;
+          }
           this.reportCurrent(intent, result);
         } catch (error) {
+          // abort / 关机：结局已经由状态机定了。再报 `cut` 会记成 engaged，再报 `error` 会改写成 failed。
+          if (this.sealed || controller.signal.aborted || this.running !== ticket || !this.deps.isLive(intent.engagementId)) {
+            return;
+          }
           this.log(`朗读出错：${String(error)}`);
-          this.reportCurrent(intent, 'cut');
+          this.reportCurrent(intent, 'error');
         }
         return;
       }
@@ -258,13 +328,25 @@ export class PetExecutor {
     this.deps.onOutcome?.(record, dismiss);
   }
 
-  /** 放掉整段 engagement 占着的话筒。 */
+  /** 放掉整段 engagement 占着的话筒，并把仲裁器的现状投影回大脑。 */
   private releaseFloor(engagementId: string): void {
     if (this.floorHeldFor !== engagementId) {
       return;
     }
-    this.deps.floor.release('pet');
+    const released = this.deps.floor.release('pet');
     this.floorHeldFor = null;
+    if (released) {
+      this.reportFloor();
+    }
+  }
+
+  /** 把 `FloorArbiter` 此刻的归属报回去。大脑侧负责和自己的投影对齐。 */
+  private reportFloor(): void {
+    this.deps.report({
+      kind: 'floor',
+      busy: this.deps.floor.busy,
+      owner: this.deps.floor.owner,
+    });
   }
 
   private teardown(): void {

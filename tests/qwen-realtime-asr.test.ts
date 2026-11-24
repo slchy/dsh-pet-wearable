@@ -726,3 +726,79 @@ test('mergeCorpusText 截断停在 maxChars 边界', () => {
   assert.equal(mergeCorpusText(['词'.repeat(800)]), '词'.repeat(800));
   assert.equal(mergeCorpusText(['词'.repeat(799)]).length, 799);
 });
+
+test('未就绪的静音补推时仍按静音，不点亮 dirty', async () => {
+  const { asr, socket } = make();
+  const connecting = asr.connect();
+  socket.open();
+  await connecting;
+  asr.feed(Buffer.alloc(640), false);
+  socket.message({ type: 'session.updated', session: {} });
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.append').length, 0);
+  asr.commit();
+  assert.equal(socket.types().filter((t) => t === 'input_audio_buffer.commit').length, 0);
+});
+
+test('拆连清掉 pendingVoice 和 discardLeft，close 唤醒 whenDecoded', async () => {
+  const sockets: FakeSocket[] = [];
+  const sentences: string[] = [];
+  const asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    onSentence: (text) => { sentences.push(text); },
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return asSocket(socket);
+    },
+  });
+
+  const first = asr.connect();
+  sockets[0]?.open();
+  await first;
+  sockets[0]?.message({ type: 'session.updated', session: {} });
+  asr.feed(Buffer.alloc(640), true);
+  asr.discard();
+  sockets[0]?.close();
+
+  asr.feed(Buffer.alloc(640), false);
+  await new Promise((resolve) => { setImmediate(resolve); });
+  const next = sockets[1];
+  assert.ok(next, '拆连之后还要能重建');
+  next.open();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  next.message({ type: 'session.updated', session: {} });
+  asr.commit();
+  assert.equal(
+    next.types().filter((t) => t === 'input_audio_buffer.commit').length,
+    0,
+    '上一轮的人声标记不该让纯静音封出一段',
+  );
+
+  asr.feed(Buffer.alloc(640), true);
+  asr.commit();
+  next.message({
+    type: 'conversation.item.input_audio_transcription.completed',
+    transcript: '下一句。',
+  });
+  assert.deepEqual(sentences, ['下一句。'], '上一轮的 discard 计数不该吃掉新连接的定稿');
+
+  const held = await ready();
+  held.asr.feed(Buffer.alloc(640), true);
+  held.asr.commit();
+  const pending = held.asr.whenDecoded();
+  assert.ok(pending);
+  let woke = false;
+  const wait = pending.then(() => { woke = true; });
+  held.asr.close();
+  await wait;
+  assert.equal(woke, true);
+});
+
+test('close 在建连途中让 open 回调失效', async () => {
+  const { asr, socket } = make();
+  const connecting = asr.connect();
+  asr.close();
+  socket.open();
+  await connecting;
+  assert.equal(socket.types().includes('session.update'), false);
+});

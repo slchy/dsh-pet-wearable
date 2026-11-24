@@ -1743,3 +1743,60 @@ test('interrupt 立刻结束认领流，不等 response.done', { timeout: 2000 }
   h.socket.message({ type: 'response.created' });
   assert.equal(h.socket.count('response.cancel'), 1);
 });
+
+test('并段 pending 在 break 之后 willServe 必为 false', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.shadow.seal(1, 40);
+  h.shadow.feed(Buffer.alloc(MS * 100), true);
+  h.shadow.seal(2, 40);
+  assert.equal(h.shadow.explain().pending, true);
+  assert.equal(h.shadow.willServe(), true);
+  assert.equal(h.shadow.currentState, 'busy');
+
+  h.socket.close();
+  assert.equal(h.shadow.currentState, 'broken');
+  assert.equal(h.shadow.explain().pending, false);
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.canAnswerText(), false);
+  assert.equal(h.shadow.canSpeakBackground(), false);
+  assert.equal(h.shadow.claim(), null);
+
+  const stopped = make('full');
+  stopped.ready();
+  stopped.shadow.restart([Buffer.alloc(MS * 100)]);
+  stopped.shadow.seal(1, 40);
+  stopped.shadow.feed(Buffer.alloc(MS * 80), true);
+  stopped.shadow.seal(2, 40);
+  assert.equal(stopped.shadow.explain().pending, true);
+  stopped.shadow.stop();
+  assert.equal(stopped.shadow.currentState, 'broken');
+  assert.equal(stopped.shadow.explain().pending, false);
+  assert.equal(stopped.shadow.willServe(), false);
+});
+
+test('injectAnswer 在 broken 或 socket 未打开时不计数', () => {
+  const idle = make('full');
+  idle.shadow.injectAnswer('问', '答');
+  idle.ready();
+  idle.shadow.restart([Buffer.alloc(MS * 40)]);
+  idle.shadow.seal(1, 10);
+  idle.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(idle.events.at(-1)?.['injects_sent'], 0);
+
+  const live = make('full');
+  live.ready();
+  live.shadow.injectAnswer('问', '答');
+  live.shadow.restart([Buffer.alloc(MS * 40)]);
+  live.shadow.seal(1, 10);
+  live.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(live.events.at(-1)?.['injects_sent'], 1);
+
+  const broken = make('full');
+  broken.ready();
+  broken.socket.close();
+  const sent = broken.socket.sent.length;
+  broken.shadow.injectAnswer('问', '还在吗');
+  assert.equal(broken.socket.sent.length, sent);
+});

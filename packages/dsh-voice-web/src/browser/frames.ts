@@ -12,6 +12,12 @@
 /** 帧头长度：1 字节类型 + 4 字节长度 */
 export const FRAME_HEADER_BYTES = 5;
 
+/**
+ * 单帧上限，与 `src/frame.ts` 的 `FRAME_MAX_BYTES` 同一数字。
+ * 超过就判定长度字段错位，停止解码 —— 继续吃后面的字节会把半截载荷当帧头。
+ */
+export const FRAME_MAX_BYTES = 32 << 20;
+
 /** 上行帧类型（浏览器 → 云端），与 `src/frame.ts` 的 `UpstreamFrameType` 对齐 */
 export const UpstreamFrameType = {
   Audio: 1,
@@ -65,10 +71,20 @@ export function decodeText(payload: Uint8Array): string {
  */
 export class FrameDecoder {
   private buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  /** 长度错位之后字节流没有边界，后面的 `push` 必须直接丢掉。 */
+  private stopped = false;
+  private readonly onProtocolError: ((reason: string) => void) | undefined;
+  private readonly maxBytes: number;
 
-  constructor(private readonly maxBytes = 32 << 20) {}
+  constructor(onProtocolError?: (reason: string) => void, maxBytes = FRAME_MAX_BYTES) {
+    this.onProtocolError = onProtocolError;
+    this.maxBytes = maxBytes;
+  }
 
   push(chunk: Uint8Array): DecodedFrame[] {
+    if (this.stopped) {
+      return [];
+    }
     if (this.buffer.length === 0) {
       this.buffer = chunk;
     } else {
@@ -85,8 +101,11 @@ export class FrameDecoder {
       const type = this.buffer[offset] ?? 0;
       const length = view.getUint32(1, true);
       if (length > this.maxBytes) {
-        // 长度已经错位，后面的字节没法再对齐，整块丢掉
+        // 长度已经错位，后面的字节没法再对齐。先停掉，再通知：
+        // 回调里若再 `push`，必须看见 `stopped`，不能递归解帧。
         this.buffer = new Uint8Array(0);
+        this.stopped = true;
+        this.onProtocolError?.(`帧长异常 ${length}（上限 ${this.maxBytes}），丢弃整个缓冲`);
         return frames;
       }
       if (this.buffer.length - offset - FRAME_HEADER_BYTES < length) {

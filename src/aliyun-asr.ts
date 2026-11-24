@@ -153,6 +153,13 @@ export class AliyunAsr {
    * 上行持续送识别（见 `TODO.md` T-005）。
    */
   private dropping = false;
+  /** 每次 `connect()` 加一。token 往返之后代次变了就放弃，不再建连。 */
+  private wsGen = 0;
+  /**
+   * 套接字还在握手时，`close()` 用它解开 `await`。
+   * 代次失效的 open/error 回调会直接 return，不解开的话这次建连挂死。
+   */
+  private settleConnect: (() => void) | null = null;
   /**
    * connect() 正在进行。
    *
@@ -198,24 +205,35 @@ export class AliyunAsr {
   async connect(): Promise<void> {
     if (this.ws || this.connecting) return;
     this.connecting = true;
+    const myGen = ++this.wsGen;
     try {
       // 不在 connect 里清 dropping：
       // dropping 只表示「本条会话已结束」，播放期并不置位。
-      // 解 dropping 的时机只有两个：初始值，以及显式 resume()。
+      // 会话结束之后不再恢复。
       this.backlog = [];
       const token = await this.token();
+      if (this.dropping || myGen !== this.wsGen) return;
       const url = `wss://nls-gateway-${this.opts.region}.aliyuncs.com/ws/v1`
         + `?token=${encodeURIComponent(token.id)}`;
 
       const ws = new WebSocket(url);
+      if (this.dropping || myGen !== this.wsGen) {
+        try { ws.close(); } catch { /* 已断 */ }
+        return;
+      }
       this.ws = ws;
       this.ready = false;
       this.taskId = null;
 
       try {
         await new Promise<void>((resolve, reject) => {
-          const onOpen = (): void => { resolve(); };
+          this.settleConnect = resolve;
+          const onOpen = (): void => {
+            if (this.dropping || myGen !== this.wsGen) return;
+            resolve();
+          };
           const onError = (e: Event): void => {
+            if (this.dropping || myGen !== this.wsGen) return;
             reject(new AliyunAsrError(`WebSocket 连接失败: ${String(e)}`));
           };
           ws.addEventListener('open', onOpen, { once: true });
@@ -231,18 +249,27 @@ export class AliyunAsr {
           // 已断
         }
         throw e;
+      } finally {
+        this.settleConnect = null;
+      }
+      if (this.dropping || myGen !== this.wsGen) {
+        if (this.ws === ws) this.drop(ws);
+        try { ws.close(); } catch { /* 已断 */ }
+        return;
       }
 
       ws.addEventListener('message', (ev) => {
         // 只认**当前**这条连接的消息。旧连接是钩子上没摘干净的孤儿，
         // 它的中间结果会和当前连接打架。
-        if (this.ws === ws) this.onMessage(ev);
+        if (myGen !== this.wsGen || this.dropping || this.ws !== ws) return;
+        this.onMessage(ev);
       });
       ws.addEventListener('error', (e) => {
-        if (this.ws !== ws) return;
+        if (myGen !== this.wsGen || this.dropping || this.ws !== ws) return;
         this.opts.onError?.(new AliyunAsrError(`WebSocket error: ${String(e)}`));
       });
       ws.addEventListener('close', (ev) => {
+        if (myGen !== this.wsGen || this.ws !== ws) return;
         this.log(`[asr] 连接关闭 code=${ev.code} reason=${ev.reason || '无'}`);
         // 关键：只有「这条就是当前连接」时才清状态。
         // `hangup()` 会先把 `this.ws` 摘空、500 ms 后才真正 close，这中间
@@ -322,10 +349,6 @@ export class AliyunAsr {
       return;
     }
     this.send(pcm);
-    if (this.backlog.length > 0) {
-      for (const b of this.backlog) this.send(b);
-      this.backlog = [];
-    }
   }
 
   private send(pcm: Buffer): void {
@@ -336,25 +359,18 @@ export class AliyunAsr {
     }
   }
 
-  /**
-   * 解除 dropping 并按需重建连接。
-   *
-   * 当前无调用点：`dropping` 只由 `close()` 置位，会话结束后不再恢复。
-   * 保留给「需要复用同一实例」的场景（例如显式重连）。
-   */
-  resume(): void {
-    this.dropping = false;
-    this.backlog = [];
-    if (!this.ws && !this.connecting) {
-      void this.connect().catch((e: Error) => {
-        this.opts.onError?.(e);
-      });
-    }
-  }
-
   close(): void {
     this.dropping = true;
+    this.wsGen += 1;
+    this.abandonConnectAttempt();
     this.hangup();
+  }
+
+  /** 解开还挂在套接字握手上的那次 await。 */
+  private abandonConnectAttempt(): void {
+    const settle = this.settleConnect;
+    this.settleConnect = null;
+    settle?.();
   }
 
   /**
@@ -411,6 +427,10 @@ export class AliyunAsr {
     const name = msg.header?.name;
 
     if (name === 'TranscriptionStarted') {
+      // 先按到达顺序把积压推完，再对外宣布就绪。
+      // 倒过来的话，下一次 `feed()` 会先发新块、再补旧块，音频乱序。
+      const queued = this.backlog.splice(0);
+      for (const chunk of queued) this.send(chunk);
       this.ready = true;
       this.log(`[asr] 已就绪 task=${this.taskId?.slice(0, 8)}…`);
       return;

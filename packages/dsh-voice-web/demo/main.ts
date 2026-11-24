@@ -28,8 +28,12 @@ const mEcho = $('m-echo');
 const mMargin = $('m-margin');
 const mVerdict = $('m-verdict');
 
-/** 服务端上行能量门，与 `VOICE_PEAK_DBFS` 默认值一致 */
-const GATE_DBFS = -40;
+/** 服务端上行能量门，与 `VOICE_PEAK_DBFS` 默认值（−30 dBFS）一致 */
+const GATE_DBFS = -30;
+const gateLabel = mMargin.previousElementSibling;
+if (gateLabel !== null) {
+  gateLabel.textContent = `对门限（−${Math.abs(GATE_DBFS)} dBFS）`;
+}
 const TEST_QUIET_MS = 1_200;
 const TEST_PLAY_MS = 3_000;
 
@@ -142,13 +146,15 @@ toggle.addEventListener('click', () => {
           log(`错误：${event.message}`);
           break;
         case 'close':
-          // 服务端 45 s 没收到上行字节会主动断开，这里如实说清
+          // 服务端 45 s 没收到上行字节会主动断开。必须先 close() 再丢掉引用，
+          // 否则麦还开着，再点「开始」会叠第二只麦克风。
           setPill('已断开', 'idle');
           toggle.dataset['running'] = 'false';
           toggle.textContent = '开始对话';
           hush.disabled = true;
           probe.disabled = true;
           log(`连接关闭 ${event.code}${event.reason === '' ? '' : ` ${event.reason}`}`);
+          instance.close();
           client = null;
           break;
       }
@@ -158,7 +164,13 @@ toggle.addEventListener('click', () => {
   setPill('启动中', 'live');
 
   void instance.start().then(
-    () => { log('麦克风已打开'); },
+    () => {
+      // 权限框期间被关掉：start() 按代次直接返回，这时不该再说麦开着。
+      if (client !== instance) {
+        return;
+      }
+      log('麦克风已打开');
+    },
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       setPill('出错', 'error');

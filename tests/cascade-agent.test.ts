@@ -1681,3 +1681,141 @@ test('toEngine 带图直接交给 dsh；dsh 抛错或只吐情绪标签时照样
   assert.equal(metaOf(taggedEvents)?.delegate, 'task');
   assert.equal(metaOf(taggedEvents)?.firstTokenMs, undefined);
 });
+
+test('插话取消后快车道失败不得再 startInner 复活 dsh', async () => {
+  let replies = 0;
+  const gate: { release: ((value: Response) => void) | null } = { release: null };
+  const agent = new CascadeAgent({
+    inner: {
+      name: 'dsh',
+      reply: () => {
+        replies += 1;
+        return Promise.resolve({ text: '复活了', speech: '复活了' });
+      },
+    },
+    apiKey: 'k',
+    speculate: false,
+    log: () => {},
+    fetchImpl: () => new Promise<Response>((resolve) => {
+      gate.release = resolve;
+    }),
+  });
+  const pending = agent.reply('你好呀', undefined, undefined, { ticket: { no: 4, gen: 2 } });
+  for (let i = 0; i < 20 && gate.release === null; i += 1) await delay(5);
+  const release = gate.release;
+  if (release === null) assert.fail('快车道请求要先发出去');
+  assert.equal(replies, 0);
+  agent.cancelTurn({ no: 4, gen: 2 });
+  release(new Response('no', { status: 503 }));
+  const view = await pending;
+  assert.equal(view.text, '');
+  assert.equal(view.speech, '');
+  assert.equal(replies, 0, '取消之后不得 abandon 再起 dsh');
+  assert.equal(agent.lastLedgerLane(), null);
+});
+
+test('toEngine 插话中止后不得再起一趟 dsh', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown): void => { unhandled.push(error); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    let replies = 0;
+    const agent = new CascadeAgent({
+      inner: {
+        name: 'dsh',
+        reply: () => {
+          replies += 1;
+          return new Promise<AgentReplyView>(() => {});
+        },
+        cancelTurn: () => {},
+      },
+      apiKey: 'k',
+      speculate: false,
+      log: () => {},
+      fetchImpl: (_url, init) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal === undefined || signal === null) {
+          reject(new Error('missing signal'));
+          return;
+        }
+        if (signal.aborted) {
+          reject(new Error('aborted'));
+          return;
+        }
+        signal.addEventListener('abort', () => { reject(new Error('aborted')); }, { once: true });
+      }),
+    });
+    const ac = new AbortController();
+    const pending = collect(agent.toEngine(quietTts()).respond(
+      turnOf('你好呀', { no: 3, gen: 1 }),
+      ac.signal,
+    ));
+    await delay(30);
+    ac.abort();
+    await pending;
+    await delay(20);
+    assert.equal(replies, 0, '中止后的失败不得复活 dsh');
+    assert.equal(agent.lastLedgerLane(), null);
+    assert.equal(unhandled.length, 0);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('投机已经起跑的 dsh，插话后再失败也不得 startInner 第二次', async () => {
+  let replies = 0;
+  const gate: { release: ((value: Response) => void) | null } = { release: null };
+  const agent = new CascadeAgent({
+    inner: {
+      name: 'dsh',
+      reply: () => {
+        replies += 1;
+        return new Promise<AgentReplyView>(() => {});
+      },
+      cancelTurn: () => {},
+    },
+    apiKey: 'k',
+    speculate: true,
+    log: () => {},
+    fetchImpl: () => new Promise<Response>((resolve) => {
+      gate.release = resolve;
+    }),
+  });
+  const pending = agent.reply('你好呀', undefined, undefined, { ticket: { no: 5, gen: 1 } });
+  for (let i = 0; i < 20 && gate.release === null; i += 1) await delay(5);
+  assert.equal(replies, 1, '投机会先起一趟');
+  agent.cancelTurn({ no: 5, gen: 1 });
+  const go = gate.release;
+  if (go === null) assert.fail('快车道请求要先发出去');
+  go(new Response('no', { status: 503 }));
+  const view = await pending;
+  await delay(20);
+  assert.equal(view.text, '');
+  assert.equal(replies, 1, '取消后不得再起第二趟');
+  assert.equal(agent.lastLedgerLane(), null);
+});
+
+test('流正常结束时 whenAborted 会摘掉 abort 监听', async () => {
+  const ac = new AbortController();
+  const signal = ac.signal;
+  let added = 0;
+  let removed = 0;
+  type Add = AbortSignal['addEventListener'];
+  type Remove = AbortSignal['removeEventListener'];
+  const add: Add = signal.addEventListener.bind(signal);
+  const remove: Remove = signal.removeEventListener.bind(signal);
+  signal.addEventListener = ((...args: Parameters<Add>) => {
+    if (args[0] === 'abort') added += 1;
+    add(...args);
+  }) as Add;
+  signal.removeEventListener = ((...args: Parameters<Remove>) => {
+    if (args[0] === 'abort') removed += 1;
+    remove(...args);
+  }) as Remove;
+
+  const agent = cascade(fakeInner().agent, async () => sse(['在呢。']), { speculate: false });
+  const events = await collect(agent.toEngine(quietTts()).respond(turnOf('你好呀'), signal));
+  assert.equal(doneOf(events)?.speech, '在呢。');
+  assert.ok(added >= 2, '引擎和播流各挂一次 abort');
+  assert.equal(removed, added, '正常结束也要摘掉 abort 监听');
+});

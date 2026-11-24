@@ -261,6 +261,46 @@ test('报告在 p90 超预算时给出「先治 ③」的判断', () => {
   assert.match(text, /先治 ③/);
 });
 
+test('feed_ms 透传，负哨兵收成 null，不进分位数', () => {
+  const raw = jsonl([
+    { t: 1, ev: 'tts.task', setup_ms: -1, feed_ms: -1, first_ms: 12 },
+  ]);
+  const parsed = parseEvents(raw);
+  assert.equal(parsed[0]?.feed_ms, -1, '档案原值要留下，哨兵只在折算时收掉');
+  assert.equal(parsed[0]?.setup_ms, -1);
+
+  const marked = jsonl([
+    { t: 0, ev: 'gate.close', gapMs: 100 },
+    { t: 200, ev: 'asr.sentence', text: '甲' },
+    { t: 220, ev: 'turn.start' },
+    { t: 300, ev: 'tts.task', setup_ms: 60, first_ms: 120, feed_ms: 40 },
+    { t: 400, ev: 'tts.first' },
+    { t: 500, ev: 'tts.task', first_ms: 330 },
+    { t: 600, ev: 'turn.end', loop_max_ms: 0, dsh_ms: 10 },
+    { t: 700, ev: 'asr.sentence', text: '乙' },
+    { t: 720, ev: 'turn.start' },
+    { t: 800, ev: 'tts.task', setup_ms: -5, feed_ms: -1, first_ms: 80 },
+    { t: 900, ev: 'tts.first' },
+    { t: 1000, ev: 'turn.end', loop_max_ms: -1, dsh_ms: 10 },
+  ]);
+  const turns = computeTurns(parseEvents(marked));
+  assert.equal(turns[0]?.ttsSetupMs, 60, '后一条缺 setup_ms 时沿用上一条');
+  assert.equal(turns[0]?.ttsFeedMs, 40, '后一条缺 feed_ms 时沿用上一条');
+  assert.equal(turns[0]?.ttsSynthMs, 330);
+  assert.equal(turns[0]?.loopMaxMs, 0, '0 是真停顿，不是哨兵');
+  assert.equal(turns[1]?.ttsSetupMs, null);
+  assert.equal(turns[1]?.ttsFeedMs, null, '最后一条的 -1 不能退回上一条的 40');
+  assert.equal(turns[1]?.ttsSynthMs, 80);
+  assert.equal(turns[1]?.loopMaxMs, null);
+
+  const summary = summarize(turns.map((turn) => turn.ttsFeedMs));
+  assert.equal(summary.count, 1);
+  assert.equal(summary.median, 40);
+  const text = formatReport(turns);
+  assert.match(text, /供给 中位 40/);
+  assert.doesNotMatch(text, /供给 中位 -1/);
+});
+
 test('报告的 p50/p90 只标在「闭嘴→出声」上，单段不许裸叫 p50', () => {
   // 项目级约定（docs/TOOLS.md §0）：裸说 p50 一律是「闭嘴→出声」。
   // ③ 曾经被当成"开轮→首块"引用，于是 1127 ms 被误读成端到端 —— 那次是 TTS

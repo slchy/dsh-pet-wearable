@@ -242,7 +242,14 @@ export function startToolControl(options: ToolControlOptions): ToolControl {
   });
 
   server.on('error', (error: Error) => {
-    active?.log?.(`  ✗ 控制口 ${options.port}: ${error.message}`);
+    const line = `  ✗ 控制口 ${options.port}: ${error.message}`;
+    // 还没有设备（进程刚起 / 全部断开）时 `active?.log?.()` 是空操作，
+    // `PHOTO_CTL_PORT` 被占的 EADDRINUSE 会被吞掉，看起来像服务没起来。
+    if (active === null) {
+      console.error(line);
+      return;
+    }
+    active.log?.(line);
   });
   server.listen(options.port, '127.0.0.1');
 

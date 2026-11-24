@@ -125,15 +125,29 @@ export function writeTokenFile(path: string, entries: readonly TokenEntry[]): vo
   }
 }
 
+/** 文件不存在才算「空表」。权限、目录、锁都不是 ENOENT，不能当成可以新建。 */
+function isEnoent(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && (error as { code: unknown }).code === 'ENOENT';
+}
+
 /**
  * 追加一个新 token。**绝不覆盖已有条目** —— 重新生成只影响新设备，
  * 不会把所有已配对设备一起踢下线。
+ *
+ * 只有 `ENOENT`（文件还没有）按空文件处理。其它读失败原样抛出，
+ * **不调用** `writeTokenFile`：当成空表再原子替换，会把已经配对的凭据整份换掉。
  */
 export function appendToken(path: string, deviceId: string | null): { token: string; entries: TokenEntry[] } {
   let entries: TokenEntry[] = [];
   try {
     entries = readTokenFile(path).entries;
-  } catch {
+  } catch (error) {
+    if (!isEnoent(error)) {
+      throw error;
+    }
     entries = [];
   }
   if (deviceId !== null) {

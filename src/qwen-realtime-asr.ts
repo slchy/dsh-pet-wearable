@@ -27,7 +27,6 @@ import WebSocket from 'ws';
 
 import type { SttProvider } from './providers.ts';
 
-const SAMPLE_RATE = 16_000;
 const OPEN = 1;
 const CLOSED = 3;
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
@@ -118,8 +117,15 @@ export class QwenRealtimeAsr {
   private ready = false;
   private connecting = false;
   private dropping = false;
-  /** 未就绪时先攒着，别丢音频 */
-  private backlog: Buffer[] = [];
+  /** 每次 `connect()` 加一。旧 socket 的回调看见代次不对就直接返回。 */
+  private wsGen = 0;
+  /**
+   * 建连的 `await` 还挂着时，`close()` / `drop()` 用它解开。
+   * 回调首行发现代次失效会直接 return，不解开的话这次 `connect()` 永远等不到头。
+   */
+  private settleConnect: (() => void) | null = null;
+  /** 未就绪时先攒着，别丢音频。`voiced` 要原样留到 `session.updated` 补推。 */
+  private backlog: Array<{ pcm: Buffer; voiced: boolean }> = [];
   /**
    * 上次 `commit` 之后有没有**真正属于下一段**的新音频。
    *
@@ -226,6 +232,7 @@ export class QwenRealtimeAsr {
   async connect(): Promise<void> {
     if (this.ws !== null || this.connecting) return;
     this.connecting = true;
+    const myGen = ++this.wsGen;
     try {
       this.backlog = [];
       const factory: RealtimeSocketFactory = this.opts.socketFactory
@@ -235,32 +242,53 @@ export class QwenRealtimeAsr {
         }) as unknown as RealtimeSocket);
       const url = `${this.opts.url ?? DEFAULT_URL}?model=${encodeURIComponent(this.opts.model ?? DEFAULT_MODEL)}`;
       const ws = factory(url, this.opts.apiKey);
+      if (myGen !== this.wsGen || this.dropping) {
+        try { ws.close(); } catch { /* 已断 */ }
+        return;
+      }
       this.ws = ws;
       this.ready = false;
 
-      await new Promise<void>((resolve, reject) => {
-        ws.on('open', () => { resolve(); });
-        ws.on('error', (...args: never[]) => {
-          reject(new QwenRealtimeAsrError(`WebSocket 连接失败: ${String(args[0])}`));
+      try {
+        await new Promise<void>((resolve, reject) => {
+          this.settleConnect = resolve;
+          ws.on('open', () => {
+            if (myGen !== this.wsGen || this.dropping) return;
+            resolve();
+          });
+          ws.on('error', (...args: never[]) => {
+            if (myGen !== this.wsGen || this.dropping) return;
+            reject(new QwenRealtimeAsrError(`WebSocket 连接失败: ${String(args[0])}`));
+          });
+          ws.on('close', () => {
+            if (myGen !== this.wsGen || this.dropping) return;
+            reject(new QwenRealtimeAsrError('连接在就绪前关闭'));
+          });
         });
-      }).catch((e: Error) => {
-        this.drop(ws);
-        try {
-          ws.close();
-        } catch {
-          // 已断
-        }
-        throw e;
-      });
+      } catch (e) {
+        const error = e instanceof Error ? e : new QwenRealtimeAsrError(String(e));
+        if (this.ws === ws) this.drop(ws);
+        try { ws.close(); } catch { /* 已断 */ }
+        throw error;
+      } finally {
+        this.settleConnect = null;
+      }
+      if (myGen !== this.wsGen || this.dropping) {
+        if (this.ws === ws) this.drop(ws);
+        return;
+      }
 
       ws.on('message', (...args: never[]) => {
+        if (myGen !== this.wsGen || this.dropping) return;
         if (this.ws === ws) this.onMessage(args[0]);
       });
       ws.on('error', (...args: never[]) => {
+        if (myGen !== this.wsGen || this.dropping) return;
         if (this.ws !== ws) return;
         this.opts.onError?.(new QwenRealtimeAsrError(`WebSocket error: ${String(args[0])}`));
       });
       ws.on('close', () => {
+        if (myGen !== this.wsGen || this.dropping) return;
         this.log('[asr] 连接关闭');
         // 只有这条就是当前连接时才清状态：迟到的 close 不能影响后来者
         this.drop(ws);
@@ -276,20 +304,41 @@ export class QwenRealtimeAsr {
   private drop(ws: RealtimeSocket | null): boolean {
     if (ws === null || this.ws !== ws) return false;
     this.ws = null;
+    this.wsGen += 1;
+    this.abandonConnectAttempt();
+    this.resetSessionState();
+    return true;
+  }
+
+  /** 解开还挂在 `connect()` 里的那次 await。代次失效的回调会直接 return，不能让它把建连挂死。 */
+  private abandonConnectAttempt(): void {
+    const settle = this.settleConnect;
+    this.settleConnect = null;
+    settle?.();
+  }
+
+  /**
+   * `drop()` 与 `close()` 共用的会话复位。
+   *
+   * 连接没了之后，静音门、丢弃计数和「等解码」的人都必须回到初值，
+   * 否则下一条连接会把上一句的尾巴或一张作废票带过去，
+   * `whenDecoded()` 也会一直挂着。
+   */
+  private resetSessionState(): void {
     this.ready = false;
     this.backlog = [];
     this.dirty = false;
     this.awaitingDecode = false;
+    this.pendingVoice = false;
+    this.holdActive = false;
+    this.commitDeferred = false;
+    this.commitWhenReady = false;
+    this.discardLeft = 0;
     this.heldDuringDecode = [];
     this.heldBytes = 0;
     this.ringDuringDecode = [];
     this.ringBytes = 0;
-    this.holdActive = false;
-    this.commitDeferred = false;
-    // 连接没了：等解码的那几个不能再挂下去（判停那边有预算，但挂住的 promise 会漏）
-    this.awaitingDecode = false;
     this.resolveDecode();
-    return true;
   }
 
   /**
@@ -335,7 +384,7 @@ export class QwenRealtimeAsr {
       void this.connect().catch((e: Error) => { this.opts.onError?.(e); });
     }
     if (!this.isReady) {
-      this.backlog.push(pcm);
+      this.backlog.push({ pcm, voiced: voiced !== false });
       if (this.backlog.length > 200) this.backlog.shift();
       return;
     }
@@ -532,10 +581,11 @@ export class QwenRealtimeAsr {
 
   close(): void {
     this.dropping = true;
+    this.wsGen += 1;
     const ws = this.ws;
     this.ws = null;
-    this.ready = false;
-    this.backlog = [];
+    this.abandonConnectAttempt();
+    this.resetSessionState();
     try {
       ws?.close();
     } catch {
@@ -566,7 +616,7 @@ export class QwenRealtimeAsr {
       this.log(this.opts.turnDetection === 'vad'
         ? '[asr] 已就绪（服务端 VAD 开，端点归服务端）'
         : '[asr] 已就绪（服务端 VAD 关闭）');
-      for (const b of this.backlog) this.sendAudio(b);
+      for (const item of this.backlog) this.sendAudio(item.pcm, item.voiced);
       this.backlog = [];
       if (this.commitWhenReady) {
         this.commitWhenReady = false;

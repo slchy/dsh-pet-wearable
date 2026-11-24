@@ -10,10 +10,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { AppSession } from '../src/app/session.ts';
 import type { DeviceCapabilities } from '../src/devices/primitives.ts';
+import { EVENTS } from '../src/events.ts';
 import { PetBrain } from '../src/pet/brain/brain.ts';
 import { PHASES, TRIGGERS, planFor, validatePlan } from '../src/pet/brain/registry.ts';
 import type { Interrupt, PetInput, PetIntent, PetState, PhaseId } from '../src/pet/brain/types.ts';
+import { PetSession } from '../src/pet/brain/session.ts';
+import { VirtualClock } from '../src/pet/sim/clock.ts';
 
 const MIN = 60_000;
 
@@ -586,6 +590,245 @@ test('speak 期间敲击：dismissed + 关麦', () => {
   assert.equal(end.record.outcome, 'dismissed');
   assert.equal(end.closeMic, true);
   assert.equal(end.dismiss, true);
+});
+
+test('greet 被 abandoned 后，同一次佩戴的下一次心跳还能再打招呼', () => {
+  const brain = new PetBrain();
+  let state = brain.initial(CAPS, { now: 0, localHour: 12 });
+  const run = (inputs: PetInput[]): PetIntent[] => {
+    const out: PetIntent[] = [];
+    for (const input of inputs) {
+      const result = brain.step(state, input);
+      state = result.state;
+      out.push(...result.intents);
+    }
+    return out;
+  };
+
+  const started = run([
+    presence(true, 0),
+    presence(false, 10 * MIN),
+    presence(true, 20 * MIN),
+    tick(20 * MIN),
+  ]);
+  assert.equal(started.find((intent) => intent.kind === 'phase.enter')?.context.reason, 'greet');
+  assert.equal(state.world.lastAwayMs, 10 * MIN, '开场不能把离场时长清掉');
+  assert.equal(state.engagement?.reason, 'greet');
+
+  const abandoned = run([userFinal(20 * MIN + 100)]);
+  assert.deepEqual(outcomes(abandoned), ['abandoned']);
+  assert.equal(state.engagement, null);
+  assert.equal(state.world.lastAwayMs, 10 * MIN, 'abandoned 必须留着 lastAwayMs');
+  assert.equal(state.fired.has(`greet:${20 * MIN}`), false, 'abandoned 会删掉候选键');
+
+  const again = run([tick(20 * MIN + 200)]);
+  const enter = again.find((intent) => intent.kind === 'phase.enter');
+  assert.ok(enter !== undefined && enter.kind === 'phase.enter');
+  assert.equal(enter.context.reason, 'greet');
+  assert.equal(enter.context.elapsedMs, 10 * MIN);
+});
+
+test('greet 非 abandoned 收场后不再因同一次离场打招呼', () => {
+  const caps: DeviceCapabilities = { ...CAPS, capture: {}, listenStart: false };
+  const brain = new PetBrain();
+  let state = brain.initial(caps, { now: 0, localHour: 12 });
+  const run = (inputs: PetInput[]): PetIntent[] => {
+    const out: PetIntent[] = [];
+    for (const input of inputs) {
+      const result = brain.step(state, input);
+      state = result.state;
+      out.push(...result.intents);
+    }
+    return out;
+  };
+
+  run([
+    presence(true, 0),
+    presence(false, 10 * MIN),
+    presence(true, 20 * MIN),
+    tick(20 * MIN),
+  ]);
+  assert.equal(state.engagement?.reason, 'greet');
+  const declined = run([phaseResult('pet-1', 1, 'compose', 'declined', 20 * MIN + 100)]);
+  assert.deepEqual(outcomes(declined), ['declined']);
+  assert.equal(state.world.lastAwayMs, null, '非 abandoned 才消费离场时长');
+  assert.deepEqual(phases(run([tick(20 * MIN + 200)])), [], '同一次佩戴不能再 greet');
+});
+
+test('speak 的 error 是 failed，cut 仍是 engaged', () => {
+  const brain = new PetBrain();
+  let state = brain.initial(CAPS, { now: 0, localHour: 12 });
+  const run = (inputs: PetInput[]): PetIntent[] => {
+    const out: PetIntent[] = [];
+    for (const input of inputs) {
+      const result = brain.step(state, input);
+      state = result.state;
+      out.push(...result.intents);
+    }
+    return out;
+  };
+
+  const reachSpeak = (): void => {
+    run([presence(true, 0), tick(20 * MIN)]);
+    run([phaseResult('pet-1', 1, 'look', 'none', 20 * MIN + 100)]);
+    run([phaseResult('pet-1', 2, 'compose', 'reply', 20 * MIN + 200, { text: '在呢' })]);
+    run([{ kind: 'micOpened', ...at({ now: 20 * MIN + 300 }) }]);
+    assert.equal(currentPhaseOf(state), 'speak');
+  };
+
+  reachSpeak();
+  const failed = run([phaseResult('pet-1', 4, 'speak', 'error', 20 * MIN + 400)]);
+  assert.deepEqual(outcomes(failed), ['failed']);
+
+  state = brain.initial(CAPS, { now: 0, localHour: 12 });
+  reachSpeak();
+  const cut = run([phaseResult('pet-1', 4, 'speak', 'cut', 20 * MIN + 400)]);
+  assert.deepEqual(outcomes(cut), ['engaged']);
+});
+
+test('closed 把话筒投影清成空闲', () => {
+  const { state } = drive([
+    { kind: 'floor', busy: true, owner: 'reply', ...at({ now: 1 }) },
+    { kind: 'closed', ...at({ now: 2 }) },
+  ]);
+  assert.equal(state.world.floorBusy, false);
+  assert.equal(state.world.floorOwner, null);
+});
+
+test('对话、播报、反射改话筒时，宠物投影与仲裁器一致；关闭后也是', () => {
+  const clock = new VirtualClock(0, 12 * 60);
+  const app = new AppSession({
+    clock,
+    caps: CAPS,
+    voice: { speak: async () => 'done', stop: () => {} },
+    device: { call: () => {} },
+    agent: { ask: async () => ({ text: '在呢' }) },
+    tickMs: 86_400_000,
+  });
+  const same = (owner: string | null): void => {
+    assert.equal(app.floor.owner, owner);
+    assert.equal(app.snapshot()?.world.floorOwner, owner);
+    assert.equal(app.snapshot()?.world.floorBusy, owner !== null);
+  };
+
+  app.userPartial();
+  same('user');
+  app.userFinal('你好');
+  same('reply');
+  app.onDialogState('listening');
+  same(null);
+  app.announce(true);
+  same('announce');
+  app.announce(false);
+  same(null);
+  app.reflexStart();
+  same('reflex');
+  app.reflexEnd();
+  same(null);
+  app.userFinal('还在');
+  same('reply');
+  app.close();
+  same(null);
+  app.dispose();
+});
+
+test('宠物占麦时投影是 pet，close 返回前就 listen.stop', async () => {
+  const clock = new VirtualClock(0, 12 * 60);
+  const calls: string[] = [];
+  const app = new AppSession({
+    clock,
+    caps: { ...CAPS, capture: {} },
+    voice: { speak: async () => 'done', stop: () => {} },
+    device: { call: (call) => { calls.push(call.op); } },
+    agent: { ask: async () => ({ text: '在呢' }) },
+    params: { greetAfterAwayMs: 60_000, chatterAfterIdleMs: 86_400_000 },
+    tickMs: 86_400_000,
+  });
+
+  app.deviceEvent({ kind: 'presence', wearing: false });
+  await clock.runUntil(60_000, () => app.isQuiet());
+  app.deviceEvent({ kind: 'presence', wearing: true });
+  await clock.drain(() => app.isQuiet());
+
+  assert.equal(app.floor.owner, 'pet', 'listen 阶段宠物必须占上话筒');
+  assert.equal(app.snapshot()?.world.floorOwner, 'pet');
+  assert.equal(app.snapshot()?.world.floorBusy, true);
+  assert.ok(calls.includes('listen.start'));
+  assert.equal(calls.filter((op) => op === 'listen.stop').length, 0);
+
+  app.close();
+  const stopsAtClose = calls.filter((op) => op === 'listen.stop').length;
+  assert.equal(stopsAtClose, 1, 'close() 返回前就要发出 listen.stop');
+  app.dispose();
+  assert.equal(calls.filter((op) => op === 'listen.stop').length, 1, 'dispose 不能再补一次关麦');
+  assert.equal(app.floor.owner, null);
+  assert.equal(app.snapshot()?.world.floorOwner, null);
+});
+
+test('朗读抛错上报 error，结局是 failed 而不是 engaged', async () => {
+  const clock = new VirtualClock(0, 12 * 60);
+  const names: string[] = [];
+  const outcomes: string[] = [];
+  const app = new AppSession({
+    clock,
+    caps: { ...CAPS, capture: {} },
+    voice: {
+      speak: async () => {
+        throw new Error('synth down');
+      },
+      stop: () => {},
+    },
+    device: { call: () => {} },
+    agent: { ask: async () => ({ text: '在呢' }) },
+    params: { greetAfterAwayMs: 60_000, chatterAfterIdleMs: 86_400_000 },
+    tickMs: 86_400_000,
+    onEvent: (name, fields) => {
+      names.push(name);
+      if (name === EVENTS.petOutcome && typeof fields['outcome'] === 'string') {
+        outcomes.push(fields['outcome']);
+      }
+    },
+  });
+
+  app.deviceEvent({ kind: 'presence', wearing: false });
+  await clock.runUntil(60_000, () => app.isQuiet());
+  app.deviceEvent({ kind: 'presence', wearing: true });
+  await clock.drain(() => app.isQuiet());
+  app.micOpened();
+  await clock.drain(() => app.isQuiet());
+
+  assert.deepEqual(outcomes, ['failed']);
+  assert.equal(outcomes.includes('engaged'), false);
+  assert.ok(names.includes(EVENTS.petOut));
+  assert.ok(names.includes(EVENTS.petSpeak));
+  assert.ok(names.includes(EVENTS.petOutcome));
+  app.dispose();
+});
+
+test('dispose 是吸收态：之后的心跳和敲击撤播报不再入队', async () => {
+  const names: string[] = [];
+  const session = new PetSession({
+    caps: CAPS,
+    clock: new VirtualClock(0, 12 * 60),
+    voice: { speak: async () => 'done', stop: () => {} },
+    device: { call: () => {} },
+    agent: { ask: async () => ({ text: '' }) },
+    onEvent: (name) => { names.push(name); },
+    dismissAnnounce: () => { names.push('dismiss-hook'); },
+  });
+  session.announce(true);
+  session.summon(false);
+  await session.whenIdle();
+  assert.ok(names.includes(EVENTS.announceDismissed));
+  assert.ok(names.includes('dismiss-hook'));
+
+  const marked = names.length;
+  session.dispose();
+  session.tick();
+  session.presence(true);
+  session.summon(false);
+  await session.whenIdle();
+  assert.equal(names.length, marked, '吸收态之后不能再收输入');
 });
 
 /** 只为 `validatePlan` 的类型检查造一个空世界。 */

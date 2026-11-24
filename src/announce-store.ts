@@ -64,20 +64,26 @@ export class AnnounceStore {
     this.log = options.log ?? (() => {});
   }
 
-  /** 存一条；返回当前积压条数。写失败只记日志，不影响通话。 */
+  /**
+   * 存一条；返回当前积压条数。
+   *
+   * 写失败时这次入队作废（磁盘上的旧队列不动），返回 0。
+   * 不能把没写上的条目算进返回值，否则调用方会以为积压里有一条其实不在的汇报。
+   */
   push(text: string, emotion?: string): number {
-    const items = this.read();
-    items.push(emotion === undefined ? { t: Date.now(), text } : { t: Date.now(), text, emotion });
-    while (items.length > this.maxItems) {
-      items.shift();
+    const next = this.read();
+    next.push(emotion === undefined ? { t: Date.now(), text } : { t: Date.now(), text, emotion });
+    while (next.length > this.maxItems) {
+      next.shift();
     }
     try {
-      writeFileSync(this.file, items.map((e) => JSON.stringify(e)).join('\n') + '\n');
+      writeFileSync(this.file, next.map((e) => JSON.stringify(e)).join('\n') + '\n');
     } catch (error) {
       this.log(`  ✗ 待补播写入失败：${(error as Error).message}`);
-      return items.length;
+      // `next` 只是这次读出来的副本，随函数返回丢掉，等于撤回这次入队。
+      return 0;
     }
-    return items.length;
+    return next.length;
   }
 
   /** 取走全部并清空（至少一次：清不掉就下次再播一次）。 */

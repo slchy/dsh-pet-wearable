@@ -43,6 +43,14 @@ export interface VoiceClientOptions {
   readonly onChunk?: (pcm: Uint8Array) => void;
 }
 
+/**
+ * 一条客户端的生命周期。`closed` 是吸收态：再 `start()` 必须换一个实例。
+ *
+ * `starting` 覆盖两个 await（`resume`、`getUserMedia`）。代次对不上就拆掉
+ * 刚拿到的麦和 context，不能等下一次 `close()` —— 那次调用会直接返回。
+ */
+export type ClientPhase = 'idle' | 'starting' | 'connecting' | 'open' | 'closed';
+
 export interface VoiceClient {
   /** 打开麦克风并建立连接。**必须在用户手势的调用栈里调用**（自动播放策略） */
   start(): Promise<void>;
@@ -85,24 +93,78 @@ function isOp(json: unknown, op: string): boolean {
 }
 
 export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
+  let phase: ClientPhase = 'idle';
+  /** 每次真正进入 `start()` 加一。`teardown` 再加一，作废还停在 await 上的那一次。 */
+  let startGen = 0;
   let socket: WebSocket | null = null;
   let context: AudioContext | null = null;
   let capture: CaptureHandle | null = null;
   let playback: PlaybackHandle | null = null;
-  const decoder = new FrameDecoder();
-  let closed = false;
+  let closeInfo: { code: number; reason: string } = { code: 1000, reason: '' };
 
   const emit = (event: VoiceClientEvent): void => {
     options.onEvent?.(event);
   };
 
-  const send = (frame: Uint8Array): void => {
-    if (socket !== null && socket.readyState === WebSocket.OPEN) {
-      socket.send(frame);
+  /**
+   * 停麦、停播放、关 context、摘掉 socket 回调。`close` 事件最多一次。
+   *
+   * `close()` 传 `false`：页面自己的「结束」按钮已经改了 UI，再发一次会和
+   * `onclose` 套娃。连接自己断、协议错、`onerror` 传 `true`。
+   */
+  const teardown = (emitClose: boolean): void => {
+    if (phase === 'closed') {
+      return;
+    }
+    phase = 'closed';
+    startGen += 1;
+    const info = closeInfo;
+    const ws = socket;
+    socket = null;
+    if (ws !== null) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    }
+    capture?.stop();
+    capture = null;
+    // 先停播放再关 context：`source.stop()` 需要 context 还活着。
+    playback?.close();
+    playback = null;
+    const ctx = context;
+    context = null;
+    if (ctx !== null && ctx.state !== 'closed') {
+      void ctx.close();
+    }
+    if (emitClose) {
+      emit({ type: 'close', code: info.code, reason: info.reason });
     }
   };
 
+  const decoder = new FrameDecoder((reason) => {
+    if (phase === 'closed') {
+      return;
+    }
+    closeInfo = { code: 1002, reason };
+    emit({ type: 'error', message: reason });
+    teardown(true);
+  });
+
+  const send = (frame: Uint8Array): void => {
+    if (phase === 'closed' || socket === null || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    socket.send(frame);
+  };
+
   const handleFrame = (type: number, payload: Uint8Array): void => {
+    if (phase === 'closed') {
+      return;
+    }
     if (type === DownstreamFrameType.Audio) {
       playback?.push(payload);
       return;
@@ -139,7 +201,7 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
 
   return {
     get active(): boolean {
-      return capture !== null && socket !== null && socket.readyState === WebSocket.OPEN;
+      return phase === 'open' && capture !== null && socket !== null && socket.readyState === WebSocket.OPEN;
     },
 
     get context(): AudioContext | null {
@@ -147,34 +209,107 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
     },
 
     async start(): Promise<void> {
-      if (closed) {
+      if (phase === 'closed') {
         throw new Error('客户端已关闭，重新创建一个实例');
       }
-      if (socket !== null) {
+      if (phase !== 'idle') {
+        return;
+      }
+      phase = 'starting';
+      const myGen = ++startGen;
+
+      const stillStarting = (): boolean => phase === 'starting' && myGen === startGen;
+
+      let ctx: AudioContext;
+      try {
+        ctx = new AudioContext();
+      } catch (error) {
+        teardown(false);
+        throw error;
+      }
+      context = ctx;
+      // teardown 已经关过共享 context 时不要再关一遍（close 尚未落定，state 可能还不是 closed）。
+      // 麦如果是这次 await 才拿到的，teardown 看不见，必须在这里 stop。
+      const abandon = (cap: CaptureHandle | null): void => {
+        cap?.stop();
+        if (phase !== 'closed') {
+          teardown(false);
+          return;
+        }
+        if (context === ctx) {
+          context = null;
+          playback?.close();
+          playback = null;
+          if (ctx.state !== 'closed') {
+            void ctx.close();
+          }
+        }
+      };
+      // 用户手势里调 `resume` —— Safari 不加这句 context 会一直 suspended。
+      // await 期间 `close()` 会把 phase 打成 closed 并加代次；回来必须先核对，
+      // 再决定要不要去申请麦克风。
+      try {
+        await ctx.resume();
+      } catch (error) {
+        if (!stillStarting()) {
+          abandon(null);
+          return;
+        }
+        teardown(false);
+        throw error;
+      }
+      if (!stillStarting()) {
+        abandon(null);
         return;
       }
 
-      context = new AudioContext();
-      // 用户手势里调 `resume` —— Safari 不加这句 context 会一直 suspended
-      await context.resume();
       playback = createPlayback({
-        context,
+        context: ctx,
         onActivity: (busy) => { emit({ type: 'speaking', active: busy }); },
       });
 
-      capture = await startCapture({
-        context,
-        onChunk: (pcm) => {
-          options.onChunk?.(pcm);
-          send(encodeFrame(UpstreamFrameType.Audio, pcm));
-        },
-        onError: (message) => { emit({ type: 'error', message }); },
-      });
+      let cap: CaptureHandle;
+      try {
+        cap = await startCapture({
+          context: ctx,
+          onChunk: (pcm) => {
+            options.onChunk?.(pcm);
+            send(encodeFrame(UpstreamFrameType.Audio, pcm));
+          },
+          onError: (message) => { emit({ type: 'error', message }); },
+        });
+      } catch (error) {
+        if (!stillStarting()) {
+          abandon(null);
+          return;
+        }
+        teardown(false);
+        throw error;
+      }
+      // 权限框可以停很久。这期间关掉的话，刚拿到的麦还没赋给 `capture`，
+      // teardown 停不到它 —— 这里必须自己 stop，并且关掉还挂在手里的 context。
+      if (!stillStarting()) {
+        abandon(cap);
+        return;
+      }
 
-      socket = new WebSocket(options.url);
-      socket.binaryType = 'arraybuffer';
+      capture = cap;
+      phase = 'connecting';
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(options.url);
+      } catch (error) {
+        teardown(false);
+        throw error;
+      }
+      socket = ws;
+      ws.binaryType = 'arraybuffer';
 
-      socket.onopen = () => {
+      ws.onopen = () => {
+        if (phase !== 'connecting' || myGen !== startGen || socket !== ws) {
+          return;
+        }
+        phase = 'open';
         emit({ type: 'open' });
         send(encodeTextFrame(UpstreamFrameType.Hello, JSON.stringify({
           proto: 2,
@@ -184,18 +319,30 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
         })));
       };
 
-      socket.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+      ws.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+        if (phase === 'closed' || socket !== ws) {
+          return;
+        }
         for (const frame of decoder.push(new Uint8Array(event.data))) {
           handleFrame(frame.type, frame.payload);
         }
       };
 
-      socket.onerror = () => {
+      ws.onerror = () => {
+        if (phase === 'closed') {
+          return;
+        }
         emit({ type: 'error', message: 'WS 连接出错' });
+        closeInfo = { code: 1006, reason: 'WS 连接出错' };
+        teardown(true);
       };
 
-      socket.onclose = (event: CloseEvent) => {
-        emit({ type: 'close', code: event.code, reason: event.reason });
+      ws.onclose = (event: CloseEvent) => {
+        if (phase === 'closed') {
+          return;
+        }
+        closeInfo = { code: event.code, reason: event.reason };
+        teardown(true);
       };
     },
 
@@ -204,21 +351,7 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
     },
 
     close(): void {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      capture?.stop();
-      capture = null;
-      playback?.close();
-      playback = null;
-      if (socket !== null) {
-        socket.onclose = null;
-        socket.close();
-        socket = null;
-      }
-      void context?.close();
-      context = null;
+      teardown(false);
     },
   };
 }

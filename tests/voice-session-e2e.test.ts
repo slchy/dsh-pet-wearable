@@ -687,7 +687,9 @@ describe('VoiceConnection 本地回环', { concurrency: false }, () => {
     const dsh = makeDsh(async () => ({ text: '还剩百分之七十七。', speech: '还剩百分之七十七。' }));
     const session = await boot(wireCascade(dsh.agent, makeTts(ttsTexts, false), stt));
     try {
-      session.client.sendEvent({ kind: 'power', percent: 77 });
+      session.client.sendEvent({ kind: 'power', percent: 77, charging: true });
+      // 缺字段的后续帧被解析成 null，不许盖掉已经记下的电量 / 充电
+      session.client.sendEvent({ kind: 'power' });
       session.client.sendEvent({ kind: 'presence', wearing: true });
       session.client.sendPcm(SILENCE);
       await userSays(stt, session.client, '你好呀');
@@ -700,6 +702,7 @@ describe('VoiceConnection 本地回环', { concurrency: false }, () => {
       await waitFor('dsh', () => dsh.calls.length === 1, 1_500);
       const note = dsh.calls[0]?.note ?? '';
       assert.ok(note.includes('电量 77%'), note);
+      assert.ok(note.includes('充电中'), note);
       assert.ok(note.includes('戴着'), note);
       assert.equal(session.client.countOp('audio.stop'), 0, 'played 没接上时第二句会打断');
       session.client.sendPlayed();

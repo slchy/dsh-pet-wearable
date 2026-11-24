@@ -93,6 +93,7 @@ export class UplinkPipeline {
   /** 统一时钟：能量门、电平表、`AudioFrame.tsMs` 共用（见 `UplinkPipelineOptions.now`） */
   private readonly now: () => number;
   private received = false;
+  /** 关管道之后为真。吸收态：`push` / `onPcm` 直接丢弃，断连后的 ffmpeg 尾包不许再进门。 */
   private closed = false;
 
   /** 电平表：窗口内峰值与窗口起点 */
@@ -171,6 +172,9 @@ export class UplinkPipeline {
 
   /** 送一段上行音频。`msbc` 是压缩帧，`pcm16` 是已经解码好的字节。 */
   push(chunk: Buffer): void {
+    if (this.closed) {
+      return;
+    }
     if (this.options.codec === 'pcm16') {
       this.received = true;
       this.onPcm(chunk);
@@ -212,6 +216,9 @@ export class UplinkPipeline {
   }
 
   private onPcm(raw: Buffer): void {
+    if (this.closed) {
+      return;
+    }
     const { onPcm, onSpeechOpen, onFrame, onSpeechClose, onRawPcm, log } = this.options;
 
     onRawPcm?.(raw);

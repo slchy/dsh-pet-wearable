@@ -254,12 +254,15 @@ export const PHASES: Record<PhaseId, PhaseSpec> = {
   /** 念出来 */
   speak: phase({
     id: 'speak',
-    results: ['done', 'cut'],
+    results: ['done', 'cut', 'error'],
     deadlineMs: () => null,
     holdsFloor: true,
     onResult: {
       done: { kind: 'next' },
+      // `cut` 是被停播/打断：用户接住了，算 engaged
       cut: { kind: 'end', outcome: 'engaged' },
+      // 朗读抛错不是被打断。再报 `cut` 会把故障记成 engaged
+      error: { kind: 'end', outcome: 'failed' },
       // speak 没有截止，这条只是补齐类型；真出现按失败算
       timeout: { kind: 'end', outcome: 'failed' },
     },

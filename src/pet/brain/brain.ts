@@ -206,12 +206,12 @@ export class PetBrain {
       durations: {},
       phaseEnteredAt: world.now,
     };
-    // 一次离场只招呼一次：把离场时长消费掉，之后不会拿着旧事实再开口
-    const nextWorld: PetWorld = picked.trigger.reason === 'greet' ? { ...world, lastAwayMs: null } : world;
+    // `lastAwayMs` 先留着。`abandoned` 会把候选键从 `fired` 里删掉，
+    // 若在开场就清掉离场时长，同一次佩戴就再也打不了招呼。消费放在 `finish()`。
     const fired = new Set(state.fired).add(picked.candidate.key);
     return {
-      state: { ...state, world: nextWorld, engagement: started, fired, seq },
-      intents: [enterIntent(started, nextWorld, this.params)],
+      state: { ...state, world, engagement: started, fired, seq },
+      intents: [enterIntent(started, world, this.params)],
     };
   }
 }
@@ -254,6 +254,9 @@ function reduceWorld(w: PetWorld, input: PetInput): PetWorld {
       return input.opensSession ? base : { ...base, lastUserAt: input.now };
     case 'floor':
       return { ...base, floorBusy: input.busy, floorOwner: input.owner };
+    case 'closed':
+      // 连接没了，话筒一定是空的。`PetSession.close` 会先清仲裁器，这里把投影对齐。
+      return { ...base, floorBusy: false, floorOwner: null };
     case 'announce':
       // 播报出声也算"最近出过声"：不占最小间隔，但会推迟下一次搭话（ADR-0001 §6）
       return input.spoken
@@ -460,8 +463,16 @@ function finish(
     ? new Set([...fired].filter((key) => key !== e.key))
     : fired;
   // 只有真出过声才推进 lastVoiceAt；`declined` / `failed` / `abandoned` 不该推迟下一次
-  const nextWorld = speechCounted(verdict.outcome, e)
-    ? { ...world, lastVoiceAt: world.now }
+  const voiced = speechCounted(verdict.outcome, e);
+  // greet 的离场事实只在非 abandoned 时消费。abandoned 删了 fired 键之后，
+  // 还得留着 lastAwayMs，同一次佩戴的下一次心跳才能再打招呼。
+  const consumeAway = e.reason === 'greet' && verdict.outcome !== 'abandoned';
+  const nextWorld: PetWorld = voiced || consumeAway
+    ? {
+      ...world,
+      ...(voiced ? { lastVoiceAt: world.now } : {}),
+      ...(consumeAway ? { lastAwayMs: null } : {}),
+    }
     : world;
   return {
     fired: nextFired,

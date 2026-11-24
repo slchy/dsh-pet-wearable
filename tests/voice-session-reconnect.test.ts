@@ -22,7 +22,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { SystemClock } from '../src/app/clock.ts';
 import { DialogRuntime } from '../src/app/dialog.ts';
-import { resolveDeviceLink, type DeviceCapabilities } from '../src/devices/index.ts';
+import { resolveDeviceLink, V1Session, type DeviceCapabilities, type DeviceLink } from '../src/devices/index.ts';
 import type { DialogState } from '../src/dialog-fsm.ts';
 import { UpstreamFrameType } from '../src/frame.ts';
 import {
@@ -35,6 +35,8 @@ import {
 import { startToolControl } from '../src/tool-control.ts';
 import type { Connection, ConnectionHandlers, DownlinkSink } from '../src/transport.ts';
 import {
+  assemblerSilenceFromGate,
+  mergePowerReading,
   runVoiceServer,
   VoiceConnection,
   type VoiceService,
@@ -109,19 +111,27 @@ interface FakeConnection {
   readonly close: () => void;
   /** 这条连接被主动 `end()` 过几次 */
   readonly ended: () => number;
+  /** v2 `Call` 帧（JSON） */
+  readonly calls: Array<Record<string, unknown>>;
+  /** 控制串 */
+  readonly controls: string[];
+  /** 把一帧交给已经 bind 的业务回调 */
+  readonly frame: (type: number, payload: Buffer) => void;
 }
 
 /** 业务层只碰 `Connection` 的这几个成员，所以假连接只要把它们演对 */
 function fakeConnection(remote: string): FakeConnection {
   let handlers: ConnectionHandlers | null = null;
   let ended = 0;
+  const calls: Array<Record<string, unknown>> = [];
+  const controls: string[] = [];
   const conn = {
     remote,
     isClosed: false,
     bind: (next: ConnectionHandlers) => { handlers = next; },
     sendAudio: () => {},
-    sendControl: () => {},
-    sendCall: () => {},
+    sendControl: (text: string) => { controls.push(text); },
+    sendCall: (json: string) => { calls.push(JSON.parse(json) as Record<string, unknown>); },
     sendWelcome: () => {},
     end: () => { ended += 1; },
   } as unknown as Connection;
@@ -129,6 +139,9 @@ function fakeConnection(remote: string): FakeConnection {
     conn,
     close: () => { handlers?.onClose('socket closed'); },
     ended: () => ended,
+    calls,
+    controls,
+    frame: (type, payload) => { handlers?.onFrame(type, payload); },
   };
 }
 
@@ -540,5 +553,203 @@ test('状态机被直接驱动（不经过 dispatch）也要通知 onDialogState
     assert.deepEqual(states, ['ending'], '状态机转移必须驱动 onDialogState');
   } finally {
     runtime.dispose();
+  }
+});
+
+// ---------------------------------------------------------------- 开麦相位 / 0 关闭 / 电量空字段
+
+function countOp(calls: Array<Record<string, unknown>>, op: string): number {
+  return calls.reduce((sum, call) => sum + (call['op'] === op ? 1 : 0), 0);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+const LISTEN_CAPS: DeviceCapabilities = { ...CAPS_A, listenStart: true };
+
+function v2ListenLink(): DeviceLink {
+  return resolveDeviceLink({ proto: 2, deviceId: 'mic', capabilities: LISTEN_CAPS });
+}
+
+function v1ListenLink(): DeviceLink {
+  return {
+    proto: 1,
+    label: 'v1-mic',
+    capabilities: { ...V1_CAPS, listenStart: true },
+    v1: new V1Session(),
+  };
+}
+
+interface MicHarness {
+  readonly fake: FakeConnection;
+  readonly spoken: string[];
+  readonly announce: (speech: string) => void;
+}
+
+/** 开麦超时故意拉得很长：卡住时短等待一定失败，而不是碰巧等到默认 1.5 s。 */
+async function withMic(
+  link: DeviceLink,
+  fn: (harness: MicHarness) => Promise<void>,
+): Promise<void> {
+  const spoken: string[] = [];
+  let announcer: ((speech: string, emotion?: string) => void) | null = null;
+  const agent: AgentProvider = {
+    name: 'mic',
+    reply: async (): Promise<AgentReplyView> => ({ text: '嗯。', speech: '嗯。' }),
+    setAnnouncer: (cb) => { announcer = cb; },
+    setDelegateHook: () => {},
+    attachAudioLane: () => {},
+    setTaskReporter: () => {},
+  };
+  const tts: TtsProvider = {
+    name: 'instant',
+    sampleRate: 16_000,
+    async *synthesize(text: string) {
+      spoken.push(text);
+      yield Buffer.alloc(2);
+    },
+  };
+  const control = startToolControl({ port: 0, photoTimeoutMs: 1_000, handlers: null });
+  await listeningPort(control);
+  const service: VoiceService = { control, activeSlot: { current: null } };
+  const options: VoiceSessionOptions = {
+    ...makeOptions(agent),
+    tts,
+    proactive: { params: { micOpenTimeoutMs: 30_000 }, tickMs: 60_000 },
+  };
+  const fake = fakeConnection('mic:1');
+  const conn = new VoiceConnection(fake.conn, options, link, service);
+  service.activeSlot.current = conn;
+  try {
+    conn.start();
+    await fn({
+      fake,
+      spoken,
+      announce: (speech) => {
+        if (announcer === null) {
+          throw new Error('播报口没有挂上');
+        }
+        announcer(speech);
+      },
+    });
+  } finally {
+    fake.close();
+    control.close();
+  }
+}
+
+test('pauseDetectMs / speculateMs 为 0 时原样透传', () => {
+  assert.deepEqual(assemblerSilenceFromGate({ pauseDetectMs: 0, speculateMs: 0 }), {
+    silencePauseMs: 0,
+    speculateMs: 0,
+  });
+  assert.deepEqual(assemblerSilenceFromGate({}), {});
+  assert.deepEqual(
+    assemblerSilenceFromGate({ pauseDetectMs: 40, speculateMs: 15 }),
+    { silencePauseMs: 40, speculateMs: 15 },
+  );
+});
+
+test('电量帧缺字段（null / undefined）不覆盖已有读数', () => {
+  const current = { percent: 77, charging: true as boolean | null };
+  assert.deepEqual(mergePowerReading(current, { percent: null, charging: null }), current);
+  assert.deepEqual(mergePowerReading(current, {}), current);
+  assert.deepEqual(mergePowerReading(current, { percent: 40 }), { percent: 40, charging: true });
+  assert.deepEqual(mergePowerReading(current, { charging: false }), { percent: 77, charging: false });
+  assert.deepEqual(mergePowerReading(current, { percent: 0 }), { percent: 0, charging: true });
+});
+
+test('listen.start 发不出去时不卡在 opening', async () => {
+  await withMic(v1ListenLink(), async ({ fake, spoken, announce }) => {
+    const started = Date.now();
+    announce('报一句');
+    const deadline = Date.now() + 800;
+    while (spoken.length === 0 && Date.now() < deadline) {
+      await delay(10);
+    }
+    assert.ok(spoken.includes('报一句'), '发送失败必须立刻放弃等麦，不能耗满 micOpenTimeoutMs');
+    assert.ok(Date.now() - started < 800);
+    assert.equal(countOp(fake.calls, 'listen.start'), 0, 'v1 表达不了 listen.start');
+  });
+});
+
+test('opening 期间上行音频以 true 叫醒等麦的人', async () => {
+  await withMic(v2ListenLink(), async ({ fake, spoken, announce }) => {
+    announce('报一句');
+    assert.equal(countOp(fake.calls, 'listen.start'), 1, '播报应先把 listen.start 发出去');
+    fake.frame(UpstreamFrameType.Audio, Buffer.alloc(320, 1));
+    const deadline = Date.now() + 800;
+    while (spoken.length === 0 && Date.now() < deadline) {
+      await delay(10);
+    }
+    assert.ok(spoken.includes('报一句'), '首帧上行必须立刻叫醒，不能耗满 micOpenTimeoutMs');
+  });
+});
+
+test('onClose 以 false 立刻叫醒等麦的人，不再等开麦超时', async () => {
+  await withMic(v2ListenLink(), async ({ fake, spoken, announce }) => {
+    announce('报一句');
+    assert.equal(countOp(fake.calls, 'listen.start'), 1);
+    const started = Date.now();
+    fake.close();
+    const deadline = Date.now() + 800;
+    while (spoken.length === 0 && countOp(fake.calls, 'listen.stop') === 0 && Date.now() < deadline) {
+      await delay(10);
+    }
+    assert.ok(
+      spoken.includes('报一句') || countOp(fake.calls, 'listen.stop') >= 1,
+      '收尾必须立刻结束等麦，播报才能继续走完',
+    );
+    assert.ok(Date.now() - started < 800);
+  });
+});
+
+test('宽限期内已有上行音频就不再发 listen.start', async () => {
+  await withMic(v2ListenLink(), async ({ fake }) => {
+    fake.frame(UpstreamFrameType.Audio, Buffer.alloc(320, 1));
+    await delay(1_700);
+    assert.equal(countOp(fake.calls, 'listen.start'), 0);
+  });
+});
+
+test('end_session 之后的宽限期拒绝 listen.start；onClose 取消 250ms 延迟关闭', async () => {
+  const control = startToolControl({ port: 0, photoTimeoutMs: 1_000, handlers: null });
+  const port = await listeningPort(control);
+  const { agent } = fakeAgent();
+  const service: VoiceService = { control, activeSlot: { current: null } };
+  const options = makeOptions(agent);
+  const link = v2ListenLink();
+  const closing = fakeConnection('closing:1');
+  const cleared = fakeConnection('cleared:1');
+  const connClosing = new VoiceConnection(closing.conn, options, link, service);
+  service.activeSlot.current = connClosing;
+  try {
+    connClosing.start();
+    const end = await fetch(`http://127.0.0.1:${port}/end_session`, { method: 'POST' });
+    assert.equal(end.status, 200);
+    assert.ok(closing.controls.includes('end_session'));
+    await delay(1_700);
+    assert.equal(countOp(closing.calls, 'listen.start'), 0, 'closing 期间不许再发 listen.start');
+    assert.equal(closing.ended(), 1, '没人提前 onClose 时，250ms 后仍要 end');
+  } finally {
+    closing.close();
+    control.close();
+  }
+
+  const control2 = startToolControl({ port: 0, photoTimeoutMs: 1_000, handlers: null });
+  const port2 = await listeningPort(control2);
+  const service2: VoiceService = { control: control2, activeSlot: { current: null } };
+  const connCleared = new VoiceConnection(cleared.conn, options, link, service2);
+  service2.activeSlot.current = connCleared;
+  try {
+    connCleared.start();
+    const end = await fetch(`http://127.0.0.1:${port2}/end_session`, { method: 'POST' });
+    assert.equal(end.status, 200);
+    cleared.close();
+    await delay(400);
+    assert.equal(cleared.ended(), 0, 'onClose 必须取消还没触发的 250ms 延迟关闭');
+  } finally {
+    control2.close();
   }
 });

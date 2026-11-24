@@ -92,6 +92,7 @@ test('情绪模式：默认 prosody，显式 useInstruction / 环境变量才发
     const plain = cosyVoiceTts({ apiKey: 'sk-test', url: server.url });
     for await (const chunk of plain.synthesize('在，哥。', 'calm')) void chunk;
     assert.equal(server.params[0]?.['instruction'], undefined, '默认不该带 instruction（系统音色会 428）');
+    assert.equal(server.params[0]?.['volume'], 50);
     assert.equal(server.params[0]?.['rate'], EMOTION_PROSODY.calm.rate);
     assert.equal(server.params[0]?.['pitch'], EMOTION_PROSODY.calm.pitch);
 
@@ -652,5 +653,138 @@ test('首块按时到达：看门狗一声不响（正常轮零开销）', { tim
     assert.deepEqual(stalls, [], '首块按时到达就不该报');
   } finally {
     await server.close();
+  }
+});
+
+test('活跃 task 不被空闲定时器打断，收尾后才重新武装', { timeout: 5000 }, async () => {
+  const server = await fakeCosyVoice();
+  try {
+    const tts = cosyVoiceTts({ apiKey: 'sk-test', url: server.url, idleCloseMs: 350 });
+    for await (const chunk of tts.synthesize('第一句。')) void chunk;
+
+    const queue = new TokenQueue();
+    queue.push('第二句还没说完，先留在连接上。');
+    const iter = tts.synthesizeStream!(queue)[Symbol.asyncIterator]();
+    const first = await iter.next();
+    assert.equal(first.done, false);
+    await new Promise((resolve) => { setTimeout(resolve, 600); });
+    queue.push('接着说。');
+    queue.close();
+    let bytes = (first.value as Buffer).length;
+    for (;;) {
+      const step = await iter.next();
+      if (step.done === true) break;
+      bytes += step.value.length;
+    }
+    assert.ok(bytes > 0);
+    assert.equal(server.runs.length, 1, 'task 进行中不能被空闲定时器弃连接');
+
+    await new Promise((resolve) => { setTimeout(resolve, 500); });
+    for await (const chunk of tts.synthesize('第三句。')) void chunk;
+    assert.equal(server.runs.length, 2, '回到空闲之后，定时器到点要关掉这条连接');
+  } finally {
+    await server.close();
+  }
+});
+
+test('坏文本帧丢掉，task-failed 之后换一条连接', { timeout: 5000 }, async () => {
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((resolve) => { wss.once('listening', resolve); });
+  let connections = 0;
+  wss.on('connection', (socket) => {
+    const mine = ++connections;
+    socket.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      let msg: { header?: { action?: string; task_id?: string } };
+      try {
+        msg = JSON.parse(String(data)) as { header?: { action?: string; task_id?: string } };
+      } catch {
+        return;
+      }
+      const reply = (event: string, extra: Record<string, string> = {}): void => {
+        socket.send(JSON.stringify({
+          header: { event, task_id: msg.header?.task_id, ...extra },
+        }));
+      };
+      if (msg.header?.action === 'run-task') {
+        socket.send('not-json{');
+        if (mine === 1) {
+          reply('task-failed', { error_message: 'Please ensure input text is valid.' });
+          return;
+        }
+        reply('task-started');
+      }
+      if (msg.header?.action === 'continue-task' && mine > 1) {
+        const loud = Buffer.alloc(4800);
+        for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(3000, i);
+        socket.send(loud);
+      }
+      if (msg.header?.action === 'finish-task' && mine > 1) {
+        reply('task-finished');
+      }
+    });
+  });
+  const address = wss.address();
+  assert.ok(address !== null && typeof address === 'object');
+  const tts = cosyVoiceTts({ apiKey: 'sk-test', url: `ws://127.0.0.1:${address.port}` });
+  try {
+    await assert.rejects(async () => {
+      for await (const chunk of tts.synthesize('第一句。')) void chunk;
+    });
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('第二句。')) bytes += chunk.length;
+    assert.ok(bytes > 0);
+    assert.equal(connections, 2);
+  } finally {
+    for (const client of wss.clients) client.terminate();
+    await new Promise<void>((resolve) => { wss.close(() => { resolve(); }); });
+  }
+});
+
+test('beginTask 超时后这条连接不能再复用', { timeout: 8000 }, async () => {
+  const prev = process.env['COSYVOICE_PREWARM'];
+  delete process.env['COSYVOICE_PREWARM'];
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((resolve) => { wss.once('listening', resolve); });
+  let connections = 0;
+  wss.on('connection', (socket) => {
+    const mine = ++connections;
+    socket.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      let msg: { header?: { action?: string; task_id?: string } };
+      try {
+        msg = JSON.parse(String(data)) as { header?: { action?: string; task_id?: string } };
+      } catch {
+        return;
+      }
+      if (mine === 1) return;
+      const reply = (event: string): void => {
+        socket.send(JSON.stringify({ header: { event, task_id: msg.header?.task_id } }));
+      };
+      if (msg.header?.action === 'run-task') reply('task-started');
+      if (msg.header?.action === 'continue-task') {
+        const loud = Buffer.alloc(4800);
+        for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(3000, i);
+        socket.send(loud);
+      }
+      if (msg.header?.action === 'finish-task') reply('task-finished');
+    });
+  });
+  const address = wss.address();
+  assert.ok(address !== null && typeof address === 'object');
+  const tts = cosyVoiceTts({ apiKey: 'sk-test', url: `ws://127.0.0.1:${address.port}` });
+  try {
+    tts.prewarm?.();
+    await new Promise((resolve) => { setTimeout(resolve, 3600); });
+    assert.equal(connections, 1);
+    let bytes = 0;
+    for await (const chunk of tts.synthesize('在。')) bytes += chunk.length;
+    assert.ok(bytes > 0);
+    assert.equal(connections, 2);
+  } finally {
+    if (prev === undefined) delete process.env['COSYVOICE_PREWARM'];
+    else process.env['COSYVOICE_PREWARM'] = prev;
+    for (const client of wss.clients) client.terminate();
+    await new Promise<void>((resolve) => { wss.close(() => { resolve(); }); });
   }
 });

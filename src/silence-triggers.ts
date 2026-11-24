@@ -36,7 +36,7 @@ export interface SilenceTriggerOptions {
   readonly sttCommitAfterMs?: number;
   /** 静音满这么久就把手上这版中间结果投机出去，不设 = 默认 100 ms，≤0 关闭 */
   readonly speculateMs?: number;
-  /** 静音满这么久就把判停**提前**跑掉，不设 = 默认 200 ms */
+  /** 静音满这么久就把判停**提前**跑掉，不设 = 默认 200 ms，≤0 关闭 */
   readonly silencePauseMs?: number;
   /** 车道起跑：宿主拿去 `omni.seal` */
   readonly onCommit?: (silenceMs: number) => void;
@@ -255,6 +255,7 @@ export class SilenceTriggers {
     if (onPartial === undefined) {
       return;
     }
+    // `undefined` 用默认 100。显式 ≤0 是关闭：0 落进下面的 `< pause` 会立刻触发。
     const pause = this.options.speculateMs ?? 100;
     if (pause <= 0) {
       return;
@@ -303,7 +304,11 @@ export class SilenceTriggers {
     if (!this.host.hasPredictor() || this.host.predictionPending()) {
       return;
     }
+    // `undefined` 用默认 200。显式 ≤0 是关闭：0 落进下面的 `< pause` 会立刻预跑。
     const pause = this.options.silencePauseMs ?? 200;
+    if (pause <= 0) {
+      return;
+    }
     // 只在「这一轮说过话、且还没为这段语音预跑过」时动手
     if (this.lastVoicedAt <= this.preFiredAt || this.lastVoicedAt <= this.host.lastUtteranceAt()) {
       return;

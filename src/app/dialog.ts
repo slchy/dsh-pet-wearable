@@ -535,6 +535,10 @@ export class DialogRuntime {
   ): Promise<void> {
     this.queued += 1;
     this.serialChain = this.serialChain.then(async () => {
+      if (this.disposed || this.core.fsm.state === 'closed') {
+        this.options.log('  （丢弃：连接已关闭，不再开轮）');
+        return;
+      }
       if (this.core.fsm.isStale(ticket)) {
         this.options.log('  （丢弃：用户已插话，这一轮过时了）');
         return;
@@ -620,6 +624,10 @@ export class DialogRuntime {
   private enqueueCapture(request: CaptureRequest, ticket: TurnTicket): void {
     this.queued += 1;
     this.serialChain = this.serialChain.then(async () => {
+      if (this.disposed || this.core.fsm.state === 'closed') {
+        this.options.log('  （丢弃：连接已关闭，不再拍照）');
+        return;
+      }
       if (this.core.fsm.isStale(ticket)) {
         this.options.log('  （丢弃：拍照请求已过时）');
         return;
@@ -728,8 +736,10 @@ export class DialogRuntime {
             call: mic.call,
             awaitMicOpen: mic.awaitMicOpen,
             // 开麦窗口里用户说了一整句就不念了。只看 `sentence`/`utterance`：
-            // 一个语气词的 partial 不值得把汇报再推后一轮
-            shouldSpeak: () => this.lastUserSentenceAt <= mark,
+            // 一个语气词的 partial 不值得把汇报再推后一轮；同时重检未 dispose 且仍在 listening
+            shouldSpeak: () => !this.disposed
+              && this.core.fsm.state === 'listening'
+              && this.lastUserSentenceAt <= mark,
             speak,
           });
           spoke = result.spoke;
@@ -786,6 +796,7 @@ export class DialogRuntime {
     this.announceQueue.length = 0;
     this.announceRetry?.();
     this.announceRetry = null;
+    this.runner.cancelCanned();
     this.photos.dispose();
     // 回执钩子是**进程级 agent 上的一个槽**：只有「我还是当前那条连接」时才摘。
     // 旧连接的 `dispose()` 晚于新连接挂载是弱网重连的常态，无条件摘会把新连接

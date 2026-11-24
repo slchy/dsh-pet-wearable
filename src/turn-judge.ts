@@ -29,6 +29,11 @@ export class TurnJudge {
   /** 串行化：侧车一次只处理一条请求 */
   private chain: Promise<unknown> = Promise.resolve();
   private pending: ((p: number) => void) | null = null;
+  /**
+   * 超时后侧车仍可能补来那一发的 8 字节 `f64`。
+   * 当时 `pending` 已经清掉，这个迟到包必须先丢掉，不能配给下一发。
+   */
+  private discardNext = 0;
 
   constructor(opts: TurnJudgeOptions) {
     this.opts = opts;
@@ -48,6 +53,10 @@ export class TurnJudge {
       while (this.rbuf.length >= 8) {
         const prob = this.rbuf.readDoubleLE(0);
         this.rbuf = this.rbuf.subarray(8);
+        if (this.discardNext > 0) {
+          this.discardNext -= 1;
+          continue;
+        }
         const r = this.pending;
         this.pending = null;
         r?.(prob);
@@ -61,6 +70,9 @@ export class TurnJudge {
     proc.on('exit', (code) => {
       this.log(`[turn-judge] 侧车退出 code=${code}，下次调用会重新拉起`);
       this.proc = null;
+      // 进程没了，迟到的那一发也不会再来。留下的 discard 计数会吞掉新进程的第一包。
+      this.discardNext = 0;
+      this.rbuf = Buffer.alloc(0);
       const r = this.pending;
       this.pending = null;
       r?.(-1);
@@ -86,6 +98,7 @@ export class TurnJudge {
         setTimeout(() => {
           if (this.pending === resolve) {
             this.pending = null;
+            this.discardNext += 1;
             resolve(-1);
           }
         }, 5000).unref?.();

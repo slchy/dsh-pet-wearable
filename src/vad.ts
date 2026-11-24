@@ -48,12 +48,14 @@ export class SileroVad {
 
   reset(o?: typeof ort): void {
     // LSTM 的 h/c 两个状态，[2, batch, 128]
-    const ortRef = o;
-    if (ortRef) {
-      this.state = new ortRef.Tensor('float32', new Float32Array(2 * 1 * 128), [2, 1, 128]);
-    } else {
-      // 没传模块时只清 context，state 等 init 时再建
-      this.state = null;
+    if (o) {
+      this.state = new o.Tensor('float32', new Float32Array(2 * 1 * 128), [2, 1, 128]);
+    } else if (this.state) {
+      // 无参且已经 init：清零复用这块 Tensor。设成 null 的话下一次 process 会抛「尚未 init」。
+      const data = this.state.data;
+      if (data instanceof Float32Array) {
+        data.fill(0);
+      }
     }
     this.context = new Float32Array(CONTEXT);
   }

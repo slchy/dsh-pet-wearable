@@ -222,6 +222,21 @@ function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * 读 `loop_max_ms` / `setup_ms` / `first_ms` / `feed_ms`。
+ *
+ * 缺字段沿用 `previous`（一轮里上一条 task 可能写过）。
+ * `< 0` 是「这段不存在」的哨兵（非流式 `feed_ms = -1`）：收成 `null`，
+ * 既不能进分位数，也不能退回上一条 task 的正数冒充这一条。
+ */
+function durationMs(value: unknown, previous: number | null): number | null {
+  const parsed = num(value);
+  if (parsed === undefined) {
+    return previous;
+  }
+  return parsed < 0 ? null : parsed;
+}
+
 /** 文本预览：超长的截断加省略号。 */
 function preview(value: unknown): string {
   if (typeof value !== 'string' || value === '') {
@@ -274,6 +289,7 @@ export function parseEvents(jsonl: string): ArchiveEvent[] {
       said: obj['said'],
       loop_max_ms: obj['loop_max_ms'],
       setup_ms: obj['setup_ms'],
+      feed_ms: obj['feed_ms'],
       first_ms: obj['first_ms'],
     });
   }
@@ -517,9 +533,9 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     for (let i = at; i < nextAt; i += 1) {
       const ev = events[i];
       if (ev?.ev !== EVENTS.ttsTask) continue;
-      ttsSetup = num(ev.setup_ms) ?? ttsSetup;
-      ttsFeed = num(ev.feed_ms) ?? ttsFeed;
-      ttsSynth = num(ev.first_ms) ?? ttsSynth;
+      ttsSetup = durationMs(ev.setup_ms, ttsSetup);
+      ttsFeed = durationMs(ev.feed_ms, ttsFeed);
+      ttsSynth = durationMs(ev.first_ms, ttsSynth);
     }
     out.push({
       turn: n + 1,
@@ -532,7 +548,7 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       firstWordMs,
       playbackMs,
       agentMs: num(end?.dsh_ms) ?? null,
-      loopMaxMs: num(end?.loop_max_ms) ?? null,
+      loopMaxMs: durationMs(end?.loop_max_ms, null),
       ttsSetupMs: ttsSetup,
       ttsFeedMs: ttsFeed,
       ttsSynthMs: ttsSynth,

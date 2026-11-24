@@ -39,73 +39,85 @@ export interface PlaybackHandle {
   close(): void;
 }
 
+class Playback implements PlaybackHandle {
+  private readonly sampleRate: number;
+  private readonly startDelaySec: number;
+  private readonly running = new Set<AudioBufferSourceNode>();
+  private nextStartAt = 0;
+  private closed = false;
+  /** 已经向页面报过「在说」。`stop()` 与 `onended` 都只在它为真时回报一次空闲。 */
+  private speaking = false;
+
+  constructor(private readonly options: PlaybackOptions) {
+    this.sampleRate = options.sampleRate ?? 24_000;
+    this.startDelaySec = options.startDelaySec ?? 0.04;
+  }
+
+  get busy(): boolean {
+    return this.running.size > 0;
+  }
+
+  push(pcm: Uint8Array): void {
+    if (this.closed || pcm.length < 2) {
+      return;
+    }
+    const { context } = this.options;
+    const samples = pcm.length >> 1;
+    const buffer = context.createBuffer(1, samples, this.sampleRate);
+    const out = buffer.getChannelData(0);
+    const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    for (let i = 0; i < samples; i += 1) {
+      out[i] = view.getInt16(i * 2, true) / 32768;
+    }
+
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+
+    // 服务端下行的块首尾相接，这里只保证不重叠、不留空
+    const startAt = Math.max(context.currentTime + this.startDelaySec, this.nextStartAt);
+    source.start(startAt);
+    this.nextStartAt = startAt + buffer.duration;
+
+    this.running.add(source);
+    if (!this.speaking) {
+      this.speaking = true;
+      this.options.onActivity?.(true);
+    }
+    source.onended = () => {
+      this.running.delete(source);
+      if (this.running.size === 0 && this.speaking) {
+        this.speaking = false;
+        this.options.onActivity?.(false);
+      }
+    };
+  }
+
+  stop(): void {
+    // 先放下旗标再 `source.stop()`：有的实现会同步进 `onended`，
+    // 那时再报一次 false，页面就会看到两次「说完了」。
+    const notify = this.speaking;
+    this.speaking = false;
+    for (const source of this.running) {
+      try {
+        source.stop();
+      } catch {
+        // 还没 start 或已经停过
+      }
+    }
+    this.running.clear();
+    this.nextStartAt = 0;
+    if (notify) {
+      this.options.onActivity?.(false);
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+    this.stop();
+  }
+}
+
 export function createPlayback(options: PlaybackOptions): PlaybackHandle {
-  const { context } = options;
-  const sampleRate = options.sampleRate ?? 24_000;
-  const startDelaySec = options.startDelaySec ?? 0.04;
-
-  const running = new Set<AudioBufferSourceNode>();
-  let nextStartAt = 0;
-  let closed = false;
-
-  return {
-    get busy(): boolean {
-      return running.size > 0;
-    },
-
-    push(pcm: Uint8Array): void {
-      if (closed || pcm.length < 2) {
-        return;
-      }
-      const samples = pcm.length >> 1;
-      const buffer = context.createBuffer(1, samples, sampleRate);
-      const out = buffer.getChannelData(0);
-      const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-      for (let i = 0; i < samples; i += 1) {
-        out[i] = view.getInt16(i * 2, true) / 32768;
-      }
-
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(context.destination);
-
-      // 服务端下行的块首尾相接，这里只保证不重叠、不留空
-      const wasIdle = running.size === 0;
-      const startAt = Math.max(context.currentTime + startDelaySec, nextStartAt);
-      source.start(startAt);
-      nextStartAt = startAt + buffer.duration;
-
-      running.add(source);
-      if (wasIdle) {
-        options.onActivity?.(true);
-      }
-      source.onended = () => {
-        running.delete(source);
-        if (running.size === 0) {
-          options.onActivity?.(false);
-        }
-      };
-    },
-
-    stop(): void {
-      const had = running.size > 0;
-      for (const source of running) {
-        try {
-          source.stop();
-        } catch {
-          // 还没 start 或已经停过
-        }
-      }
-      running.clear();
-      nextStartAt = 0;
-      if (had) {
-        options.onActivity?.(false);
-      }
-    },
-
-    close(): void {
-      closed = true;
-      this.stop();
-    },
-  };
+  return new Playback(options);
 }

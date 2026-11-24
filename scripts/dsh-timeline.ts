@@ -347,11 +347,23 @@ function main(argv: readonly string[]): number {
     console.log('\n=== 每轮的 agent 内部（对应 miai 的 turn.start → tts.first）');
     const dshRows = rows.filter((r) => r.src === 'dsh' && typeof r.ms === 'number');
     const starts = ourEvents.filter((e) => e.ev === EVENTS.turnStart);
-    const firsts = ourEvents.filter((e) => e.ev === EVENTS.ttsFirst);
     console.log(`${'轮'.padStart(3)}  ${'agent 段'.padStart(10)}  ${'步数'.padStart(4)}  ${'工具'.padStart(4)}  工具名`);
     for (let i = 0; i < starts.length; i += 1) {
       const from = starts[i]?.t ?? 0;
-      const to = firsts[i]?.t ?? from;
+      const nextStart = starts[i + 1]?.t;
+      // ③ 只配对落在本轮 [turn.start, 下一轮 turn.start) 里的 tts.first。
+      // 用全局下标 firsts[i] 会把「这一轮没有首块、下一轮有」错配到这一轮上。
+      let to = from;
+      for (const event of ourEvents) {
+        if (event.ev !== EVENTS.ttsFirst || event.t < from) {
+          continue;
+        }
+        if (nextStart !== undefined && event.t >= nextStart) {
+          continue;
+        }
+        to = event.t;
+        break;
+      }
       const inside = dshRows.filter((r) => r.ms >= from && r.ms <= to);
       const steps = inside.filter((r) => r.label === 'step/start').length;
       const tools = inside.filter((r) => r.label.startsWith('tool '));

@@ -48,7 +48,7 @@
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
-| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1130` | 无关首声（不在停嘴→出声路径上） | — |
+| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1169` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_SPECULATE` | 1 | —（开关） | `src/main.ts:1066` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PARTIAL_SPECULATE` | 1 | —（开关） | `src/main.ts:1084` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PREFETCH` | 1 | —（开关） | `src/main.ts:1137` | 无关首声（不在停嘴→出声路径上） | — |
@@ -63,19 +63,19 @@
 | `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:53` | 无关首声（不在停嘴→出声路径上） | — |
 | `CLOCK_MISMATCH_MS` | 1e9 | —（判据） | `src/barge-voicing.ts:52` | 无（纯判据：只用来发现两把时钟接错，不放慢任何东西） | — |
-| `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:250` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
-| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:379` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
+| `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:253` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
+| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:390` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `TRUNCATED_EPSILON_MS` | 300 | —（判据） | `src/engine-contract.ts:139` | 无（纯判据：轮末判「用户少听了没有」，不产生任何等待） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:72` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:73` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_KEEPALIVE_MS` | 50000 | wall（连接空闲） | `src/http-agent.ts:27` | 无关首声（不在停嘴→出声路径上） | — |
 | `WAITED_THRESHOLD_MS` | 100 | —（统计判据） | `src/latency-report.ts:185` | 无（报告分组门槛，不参与调度） | — |
-| `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:598` | 无（它是报警线，不约束任何环节） | — |
-| `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:601` | 无（报告里的「慢轮」门槛） | — |
+| `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:614` | 无（它是报警线，不约束任何环节） | — |
+| `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:617` | 无（报告里的「慢轮」门槛） | — |
 | `RESOLUTION_MS` | 25 | wall | `src/loop-lag.ts:29` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio | `src/main.ts:429` | 无关首声（不在停嘴→出声路径上） | — |
-| `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:113` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
+| `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:120` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
 | `DEFAULT_CAPTURE_TIMEOUT_MS` | 20000 | wall | `src/photo-inbox.ts:38` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_CONFIRM_TIMEOUT_MS` | 40000 | wall | `src/photo-inbox.ts:45` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_TIMEOUT_MS` | 400 | wall | `src/semantic-endpoint.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
@@ -89,8 +89,8 @@
 | `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:131` | ASR 出句之前 | — |
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:140` | 无关首声（不在停嘴→出声路径上） | — |
 | `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:151` | 无关首声（不在停嘴→出声路径上） | — |
-| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:198` | 判停侧车输入预处理（不额外等） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:527` | 无关首声（不在停嘴→出声路径上） | — |
+| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:269` | 判停侧车输入预处理（不额外等） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:598` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 四、还没标注的
 

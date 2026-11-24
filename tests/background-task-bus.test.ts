@@ -210,6 +210,37 @@ test('同一轮 early_rule 接着 tool_call 只执行一次，还在排队就升
   assert.equal(must(reports[1], 'second report').query, '更全的问法');
 });
 
+test('空闲总线直接收到 tool_call 时执行改写查询；开跑后不能再改', async () => {
+  const held = holdRunner();
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: () => {},
+  });
+  const rewritten = '改写后的问题\n用户原话：「原话」';
+  const idle = bus.dispatch({
+    query: rewritten,
+    source: 'tool_call',
+    turnNo: 3,
+  });
+  assert.equal(idle.deduplicated, false);
+  assert.equal(idle.state(), 'queued');
+  await flush();
+  assert.equal(must(held.calls[0], 'idle').query, rewritten);
+  assert.equal(idle.state(), 'running');
+
+  const late = bus.dispatch({
+    query: '开跑之后不该覆盖',
+    source: 'tool_call',
+    turnNo: 3,
+  });
+  assert.equal(late.deduplicated, true);
+  assert.equal(late.taskId, idle.taskId);
+  assert.equal(must(held.calls[0], '仍是改写').query, rewritten);
+  must(held.pending[0], 'slot').resolve({ text: '好' });
+  await flush();
+  assert.equal(held.calls.length, 1);
+});
+
 test('静默任务不参与 turnNo 去重', async () => {
   const held = holdRunner();
   const bus = new BackgroundTaskBus({

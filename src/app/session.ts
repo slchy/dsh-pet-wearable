@@ -80,7 +80,8 @@ export class AppSession {
   /**
    * **话筒的唯一真相**（ADR-0001 §6）。应用层持有，宠物通过 `pet.floor` 读同一个实例。
    *
-   * 谁占着 → `floor.owner`；要是空着 → `null`。没有任何第二份「现在谁在说话」的状态。
+   * 谁占着 → `floor.owner`；要是空着 → `null`。宠物环里的 `floorOwner` 只是这份真相的投影：
+   * 对话、播报、宠物每申请或释放一次，都要把 `{ busy, owner }` 同步过去。
    */
   readonly floor: FloorArbiter;
 
@@ -257,6 +258,8 @@ export class AppSession {
     }
     this.closed = true;
     this.stopHeartbeat();
+    // 宠物在的时候由它同步收口：清同一个仲裁器、把 `closed` 记进大脑、当场 `listen.stop`。
+    // 这里再 `clear` 一次，覆盖没装宠物的配置。
     this.pet?.close();
     this.floor.clear();
   }
@@ -264,6 +267,8 @@ export class AppSession {
   dispose(): void {
     this.closed = true;
     this.stopHeartbeat();
+    // 吸收态在 `PetSession.dispose` 里同步置上。麦若还开着，那里会先停再拆，
+    // 不把 `listen.stop` 留到微任务。
     this.pet?.dispose();
     this.dialog?.dispose();
     this.floor.clear();

@@ -153,7 +153,14 @@ export class PetSession {
       device: options.device,
       agent: options.agent,
       floor: this.floor,
+      isLive: (engagementId) => this.state.engagement?.id === engagementId,
       report: (input) => {
+        if (input.kind === 'floor') {
+          // 抢麦失败时归属往往没变，但大脑必须再看一次，否则 floorTaken 没有输入。
+          const force = input.busy && input.owner !== 'pet';
+          this.publishFloor(force);
+          return;
+        }
         this.enqueue({ ...input, ...this.stamp() } as PetInput);
       },
       onOutcome: (record, dismiss) => {
@@ -214,13 +221,25 @@ export class PetSession {
     this.enqueue({ kind: 'micOpened', ...this.stamp() });
   }
 
-  /** 连接关闭：有 engagement 就记 `aborted`。 */
+  /**
+   * 连接关闭：有 engagement 就记 `aborted`。
+   *
+   * 顺序是同步的：先封执行器，再清话筒，再把 `closed` 送进大脑，
+   * 然后立刻对活跃麦发 `listen.stop`。关麦不能等 `end` 的微任务 ——
+   * 紧接着的 `dispose()` 会先清掉 `micOpenFor`。
+   */
   close(): void {
     if (this.closed) {
       return;
     }
+    const hadEngagement = this.state.engagement !== null;
+    this.executor.seal();
+    this.floor.clear();
     this.closed = true;
     this.enqueue({ kind: 'closed', ...this.stamp() });
+    if (hadEngagement) {
+      this.executor.stopOpenMic();
+    }
   }
 
   // ---------------------------------------------------------------- 话筒
@@ -231,11 +250,8 @@ export class PetSession {
    * @returns 是否拿到；拿不到调用方自行降级
    */
   acquireFloor(owner: FloorOwner): boolean {
-    const before = this.floor.owner;
     const ok = this.floor.acquire(owner);
-    if (ok && this.floor.owner !== before) {
-      this.enqueue({ kind: 'floor', busy: true, owner: this.floor.owner, ...this.stamp() });
-    }
+    this.publishFloor(false);
     return ok;
   }
 
@@ -244,24 +260,18 @@ export class PetSession {
    * 宠物环 —— 否则宠物看到的 `floorBusy` 会停在旧值上。
    */
   handoffFloor(from: FloorOwner, to: FloorOwner): boolean {
-    const before = this.floor.owner;
     if (!this.floor.handoff(from, to)) {
       return false;
     }
-    if (this.floor.owner !== before) {
-      this.enqueue({ kind: 'floor', busy: true, owner: this.floor.owner, ...this.stamp() });
-    }
+    this.publishFloor(false);
     return true;
   }
 
   releaseFloor(owner: FloorOwner): void {
-    const before = this.floor.owner;
     if (!this.floor.release(owner)) {
       return;
     }
-    if (this.floor.owner !== before) {
-      this.enqueue({ kind: 'floor', busy: this.floor.busy, owner: this.floor.owner, ...this.stamp() });
-    }
+    this.publishFloor(false);
   }
 
   // ---------------------------------------------------------------- 观测
@@ -291,16 +301,49 @@ export class PetSession {
     });
   }
 
-  /** 收尾：丢掉在途动作。**不**产生结局（关闭时会由 `close()` 产生）。 */
+  /**
+   * 收尾：丢掉在途动作。**不**产生结局（关闭时会由 `close()` 产生）。
+   *
+   * `closed` 在这里同步置上，作为吸收态。还开着的麦先停掉，话筒投影先对齐，
+   * 然后再拆执行器 —— 拆的过程里再报上来的结果会被吸收态丢掉。
+   */
   dispose(): void {
+    if (!this.closed && this.state.engagement !== null) {
+      this.executor.stopOpenMic();
+    }
+    if (!this.closed) {
+      this.floor.clear();
+      this.publishFloor(false);
+    }
+    this.closed = true;
     this.executor.dispose();
-    this.floor.clear();
   }
 
   // ---------------------------------------------------------------- 内部
 
   private stamp(): { now: number; localHour: number } {
     return { now: this.options.clock.now(), localHour: this.options.clock.localHour() };
+  }
+
+  /**
+   * 把仲裁器的当前归属写进大脑。
+   *
+   * 仲裁器是话筒的唯一真相，`PetWorld.floorOwner` 只是投影。归属没变且不是
+   * 「抢麦失败」时不入队，避免把同一次占用再报成 `floorTaken`。
+   *
+   * @param force 抢麦失败：即使投影已经一致，也要再送一次让状态机决断
+   */
+  private publishFloor(force: boolean): void {
+    if (this.closed) {
+      return;
+    }
+    const busy = this.floor.busy;
+    const owner = this.floor.owner;
+    const same = this.state.world.floorBusy === busy && this.state.world.floorOwner === owner;
+    if (same && !force) {
+      return;
+    }
+    this.enqueue({ kind: 'floor', busy, owner, ...this.stamp() });
   }
 
   /** 当前处在哪个阶段，或「闲置」。日志里带上它，才知道这句话是在什么状态下判的。 */
@@ -343,7 +386,7 @@ export class PetSession {
           this.options.log?.(`宠物 ·  心跳后仍不出声${this.phaseNote()}`);
         }
         for (const intent of result.intents) {
-          this.options.onEvent?.('pet.out', intent as unknown as Record<string, unknown>);
+          this.options.onEvent?.(EVENTS.petOut, intent as unknown as Record<string, unknown>);
           this.options.log?.(`宠物 → ${describePetIntent(intent)}`);
           this.inFlight += 1;
           // 推到微任务里执行：执行器绝不能重入 pump，否则它会在同一条输入里
@@ -377,7 +420,7 @@ export class PetSession {
   }
 
   private emitOutcome(record: PetOutcomeRecord, dismiss: boolean): void {
-    this.options.onEvent?.('pet.outcome', { ...record, dismiss });
+    this.options.onEvent?.(EVENTS.petOutcome, { ...record, dismiss });
     this.options.log?.(`主动开口结束（${record.reason}/${record.outcome}，${record.phase}）`);
   }
 }

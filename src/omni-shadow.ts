@@ -586,30 +586,7 @@ export class OmniShadow {
   }
 
   stop(): void {
-    this.clearTimers();
-    const ws = this.ws;
-    this.ws = null;
-    this.opened = false;
-    this.state = 'broken';
-    this.claimReserved = false;
-    const resp = this.resp;
-    this.resp = null;
-    this.claimedResp = null;
-    if (resp !== null) {
-      resp.closed = true;
-      this.wakeAudio(resp);
-    }
-    // 生成期攒的音频属于这条连接，别漏进下一场
-    this.held = [];
-    this.heldBytes = 0;
-    this.wakeLive();
-    if (ws !== null) {
-      try {
-        ws.close();
-      } catch {
-        // 已经断了
-      }
-    }
+    this.teardown('stop', false);
   }
 
   // ---------------------------------------------------------------- 音频与封段
@@ -767,6 +744,7 @@ export class OmniShadow {
    * 砍掉：并段轮的回答质量与单段轮 5/5 无差别（`tmp/omni-probe/barge-in.cjs`）。
    */
   willServe(): boolean {
+    if (this.state !== 'ready' && this.state !== 'busy') return false;
     if ((this.opts.serve ?? 'off') === 'off') {
       return false;
     }
@@ -947,6 +925,7 @@ export class OmniShadow {
    * 服务端回 `Conversation already has an active response` 并且那一次 create 永久丢失。
    */
   canSpeakBackground(): boolean {
+    if (this.state !== 'ready' && this.state !== 'busy') return false;
     if ((this.opts.serve ?? 'off') === 'off') {
       return false;
     }
@@ -964,6 +943,7 @@ export class OmniShadow {
    * 未传 `serve` 与 `'off'` 一样，只测不发声。
    */
   canAnswerText(): boolean {
+    if (this.state !== 'ready' && this.state !== 'busy') return false;
     if ((this.opts.serve ?? 'off') === 'off') {
       return false;
     }
@@ -1183,19 +1163,20 @@ export class OmniShadow {
         + `但那段回答没能说给用户听，用户并不知道内容。回答是：${answer}）`
       : `（系统旁注：用户刚才问的「${question}」，你已经用语音把下面这段念给他了：`
         + `${answer}）`;
+    // 计数发生在「确实会进这条连接的队列」之后。broken 或 socket 还没 open
+    // 时一个字都发不出去，提前 +1 会让档案里的 injects_sent 对不上实际旁注。
+    // connecting 且已经 open 仍然排队：session.updated 自己不刷，等回到 ready。
+    if (this.state === 'broken' || this.ws === null || !this.opened) {
+      if (this.state === 'broken') {
+        this.log('[omni] 回注丢弃：车道已断');
+      }
+      return;
+    }
     this.injectsSent += 1;
     this.log(
       `[omni] 回注 ${[...answer].length} 字（${kind === 'unspoken' ? '没念出去' : '已播完'}）`
       + `：${answer.slice(0, 20)}${[...answer].length > 20 ? '…' : ''}`,
     );
-    if (this.state === 'broken' || this.state === 'idle') {
-      // **不能扔**：`idle` 只是「还没封过段」，下一次 `finish()` 就会把队列刷出去。
-      // 原来是直接丢，于是「连接刚建好、第一轮就被委派」这种情况下永远补不进记忆。
-      if (this.state === 'broken') {
-        this.log('[omni] 回注丢弃：车道已断');
-        return;
-      }
-    }
     if (this.injects.length >= MAX_PENDING_INJECTS) {
       this.injects.shift();
       this.log('[omni] 回注队列满，丢掉最早的一条');
@@ -1723,7 +1704,13 @@ export class OmniShadow {
     this.opts.emit({ seq, skipped: why, local_port: this.localPort });
   }
 
-  private break(reason: string): void {
+  /**
+   * `stop()` 与 `break()` 的唯一收口。
+   *
+   * `broken` 是吸收态：再进来直接返回，避免第二次 close 把已经换掉的状态又搅一遍。
+   * `emitSkipped` 只属于故障路径（断线、超时、协议错误）。主动 `stop()` 不写档案。
+   */
+  private teardown(reason: string, emitSkipped: boolean): void {
     if (this.state === 'broken') {
       return;
     }
@@ -1732,17 +1719,17 @@ export class OmniShadow {
     this.ws = null;
     this.opened = false;
     this.state = 'broken';
-    // 读端不能挂在 await 上等一个永远不会来的块
     const resp = this.resp;
     this.resp = null;
-    if (resp !== null) {
-      resp.closed = true;
-      this.wakeAudio(resp);
-    }
+    this.pending = null;
     this.claimReserved = false;
     this.claimedResp = null;
     this.held = [];
     this.heldBytes = 0;
+    if (resp !== null) {
+      resp.closed = true;
+    }
+    this.wakeAudio(resp);
     this.wakeLive();
     if (ws !== null) {
       try {
@@ -1751,9 +1738,16 @@ export class OmniShadow {
         // 已经断了
       }
     }
+    if (!emitSkipped) {
+      return;
+    }
     this.log(`[omni] 影子停用：${reason}`);
     // 落一条可见记录：档案里能看出「从这里开始没有 omni 数据」
     this.opts.emit({ seq: null, skipped: 'broken', why: reason.slice(0, 120) });
+  }
+
+  private break(reason: string): void {
+    this.teardown(reason, true);
   }
 
   private armConnectTimeout(): void {

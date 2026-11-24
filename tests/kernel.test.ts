@@ -706,3 +706,82 @@ test('幂等重述的结算照抄车道与时刻，与新算的那次一字不�
   assert.equal(settles.length, 2);
   assert.deepEqual(settles[1], settles[0], '第二次必须是第一次的原样重述（含 lane / endedAtMs）');
 });
+
+// ---------------------------------------------------------------- 回执票据 + turnEnded 不写相位
+
+test('beginTurn 无条件清 receiptOnly；不带票据的回执进出仍然可用', () => {
+  const fsm = new DialogFsm(() => {});
+  const first = fsm.beginTurn();
+  assert.ok(first);
+  assert.equal(fsm.receiptStarted(), true, '无参口径：thinking 里可以出回执');
+  assert.equal(fsm.speakingIsReceiptOnly, true);
+  const second = fsm.beginTurn();
+  assert.ok(second);
+  assert.equal(fsm.state, 'thinking');
+  assert.equal(fsm.speakingIsReceiptOnly, false, '新轮必须清掉上一轮的 receiptOnly');
+  assert.notEqual(second.no, first.no);
+});
+
+test('带票据的 receiptStarted / receiptEnded：过期票是空操作', () => {
+  const fsm = new DialogFsm(() => {});
+  const t1 = fsm.beginTurn();
+  assert.ok(t1);
+  const t2 = fsm.beginTurn();
+  assert.ok(t2);
+  assert.equal(fsm.receiptStarted(t1), false, '上一轮的票不能把新轮推进 speaking');
+  assert.equal(fsm.state, 'thinking');
+  assert.equal(fsm.receiptStarted(t2), true);
+  assert.equal(fsm.state, 'speaking');
+  assert.equal(fsm.speakingIsReceiptOnly, true);
+
+  fsm.receiptEnded(t1);
+  assert.equal(fsm.state, 'speaking', '过期 receiptEnded 不得把当前回执打回 thinking');
+  assert.equal(fsm.speakingIsReceiptOnly, true);
+  assert.equal(fsm.turn, t2.no);
+
+  fsm.receiptEnded(t2);
+  assert.equal(fsm.state, 'thinking');
+  assert.equal(fsm.speakingIsReceiptOnly, false);
+});
+
+test('turnEnded 只结算播放区与账本，不改相位、endAfterSpeech、receiptOnly', () => {
+  const ending = reduceKernel(initialKernelState(), [
+    { type: 'beginTurn', atMs: 0 },
+    { type: 'audioStarted', ticket: ticket(1, 0) },
+    { type: 'requestEnd' },
+    { type: 'audioDone', ticket: ticket(1, 0) },
+  ]).state;
+  assert.equal(ending.dialog.phase, 'ending');
+  assert.equal(ending.dialog.endAfterSpeech, true);
+  const [afterEnding, endingEffects] = step(ending, {
+    type: 'turnEnded',
+    ticket: ticket(1, 0),
+    atMs: 100,
+  });
+  assert.equal(afterEnding.dialog.phase, 'ending', '不得把 ending 打回 listening');
+  assert.equal(afterEnding.dialog.endAfterSpeech, true);
+  assert.equal(afterEnding.dialog.receiptOnly, false);
+  assert.equal(afterEnding.playback.ticket, null, '播放区仍然要结清');
+  assert.equal(endingEffects.some((effect) => effect.type === 'settleTurn'), true);
+
+  const receipt = reduceKernel(initialKernelState(), [
+    { type: 'beginTurn', atMs: 0 },
+    { type: 'receiptStarted' },
+    { type: 'requestEnd' },
+  ]).state;
+  assert.equal(receipt.dialog.phase, 'speaking');
+  assert.equal(receipt.dialog.receiptOnly, true);
+  assert.equal(receipt.dialog.endAfterSpeech, true);
+  const [afterReceipt] = step(receipt, {
+    type: 'turnEnded',
+    ticket: ticket(1, 0),
+    atMs: 50,
+  });
+  assert.equal(afterReceipt.dialog.phase, 'speaking');
+  assert.equal(afterReceipt.dialog.receiptOnly, true, 'turnEnded 不得清 receiptOnly，也不得留下 listening+receiptOnly');
+  assert.equal(afterReceipt.dialog.endAfterSpeech, true);
+
+  const [left] = step(afterReceipt, { type: 'audioDone', ticket: ticket(1, 0) });
+  assert.equal(left.dialog.phase, 'ending', 'audioDone 才是离开 speaking 的入口，回执期也要能走到 ending');
+  assert.equal(left.dialog.receiptOnly, false);
+});

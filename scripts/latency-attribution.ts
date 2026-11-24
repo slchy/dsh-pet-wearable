@@ -26,7 +26,14 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { isMainModule } from '../src/main.ts';
-import { computeTurns, parseEvents, percentile, type ArchiveEvent, type TurnLatency } from '../src/latency-report.ts';
+import {
+  FIRST_WORD_BUDGET_MS,
+  computeTurns,
+  parseEvents,
+  percentile,
+  type ArchiveEvent,
+  type TurnLatency,
+} from '../src/latency-report.ts';
 
 type Seg = 'silenceToAsr' | 'asrToTurn' | 'turnToAudio';
 
@@ -116,7 +123,7 @@ function verbatimField(event: ArchiveEvent): boolean {
 
 /**
  * 委派轮：某次 `turn.start` 对应的 `turn.end`（下一次 `turn.start` 之前）带有
- * `delegate` 字符串。边界与本文件里「按路径拆」取 `path` 的方式相同。
+ * `delegate` 字符串。时间窗与 `computeTurns` 相同；`path` 本身不在这里重算。
  */
 function collectDelegatedTurns(events: readonly ArchiveEvent[]): DelegatedTurn[] {
   const startTimes: number[] = [];
@@ -304,16 +311,6 @@ function overlayLiveFields(jsonl: string, events: readonly ArchiveEvent[]): Arch
 export function formatAttribution(events: readonly ArchiveEvent[], label: string): string {
   const turns = computeTurns(events);
 
-  // 每轮走的哪条（`turn.end.path`）。必须按**顺序**对齐：`computeTurns` 按 `turn.start`
-  // 出现顺序编号，这边照同一顺序取「该 turn.start 之后第一个 turn.end」。
-  const startTimes = events.filter((e) => e.ev === 'turn.start').map((e) => e.t);
-  const paths: (string | null)[] = startTimes.map((t, i) => {
-    const next = startTimes[i + 1] ?? Number.POSITIVE_INFINITY;
-    const end = events.find((e) => e.ev === 'turn.end' && e.t > t && e.t < next);
-    const value = end?.path;
-    return typeof value === 'string' ? value : null;
-  });
-
   const lines: string[] = [`# ${label}（${turns.length} 轮）`, ''];
 
   // ---- 1. 每段自己的分布 ----
@@ -383,7 +380,7 @@ export function formatAttribution(events: readonly ArchiveEvent[], label: string
     if (typeof value !== 'number' || !Number.isFinite(value)) {
       continue;
     }
-    const path = paths[turn.turn - 1] ?? '（未记 path）';
+    const path = turn.path ?? '（未记 path）';
     const list = byPath.get(path) ?? [];
     list.push(value);
     byPath.set(path, list);
@@ -397,7 +394,7 @@ export function formatAttribution(events: readonly ArchiveEvent[], label: string
     const sorted = [...values].sort((a, b) => a - b);
     lines.push(`- **${path}**：${describe(values)}  取值 ${sorted.join(' / ')}`);
     if (p50 !== null && p90 !== null) {
-      lines.push(`  → p50 ${Math.round(p50)} / p90 ${Math.round(p90)}（预算 1200）`);
+      lines.push(`  → p50 ${Math.round(p50)} / p90 ${Math.round(p90)}（预算 ${FIRST_WORD_BUDGET_MS}）`);
     }
   }
   lines.push('');
@@ -442,11 +439,10 @@ export function formatAttribution(events: readonly ArchiveEvent[], label: string
   lines.push('');
 
   // ---- 4. 慢轮清单：超过预算的轮次逐条摊开 ----
-  const BUDGET = 1200;
   const slow = turns
-    .filter((t) => typeof t.firstWordMs === 'number' && t.firstWordMs > BUDGET)
+    .filter((t) => typeof t.firstWordMs === 'number' && t.firstWordMs > FIRST_WORD_BUDGET_MS)
     .sort((a, b) => (b.firstWordMs ?? 0) - (a.firstWordMs ?? 0));
-  lines.push(`## 超预算轮次（> ${BUDGET} ms，共 ${slow.length}/${turns.length}）`);
+  lines.push(`## 超预算轮次（> ${FIRST_WORD_BUDGET_MS} ms，共 ${slow.length}/${turns.length}）`);
   for (const turn of slow) {
     const segs = segmentsOf(turn);
     const top = [...segs].sort((a, b) => b.value - a.value)[0];

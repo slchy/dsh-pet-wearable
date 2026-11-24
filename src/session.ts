@@ -191,6 +191,11 @@ export interface SupersededEntry {
   readonly dir: string;
 }
 
+/** 比较路径时把 Windows 的 `\` 收成 `/`，并去掉末尾斜杠。 */
+function normalizeSlashes(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
 /**
  * 分拣「该删的」和「该留的」。
  *
@@ -206,6 +211,9 @@ export function splitSuperseded(
   const drop: SupersededEntry[] = [];
   const keep: SupersededEntry[] = [];
   let bad = 0;
+  // Windows 上 `join` 出来的是反斜杠。先收成 `/` 再比前缀和末段，
+  // 否则每一条都会被当成坏记录，过期会话永远删不掉。
+  const root = normalizeSlashes(sessionsRoot);
   for (const raw of entries) {
     if (!raw || typeof raw !== 'object') { bad += 1; continue; }
     const e = raw as Record<string, unknown>;
@@ -213,8 +221,12 @@ export function splitSuperseded(
     const at = typeof e['at'] === 'number' && Number.isFinite(e['at']) ? e['at'] : 0;
     const dir = typeof e['dir'] === 'string' ? e['dir'] : '';
     if (id === '' || at <= 0 || dir === '') { bad += 1; continue; }
-    // 只认 dsh sessions 根下、目录名正好是 id 的那一层
-    if (!dir.startsWith(`${sessionsRoot}/`) || dir.split('/').pop() !== id) { bad += 1; continue; }
+    const dirNorm = normalizeSlashes(dir);
+    // 只认 dsh sessions 根下、目录名正好是 id 的那一层。落盘仍用原路径。
+    if (root === '' || !dirNorm.startsWith(`${root}/`) || dirNorm.split('/').pop() !== id) {
+      bad += 1;
+      continue;
+    }
     if (now - at >= ttl) drop.push({ id, at, dir });
     else keep.push({ id, at, dir });
   }
@@ -344,6 +356,17 @@ export function parseEvents(stdout: string): {
   return { sessionId, final, streamed, usage };
 }
 
+/**
+ * 主会话一轮的相位。`askSdk` 的 `finally` 只按它归位：
+ * `session/prompt` 抛错时不能把 `onIdle` 留在槽上，否则 `isBusy()` 永远为真。
+ *
+ * - `idle`：没有在等的主轮，也没有放手后还在跑的委派轮
+ * - `prompting_rpc`：正在等 `session/prompt` 的响应
+ * - `awaiting_idle`：prompt 已被接受，在等这条主会话的 `idle`
+ * - `detached_running`：调用方已经放手，dsh 那一轮还在跑
+ */
+export type DshTurnPhase = 'idle' | 'prompting_rpc' | 'awaiting_idle' | 'detached_running';
+
 export class DshSession {
   private readonly program: string;
   private readonly workDir: string;
@@ -357,6 +380,13 @@ export class DshSession {
 
   // ---------------------------------------------------------------- sdk 常驻态
   private proc: ChildProcess | null = null;
+  /**
+   * 常驻进程的代次。每次 spawn 加一。
+   *
+   * `close` / `error` / `stop()` 的 2s 强杀都抓住自己那一代：旧进程晚到的退出
+   * 不能 reject 新进程的 pending，也不能写新进程的 `exitError`，更不能把新进程杀掉。
+   */
+  private procGen = 0;
   private buf = '';
   private nextId = 1;
   private readonly pending = new Map<
@@ -392,6 +422,8 @@ export class DshSession {
   private readonly handshaking = new SingleFlight<void>();
   /** 当前在途那一轮的票据（`null` = 还没开始 / 已经结束）；取消时按它丢过期票据 */
   private activeTicket: TurnTicket | null = null;
+  /** 主轮相位。`isBusy()` 只看它，不再靠「`onIdle` 有没有被清掉」来猜。 */
+  private turnPhase: DshTurnPhase = 'idle';
   /** 轮次串行队列的尾巴（`ask` 排队用，见 `ask` 的注释） */
   private turns: Promise<void> = Promise.resolve();
   /** 当前在途那一轮是不是**被我们主动取消**的（是的话收成空答复，不抛错） */
@@ -596,11 +628,10 @@ export class DshSession {
     if (this.proc === null || sessionId === null || (waiter === null && !this.detached)) {
       return;
     }
-    // **按代次丢弃迟到的取消**：只有「当前在途那一轮」的票据才允许取消。
-    // 没有这道检查时，快模型比 dsh 慢就会把取消打到下一轮头上（实测打死过 harness）。
-    const active = this.activeTicket;
-    if (ticket !== undefined && active !== null
-      && (ticket.no !== active.no || ticket.gen !== active.gen)) {
+    // **有票据就必须对上当前在途轮**。`activeTicket === null`（这一轮已经收尾，
+    // 或还没臂上）也直接丢掉 —— 过期票据不能在「没人认领」的窗口里放行。
+    // 不带票据的是显式人工取消，仍然放行。
+    if (ticket !== undefined && !this.ticketMatches(ticket)) {
       this.log(`  取消    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
       return;
     }
@@ -632,8 +663,22 @@ export class DshSession {
       this.detachedTurn = null;
       this.detachedText = '';
       this.detachedUserText = '';
+      if (this.turnPhase === 'detached_running') {
+        this.turnPhase = 'idle';
+      }
       this.log('  取消    放手的委派轮也一起取消（用户显式说了不要）');
     }
+  }
+
+  /**
+   * 传入的票据是不是「当前正在臂上的那一轮」。
+   *
+   * `activeTicket === null` 时一律不是：轮次已经收尾（或还没写上票据），
+   * 过期票据不能靠这个空窗放行。
+   */
+  private ticketMatches(ticket: TurnTicket): boolean {
+    const active = this.activeTicket;
+    return active !== null && ticket.no === active.no && ticket.gen === active.gen;
   }
 
   /**
@@ -641,9 +686,12 @@ export class DshSession {
    *
    * 用户说「算了 / 别查了」时要据此决定是否真的发取消 —— 没有在跑的东西，那就是
    * 一句普通闲聊，别去打扰 dsh。
+   *
+   * 只看相位：`prompting_rpc` / `awaiting_idle` / `detached_running` 才算忙。
+   * `session/prompt` 抛错时 `finally` 会把相位归回 `idle`，不会永锁。
    */
   isBusy(): boolean {
-    return this.proc !== null && (this.onIdle !== null || this.detached);
+    return this.proc !== null && this.turnPhase !== 'idle';
   }
 
   /**
@@ -678,14 +726,13 @@ export class DshSession {
    * `onAnnounce` —— 与「后台任务结算」同一口播报，用户照样能听到答案。
    *
    * 票据按代次校验，规则与 `cancelTurn` 一致：迟到的放手不能摘掉下一轮的等待者。
+   * 带了票据而 `activeTicket === null` 时同样丢掉，不能把「已经没人等」当成放行。
    */
   detachTurn(ticket?: TurnTicket): void {
     if (this.proc === null) {
       return;
     }
-    const active = this.activeTicket;
-    if (ticket !== undefined && active !== null
-      && (ticket.no !== active.no || ticket.gen !== active.gen)) {
+    if (ticket !== undefined && !this.ticketMatches(ticket)) {
       this.log(`  放手    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
       return;
     }
@@ -715,7 +762,7 @@ export class DshSession {
     if (type !== 'turn/start' && type !== 'turn/end') {
       return;
     }
-    if (sessionId !== '' && this.openSessionId !== null && sessionId !== this.openSessionId) {
+    if (!this.isMainSession(sessionId)) {
       return;
     }
     const data = e['data'] as Record<string, unknown> | undefined;
@@ -735,6 +782,10 @@ export class DshSession {
     }
     this.detached = false;
     this.detachedTurn = null;
+    // 新一轮如果已经臂上（`prompting_rpc` / `awaiting_idle`），别把它的相位打回 idle。
+    if (this.turnPhase === 'detached_running') {
+      this.turnPhase = 'idle';
+    }
     // 同一轮的 idle 紧跟着就来，它属于这一轮（不是新一轮的）
     this.swallowNextIdle = true;
     const text = (this.detachedText || this.assistantText).trim();
@@ -804,9 +855,11 @@ export class DshSession {
   stop(): void {
     const proc = this.proc;
     if (!proc) return;
+    const myGen = this.procGen;
     this.proc = null;
     this.sdkReady = false;
     this.openSessionId = null;
+    this.turnPhase = 'idle';
     try {
       proc.stdin?.write(
         `${JSON.stringify({ jsonrpc: '2.0', id: this.nextId++, method: 'shutdown', params: {} })}\n`,
@@ -814,8 +867,10 @@ export class DshSession {
     } catch {
       // 已经退了
     }
-    // 给 shutdown 一点时间优雅退出，超时就强杀
+    // 给 shutdown 一点时间优雅退出，超时就强杀。
+    // 代次已经往前走（新的 spawn 起来了）就绝不能再杀：定时器抓住的是这一代。
     setTimeout(() => {
+      if (myGen !== this.procGen) return;
       try {
         proc.kill();
       } catch {
@@ -869,37 +924,48 @@ export class DshSession {
     this.turnStartedAt = started;
     this.firstTokenMs = null;
     this.exitError = null;
+    // 自发轮还没收尾时，它的 idle 不带轮号。先记一笔，在下一条 turn/start
+    // 之前吃掉（`turn/start` 里会清这个标记），免得它把本轮的等待者提前叫醒。
+    // 放在臂 `onIdle` 之前、且中间没有 await：idle 不可能插进这个窗口。
+    if (this.spontaneous.isActive) {
+      this.swallowNextIdle = true;
+    }
     // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
     this.spontaneous.reset();
-    // 记下这一轮的票据：`cancelTurn(ticket)` 靠它丢弃迟到的取消
-    this.activeTicket = ticket ?? null;
-    this.activeUserText = text;
-    this.cancelRequested = false;
-    const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
 
-    await this.rpc('session/prompt', {
-      sessionId,
-      contentBlocks: image
-        ? [
-            { type: 'text', text },
-            { type: 'image', mimeType: image.mimeType, data: image.data },
-          ]
-        : [{ type: 'text', text }],
-    });
-
+    // 从写票据 / 等待者 / 相位之前就进 try：`session/prompt` 抛错也要走 finally，
+    // 否则 `onIdle` 留下，`isBusy()` 永远为真。
     let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new DshError(`等待 turn 结束超时（${this.timeoutMs} ms）`)),
-        this.timeoutMs,
-      );
-    });
     try {
+      this.turnPhase = 'prompting_rpc';
+      this.activeTicket = ticket ?? null;
+      this.activeUserText = text;
+      this.cancelRequested = false;
+      const idle = new Promise<void>((resolve) => { this.onIdle = resolve; });
+
+      await this.rpc('session/prompt', {
+        sessionId,
+        contentBlocks: image
+          ? [
+              { type: 'text', text },
+              { type: 'image', mimeType: image.mimeType, data: image.data },
+            ]
+          : [{ type: 'text', text }],
+      });
+
+      this.turnPhase = 'awaiting_idle';
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new DshError(`等待 turn 结束超时（${this.timeoutMs} ms）`)),
+          this.timeoutMs,
+        );
+      });
       await Promise.race([idle, timeout]);
     } finally {
       clearTimeout(timer);
       this.onIdle = null;
       this.activeTicket = null;
+      this.turnPhase = this.detached ? 'detached_running' : 'idle';
     }
 
     const answer = this.assistantText.trim();
@@ -1124,6 +1190,9 @@ export class DshSession {
     // dsh 里的 `voice-live` 插件启动时读它，读不到就整个不启用。
     await this.ensureLiveRelay();
 
+    // 每次 spawn 加一代。close / error 抓住的是这一代，不是「当前这个字段」。
+    this.procGen += 1;
+    const myGen = this.procGen;
     const proc = this.spawnProgram([
       '--profile', 'sdk',
       ...(this.patch ? ['--patch', this.patch] : []),
@@ -1137,11 +1206,13 @@ export class DshSession {
       if (s) this.log(`[sdk] ${s.slice(0, 200)}`);
     });
     proc.on('error', (e: Error) => {
+      if (myGen !== this.procGen) return;
       this.log(`[sdk] 启动失败：${e.message}`);
       this.sdkReady = false;
       if (this.proc === proc) this.proc = null;
     });
     proc.on('close', (code: number | null) => {
+      if (myGen !== this.procGen) return;
       this.sdkReady = false;
       // 进程没了，里面的会话也就不在了；下次必须重新 resume
       this.openSessionId = null;
@@ -1151,6 +1222,8 @@ export class DshSession {
       this.detachedTurn = null;
       this.currentTurn = null;
       this.swallowNextIdle = false;
+      this.turnPhase = 'idle';
+      this.activeTicket = null;
       if (this.proc === proc) this.proc = null;
       // 没收到 shutdown 就退出，说明崩了；挂起的请求全部失败
       for (const [, p] of this.pending) p.reject(new DshError(`sdk 进程退出（code=${code}）`));
@@ -1352,16 +1425,23 @@ export class DshSession {
       const ev = p['event'];
       if (!ev || typeof ev !== 'object') return;
       const e = ev as Record<string, unknown>;
-      // 后台作业/子代理的状态全在事件里，先喂给任务板（不认识的类型它自己忽略）
+      const eventSessionId = typeof p['sessionId'] === 'string' ? p['sessionId'] : '';
+      // 后台作业/子代理的状态全在事件里，先喂给任务板（不认识的类型它自己忽略）。
+      // 子会话的事件只允许到这里：下面的主轮文本 / 轮界一律不看。
       this.tasks.observe(
-        typeof p['sessionId'] === 'string' ? p['sessionId'] : '',
+        eventSessionId,
         typeof e['type'] === 'string' ? e['type'] : '',
         e['data'] as Record<string, unknown> | undefined,
       );
+      // 空 sessionId、或不是当前打开的主会话：不能写 assistantText / 用量，
+      // 也不能推动主轮的 turn 边界。
+      if (!this.isMainSession(eventSessionId)) {
+        return;
+      }
       // 撤回用的刻度：`turn/start` 之前那一条 `agent/inbox/spliced`（inserted 非空）
       // 就是把这句话塞进收件箱的地方。切在它之后，fork 出来的新会话会把它当待办
       // **重放一遍** —— 探针实测：切点取 turn/start−1 时幽灵句出现了 2 次。
-      if (p['sessionId'] === this.openSessionId && typeof e['seq'] === 'number') {
+      if (typeof e['seq'] === 'number') {
         const data = e['data'] as Record<string, unknown> | undefined;
         const inserted = data?.['inserted'];
         this.rollback.observe(
@@ -1372,7 +1452,7 @@ export class DshSession {
         );
       }
       if (e['type'] !== 'assistant/message') {
-        this.observeTurnBoundary(e, typeof p['sessionId'] === 'string' ? p['sessionId'] : '');
+        this.observeTurnBoundary(e, eventSessionId);
         return;
       }
 
@@ -1411,6 +1491,10 @@ export class DshSession {
     }
 
     if (method === 'session.status') {
+      // 子会话的 idle/running 不能唤醒主轮，也不能被当成自发轮。
+      if (!this.isMainSession(p['sessionId'])) {
+        return;
+      }
       const status = typeof p['status'] === 'string' ? p['status'] : '';
       // 这条 idle 属于刚结算的「放手」那一轮 —— 吃掉它，别去唤醒新一轮的等待者
       if (status === 'idle' && this.swallowNextIdle) {
@@ -1439,6 +1523,17 @@ export class DshSession {
         fire();
       }
     }
+  }
+
+  /**
+   * 这条事件是不是当前打开的主会话。
+   *
+   * 空 id、还没打开、对不上 `openSessionId`，都不是。子会话只能进任务板。
+   */
+  private isMainSession(sessionId: unknown): boolean {
+    return typeof sessionId === 'string'
+      && sessionId !== ''
+      && sessionId === this.openSessionId;
   }
 
   // ---------------------------------------------------------------- 内部

@@ -12,8 +12,10 @@
  * - **取消没有回执**：取消之后迟到的那一帧图要吃掉，不能当成「看一眼」
  * - **没有开麦动词**：`listen.start` 表达不了
  *
- * 因为拿不到 id，归属只能靠「上一趟请求的图一定先于下一趟到达」这条顺序假设：
- * 公告过的、取消掉的图都排在在途请求之前认领（见 {@link V1Session.image}）。
+ * 因为拿不到 id，归属只能靠「上一趟请求的图一定先于下一趟到达」这条顺序假设。
+ * `status()` 和 `image()` 共用 {@link V1Session.ownerId}：
+ * **已公告 → 已取消残留 → 在途**。取消 A 之后立刻 encode B，迟到的
+ * `hq_image` / `hq_failed` 仍记在 A 上。
  * 一句话：**宁可让新请求超时，也不把旧图当新图交出去。**
  */
 import type {
@@ -125,10 +127,21 @@ export class V1Session {
     }
   }
 
+  /**
+   * 这一帧状态、下一帧图该归谁。
+   *
+   * 顺序只有这一处：已公告的高清 → 取消后还在路上的旧请求 → 当前在途。
+   * `inflight` 放最后，是为了取消 A 后立刻 encode B 时，旧的 `hq_image` /
+   * `hq_failed` 不会被写成 B。
+   */
+  private ownerId(): string | null {
+    return this.announcedId ?? this.cancelledId ?? this.inflight?.id ?? null;
+  }
+
   /** `Status` 帧（JSON）→ 原语事件。 */
   status(json: Record<string, unknown>): V1StatusResult {
     const name = json['ev'];
-    const id = this.inflight?.id ?? this.cancelledId;
+    const id = this.ownerId();
     switch (name) {
       case 'hq_armed': {
         // fresh=true：相机里已经有新图，不用等人
@@ -146,7 +159,13 @@ export class V1Session {
         };
       }
       case 'hq_image':
+        // 公告落在 ownerId 上，不是「谁正在 inflight」。
+        // 同一 id 的取消残留和公告指的是同一帧：叠成两次认领，
+        // 会把下一帧（新请求的图）再吃掉。
         this.announcedId = id;
+        if (id !== null && this.cancelledId === id) {
+          this.cancelledId = null;
+        }
         return { known: true, event: null };
       case 'hq_failed': {
         if (id === null) {
@@ -176,19 +195,19 @@ export class V1Session {
   /**
    * 一帧图属于哪个请求。
    *
-   * 认领顺序固定：**公告的高清 → 取消后的迟到图 → 在途 glance 的第一帧**。
+   * 认领顺序就是 {@link ownerId}：**公告的高清 → 取消后的迟到图 → 在途 glance 的第一帧**。
+   * detail 在公告之前的低清回图不认领（`ownerId` 会指向在途 detail，这里故意不取）。
    * v1 按序处理命令，旧请求的回图一定先于新请求到达，所以先认领旧请求的。
    *
    * @returns 请求 id；`null` = 不属于任何请求（用户自己拍的，或等快门时的低清回图）
    */
   image(): string | null {
+    const id = this.ownerId();
     if (this.announcedId !== null) {
-      const id = this.announcedId;
       this.announcedId = null;
       return id;
     }
     if (this.cancelledId !== null) {
-      const id = this.cancelledId;
       this.cancelledId = null;
       return id;
     }

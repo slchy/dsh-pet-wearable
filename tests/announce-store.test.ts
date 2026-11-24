@@ -2,7 +2,7 @@
  * `AnnounceStore` 的单测：离线期间攒下的后台汇报，下次连上要能完整取走。
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -100,6 +100,30 @@ test('写入是同步的：push 之后文件立刻可读', () => {
     s.push('断线期间的汇报');
     assert.match(readFileSync(file, 'utf8'), /断线期间的汇报/);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('写入失败时回滚本次入队并返回 0，不虚报积压', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'announce-fail-'));
+  const file = join(dir, 'announce.jsonl');
+  try {
+    const logs: string[] = [];
+    const s = AnnounceStore.open({ file, maxItems: 2, log: (line) => { logs.push(line); } });
+    assert.ok(s);
+    assert.equal(s.push('已有'), 1);
+    assert.equal(s.push('还在'), 2);
+    chmodSync(file, 0o444);
+    try {
+      assert.equal(s.push('写不进去'), 0, '没写上的条目不能算进积压');
+      assert.ok(logs.some((line) => line.includes('写入失败')));
+    } finally {
+      chmodSync(file, 0o666);
+    }
+    assert.equal(s.size, 2, '失败的入队不能把已经落盘的队列改掉');
+    assert.deepEqual(s.drain(), [{ text: '已有' }, { text: '还在' }]);
+  } finally {
+    try { chmodSync(file, 0o666); } catch { /* 文件可能还没建出来 */ }
     rmSync(dir, { recursive: true, force: true });
   }
 });

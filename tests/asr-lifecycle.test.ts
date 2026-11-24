@@ -29,7 +29,7 @@ class FakeWs {
   static instances: FakeWs[] = [];
 
   readyState = FakeWs.CONNECTING;
-  sent: string[] = [];
+  sent: Array<string | Buffer> = [];
   readonly url: string;
   private readonly listeners = new Map<string, Array<(ev: unknown) => void>>();
 
@@ -54,7 +54,7 @@ class FakeWs {
     for (const fn of [...(this.listeners.get(type) ?? [])]) fn(ev);
   }
 
-  send(data: string): void {
+  send(data: string | Buffer): void {
     this.sent.push(data);
   }
 
@@ -76,7 +76,12 @@ class FakeWs {
   }
 
   get names(): string[] {
-    return this.sent.map((raw) => (JSON.parse(raw) as { header: { name: string } }).header.name);
+    const names: string[] = [];
+    for (const raw of this.sent) {
+      if (typeof raw !== 'string') continue;
+      names.push((JSON.parse(raw) as { header: { name: string } }).header.name);
+    }
+    return names;
   }
 }
 
@@ -191,7 +196,7 @@ test('热词表：只有配置了真 ID 才下发 vocabulary_id', async () => {
     const { asr } = makeAsr(overrides);
     const ws = await connectReady(asr);
     const raw = ws.sent[0];
-    assert.ok(raw, '应当发出 StartTranscription');
+    assert.ok(typeof raw === 'string', '应当发出 StartTranscription');
     return (JSON.parse(raw) as { payload: Record<string, unknown> }).payload;
   };
 
@@ -271,4 +276,46 @@ test('open() 就把 token 取回来 —— 别等 feed() 那一刻', async () =>
   assert.equal(calls, 1, '设备刚连上就该把 token 拿好，用户开口时只剩建链');
   assert.equal(FakeWs.instances.length, 0, '只预取 token，不建空连接（会被服务端判 IDLE_TIMEOUT）');
   session.close();
+});
+
+test('TranscriptionStarted 按 FIFO 先刷积压，再接受新块', async () => {
+  const { asr } = makeAsr();
+  asr.feed(Buffer.from([1, 2]));
+  asr.feed(Buffer.from([3, 4]));
+  await tick();
+  const ws = FakeWs.instances[0];
+  assert.ok(ws);
+  ws.open();
+  await tick();
+  asr.feed(Buffer.from([5, 6]));
+  ws.msg('TranscriptionStarted');
+  asr.feed(Buffer.from([7, 8]));
+  const audio = ws.sent.filter((item): item is Buffer => Buffer.isBuffer(item));
+  assert.deepEqual(audio.map((chunk) => [...chunk]), [
+    [1, 2],
+    [3, 4],
+    [5, 6],
+    [7, 8],
+  ]);
+});
+
+test('close 发生在 token 往返期间就放弃建连', async () => {
+  const gate: { release: ((token: { id: string; expireAtSec: number }) => void) | null } = {
+    release: null,
+  };
+  const { asr } = makeAsr({
+    tokenProvider: () => new Promise((resolve) => {
+      gate.release = (token) => { resolve(token); };
+    }),
+  });
+  asr.feed(Buffer.alloc(8));
+  await tick();
+  assert.equal(FakeWs.instances.length, 0);
+  asr.close();
+  const finish = gate.release;
+  assert.ok(finish);
+  finish({ id: 'tok', expireAtSec: Math.floor(Date.now() / 1000) + 3600 });
+  await tick();
+  await tick();
+  assert.equal(FakeWs.instances.length, 0);
 });
