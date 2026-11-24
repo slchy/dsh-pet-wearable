@@ -31,7 +31,6 @@ import {
 } from '../../src/main.ts';
 import { MemoryFile } from '../../src/memory-file.ts';
 import { omniTts } from '../../src/omni-tts.ts';
-import { DEFAULT_CONFIRM_TIMEOUT_MS } from '../../src/photo-inbox.ts';
 import {
   cannedStt,
   silentTts,
@@ -48,6 +47,7 @@ import { DshSession } from '../../src/session.ts';
 import { sampleSocket } from '../../src/socket-stats.ts';
 import { TurnJudge } from '../../src/turn-judge.ts';
 import { envNumber, envString, sleep } from '../../src/util.ts';
+import { buildVoiceRuntimeConfig } from '../../src/voice-config.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from '../../src/voice-session.ts';
 import type { BgReportRecord, DshCallRecord, EvalCase, EvalManifest } from './types.ts';
 
@@ -419,15 +419,33 @@ async function main(): Promise<void> {
   }
 
   const semanticKey = (env['FAST_LANE_API_KEY'] ?? env['DEEPSEEK_API_KEY'] ?? '').trim();
-  const semantic = noSemantic || envString('SEMANTIC_END_TAG') === '0' || semanticKey === ''
-    ? null
-    : semanticEndpoint({
+  const semanticEnabled = !noSemantic
+    && envString('SEMANTIC_END_TAG') !== '0'
+    && semanticKey !== '';
+  // 与 CLI 同一套默认值。沙盒只显式加长空闲、放大档案、缩短拍照等待。
+  const voice = buildVoiceRuntimeConfig({
+    env,
+    sttSpec,
+    turnJudgeEnabled,
+    turnJudgePython,
+    turnJudgeScript,
+    semanticEnabled,
+    overrides: {
+      idleTimeoutMs: 120_000,
+      archiveMaxMb: 200,
+      archiveKeep: 100,
+      photoTimeoutMs: 20_000,
+    },
+  });
+  const semantic = semanticEnabled
+    ? semanticEndpoint({
       apiKey: semanticKey,
       ...(env['FAST_LANE_MODEL'] === undefined ? {} : { model: env['FAST_LANE_MODEL'] }),
       ...(env['FAST_LANE_BASE_URL'] === undefined ? {} : { baseUrl: env['FAST_LANE_BASE_URL'] }),
-      timeoutMs: envNumber('SEMANTIC_END_TAG_TIMEOUT_MS', 400),
+      timeoutMs: voice.semanticTimeoutMs,
       log,
-    });
+    })
+    : null;
 
   const cleanup = (): void => {
     turnJudgeClient?.stop();
@@ -436,9 +454,6 @@ async function main(): Promise<void> {
   };
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
   process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-
-  const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 2));
-  const peakDbfs = envNumber('VOICE_PEAK_DBFS', -46);
 
   const code = await runVoiceServer({
     port,
@@ -457,56 +472,27 @@ async function main(): Promise<void> {
         onFallbackAnnounceSpoken: wrappedFallbackSpoken,
       }),
     ...(streaming.omniShadow === undefined ? {} : { omniShadow: streaming.omniShadow }),
-    turnJudge: turnJudgeEnabled
-      ? {
-        pythonPath: turnJudgePython,
-        scriptPath: turnJudgeScript,
-        quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
-        extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 200),
-        maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 2),
-        maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 1),
-        trailingTrimMs: envNumber('TURN_JUDGE_TRIM_MS', 20),
-        threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
-        thresholdCjk: envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35),
-        waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 200),
-        waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 1_200),
-        maxOpenSilenceMs: envNumber('TURN_JUDGE_MAX_OPEN_SILENCE_MS', 650),
-      }
-      : undefined,
+    ...(voice.turnJudge === undefined ? {} : { turnJudge: voice.turnJudge }),
     ...(turnJudgeClient === null ? {} : { turnJudgeClient }),
     ...(semantic === null
       ? {}
-      : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 400) }),
-    gate: {
-      thresholdDbfs: peakDbfs,
-      holdMs: envNumber('VOICE_HOLD_MS', 2000),
-      prerollMs: envNumber('VOICE_PREROLL_MS', 800),
-      pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
-      speculateMs: envNumber('VOICE_SPECULATE_MS', 100),
-      commitMs: envNumber('VOICE_COMMIT_MS', sttSpec === 'qwen-realtime' ? 20 : 0),
-      sttCommitMs: envNumber('VOICE_STT_COMMIT_MS', sttSpec === 'qwen-realtime' ? 150 : 0),
-      ...(sttSpec === 'qwen-realtime'
-        ? {
-          openQuietMs: envNumber('VOICE_OPEN_QUIET_MS', 300),
-          openQuietShortMs: envNumber('VOICE_OPEN_QUIET_SHORT_MS', 200),
-        }
-        : {}),
-    },
-    playbackTailMs: 600,
+      : { semantic, semanticBudgetMs: voice.semanticBudgetMs }),
+    gate: voice.gate,
+    playbackTailMs: voice.playbackTailMs,
     ttsGain: envNumber('MIAI_TTS_GAIN', 1),
-    micGain,
+    micGain: voice.micGain,
     levelLogMs: 0,
     archiveDir,
-    archiveMaxMb: 200,
-    archiveKeep: 100,
+    archiveMaxMb: voice.archiveMaxMb,
+    archiveKeep: voice.archiveKeep,
     setAudit: (sink, expected) => { auditSlot.set(sink, expected); },
     photoDir: '',
     controlPort: 0,
-    photoTimeoutMs: 20_000,
-    confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS,
-    imageQuestion: '这张图里有什么？用一两句话口语化描述。',
+    photoTimeoutMs: voice.photoTimeoutMs,
+    confirmTimeoutMs: voice.confirmTimeoutMs,
+    imageQuestion: voice.imageQuestion,
     announceStore,
-    idleTimeoutMs: 120_000,
+    idleTimeoutMs: voice.idleTimeoutMs,
     serve: true,
   });
   cleanup();

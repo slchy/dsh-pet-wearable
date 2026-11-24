@@ -87,8 +87,17 @@ export class SilenceTriggers {
    *
    * 单帧不算数：这段录音里 20 ms 的「有声」有 14 处，多是塞音闭塞段或门限抖动。
    * 从第二帧起才更新 `lastVoicedAt`，之后每帧都推进 —— 它仍然等于真实停嘴时刻。
+   *
+   * `noteFrame(..., alreadyDebounced: true)` 不再用这个计数：能量门已经去过抖。
    */
   private voicedRun = 0;
+  /**
+   * 本帧若上游给了已经去过抖的静音时长，四个阈值都读它。
+   *
+   * `null` = 按 `atMs - lastVoicedAt` 现算（`addAudio` / 老调用）。
+   * 只在一次 `noteFrame` 的静音分支里有效，离开时还原，免得嵌套调用串味。
+   */
+  private trustedSilenceMs: number | null = null;
   /** 这一段语音是否已经预跑过判停（每段只跑一次，别每块静音都跑） */
   private preFiredAt = NEVER;
   /**
@@ -121,17 +130,32 @@ export class SilenceTriggers {
    *
    * `voiced` 与 `atMs` 都来自声学前端（`AudioFrame`）：**不在这里按能量重算**，
    * 也不在这里读时钟 —— 那样「有没有人说话」和「静音多久」又会变成两套算法。
+   *
+   * `alreadyDebounced === true` 且给了 `frontSilenceMs` 时，信任能量门的去抖结果
+   * 和它的静音累计：有声帧立刻推进 `lastVoicedAt`，静音帧的四个阈值与回调都用
+   * `frontSilenceMs`。这样档案里的 `front_silence_ms` 和封段的 `silence_ms` 是同一个数。
+   * 没传这个标志的老路径（`addAudio`）仍自己做两帧去抖，并按时刻现算静音。
    */
-  noteFrame(voiced: boolean, atMs: number): void {
+  noteFrame(
+    voiced: boolean,
+    atMs: number,
+    frontSilenceMs?: number,
+    alreadyDebounced?: boolean,
+  ): void {
+    const trustFront = alreadyDebounced === true && frontSilenceMs !== undefined;
     if (voiced) {
-      // **去抖**：这段录音里 20 ms 的「有声」帧有 14 处，很多是塞音的闭塞段
-      // 或门限抖动，不是真的重新开口。单帧就把 `lastVoicedAt` 推平会让
-      // 「截至此刻的静音」被反复归零（开轮条件永远不成立），预跑也被无谓作废。
-      // 所以第一帧只计数，从**第二帧**起才更新 —— 之后每帧都推进，`lastVoicedAt`
-      // 仍然等于「真实停嘴」那一刻（不能停在首帧，否则一句话说两秒就被算成两秒静音）。
-      this.voicedRun += 1;
-      if (this.voicedRun < 2) {
-        return;
+      if (!trustFront) {
+        // **去抖**：这段录音里 20 ms 的「有声」帧有 14 处，很多是塞音的闭塞段
+        // 或门限抖动，不是真的重新开口。单帧就把 `lastVoicedAt` 推平会让
+        // 「截至此刻的静音」被反复归零（开轮条件永远不成立），预跑也被无谓作废。
+        // 所以第一帧只计数，从**第二帧**起才更新 —— 之后每帧都推进，`lastVoicedAt`
+        // 仍然等于「真实停嘴」那一刻（不能停在首帧，否则一句话说两秒就被算成两秒静音）。
+        this.voicedRun += 1;
+        if (this.voicedRun < 2) {
+          return;
+        }
+      } else {
+        this.voicedRun = 0;
       }
       this.lastVoicedAt = atMs;
       // 音频比快照长了：通知宿主作废在跑预跑、并在已有缓冲句时迁入 speaking_more
@@ -142,13 +166,29 @@ export class SilenceTriggers {
     // 两条线拆开跑，阈值不同：
     //   投机 100 ms —— 拿中间结果先问出去，等久了纯属白等
     //   判停 200 ms —— 判停器看的是音频，跟 ASR 的静音窗对齐
-    this.maybeSpeculate(atMs);
-    this.maybePrefirePrediction(atMs);
-    this.maybeCommit(atMs);
-    this.maybeSttCommit(atMs);
-    if (this.lastVoicedAt !== NEVER) {
-      this.host.onSilence?.(atMs, atMs - this.lastVoicedAt);
+    const previous = this.trustedSilenceMs;
+    this.trustedSilenceMs = trustFront ? frontSilenceMs : null;
+    try {
+      this.maybeSpeculate(atMs);
+      this.maybePrefirePrediction(atMs);
+      this.maybeCommit(atMs);
+      this.maybeSttCommit(atMs);
+      if (this.lastVoicedAt !== NEVER) {
+        this.host.onSilence?.(atMs, this.silenceAt(atMs));
+      }
+    } finally {
+      this.trustedSilenceMs = previous;
     }
+  }
+
+  /**
+   * 这一帧的连续静音。
+   *
+   * 上游已经去过抖时用它给的 `frontSilenceMs`；否则用 `atMs - lastVoicedAt`。
+   * 两条公式不会同时生效，所以封段日志里的静音和能量门的静音对得上同一个数。
+   */
+  private silenceAt(t: number): number {
+    return this.trustedSilenceMs ?? (t - this.lastVoicedAt);
   }
 
   /** 一句新定稿：投机的次数配额与去重按句重置（下一段语音可以再投机两次） */
@@ -183,7 +223,7 @@ export class SilenceTriggers {
     if (this.lastVoicedAt <= firedAt) {
       return false;
     }
-    return t - this.lastVoicedAt >= after;
+    return this.silenceAt(t) >= after;
   }
 
   /**
@@ -202,9 +242,9 @@ export class SilenceTriggers {
       return;
     }
     this.sealFiredAt = t;
-    // `after` 是**配置值**，实际静音是 `t - lastVoicedAt` —— 两者之差就是「静音开始
-    // 到真有音频帧到达」的等待。日志和档案都要记实际值，否则永远看不见那截开销。
-    const silenceMs = t - this.lastVoicedAt;
+    // 实际静音：老路径是 `t - lastVoicedAt`，能量门已去抖时就是它给的 `frontSilenceMs`。
+    // 日志和档案都记这个数，和 `AudioFrame.silenceMs` 是同一份。
+    const silenceMs = this.silenceAt(t);
     this.options.log(
       `  封段    静音 ${this.options.commitAfterMs} ms（实际 ${silenceMs.toFixed(0)} ms）→ 车道起跑`,
     );
@@ -226,7 +266,7 @@ export class SilenceTriggers {
       return;
     }
     this.sttCommitFiredAt = t;
-    const silenceMs = t - this.lastVoicedAt;
+    const silenceMs = this.silenceAt(t);
     this.options.log(
       `  封段    ASR 静音 ${this.options.sttCommitAfterMs} ms`
         + `（实际 ${silenceMs.toFixed(0)} ms）→ 开始解码`,
@@ -263,7 +303,7 @@ export class SilenceTriggers {
     if (this.lastVoicedAt === NEVER || this.lastVoicedAt <= this.host.lastUtteranceAt()) {
       return;
     }
-    if (t - this.lastVoicedAt < pause) {
+    if (this.silenceAt(t) < pause) {
       return;
     }
     // 这段语音已经投机过了：后来补的 partial 不再顶掉在跑的那一趟
@@ -313,7 +353,7 @@ export class SilenceTriggers {
     if (this.lastVoicedAt <= this.preFiredAt || this.lastVoicedAt <= this.host.lastUtteranceAt()) {
       return;
     }
-    if (t - this.lastVoicedAt < pause) {
+    if (this.silenceAt(t) < pause) {
       return;
     }
     this.preFiredAt = t;

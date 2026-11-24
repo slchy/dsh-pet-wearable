@@ -21,9 +21,11 @@ export const TTS_SAMPLE_RATE = 24_000;
 
 export class MimoError extends Error {}
 
-function apiKey(): string {
-  const k = process.env.MIMO_API_KEY?.trim();
-  if (!k) {
+/** 调用方传入的 key 优先；没传再读 `MIMO_API_KEY`。两边都空才抛。 */
+function resolveApiKey(explicit?: string): string {
+  const passed = explicit?.trim() ?? '';
+  const k = passed !== '' ? passed : process.env['MIMO_API_KEY']?.trim() ?? '';
+  if (k === '') {
     throw new MimoError('未设置 MIMO_API_KEY');
   }
   return k;
@@ -51,11 +53,11 @@ export function pcmToWav(pcm: Buffer, rate = ASR_SAMPLE_RATE, channels = 1): Buf
 
 type SseObject = Record<string, unknown>;
 
-async function* sse(body: unknown): AsyncGenerator<SseObject> {
+async function* sse(body: unknown, apiKey?: string): AsyncGenerator<SseObject> {
   const res = await fetch(API_URL, {
     method: 'POST',
     headers: {
-      'api-key': apiKey(),
+      'api-key': resolveApiKey(apiKey),
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     },
@@ -178,7 +180,8 @@ export function styleFor(
 export async function* ttsStream(
   text: string,
   voice = 'Chloe',
-  style = 'Calm, natural, conversational.',
+  style = BASE_STYLE,
+  apiKey?: string,
 ): AsyncGenerator<Buffer> {
   for await (const obj of sse({
     model: TTS_MODEL,
@@ -188,7 +191,7 @@ export async function* ttsStream(
     ],
     audio: { format: 'pcm16', voice },
     stream: true,
-  })) {
+  }, apiKey)) {
     const d = deltaAudio(obj);
     if (!d) continue;
     yield Buffer.from(d, 'base64');
@@ -199,7 +202,7 @@ export async function* ttsStream(
 export async function tts(
   text: string,
   voice = 'Chloe',
-  style = 'Calm, natural, conversational.',
+  style = BASE_STYLE,
 ): Promise<{ pcm: Buffer; chunks: number }> {
   const parts: Buffer[] = [];
   for await (const pcm of ttsStream(text, voice, style)) {
@@ -221,14 +224,17 @@ export function mimoTts(options: {
   readonly voice?: string;
   readonly baseStyle?: string;
   readonly overrides?: Partial<Record<Emotion, string>>;
+  /** 传入优先；缺省再读 `MIMO_API_KEY`。 */
+  readonly apiKey?: string;
 } = {}): TtsProvider {
   const voice = options.voice ?? DEFAULT_TTS_VOICE;
   const base = options.baseStyle ?? BASE_STYLE;
   const overrides = options.overrides ?? {};
+  const apiKey = options.apiKey;
   return {
     name: `mimo:${voice}`,
     sampleRate: TTS_SAMPLE_RATE,
     synthesize: (text: string, emotion?: string) =>
-      ttsStream(text, voice, styleFor(asEmotion(emotion), base, overrides)),
+      ttsStream(text, voice, styleFor(asEmotion(emotion), base, overrides), apiKey),
   };
 }

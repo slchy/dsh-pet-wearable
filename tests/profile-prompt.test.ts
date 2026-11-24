@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { emotionTagList } from '../src/emotion.ts';
+import { EMOTION_LABELS, emotionTagList, type Emotion } from '../src/emotion.ts';
 import { FAST_LANE_PERSONA_HEADER, OMNI_SHORT_INSTRUCTIONS, PERSONA_NAME, PERSONA_ROLE } from '../src/persona.ts';
 
 const yml = readFileSync(new URL('../mcp/profile.cordis.yml', import.meta.url), 'utf8');
@@ -129,4 +129,49 @@ test('omni 短人设带上了定位，快车道人设头说清了「哥」与语
   const fastLane = FAST_LANE_PERSONA_HEADER.join('\n');
   assert.ok(fastLane.includes('「哥」'), '快车道人设头要保留对用户的称呼，否则口吻会变生分');
   assert.ok(fastLane.includes('语音'), '快车道人设头要说明「你的话会变成语音」，不然它会写 markdown');
+});
+
+const FAST_LANE_EMOTION_KEYS = [
+  'happy',
+  'proud',
+  'surprised',
+  'calm',
+  'worried',
+  'sulk',
+] as const satisfies readonly Emotion[];
+
+test('快车道六个情绪标签从 EMOTION_LABELS 派生，不另写一份中文', () => {
+  const tags = FAST_LANE_EMOTION_KEYS.map((key) => `[${EMOTION_LABELS[key]}]`).join(' ');
+  const fastLane = FAST_LANE_PERSONA_HEADER.join('\n');
+  const persona = readFileSync(new URL('../src/persona.ts', import.meta.url), 'utf8');
+  assert.ok(
+    fastLane.includes(`从这六个里选：${tags}。`),
+    '快车道情绪枚举必须等于 EMOTION_LABELS 里那六个 key 的标签',
+  );
+  assert.equal(fastLane.includes(`[${EMOTION_LABELS.angry}]`), false);
+  assert.equal(fastLane.includes(`[${EMOTION_LABELS.disgust}]`), false);
+  assert.equal(
+    persona.includes(tags),
+    false,
+    'persona.ts 里不应再手写那一串中文标签',
+  );
+});
+
+test('快车道四条系统提示词只在 persona.ts 定义', () => {
+  const names = [
+    'SYSTEM_PROMPT_WITH_DELEGATE',
+    'SYSTEM_PROMPT_PLAIN',
+    'TASK_RULE',
+    'TASK_RULE_PLAIN',
+  ];
+  const persona = readFileSync(new URL('../src/persona.ts', import.meta.url), 'utf8');
+  const fronted = readFileSync(new URL('../src/fronted-agent.ts', import.meta.url), 'utf8');
+  const cascade = readFileSync(new URL('../src/pipelines/cascade-agent.ts', import.meta.url), 'utf8');
+  for (const name of names) {
+    assert.match(persona, new RegExp(`export const ${name}\\b`));
+    assert.equal(fronted.includes(`const ${name}`), false, `fronted-agent.ts 又定义了 ${name}`);
+    assert.equal(cascade.includes(`const ${name}`), false, `cascade-agent.ts 又定义了 ${name}`);
+    assert.ok(fronted.includes(name), `fronted-agent.ts 应该引用 ${name}`);
+    assert.ok(cascade.includes(name), `cascade-agent.ts 应该引用 ${name}`);
+  }
 });

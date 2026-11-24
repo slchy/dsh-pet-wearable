@@ -5,9 +5,11 @@
  * - `CascadeVoiceEngine`：LLM → TTS
  * - `AgentEngineAdapter`：把现有 `AgentProvider` 的 omni / stream / pump 收成同一条事件流
  *
- * 别处一律从这里 `import`，不要伸进具体文件。内核只认 `engine-contract.ts` 的
- * `FastVoiceEngine`。`TurnRunner` 仍按三分支直接调 `AgentProvider`，换泵是下一阶段；
- * 适配器先把那三条分支的行为收齐，避免一切过去就静默丢掉流式回落和转交垫话。
+ * 别处一律从这里 `import` 这三个引擎，不要伸进具体文件。内核只认
+ * `engine-contract.ts` 的 `FastVoiceEngine`。`TurnRunner.run()` 只消费
+ * `respond()`：生产的 `live` / `cascade` 管道直接注入引擎；只给了
+ * `{ agent, tts }` 的旧装配包一层 `AgentEngineAdapter`。
+ * 流式队列、中止门、念出去的全文在 `stream-utils.ts`，三条引擎共用一份。
  */
 export { LiveVoiceEngine, type LiveAudioLane } from './live-voice-engine.ts';
 export {

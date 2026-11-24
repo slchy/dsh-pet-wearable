@@ -6,7 +6,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
-import { EnergyGate } from './energy-gate.ts';
+import { EnergyGate, type PrerollFrame } from './energy-gate.ts';
 import type { AudioFrame } from './engine-contract.ts';
 import { pcm16Gain, pcm16PeakDbfs } from './pcm.ts';
 
@@ -64,6 +64,13 @@ export interface UplinkPipelineOptions {
    * 默认关（0）：正常运行时每 2 s 一行太吵。调音时开 `MIAI_LEVEL_LOG=2000`。
    */
   readonly levelLogMs?: number;
+  /**
+   * 连续多少块过门限才把 `AudioFrame.voiced` 打成 true。
+   *
+   * 缺省 1，能量门的历史行为。生产连接传 2，与静音触发器的两帧去抖对齐：
+   * 单帧尖峰不再把 `silenceMs` 打回 0。
+   */
+  readonly voiceDebounceFrames?: number;
   /** 每块解码后的 PCM：判停器、落盘都要它 */
   readonly onPcm: (pcm: Buffer) => void;
   /**
@@ -71,8 +78,18 @@ export interface UplinkPipelineOptions {
    * 否则事后没法重算"换个增益会不会识别出来"。
    */
   readonly onRawPcm?: (pcm: Buffer) => void;
-  /** 有声开始：先把 preroll 喂进 STT，再继续喂后续 */
-  readonly onSpeechOpen: (peakDbfs: number, preroll: readonly Buffer[], prerollMs: number) => void;
+  /**
+   * 有声开始：先把 preroll 喂进 STT，再继续喂后续。
+   *
+   * `prerollFrames` 是同一批预卷，`voiced` 已由能量门标好。给了就用它，
+   * 不要再对 `preroll` 重算峰值。缺省（老调用方）可以不传。
+   */
+  readonly onSpeechOpen: (
+    peakDbfs: number,
+    preroll: readonly Buffer[],
+    prerollMs: number,
+    prerollFrames?: readonly PrerollFrame[],
+  ) => void;
   /**
    * 门开着时的每一块音频 —— **声学前端的唯一出口**（见 `engine-contract.ts` 契约①）。
    *
@@ -107,12 +124,11 @@ export class UplinkPipeline {
    *
    * 峰值取的是**放大后**的电平（和喂给 ASR 的一致），这样读数和门限是同一个坐标系。
    */
-  private meter(pcm: Buffer): void {
+  private meter(pcm: Buffer, now: number): void {
     const period = this.options.levelLogMs ?? 0;
     if (period <= 0) {
       return;
     }
-    const now = this.now();
     if (this.meterAt === 0) {
       this.meterAt = now;
       this.meterPeak = -Infinity;
@@ -145,6 +161,9 @@ export class UplinkPipeline {
       // **必须透传**：门自己默认 `Date.now()`，跟宿主的 `SystemClock` 差 1.7e12。
       // 漏传的症状是「第一块静音就把门关了」（gap 看似无穷大），或反过来永不关门。
       now: this.now,
+      ...(options.voiceDebounceFrames === undefined
+        ? {}
+        : { voiceDebounceFrames: options.voiceDebounceFrames }),
     });
 
     this.ffmpeg = options.codec === 'pcm16'
@@ -226,20 +245,27 @@ export class UplinkPipeline {
     const pcm = pcm16Gain(raw, this.options.gain ?? 1);
     onPcm(pcm);
 
-    this.meter(pcm);
+    // 能量门的保持窗口和 `AudioFrame.tsMs` 共用这一下。同一帧再读一次时钟，
+    // 两边的「静音多久」就会差一截。
+    const tsMs = this.now();
+    this.meter(pcm, tsMs);
 
-    const decision = this.gate.process(pcm);
+    const decision = this.gate.process(pcm, tsMs);
     if (decision.opened) {
       log(
         `  上行    有声 ${decision.opened.peakDbfs.toFixed(1)} dBFS → 开始推送`
         + `（补 ${decision.opened.preroll.length} 块 / ${decision.opened.prerollMs} ms）`,
       );
       this.gateSeq += 1;
-      onSpeechOpen(decision.opened.peakDbfs, decision.opened.preroll, decision.opened.prerollMs);
+      onSpeechOpen(
+        decision.opened.peakDbfs,
+        decision.opened.preroll,
+        decision.opened.prerollMs,
+        decision.opened.prerollFrames,
+      );
     }
     if (decision.forward) {
       // 与能量门同一把尺：下游拿 `tsMs` 和宿主的 `lastSentenceAt` 比「这之后有没有人说话」
-      const tsMs = this.now();
       onFrame({
         pcm,
         voiced: decision.voiced,

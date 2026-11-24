@@ -69,13 +69,11 @@ switch (sub) {
     }
     const tls = has(argv, '--tls');
 
-    // 生成之前就把配置判一遍：给出了一个连自己都会被拒的监听地址，先说出来
+    // 本机与否只走 checkBindSafety（内部是 isLoopbackHost：localhost / ::1 / 127.*）。
+    // 不要再手写 host !== '127.0.0.1'，那会把 localhost 和 ::1 误报成「非本机还没开 TLS」。
     const safety = checkBindSafety({ host, hasTls: tls, hasAuth: true });
     if (!safety.ok) {
       console.warn(`! ${safety.message}\n  （token 照样会生成，但该地址现在还绑不上）\n`);
-    }
-    if (host !== '127.0.0.1' && !tls) {
-      console.warn('! 没带 --tls：非本机地址必须同时有 TLS，否则服务端会拒绝监听\n');
     }
 
     let token: string;

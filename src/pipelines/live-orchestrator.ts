@@ -14,6 +14,7 @@ import { BackgroundTaskBus } from '../background-task-bus.ts';
 import { ConversationLedger, type LedgerTurn } from '../conversation-ledger.ts';
 import type { AudioFrame, EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
 import { LiveVoiceEngine, streamLiveAnswer, type LiveAudioLane } from '../engines/live-voice-engine.ts';
+import { createAbortGate } from '../engines/stream-utils.ts';
 import type { TurnTicket } from '../kernel.ts';
 import { LIVE_BACKEND_TASK_DIRECTIVE, buildLiveReportPrompt } from '../persona.ts';
 import type {
@@ -88,26 +89,6 @@ function turnContext(turn: TurnInput): TurnContext | undefined {
 
 function asBuffer(pcm: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm);
-}
-
-/** 已中止立刻兑现。调用方在 `finally` 里摘掉监听，避免一轮挂一个永久回调。 */
-function whenAborted(signal: AbortSignal): { readonly done: Promise<void>; cancel(): void } {
-  if (signal.aborted) {
-    return { done: Promise.resolve(), cancel() {} };
-  }
-  let onAbort: (() => void) | undefined;
-  const done = new Promise<void>((resolve) => {
-    onAbort = () => {
-      resolve();
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-  return {
-    done,
-    cancel() {
-      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
-    },
-  };
 }
 
 /**
@@ -533,7 +514,7 @@ export class LiveOrchestrator implements AgentProvider {
   private async *synth(text: string, signal: AbortSignal): AsyncGenerator<EngineEvent> {
     if (signal.aborted || this.disposed || text.trim() === '') return;
     const iter = this.tts.synthesize(text)[Symbol.asyncIterator]();
-    const gate = whenAborted(signal);
+    const gate = createAbortGate(signal);
     try {
       for (;;) {
         if (signal.aborted) return;

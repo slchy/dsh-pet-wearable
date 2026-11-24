@@ -18,10 +18,12 @@ import type * as ort from 'onnxruntime-node';
 
 import { UtteranceAssembler, looksUnfinished, type UtteranceAssemblerOptions } from '../src/utterance-assembler.ts';
 import type { AudioFrame } from '../src/engine-contract.ts';
+import { DEFAULT_PET_PARAMS } from '../src/pet/brain/registry.ts';
 import { SilenceTriggers } from '../src/silence-triggers.ts';
 import { TurnJudge } from '../src/turn-judge.ts';
 import { UplinkPipeline } from '../src/uplink-pipeline.ts';
 import { SileroVad } from '../src/vad.ts';
+import { announceListenMs } from '../src/voice-session.ts';
 
 interface Harness {
   assembler: UtteranceAssembler;
@@ -1603,11 +1605,16 @@ test('等语义期间静音到顶，明确 MORE 也不再延长', async () => {
 // 能量门已经算过 `voiced`，组装器不该再按能量算一遍：同一段音频在门与判停两处
 // 得到两个「有没有人说话」，正是「有时候丢字、有时候灌静音」的来源。
 
-function frameAt(tsMs: number, voiced: boolean, pcm: Buffer = Buffer.alloc(640)): AudioFrame {
-  return { pcm, voiced, silenceMs: 0, gateSeq: 1, tsMs };
+function frameAt(
+  tsMs: number,
+  voiced: boolean,
+  pcm: Buffer = Buffer.alloc(640),
+  silenceMs = 0,
+): AudioFrame {
+  return { pcm, voiced, silenceMs, gateSeq: 1, tsMs };
 }
 
-test('addFrame：`voiced` 与时刻都听前端的，全零 PCM 也算有声', () => {
+test('addFrame：已去抖的 voiced 立刻算数，静音只信 frame.silenceMs', () => {
   const commits: number[] = [];
   let clock = 1;                       // 故意和 frame.tsMs 差得很远：用错时钟一眼就露
   const assembler = new UtteranceAssembler({
@@ -1625,17 +1632,43 @@ test('addFrame：`voiced` 与时刻都听前端的，全零 PCM 也算有声', (
     log: () => {},
   });
   try {
+    // 全零 PCM。若在组装器里重算峰值，这一帧会被判成静音，lastVoicedAt 停在 −∞。
     assembler.addFrame(frameAt(5_000, true));
-    assert.equal(assembler.lastVoicedAtMs, Number.NEGATIVE_INFINITY, '第一帧只计数（2 帧去抖）');
-    assembler.addFrame(frameAt(5_020, true));
-    assert.equal(assembler.lastVoicedAtMs, 5_020, '第二帧起推进，且用的是 frame.tsMs');
+    assert.equal(assembler.lastVoicedAtMs, 5_000, '上游已去抖：第一帧就推进，且用 frame.tsMs');
 
-    assembler.addFrame(frameAt(5_040, false));
-    assembler.addFrame(frameAt(5_060, false));
-    // 若在组装器里重算能量峰值，这两帧全零 PCM 会被判成「静音」，`lastVoicedAt`
-    // 一直是 −∞，一封都不会有。
-    assert.deepEqual(commits, [40], '静音时长按 frame.tsMs 累计（5060 − 5020）');
-    assert.equal(assembler.lastVoicedAtMs, 5_020, '静音帧不推进「最近有声」');
+    // 墙钟几乎没动，帧时间戳只差 20，前端静音却报 40。必须用 silenceMs。
+    clock = 2;
+    assembler.addFrame(frameAt(5_020, false, Buffer.alloc(640), 40));
+    assert.deepEqual(commits, [40], '封段静音 === frame.silenceMs');
+    assert.equal(assembler.lastVoicedAtMs, 5_000, '静音帧不推进「最近有声」');
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('addAudio 仍做两帧去抖：单帧尖峰不推进 lastVoicedAt', () => {
+  let clock = 5_000;
+  const assembler = new UtteranceAssembler({
+    quietMs: 0,
+    extendMs: 30,
+    maxExtensions: 1,
+    fallbackWindowMs: 0,
+    threshold: 0.5,
+    recentMaxBytes: 16_000,
+    silenceDb: -40,
+    now: () => clock,
+    onUtterance: () => {},
+    log: () => {},
+  });
+  try {
+    assembler.addAudio(voiced());
+    assert.equal(assembler.lastVoicedAtMs, Number.NEGATIVE_INFINITY, '第一帧只计数');
+    clock = 5_020;
+    assembler.addAudio(voiced());
+    assert.equal(assembler.lastVoicedAtMs, 5_020, '第二帧起推进');
+    clock = 5_040;
+    assembler.addAudio(silent());
+    assert.equal(assembler.lastVoicedAtMs, 5_020, '静音帧不推进');
   } finally {
     assembler.dispose();
   }
@@ -1659,18 +1692,32 @@ test('addFrame 的四路触发与 addAudio 完全一致', async () => {
       log: () => {},
     });
     try {
+      // addFrame 吃的是能量门去抖之后的帧：第一块过门限还不算有声。
+      let heard = 0;
+      let lastVoicedAt = Number.NEGATIVE_INFINITY;
       for (let i = 0; i < 6; i += 1) {
         clock += 20;
         const chunk = voiced();
-        if (kind === 'audio') assembler.addAudio(chunk);
-        else assembler.addFrame(frameAt(clock, true, chunk));
+        if (kind === 'audio') {
+          assembler.addAudio(chunk);
+        } else {
+          heard += 1;
+          const confirmed = heard >= 2;
+          if (confirmed) lastVoicedAt = clock;
+          assembler.addFrame(frameAt(clock, confirmed, chunk, 0));
+        }
       }
       assembler.notePartial('你好');
       for (let i = 0; i < 4; i += 1) {
         clock += 20;
         const chunk = silent(20);
-        if (kind === 'audio') assembler.addAudio(chunk);
-        else assembler.addFrame(frameAt(clock, false, chunk));
+        if (kind === 'audio') {
+          assembler.addAudio(chunk);
+        } else {
+          heard = 0;
+          const silenceMs = lastVoicedAt === Number.NEGATIVE_INFINITY ? 0 : clock - lastVoicedAt;
+          assembler.addFrame(frameAt(clock, false, chunk, silenceMs));
+        }
       }
       await delay(30);
     } finally {
@@ -1721,6 +1768,75 @@ test('UplinkPipeline 把注入的时钟同时交给能量门与 AudioFrame.tsMs'
     assert.equal(closes.length, 0, '20 ms 静音不该关门');
     assert.equal(frames.length, 2);
     assert.equal(frames[1]!.silenceMs, 20, '静音时长按注入的时钟算');
+  } finally {
+    pipeline.end();
+  }
+});
+
+test('UplinkPipeline voiceDebounceFrames:2 单帧尖峰不归零，预卷带 voiced，时钟只读一次', () => {
+  let clock = 10_000;
+  let nowCalls = 0;
+  const frames: AudioFrame[] = [];
+  const opens: Array<readonly { readonly pcm: Buffer; readonly voiced: boolean }[] | undefined> = [];
+  const pipeline = new UplinkPipeline({
+    ffmpegPath: 'ffmpeg',
+    codec: 'pcm16',
+    sampleRate: 16_000,
+    gate: { thresholdDbfs: -40, holdMs: 2_000, prerollMs: 800 },
+    voiceDebounceFrames: 2,
+    now: () => {
+      nowCalls += 1;
+      return clock;
+    },
+    log: () => {},
+    onError: () => {},
+    onPcm: () => {},
+    onSpeechOpen: (_peak, _preroll, _ms, prerollFrames) => { opens.push(prerollFrames); },
+    onFrame: (frame) => { frames.push(frame); },
+    onSpeechClose: () => {},
+  });
+  try {
+    pipeline.push(Buffer.alloc(640));
+    assert.equal(frames.length, 0, '纯静音不开门');
+    assert.equal(nowCalls, 1, '每块只读一次时钟');
+
+    clock += 20;
+    pipeline.push(voiced());
+    assert.equal(frames.length, 0, '单帧尖峰还不开门、也不吐有声帧');
+    assert.equal(nowCalls, 2);
+
+    clock += 20;
+    pipeline.push(voiced());
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0]!.voiced, true, '连续第二帧才算有声');
+    assert.equal(frames[0]!.silenceMs, 0);
+    assert.equal(frames[0]!.tsMs, clock);
+    assert.equal(nowCalls, 3, '开门这一帧也不能把 now() 读两次');
+    const labeled = opens[0];
+    assert.ok(labeled);
+    assert.equal(labeled.length, 2);
+    assert.equal(labeled[0]!.voiced, false, '预卷里的静音块在门内标成无声');
+    assert.equal(labeled[1]!.voiced, true, '开门前那块有声预卷在门内标好');
+
+    clock += 100;
+    pipeline.push(Buffer.alloc(640));
+    assert.equal(frames[1]!.voiced, false);
+    assert.equal(frames[1]!.silenceMs, 100);
+
+    clock += 20;
+    pipeline.push(voiced());
+    assert.equal(frames[2]!.voiced, false, '门开着的单帧尖峰不算有声');
+    assert.equal(frames[2]!.silenceMs, 120, '单帧尖峰不把 silenceMs 打回 0');
+
+    clock += 20;
+    pipeline.push(voiced());
+    assert.equal(frames[3]!.voiced, true);
+    assert.equal(frames[3]!.silenceMs, 0, '连续第二帧才把静音归零');
+
+    clock += 20;
+    pipeline.push(Buffer.alloc(640));
+    assert.equal(frames[4]!.silenceMs, 20, '最近有声停在第二帧，不停在尖峰那一帧');
+    assert.equal(nowCalls, 7);
   } finally {
     pipeline.end();
   }
@@ -2324,6 +2440,63 @@ test('SilenceTriggers 传 0 彻底关闭预跑和投机，不传则仍用 100/20
   assert.equal(opened.predicts, 0);
   on.noteFrame(false, 1_220);
   assert.equal(opened.predicts, 1, '不传 silencePauseMs 时静音 200 ms 要预跑');
+});
+
+test('SilenceTriggers alreadyDebounced 信任 frontSilenceMs，不再做第二套去抖', () => {
+  const commits: number[] = [];
+  const voicedAt: number[] = [];
+  const silences: number[] = [];
+  const triggers = new SilenceTriggers({
+    commitAfterMs: 40,
+    log: () => {},
+    onCommit: (ms) => { commits.push(ms); },
+  }, {
+    pendingText: () => '',
+    lastUtteranceAt: () => Number.NEGATIVE_INFINITY,
+    lastPartialAt: () => Number.NEGATIVE_INFINITY,
+    lastPartialText: () => '',
+    hasPredictor: () => false,
+    predictionPending: () => false,
+    startUpcomingPrediction: () => {},
+    onVoiced: (at) => { voicedAt.push(at); },
+    onSilence: (_at, ms) => { silences.push(ms); },
+  });
+  triggers.noteFrame(true, 5_000, 0, true);
+  assert.deepEqual(voicedAt, [5_000], '已去抖的单帧立刻推进');
+  assert.equal(triggers.lastVoicedAtMs, 5_000);
+  // 时间戳只过了 20，前端静音报 90。按时刻另算会得到 20，封段门槛 40 不会响。
+  triggers.noteFrame(false, 5_020, 90, true);
+  assert.deepEqual(commits, [90], '封段静音就是 frontSilenceMs');
+  assert.deepEqual(silences, [90]);
+
+  const legacy = new SilenceTriggers({
+    log: () => {},
+  }, {
+    pendingText: () => '',
+    lastUtteranceAt: () => Number.NEGATIVE_INFINITY,
+    lastPartialAt: () => Number.NEGATIVE_INFINITY,
+    lastPartialText: () => '',
+    hasPredictor: () => false,
+    predictionPending: () => false,
+    startUpcomingPrediction: () => {},
+    onVoiced: () => {},
+  });
+  legacy.noteFrame(true, 1_000);
+  assert.equal(legacy.lastVoicedAtMs, Number.NEGATIVE_INFINITY, '老路径第一帧只计数');
+  legacy.noteFrame(true, 1_020);
+  assert.equal(legacy.lastVoicedAtMs, 1_020);
+});
+
+test('announceListenMs 认 params.listenMs，其次认 PET_LISTEN_MS 那一层', () => {
+  assert.equal(announceListenMs(undefined), DEFAULT_PET_PARAMS.listenMs);
+  assert.equal(announceListenMs(null), DEFAULT_PET_PARAMS.listenMs);
+  assert.equal(announceListenMs({ listenMs: 1_500 }), 1_500);
+  assert.equal(announceListenMs({ params: { listenMs: 2_500 } }), 2_500);
+  assert.equal(
+    announceListenMs({ params: { listenMs: 2_500 }, listenMs: 1_500 }),
+    2_500,
+    'params.listenMs 优先于这一层的 listenMs',
+  );
 });
 
 test('TurnJudge 按时回来的 f64 交给当前 pending', async () => {

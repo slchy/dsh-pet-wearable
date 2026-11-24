@@ -2,7 +2,7 @@
  * dsh 插件入口（web 兼容层）。
  *
  * 一条链：浏览器 ⇄ WS ⇄ 本进程的桥 ⇄ TCP 127.0.0.1 ⇄ 本进程内的语音栈。
- * 语音栈就是包① 那一套（`src/voice/` 是它的副本，由 `scripts/sync-voice.mjs`
+ * 语音栈就是包① 那一套（`src/voice/` 是它的副本，由 `scripts/sync-runtime.mjs`
  * 生成、不进 git），装配**直接复用包① 导出的那两个函数**
  * （`assemblePipelinePlan` / `assembleStreamingAgent`）—— 与 CLI 是同一份装配代码，
  * 两边不会漂。
@@ -33,10 +33,15 @@ import {
   createAuditSlot,
   loadAuthenticator,
   loadDotEnv,
+  loadStaticAsrCorpus,
+  resolveAsrLanguage,
   type AssembledStreamingPipeline,
 } from './voice/main.ts'
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './voice/announce-store.ts'
-import { checkBindSafety } from './voice/bind-policy.ts'
+import { checkBindSafety, isLoopbackHost } from './voice/bind-policy.ts'
+import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './voice/http-agent.ts'
+import { expiryWarning } from './voice/tls-cert.ts'
+import { buildVoiceRuntimeConfig } from './voice/voice-config.ts'
 import {
   KEEPALIVE_PROMPT,
   newActivityState,
@@ -87,10 +92,14 @@ function loadBridgeTls(config: VoiceWebConfig): { key: Buffer; cert: Buffer } | 
     return undefined
   }
   try {
+    const cert = readFileSync(config.tls.certPath)
+    for (const line of expiryWarning(cert) ?? []) {
+      console.warn(`  ${line}`)
+    }
     return {
       key: readFileSync(config.tls.keyPath),
-      cert: readFileSync(config.tls.certPath),
-    };
+      cert,
+    }
   } catch (error) {
     throw new Error(`voice-web: TLS 证书读不到（${(error as Error).message}）`);
   }
@@ -168,7 +177,7 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
   }
   // 非本机地址必须明说来源：wss 下浏览器不替服务端拦跨站页面，
   // 一个任意网页就能接上来推流。同源兜底在这里不够用。
-  if (config.host !== '127.0.0.1' && config.host !== 'localhost' && config.origins.length === 0) {
+  if (!isLoopbackHost(config.host) && config.origins.length === 0) {
     throw new Error('voice-web: 监听非本机地址时必须配 origins（允许的页面来源），否则任何网页都能连上来')
   }
 
@@ -195,6 +204,9 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       if (loaded > 0) {
         report(`凭据    ${process.cwd()}\\.env（${loaded} 项）`)
       }
+      const keepAliveMs = envNumber('MIAI_HTTP_KEEPALIVE_MS', DEFAULT_KEEPALIVE_MS)
+      installHttpAgent(keepAliveMs)
+      report(`HTTP     连接保活 ${keepAliveMs} ms（默认 4 秒会让每轮重新握手）`)
 
       // 审计出口自己造一份：`createAuditSlot()` 是每个宿主一份，不共用包① 的全局槽。
       // TTS provider 与流式装配都往这里写，`setAudit` 再把「当前连接」的档案挂上来。
@@ -216,11 +228,14 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
         throw new Error(`voice-web: ${safety.message}`)
       }
 
-      const stt = await buildStt(config.stt, sttCreds())
+      const workDir = config.workDir === '' ? process.cwd() : config.workDir
+      const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md')
+      const memoryFile = new MemoryFile(memoryPath)
+      const corpusText = loadStaticAsrCorpus(memoryFile.hotwordHints(), process.env)
+      const language = resolveAsrLanguage(process.env)
+      const stt = await buildStt(config.stt, { ...sttCreds(), corpusText, language })
       const tts = await buildTts(config.tts, audit)
       report(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）`)
-
-      const workDir = config.workDir === '' ? process.cwd() : config.workDir
       // 与 CLI 同一个队列：任务结果离线时先存着，重连后补播
       const announceStore = AnnounceStore.open({
         file: process.env['MIAI_ANNOUNCE_FILE'] ?? join(homedir(), '.voice-agent', 'announce.jsonl'),
@@ -270,8 +285,6 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
           throw new Error('管道装配需要 dsh 会话，但 agent 不是 dsh')
         }
         const activity = newActivityState(Date.now())
-        const memoryPath = process.env['MEMORY_FILE'] ?? join(workDir, 'MEMORY.md')
-        const memoryFile = new MemoryFile(memoryPath)
 
         // 投机只在级联 + 真有快车道时才问；live 不加载文本快车道，问了也没用
         const speculate = plan.mode === 'cascade' && plan.useCascadeFastLane
@@ -293,6 +306,9 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
           speculate,
           announceStore,
           log: report,
+          memorySummary: () => memoryFile.summary(),
+          asrCorpusText: corpusText,
+          asrLanguage: language,
         })
         agent = streaming.agent
         report(`记忆      ${memoryPath}（${memoryFile.entries().length} 条，快车道只读）`)
@@ -321,18 +337,25 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
         }
       }
 
-      // 判停侧车与语义判停：旋钮与默认值都与 CLI 一致（见 `src/main.ts` 的
-      // `runVoiceServer({...})`）。**改那边记得改这里** —— 这两块是唯一还没抽成
-      // 共用函数的部分。
+      // 门限、判停、端点、超时与 CLI 同一份（`voice-config.ts`）。
+      // 浏览器只盖两处：上行增益 1×（getUserMedia 已开 AGC），控制口 0（没有固定偏移）。
       const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? ''
       const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? ''
       const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
         && turnJudgePython !== '' && turnJudgeScript !== ''
-
       const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim()
-      const semantic = envString('SEMANTIC_END_TAG') === '0' || semanticKey === ''
-        ? null
-        : semanticEndpoint({
+      const semanticEnabled = envString('SEMANTIC_END_TAG') !== '0' && semanticKey !== ''
+      const runtime = buildVoiceRuntimeConfig({
+        env: process.env,
+        sttSpec: config.stt,
+        turnJudgeEnabled,
+        turnJudgePython,
+        turnJudgeScript,
+        semanticEnabled,
+        overrides: { micGain: 1, controlPort: 0 },
+      })
+      const semantic = semanticEnabled
+        ? semanticEndpoint({
           apiKey: semanticKey,
           ...(process.env['FAST_LANE_MODEL'] === undefined
             ? {}
@@ -340,9 +363,10 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
           ...(process.env['FAST_LANE_BASE_URL'] === undefined
             ? {}
             : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
-          timeoutMs: envNumber('SEMANTIC_END_TAG_TIMEOUT_MS', 400),
+          timeoutMs: runtime.semanticTimeoutMs,
           log: report,
         })
+        : null
 
       const turnJudgeClient = turnJudgeEnabled
         ? new TurnJudge({ python: turnJudgePython, script: turnJudgeScript, log: report })
@@ -359,9 +383,11 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
       }
       turnJudge = turnJudgeClient
 
-      // 语音栈先起：端口 0 → `onListening` 报出真实端口，再把桥接上去
-      const voicePort = await new Promise<number>((resolve) => {
-        void runVoiceServer({
+      // 语音栈先起：端口 0 → `onListening` 报出真实端口，再把桥接上去。
+      // `runVoiceServer` 若在 `onListening` 之前就返回或抛错（端口冲突、绑定失败），
+      // 必须 reject，否则这个 Promise 永远等不到。
+      const voicePort = await new Promise<number>((resolve, reject) => {
+        runVoiceServer({
           port: 0,
           host: '127.0.0.1',
           device: config.device,
@@ -380,80 +406,47 @@ export function apply(ctx: Context, config: VoiceWebConfig): void {
             }),
           // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
           ...(streaming?.omniShadow === undefined ? {} : { omniShadow: streaming.omniShadow }),
-          ...(turnJudgeClient === null
+          ...(turnJudgeClient === null || runtime.turnJudge === undefined
             ? {}
-            : {
-              turnJudge: {
-                pythonPath: turnJudgePython,
-                scriptPath: turnJudgeScript,
-                quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
-                extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 200),
-                maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 2),
-                maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 1),
-                trailingTrimMs: envNumber('TURN_JUDGE_TRIM_MS', 20),
-                threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
-                thresholdCjk: envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35),
-                waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 200),
-                waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 1_200),
-                maxOpenSilenceMs: envNumber('TURN_JUDGE_MAX_OPEN_SILENCE_MS', 650),
-              },
-              turnJudgeClient,
-            }),
+            : { turnJudge: runtime.turnJudge, turnJudgeClient }),
           ...(semantic === null
             ? {}
-            : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 300) }),
-          gate: {
-            // 默认 −30 与线上一致。**但上行增益用 1×，不是 CLI 的 4×**：
-            // 浏览器侧 `getUserMedia` 已经开着 autoGainControl，再乘 4 会顶到削波。
-            // 门限按「放大后」算，所以这两项要成对看 —— 改一个就得回头量另一个。
-            thresholdDbfs: envNumber('VOICE_PEAK_DBFS', -30),
-            holdMs: envNumber('VOICE_HOLD_MS', 2000),
-            prerollMs: envNumber('VOICE_PREROLL_MS', 800),
-            pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
-            speculateMs: envNumber('VOICE_SPECULATE_MS', 100),
-            // 端点由我们控的 ASR 才由宿主封段；服务端自己判句的 provider（NLS）必须留 0
-            commitMs: envNumber('VOICE_COMMIT_MS', config.stt === 'qwen-realtime' ? 20 : 0),
-            sttCommitMs: envNumber('VOICE_STT_COMMIT_MS', config.stt === 'qwen-realtime' ? 150 : 0),
-            ...(config.stt === 'qwen-realtime'
-              ? {
-                openQuietMs: envNumber('VOICE_OPEN_QUIET_MS', 300),
-                openQuietShortMs: envNumber('VOICE_OPEN_QUIET_SHORT_MS', 200),
-              }
-              : {}),
-          },
-          playbackTailMs: 600,
+            : { semantic, semanticBudgetMs: runtime.semanticBudgetMs }),
+          gate: runtime.gate,
+          playbackTailMs: runtime.playbackTailMs,
           ttsGain: envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1)),
-          micGain: envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 1)),
+          micGain: runtime.micGain,
           levelLogMs: envNumber('MIAI_LEVEL_LOG', 0),
           archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
-          archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
-          archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
+          archiveMaxMb: runtime.archiveMaxMb,
+          archiveKeep: runtime.archiveKeep,
           // 连接建立/断开时把审计（快车道 + TTS 两段）接到这条档案上。
           // 两参都转发：槽位靠 `expected` 做所有权守卫（旧连接收尾摘不掉新连接的）。
           setAudit: (sink, expected) => { auditSlot.set(sink, expected) },
           photoDir: process.env['PHOTO_DIR'] ?? '',
-          // 浏览器没有拍照，但这个口不能省：类型上必填，留空会撞端口。
-          // 0 = 系统挑空闲口（里层端口本身就是 0，没有固定偏移可用）
-          controlPort: envNumber('PHOTO_CTL_PORT', 0),
-          photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 60_000),
-          confirmTimeoutMs: envNumber('MIAI_CONFIRM_TIMEOUT_MS', 30_000),
-          imageQuestion: '这张图里有什么？用一两句话口语化描述。',
+          // 浏览器没有拍照。0 = 系统挑空闲口（里层端口本身就是 0，没有固定偏移）。
+          controlPort: runtime.controlPort,
+          photoTimeoutMs: runtime.photoTimeoutMs,
+          confirmTimeoutMs: runtime.confirmTimeoutMs,
+          imageQuestion: runtime.imageQuestion,
           announceStore,
           // 里层明文：桥用 `net.connect` 连进来（见文件头）
           authenticate,
-          idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
+          idleTimeoutMs: runtime.idleTimeoutMs,
           // 多标签页 = 多条连接；同时也是「必须靠 onListening().stop() 收尾」的原因
           serve: true,
           onListening: (info) => {
             voice.stop = info.stop
             resolve(info.port)
           },
+        }).then((code) => {
+          logger.info(`语音栈退出 ${code}`)
+          reject(new Error(`语音栈在开始监听前就退出了（code=${code}）`))
+        }, (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          logger.error(`语音栈启动失败: ${message}`)
+          reject(error instanceof Error ? error : new Error(message))
         })
-          .then((code) => { logger.info(`语音栈退出 ${code}`) })
-          .catch((error: unknown) => {
-            logger.error(`语音栈启动失败: ${(error as Error).message}`)
-            resolve(0)
-          })
       })
       if (voicePort === 0) {
         throw new Error('语音栈没有起来，桥不接')

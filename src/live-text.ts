@@ -140,7 +140,12 @@ export class LiveTextRelay {
     this.handler = handler;
   }
 
-  /** 起监听（幂等），返回端口。失败返回 0（插件侧就不启用）。 */
+  /**
+   * 起监听（幂等）。
+   *
+   * 返回**此刻已经绑定上的端口**。`listen(0)` 要等系统分配，这一拍之前是 0，
+   * 不表示失败。要拿真实端口，用 {@link ready}。
+   */
   start(): number {
     if (this.server !== null) {
       return this._port;
@@ -158,23 +163,11 @@ export class LiveTextRelay {
         this.log(`  流式    ✗ 侧通道监听失败：${e.message}`);
         this.server = null;
       });
-      // 同步拿不到端口，所以用 0 让系统分配后**同步读回**——
-      // `listen` 是异步的，这里用 `address()` 在 listen 回调里补，调用方拿到的
-      // 是 0。为了不让调用方等异步，改成先 listen(0) 再用 `server.address()`
-      // 轮询到就绪（Node 里 listen 之后立刻 address() 通常还没绑定）。
       server.listen(0, '127.0.0.1');
       this.server = server;
-      const addr = server.address();
-      if (addr !== null && typeof addr === 'object') {
-        this._port = addr.port;
-      } else {
-        // 还没绑定完：等 listening 事件
-        server.once('listening', () => {
-          const a = server.address();
-          if (a !== null && typeof a === 'object') {
-            this._port = a.port;
-          }
-        });
+      this.capturePort(server);
+      if (this._port === 0) {
+        server.once('listening', () => { this.capturePort(server); });
       }
       return this._port;
     } catch (e) {
@@ -183,26 +176,35 @@ export class LiveTextRelay {
     }
   }
 
-  /** 等端口就绪（`listen` 是异步的，spawn 子进程前要拿到真端口）。 */
+  /**
+   * 等到 bind 完成，返回系统分配的端口（大于 0）。
+   * 监听失败时返回 0。`start()` 的同步返回值在绑定完成前可能仍是 0。
+   */
   async ready(): Promise<number> {
-    const port = this.start();
-    if (port > 0 || this.server === null) {
-      return port;
-    }
+    this.start();
     const server = this.server;
-    return await new Promise<number>((resolve) => {
-      const done = (): void => {
-        const a = server.address();
-        this._port = a !== null && typeof a === 'object' ? a.port : 0;
-        resolve(this._port);
-      };
-      if (server.listening) {
-        done();
-        return;
+    if (server === null) {
+      return 0;
+    }
+    if (!server.listening) {
+      const opened = await new Promise<boolean>((resolve) => {
+        const onListening = (): void => {
+          server.off('error', onError);
+          resolve(true);
+        };
+        const onError = (): void => {
+          server.off('listening', onListening);
+          resolve(false);
+        };
+        server.once('listening', onListening);
+        server.once('error', onError);
+      });
+      if (!opened || this.server === null) {
+        return 0;
       }
-      server.once('listening', done);
-      setTimeout(done, 1000).unref?.();
-    });
+    }
+    this.capturePort(server);
+    return this._port;
   }
 
   get port(): number {
@@ -217,6 +219,13 @@ export class LiveTextRelay {
     this._port = 0;
   }
 
+  private capturePort(server: Server): void {
+    const addr = server.address();
+    if (addr !== null && typeof addr === 'object') {
+      this._port = addr.port;
+    }
+  }
+
   private consume(chunk: string): void {
     this.buffer += chunk;
     let at = this.buffer.indexOf('\n');
@@ -224,10 +233,15 @@ export class LiveTextRelay {
       const line = this.buffer.slice(0, at).trim();
       this.buffer = this.buffer.slice(at + 1);
       if (line !== '') {
+        let msg: LiveMessage | null = null;
         try {
-          this.handler?.(JSON.parse(line) as LiveMessage);
-        } catch {
-          // 半行/坏行直接丢：这条通道是加速用的，不是数据源
+          msg = JSON.parse(line) as LiveMessage;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          this.log(`  流式    ✗ 侧通道行解析失败：${reason}（${line.slice(0, 80)}）`);
+        }
+        if (msg !== null) {
+          this.handler?.(msg);
         }
       }
       at = this.buffer.indexOf('\n');

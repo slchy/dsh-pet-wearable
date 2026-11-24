@@ -57,16 +57,6 @@ export function isPreTurnSegment(
   return cause.commitSeq <= base;
 }
 
-/**
- * 这段转写能不能构成**插话**（打断正在播的回答）。
- *
- * 与 {@link isPreTurnSegment} 互补，但单独命名：调用点读起来是"能不能打断"，
- * 而不是"是不是旧段"的否定 —— 后者在 `thinking` 之类的状态上会让人想歪。
- */
-export function mayBargeIn(cause: CausalStamp, mark: CausalWatermark): boolean {
-  return !isPreTurnSegment(cause, mark);
-}
-
 /** 轮次票据的因果坐标：`no` 是第几轮，`gen` 是被插话顶掉过几次 */
 export interface TicketCoordinate {
   readonly no: number;

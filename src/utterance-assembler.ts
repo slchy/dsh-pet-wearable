@@ -587,9 +587,10 @@ export class UtteranceAssembler {
   /**
    * 喂一帧声学前端的输出（见 `engine-contract.ts` 契约①）。
    *
-   * 与 {@link addAudio} 的区别只有一处：`voiced` 与 `tsMs` 都是**前端给的**，
-   * 所以这里**绝不调用 `pcm16PeakDbfs`**，也不读 `this.now()` —— 门与判停
-   * 用同一份 `voiced`、同一个时钟，四个静音阈值才对得上同一段音频。
+   * `voiced`、`tsMs`、`silenceMs` 都是能量门给的，而且 `voiced` 已经按
+   * `voiceDebounceFrames` 去过抖。这里**绝不调用 `pcm16PeakDbfs`**，也不读
+   * `this.now()`，也不再做第二套两帧去抖 —— 四个静音阈值读的就是
+   * `frame.silenceMs`，和档案里的 `front_silence_ms` 是同一个数。
    *
    * ⚠️ 宿主的 `now` 必须和产出 `frame.tsMs` 的时钟是**同一把尺**：本类会在
    * `evaluate` 里拿 `this.now()` 减 `lastVoicedAt` 算静音（见 `barge-voicing.ts`）。
@@ -601,7 +602,7 @@ export class UtteranceAssembler {
     this.recentChunks.push(Buffer.from(frame.pcm));
     this.recentBytes += frame.pcm.length;
     this.trimRecent();
-    this.silence.noteFrame(frame.voiced, frame.tsMs);
+    this.silence.noteFrame(frame.voiced, frame.tsMs, frame.silenceMs, true);
   }
 
   /**
@@ -896,10 +897,12 @@ export class UtteranceAssembler {
   }
 
   /**
-   * 收到去抖后的真实新语音帧（连续 ≥2 帧有声）。
+   * 收到去抖后的真实新语音帧。
    *
-   * 物理不变量：缓冲文本非空期间一旦收到新语音，必须取消在途定时器并迁入
-   * `speaking_more` —— 预算耗尽只能限制「安静时多等几拍」，绝不能在说话中途截断。
+   * `addAudio` 在 `SilenceTriggers` 里数到第 2 帧才到这里；`addFrame` 的
+   * `voiced` 由能量门去抖后直接为 true。缓冲文本非空期间一旦收到，必须取消
+   * 在途定时器并迁入 `speaking_more` —— 预算耗尽只能限制「安静时多等几拍」，
+   * 绝不能在说话中途截断。
    */
   private handleVoiced(atMs: number): void {
     this.prediction = null;

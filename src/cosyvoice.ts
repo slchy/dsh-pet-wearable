@@ -39,8 +39,7 @@ import { randomUUID } from 'node:crypto';
 
 import WebSocket from 'ws';
 
-import { asEmotion, type Emotion } from './emotion.ts';
-import { cleanForSpeech } from './agent.ts';
+import { asEmotion, cleanForSpeech, type Emotion } from './emotion.ts';
 import type { TtsProvider } from './providers.ts';
 
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/inference';

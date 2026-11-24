@@ -44,26 +44,31 @@ const ACK_MARKERS: readonly string[] = [
 ];
 
 /**
+ * 长的在前。`知道了` 是 `我知道了` 的后缀，全局 `split` 会从词中间下刀：
+ * 词表顺序一变，`我知道了` 就被削成 `我`。从左到右只在当前位置吃最长的那个。
+ */
+const MARKERS_LONGEST_FIRST: readonly string[] = [...ACK_MARKERS].sort(
+  (a, b) => b.length - a.length,
+);
+
+/**
  * 该句是否只是旁听反馈。
  *
- * 做法：去掉标点与空白后，反复剔除应答词，若什么都不剩就是旁听反馈。
+ * 去掉标点与空白后，从左到右按长度降序贪心剥离应答词。
+ * 游标每次前进一整词，整段都被吃完才算旁听反馈。
  */
 export function isBackchannelOnly(text: string): boolean {
-  let rest = text.replace(PUNCTUATION, '');
-  if (!rest) {
+  const rest = text.replace(PUNCTUATION, '');
+  if (rest.length === 0) {
     return false;
   }
-
-  // 反复剔除，直到不再变化（处理「嗯嗯」「知道了知道了」这类叠用）
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const marker of ACK_MARKERS) {
-      if (rest.includes(marker)) {
-        rest = rest.split(marker).join('');
-        changed = true;
-      }
+  let index = 0;
+  while (index < rest.length) {
+    const marker = MARKERS_LONGEST_FIRST.find((item) => rest.startsWith(item, index));
+    if (marker === undefined) {
+      return false;
     }
+    index += marker.length;
   }
-  return rest.length === 0;
+  return true;
 }

@@ -3,7 +3,8 @@
  *
  * 两层解耦：
  * - `session.ts` 只管怎么调 dsh、怎么续会话（机制）
- * - 这里管输出清洗（策略）
+ * - 这里管输出清洗（策略）。`cleanForSpeech` 的实现在 `emotion.ts`，
+ *   合成器和本文件都从那里取；本文件继续转出同名。
  *
  * **人设与行为规则不在这里**：全文存放在 `mcp/profile.cordis.yml` 的
  * `personaPrefix`，由 dsh 作为系统提示词注入（部署时装成
@@ -19,8 +20,10 @@ import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import type { DelegateReason } from './providers.ts';
-import { parseEmotion, stripEmotionTags } from './emotion.ts';
+import { cleanForSpeech, parseEmotion } from './emotion.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
+
+export { cleanForSpeech } from './emotion.ts';
 
 /**
  * dsh 的压缩阈值（token）—— 来自 profile 里的 `compaction-basic.thresholdRatio: 0.125`。
@@ -48,49 +51,6 @@ export function compactionNote(current: number | undefined, previous: number | u
     return `  ← 刚压缩过（上一轮 ${previous}）：这一轮变慢可能是它`;
   }
   return '';
-}
-
-/** 兜底：TTS 前再清洗一遍，挡住模型偶尔漏掉的格式。 */
-export function cleanForSpeech(text: string): string {  // 情绪标签只该出现在开头（`parseEmotion` 已经剥过一次）；模型有时会在句中
-  // 再写一个，那些会被原样念出来（「方括号开心」）。标签表来自 `emotion.ts`，
-  // 这里不重复抄写。
-  return stripEmotionTags(text)
-    // 标签表之外的自造语气标签（`[笑]` `[叹气]`）抓不到，同样会被念出来。
-    // 只列「不可能是正常内容」的词：`[两]` 这类正常方括号必须保留（见 tests）。
-    .replace(/(?:\[|【)\s*(?:轻?笑|笑声|苦笑|冷笑|叹气|轻叹|哭声?|哼|小声|低声)\s*(?:\]|】)/g, '')
-    // 快车道判委派前可能已经推出半个标签（`[[`），和 dsh 的正文拼在一起就是 `[[[你好…`
-    .replace(/^\s*(?:\[|【|\]|】){1,4}\s*/, '')
-    // 模型偶尔用实体代替字符，最常漏的是零宽空格（`&#8203;`）—— 字面送进 TTS
-    // 会被念成「ampersand hash…」，所以先在**文本层**把它们清掉，别指望合成器忽略
-    .replace(/&#(?:8203|8204|8205|65279);/g, '')
-    .replace(/&#x(?:200b|200c|200d|feff);/gi, '')
-    .replace(/[\u200b-\u200f\u2060\ufeff]/g, '')
-    // 命名实体按最常见的几个还原：`&nbsp;` 先变空格，交给下面的中文空格规则处理
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&amp;/g, '&') // 最后做，避免 `&amp;lt;` 被解两次
-    .replace(/```[\s\S]*?```/g, '')          // 代码块整块丢掉
-    .replace(/`([^`]+)`/g, '$1')             // 行内代码留内容
-    .replace(/^#{1,6}\s+/gm, '')             // 标题
-    .replace(/^\s*[-*+]\s+/gm, '')           // 列表符号
-    .replace(/^\s*\d+\.\s+/gm, '')           // 有序列表
-    .replace(/\*\*([^*]+)\*\*/g, '$1')       // 粗体
-    .replace(/__([^_]+)__/g, '$1')           // 粗体变体
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') // 链接留文字
-    .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')  // emoji
-    .replace(/\n{2,}/g, '\n')
-    .replace(/[ \t]{2,}/g, ' ')
-    // 两个中日韩字符之间的空格没有语义，只会让合成器塞一个停顿 —— 而这种空格
-    // 几乎都是「为了写 markdown 才加的」（`和 + 反引号代码`）。英文 / 数字 /
-    // 代码段两侧的空格有语义（`看这个 npm run build 命令`），一律不动。
-    .replace(
-      /(?<=[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])[ \t\u3000]+(?=[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef])/g,
-      '',
-    )
-    .trim();
 }
 
 export interface AgentReply extends AskResult {

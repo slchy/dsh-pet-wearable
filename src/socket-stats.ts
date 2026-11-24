@@ -31,8 +31,11 @@ export interface SocketStat {
   readonly local: string;
   /** 对端 `IP:端口`（出向连接用；入向连接这是我们的客户端地址） */
   readonly peer: string;
-  /** 这条连接累计重传了多少段 —— 关键字段，>0 才说明它丢过包 */
-  readonly retrans: number;
+  /**
+   * 这条连接累计重传了多少段（`retrans:当前/累计` 的累计值）。
+   * 读不到 `retrans:` 时是 `null`，不拿 0 冒充「没重传」—— 与 `net-counters.ts` 同一口径。
+   */
+  readonly retrans: number | null;
   /** 当前 RTO（ms）。`ss` 不给时为 `null` */
   readonly rto: number | null;
   /** 平滑 RTT（ms） */
@@ -69,12 +72,10 @@ export function parseSsOutput(text: string): SocketStat[] {
     out.push({
       local,
       peer,
-      // `retrans:0/12` —— 斜杠后面是「连当前这次在内的总重传次数」，取后者
+      // `retrans:0/12` —— 斜杠后面是累计总次数。没有这个字段就是没读到，记 null。
       retrans: (() => {
         const m = /retrans:(\d+)\/(\d+)/.exec(metrics);
-        if (m?.[2] !== undefined) return Number.parseInt(m[2], 10);
-        if (m?.[1] !== undefined) return Number.parseInt(m[1], 10);
-        return 0;
+        return m?.[2] === undefined ? null : Number.parseInt(m[2], 10);
       })(),
       rto: num(/\brto:(\d+)/),
       rtt: (() => {

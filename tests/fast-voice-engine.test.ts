@@ -9,11 +9,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { getEventListeners } from 'node:events';
+
 import type { EngineEvent, FastVoiceEngine, TurnInput } from '../src/engine-contract.ts';
 import type { AgentProvider, AgentReplyView, TtsProvider, TurnContext } from '../src/providers.ts';
 import { AgentEngineAdapter } from '../src/engines/index.ts';
 import { CascadeVoiceEngine } from '../src/engines/cascade-voice-engine.ts';
 import { LiveVoiceEngine } from '../src/engines/live-voice-engine.ts';
+import { createAbortGate, EventQueue, spokenFromStream } from '../src/engines/stream-utils.ts';
 import { FrontedAgent } from '../src/fronted-agent.ts';
 
 const TURN: TurnInput = {
@@ -1083,4 +1086,70 @@ test('AgentEngineAdapter：abortSpeculation 交给 dropPrefetch', () => {
     rig.logs.filter((line) => line.startsWith('drop:')),
     ['drop:barge_in', 'drop:delegated', 'drop:superseded'],
   );
+});
+
+test('createAbortGate：cancel 摘掉 abort 监听；已中止不再挂新的', async () => {
+  const controller = new AbortController();
+  const gate = createAbortGate(controller.signal);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 1);
+  let settled = false;
+  void gate.done.then(() => { settled = true; });
+  gate.cancel();
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(settled, false, '摘掉之后这次中止不再兑现已经取消的门');
+
+  const again = createAbortGate(controller.signal);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  await again.done;
+});
+
+test('EventQueue：先推后读、先读后推都按到达顺序吐出', async () => {
+  const queue = new EventQueue<string>();
+  queue.push('a');
+  const iter = queue[Symbol.asyncIterator]();
+  assert.deepEqual(await iter.next(), { value: 'a', done: false });
+  const pending = iter.next();
+  queue.push('b');
+  assert.deepEqual(await pending, { value: 'b', done: false });
+  queue.close();
+  assert.equal((await iter.next()).done, true);
+  queue.push('c');
+  assert.equal((await queue[Symbol.asyncIterator]().next()).done, true);
+});
+
+test('spokenFromStream：剥开头情绪并按 TTS 口径清洗', () => {
+  assert.equal(spokenFromStream('[开心]**好的**，哥'), '好的，哥');
+  assert.equal(spokenFromStream('好的[担心]呀'), '好的呀');
+});
+
+test('FrontedAgent.reply：forceDelegate 在 await 之前钉上本轮票据', async () => {
+  let detached = 0;
+  const held: { release: (() => void) | null } = { release: null };
+  const inner: AgentProvider = {
+    name: 'dsh',
+    reply: (text) => new Promise((resolve) => {
+      if (!text.includes('订单')) {
+        resolve({ text: '好。', speech: '好。' });
+        return;
+      }
+      held.release = () => resolve({ text: '查到了。', speech: '查到了。' });
+    }),
+    detachTurn: () => { detached += 1; },
+    cancelTurn: () => {},
+  };
+  const agent = new FrontedAgent({ inner, apiKey: '' });
+  await agent.reply('你好呀', undefined, undefined, { ticket: { no: 1, gen: 1 } });
+  const next = { no: 2, gen: 2 };
+  const pending = agent.reply('帮我查订单', undefined, undefined, {
+    ticket: next,
+    forceDelegate: 'delegate',
+    receiptSpoken: true,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  agent.cancelTurn(next);
+  held.release?.();
+  await pending;
+  assert.equal(detached, 1, '新票据必须在 delegate 之前钉上，插话才能放手这一轮');
 });

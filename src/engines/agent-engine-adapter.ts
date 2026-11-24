@@ -24,16 +24,8 @@ import type {
 } from '../providers.ts';
 import { TokenQueue } from '../token-queue.ts';
 import { SentencePump } from '../sentence-pump.ts';
-import { cleanForSpeech } from '../agent.ts';
-import { parseEmotion } from '../emotion.ts';
-
-/**
- * 流式那条路实际念出去的全文。与 `turn-runner.ts` 的 `spokenFromStream` 同一份语义：
- * 多步时 `reply.speech` 只是最后一步，续话必须按全部增量切。
- */
-function spokenFromStream(raw: string): string {
-  return cleanForSpeech(parseEmotion(raw).rest);
-}
+import { cleanForSpeech, parseEmotion } from '../emotion.ts';
+import { createAbortGate, EventQueue, spokenFromStream } from './stream-utils.ts';
 
 const ABORTED = Symbol('aborted');
 
@@ -51,72 +43,6 @@ export interface AgentEngineAdapterOptions {
    */
   readonly clock: () => number;
   readonly log?: (line: string) => void;
-}
-
-class EventQueue implements AsyncIterable<EngineEvent> {
-  private readonly pending: EngineEvent[] = [];
-  private wake: (() => void) | null = null;
-  private closed = false;
-
-  push(event: EngineEvent): void {
-    if (this.closed) {
-      return;
-    }
-    this.pending.push(event);
-    const wake = this.wake;
-    this.wake = null;
-    wake?.();
-  }
-
-  close(): void {
-    this.closed = true;
-    const wake = this.wake;
-    this.wake = null;
-    wake?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<EngineEvent> {
-    for (;;) {
-      const next = this.pending.shift();
-      if (next !== undefined) {
-        yield next;
-        continue;
-      }
-      if (this.closed) {
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        this.wake = resolve;
-      });
-    }
-  }
-}
-
-interface AbortGate {
-  readonly when: Promise<null>;
-  cancel(): void;
-}
-
-function abortGate(signal: AbortSignal): AbortGate {
-  let fire: (() => void) | null = null;
-  const when = new Promise<null>((resolve) => {
-    fire = () => {
-      resolve(null);
-    };
-    if (signal.aborted) {
-      fire();
-      return;
-    }
-    signal.addEventListener('abort', fire, { once: true });
-  });
-  return {
-    when,
-    cancel: () => {
-      if (fire !== null) {
-        signal.removeEventListener('abort', fire);
-      }
-    },
-  };
 }
 
 /**
@@ -272,7 +198,7 @@ export class AgentEngineAdapter implements FastVoiceEngine {
     text: string,
     emotion: string | undefined,
     signal: AbortSignal,
-    queue: EventQueue,
+    queue: EventQueue<EngineEvent>,
   ): Promise<number> {
     if (signal.aborted || text.trim() === '') {
       return 0;
@@ -291,17 +217,17 @@ export class AgentEngineAdapter implements FastVoiceEngine {
   private async drainClaimedAudio(
     audio: AgentAudioAnswer,
     signal: AbortSignal,
-    queue: EventQueue,
+    queue: EventQueue<EngineEvent>,
   ): Promise<{ readonly aborted: boolean; readonly chunks: number }> {
     const chunks = audio.chunks[Symbol.asyncIterator]();
-    const gate = abortGate(signal);
+    const gate = createAbortGate(signal);
     let said = 0;
     let n = 0;
     try {
       for (;;) {
         const step = chunks.next();
-        const winner = await Promise.race([step, gate.when]);
-        if (winner === null || signal.aborted) {
+        const winner = await Promise.race([step, gate.done]);
+        if (winner === undefined || signal.aborted) {
           void Promise.resolve(step).catch(() => {});
           void Promise.resolve(chunks.return?.()).catch(() => {});
           return { aborted: true, chunks: n };
@@ -328,7 +254,7 @@ export class AgentEngineAdapter implements FastVoiceEngine {
     if (signal.aborted) {
       return;
     }
-    const queue = new EventQueue();
+    const queue = new EventQueue<EngineEvent>();
     const active: ActiveStream = { tokens: null };
     const onAbort = (): void => {
       // 文本队列关掉，流式 TTS 才能从 `for await` 里出来；不关事件队列，
@@ -371,7 +297,7 @@ export class AgentEngineAdapter implements FastVoiceEngine {
   private async produce(
     turn: TurnInput,
     signal: AbortSignal,
-    queue: EventQueue,
+    queue: EventQueue<EngineEvent>,
     active: ActiveStream,
   ): Promise<void> {
     const agent = this.options.agent;
@@ -558,7 +484,7 @@ export class AgentEngineAdapter implements FastVoiceEngine {
     turn: TurnInput,
     reply: AgentReplyView,
     signal: AbortSignal,
-    queue: EventQueue,
+    queue: EventQueue<EngineEvent>,
     active: ActiveStream,
     image: AgentImage | undefined,
     note: string | undefined,

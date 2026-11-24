@@ -19,18 +19,7 @@
 import type { EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
 import type { TtsProvider } from '../providers.ts';
 import { TokenQueue } from '../token-queue.ts';
-import { cleanForSpeech } from '../agent.ts';
-import { parseEmotion } from '../emotion.ts';
-
-/**
- * 流式那条路**实际念出去的全文**：增量按到达顺序拼起来，再剥情绪标签、按 TTS 口径清洗。
- *
- * 与 `turn-runner.ts` 的 `spokenFromStream` 同一份语义（多步时 `reply.speech`
- * 只是最后一步，打断续话要对已播全文）。两处不能各写一套清洗。
- */
-function spokenFromStream(raw: string): string {
-  return cleanForSpeech(parseEmotion(raw).rest);
-}
+import { createAbortGate, EventQueue, spokenFromStream } from './stream-utils.ts';
 
 /** `ask` 交回来的东西：编排层真正需要的字段，不多不少 */
 export interface CascadeAnswer {
@@ -81,84 +70,6 @@ export interface CascadeEnginePorts {
   readonly log?: (line: string) => void;
 }
 
-/**
- * 把两个生产者的输出并成一条事件流。
- *
- * 与 `TokenQueue` 同一个形状（先 push 后迭代、先迭代后 push 都要成立），
- * 只是元素是 `EngineEvent`：文本与音频要走**同一条** order，不能各排一队
- * 再在消费端猜谁先到。
- */
-class EventQueue implements AsyncIterable<EngineEvent> {
-  private readonly pending: EngineEvent[] = [];
-  private wake: (() => void) | null = null;
-  private closed = false;
-
-  push(event: EngineEvent): void {
-    if (this.closed) {
-      return;
-    }
-    this.pending.push(event);
-    const wake = this.wake;
-    this.wake = null;
-    wake?.();
-  }
-
-  close(): void {
-    this.closed = true;
-    const wake = this.wake;
-    this.wake = null;
-    wake?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<EngineEvent> {
-    for (;;) {
-      const next = this.pending.shift();
-      if (next !== undefined) {
-        yield next;
-        continue;
-      }
-      if (this.closed) {
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        this.wake = resolve;
-      });
-    }
-  }
-}
-
-/**
- * `AbortSignal` 的一次性等待器。
- *
- * 已中止时立刻兑现。`cancel` 摘掉监听，避免一轮结束之后还挂着。
- */
-interface AbortGate {
-  readonly when: Promise<null>;
-  cancel(): void;
-}
-
-function abortGate(signal: AbortSignal): AbortGate {
-  let fire: (() => void) | null = null;
-  const when = new Promise<null>((resolve) => {
-    fire = () => {
-      resolve(null);
-    };
-    if (signal.aborted) {
-      fire();
-      return;
-    }
-    signal.addEventListener('abort', fire, { once: true });
-  });
-  return {
-    when,
-    cancel: () => {
-      if (fire !== null) {
-        signal.removeEventListener('abort', fire);
-      }
-    },
-  };
-}
-
 async function waitGate(
   chain: (() => Promise<void>) | undefined,
   signal: AbortSignal,
@@ -172,9 +83,9 @@ async function waitGate(
   } catch {
     return;
   }
-  const gate = abortGate(signal);
+  const gate = createAbortGate(signal);
   try {
-    await Promise.race([chained.catch(() => undefined), gate.when]);
+    await Promise.race([chained.catch(() => undefined), gate.done]);
   } finally {
     gate.cancel();
   }
@@ -216,7 +127,7 @@ export class CascadeVoiceEngine implements FastVoiceEngine {
     if (signal.aborted) {
       return;
     }
-    const queue = new EventQueue();
+    const queue = new EventQueue<EngineEvent>();
     /** 送进流式 TTS 的文本。没有 `synthesizeStream` 时它只是空跑 */
     const textIn = new TokenQueue();
     const tts = this.ports.tts;

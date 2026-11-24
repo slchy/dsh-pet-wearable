@@ -15,6 +15,7 @@
  */
 import type { AudioFrame, EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
 import type { AgentAudioAnswer, FastLaneAudioLane, InjectKind } from '../providers.ts';
+import { createAbortGate } from './stream-utils.ts';
 
 /**
  * Live 需要的车道：`providers.ts` 那条 + 上行音频入口。
@@ -37,39 +38,6 @@ export interface LiveAudioLane extends FastLaneAudioLane {
 }
 
 /**
- * `AbortSignal` 的一次性等待器。
- *
- * 不每块都挂监听：一轮有几十上百块音频，挂/摘监听会把开销堆在关键路径上。
- * 已中止时立刻兑现，调用方不用先查 `signal.aborted`。
- */
-interface AbortGate {
-  readonly when: Promise<null>;
-  cancel(): void;
-}
-
-function abortGate(signal: AbortSignal): AbortGate {
-  let fire: (() => void) | null = null;
-  const when = new Promise<null>((resolve) => {
-    fire = () => {
-      resolve(null);
-    };
-    if (signal.aborted) {
-      fire();
-      return;
-    }
-    signal.addEventListener('abort', fire, { once: true });
-  });
-  return {
-    when,
-    cancel: () => {
-      if (fire !== null) {
-        signal.removeEventListener('abort', fire);
-      }
-    },
-  };
-}
-
-/**
  * 把一份已经拿到的 {@link AgentAudioAnswer} 收成和 `claim()` 成功后相同的事件流。
  *
  * `respond()` 走封段认领；编排器在没有封段时走 `answerFromText()`。两条都不能各写
@@ -81,14 +49,15 @@ export async function* streamLiveAnswer(
 ): AsyncGenerator<EngineEvent> {
   yield { type: 'meta', path: 'omni' };
 
-  const gate = abortGate(signal);
+  const gate = createAbortGate(signal);
   let said = 0;
   const chunks = answer.chunks[Symbol.asyncIterator]();
   try {
     for (;;) {
       const step = chunks.next();
-      const winner = await Promise.race([step, gate.when]);
-      if (winner === null) {
+      // `done` 兑现为 undefined；`next()` 永远是对象。undefined 就是这一轮被中止。
+      const winner = await Promise.race([step, gate.done]);
+      if (winner === undefined) {
         // 中止：不再等下一块，也不再产事件 —— 这一轮的声音到此为止。
         // 放弃 `step` 时要接住它后续的拒绝，否则会变成未处理的 rejection；
         // `return()` 不 await：读端可能正挂在 `waitLive()` 上。

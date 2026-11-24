@@ -16,7 +16,6 @@
  */
 import type { TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
-import { pcm16PeakDbfs } from './pcm.ts';
 import { voicingVerdict } from './barge-voicing.ts';
 import type { AnnounceStore } from './announce-store.ts';
 import { EVENTS } from './events.ts';
@@ -680,6 +679,21 @@ function omniStaticContext(
   };
 }
 
+/**
+ * 播报开麦后还要听多久。
+ *
+ * `params.listenMs` 是宠物参数上的显式值，优先用它。没有的话用这一层的
+ * `listenMs`——启动程序把 `PET_LISTEN_MS` 放在这里，不放进 `params`。
+ * 两边都没有才落到默认 8 s。只读默认值会让环境变量对播报开麦完全失效。
+ */
+export function announceListenMs(
+  proactive: VoiceSessionOptions['proactive'],
+): number {
+  return proactive?.params?.listenMs
+    ?? proactive?.listenMs
+    ?? DEFAULT_PET_PARAMS.listenMs;
+}
+
 /** 空白不当事实。有内容则原样返回，不改写。 */
 function textIfPresent(text: string | undefined): string | undefined {
   if (text === undefined || text.trim() === '') {
@@ -766,9 +780,9 @@ export class VoiceConnection {
   /**
    * 最近一帧的**前端**静音时长（`AudioFrame.silenceMs`，能量门算的）。
    *
-   * 落进 `asr.commit.front_silence_ms`：组装器那条「静音 20 ms（实际 92 ms）」
-   * 里的 92 是**它自己的 tick 延迟**（下一块音频什么时候到），而真机那句话问的
-   * 「到底静了多久」要的是这个数。两个数并排落档，①a 才拆得开。
+   * 落进 `asr.commit.front_silence_ms`。封段回调的 `silence_ms` 读的是同一帧的
+   * 同一个数（`addFrame` 把 `frame.silenceMs` 原样交给静音触发器），所以两列相等。
+   * 必须在 `addFrame` **之前**写好：封段是同步发生的，晚一步读到的是上一帧。
    */
   private lastFrameSilenceMs = 0;
 
@@ -874,7 +888,7 @@ export class VoiceConnection {
             announceMic: {
               listenStart: true,
               micOpenTimeoutMs: this.micOpenTimeoutMs,
-              listenMs: DEFAULT_PET_PARAMS.listenMs,
+              listenMs: announceListenMs(proactive),
               call: (call: DeviceCall) => { this.sendCall(call); },
               awaitMicOpen: (timeoutMs: number) => this.awaitMicOpen(timeoutMs),
             },
@@ -1037,8 +1051,7 @@ export class VoiceConnection {
                 this.archive?.event(EVENTS.asrCommit, {
                   seq,
                   silence_ms: Math.round(silenceMs),
-                  // 前端（能量门）算的真静音时长。与 `silence_ms` 的差就是
-                  // 「静音开始到真有音频帧到达」的 tick 延迟 —— ①a 拆开看这两个数
+                  // 与 `silence_ms` 同源：都是触发这一次封段的那一帧的能量门静音。
                   front_silence_ms: Math.round(this.lastFrameSilenceMs),
                   want_ms: options.gate.sttCommitMs,
                   // 与 `omni.shadow` 的 join key：同一段语音的车道序号。
@@ -1121,6 +1134,8 @@ export class VoiceConnection {
        * 且一行日志都没有（见 `uplink-pipeline.ts` 的同名选项）。
        */
       now: this.assemblerNow,
+      // 与 SilenceTriggers 的两帧去抖对齐：单帧尖峰不把 silenceMs 打回 0。
+      voiceDebounceFrames: 2,
       log,
       onError: (line) => { console.error(`[ffmpeg] ${line}`); },
       onRawPcm: (raw) => { this.archive?.pcmRaw(raw); },
@@ -1128,19 +1143,14 @@ export class VoiceConnection {
       // 是唯一入口。两处都收等于每帧进 `recentChunks` 两次，而且这条老路会按
       // `silenceDb` **自己重算**能量，与能量门的 `voiced` 两套判据（见 `addAudio`）。
       onPcm: () => {},
-      onSpeechOpen: (peakDbfs, preroll, prerollMs) => {
+      onSpeechOpen: (peakDbfs, preroll, prerollMs, prerollFrames) => {
         this.archive?.event(EVENTS.gateOpen, { peakDbfs: Number(peakDbfs.toFixed(1)), prerollMs });
         // 新一轮开口：判停窗口只留这一句（官方也是按句裁的）。预卷就是这段的开头，
         // 前面那些静音 / 上一轮的回答都不该进模型。
         this.assembler.resetAudio(preroll);
-        // 预卷里**大部分是静音**（它是「触发点之前 800 ms」，不是语音起点）。
-        // 按同一套门限逐块标 voiced：静音只进软起音环，不会一开麦就让服务端先在
-        // 静音上吐一个「嗯。」（那一下还会把宠物话筒改成 owner=user）。
-        //
-        // 比较符必须与 `EnergyGate` 严格一致（`peakDbfs > thresholdDbfs`）：
-        // `>=` 会把「恰好等于门限」的那一块标成有声，而门自己把它当静音。
-        for (const part of preroll) {
-          this.stt.feed(part, pcm16PeakDbfs(part) > options.gate.thresholdDbfs);
+        // 预卷的 voiced 由能量门按同一条门限标好。这里直接喂，不再重算峰值。
+        for (const part of prerollFrames ?? []) {
+          this.stt.feed(part.pcm, part.voiced);
         }
         // 影子按「这一句」重新起一段。封段后到下一次开口之间的静音**一个字节都不推**
         // （见 `OmniShadow` 的 mute），所以这里只要把预卷补上就行。
@@ -1149,11 +1159,13 @@ export class VoiceConnection {
       onFrame: (frame) => {
         // 能量门周期号进共享内核（只作参考，不参与因果裁决 —— `causal.ts` 顶部）
         this.core.runtime.dispatch({ type: 'gate', gateSeq: frame.gateSeq });
+        // 先记下这一帧的静音，再交给装配器：封段在 addFrame 里同步发生，
+        // 档案的 front_silence_ms 要和回调里的 silence_ms 是同一个数。
+        this.lastFrameSilenceMs = frame.silenceMs;
         // 声学前端的**唯一出口**：`voiced` / `silenceMs` / `tsMs` 都是门算好的，
         // 装配器不再按 `silenceDb` 重算一遍（两处各算一遍正是「有时候丢字、
         // 有时候灌静音」的来源，见 `UtteranceAssembler.addFrame`）。
         this.assembler.addFrame(frame);
-        this.lastFrameSilenceMs = frame.silenceMs;
         // `voiced` 必须透传：门比封段晚关约 2 s，不带它 ASR 的「解码期暂存」
         // 就会把尾静音攒下来补推，换来一句幻觉定稿（实测 150 ms 静音 → 「嗯。」）
         this.stt.feed(frame.pcm, frame.voiced);

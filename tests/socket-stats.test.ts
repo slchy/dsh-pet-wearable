@@ -50,13 +50,21 @@ test('按块解析：对端地址、retrans（取斜杠后面那个总数）、r
   }, '手机那条：388 次重传 + 1460 字节没被确认 —— 这才是「整机 388」可能的真身');
 });
 
-test('没有 retrans 字段的连接记 0（不是 null）—— 「没重传」和「没读到」要分开', () => {
+test('没有 retrans 字段时记 null —— 读不到不拿 0 冒充「没重传」', () => {
   const out = parseSsOutput([
     'ESTAB 0 0 10.0.0.8:1 1.2.3.4:443',
     '\t cubic rto:200 rtt:1.0/0.1',
   ].join('\n'));
-  assert.equal(out[0]?.retrans, 0);
+  assert.equal(out[0]?.retrans, null);
   assert.equal(out[0]?.rto, 200);
+});
+
+test('retrans:0/0 是读到了零次，仍为 0', () => {
+  const out = parseSsOutput([
+    'ESTAB 0 0 10.0.0.8:1 1.2.3.4:443',
+    '\t cubic retrans:0/0 rto:200',
+  ].join('\n'));
+  assert.equal(out[0]?.retrans, 0);
 });
 
 test('空输入 / 只有表头 → 空数组，不抛', () => {

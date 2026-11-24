@@ -12,9 +12,15 @@ import { ConversationLedger, type LedgerLane, type LedgerTurn } from '../convers
 import type { TurnTicket } from '../dialog-fsm.ts';
 import { parseEmotion } from '../emotion.ts';
 import type { EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
+import { createAbortGate, EventQueue, spokenFromStream } from '../engines/stream-utils.ts';
 import { EVENTS } from '../events.ts';
 import { FastLlmClient, type FastAnswer } from '../fast-llm-client.ts';
-import { FAST_LANE_PERSONA_HEADER } from '../persona.ts';
+import {
+  SYSTEM_PROMPT_PLAIN,
+  SYSTEM_PROMPT_WITH_DELEGATE,
+  TASK_RULE,
+  TASK_RULE_PLAIN,
+} from '../persona.ts';
 import { normalizeForCompare, PrefetchSlot, SPEC_MIN_CHARS } from '../prefetch-slot.ts';
 import type {
   AgentImage,
@@ -33,58 +39,6 @@ import {
   routeTurn,
   type RouteDecision,
 } from '../turn-router.ts';
-
-const SYSTEM_PROMPT_WITH_DELEGATE = [
-  ...FAST_LANE_PERSONA_HEADER,
-  '',
-  '下面是「快车道」的分流规则（这条链路只负责闲聊，**语义判断，不看字面**）：',
-  '直接回答这些（**不要委派**）：',
-  '- 招呼、寒暄、夸奖、撒娇、道别、问你是谁/叫什么名字；',
-  '- 表达感受：累、饿、冷、疼、难过、开心、烦躁 —— 只要他没要求你做事，',
-  '  就顺着他的话回应（例如「我好累啊」→「那歇会儿吧，我陪着你」）。',
-  '- **和你聊他自己、聊你已经聊过的事、问你的看法**（例如「你看过星球大战没？」',
-  '  「你觉得那部怎么样？」「为什么？」「你今天怎么样啊？」）—— 这些就是闲聊，',
-  '  照你的身份照实聊，不确定的就说不确定，**不要委派**。',
-  '只输出 [[DELEGATE]]（六个字符，不要解释、不要标点、也不要情绪标签）当且仅当：',
-  '- 需要**实时或外部**信息：天气、时间、新闻、股价、比分、路况、地图路线；',
-  '- 需要**设备**：拍照、看界面/屏幕、电量、定位、设置、打电话、导航、下单；',
-  '- 需要**动你手上的东西**：查文件、看日志、读写记忆、记下来、取消任务；',
-  '- 用户话里带着**具体数字、编号、人名、地点**，或要求你转述这类内容；',
-  '- 你心里没底，答错会让他照做（宁可委派，也别猜）。',
-  '**判断依据是这句话的意思，不是它出现了哪个字**：「你看过吗」是聊天（答），',
-  '「帮我看一下订单」是办事（委派）。',
-  '**你没有工具**。需要工具才能答的，一律 [[DELEGATE]]，不要假装查过。',
-  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown。',
-].join('\n');
-
-const SYSTEM_PROMPT_PLAIN = [
-  ...FAST_LANE_PERSONA_HEADER,
-  '',
-  '你就是在陪他聊天，他说什么你接什么：',
-  '- 招呼、寒暄、夸奖、撒娇、道别 —— 接住就好，不用客套。',
-  '- 他说累、饿、冷、难过、烦躁 —— 先接情绪，别急着给建议。',
-  '- 问你看法、聊他看过的片子书、聊你俩之前说过的 —— 照实聊，',
-  '  **不确定就说不知道**，别编细节、别假装查过。',
-  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown。',
-].join('\n');
-
-const TASK_RULE = [
-  '',
-  '【这一轮额外给了你一条「后台任务」事实】',
-  '- 用户问进度（好了吗/查到了吗/还在跑吗/怎么样了/还要多久），**不要委派**，',
-  '  直接用那条事实说一句：在跑就说还在跑，别报结果；',
-  '- 事实说没有在跑的，就别编「正在查」，也别编「刚查到」；',
-  '- 不要复述整条事实，用口语说一句。',
-].join('\n');
-
-const TASK_RULE_PLAIN = [
-  '',
-  '【这一轮额外给了你一条「后台任务」事实】',
-  '- 用户问进度（好了吗/查到了吗/还在跑吗/怎么样了/还要多久），**直接照那条事实说一句**：',
-  '  在跑就说还在跑，别报结果；',
-  '- 事实说没有在跑的，就别编「正在查」，也别编「刚查到」；',
-  '- 不要复述整条事实，用口语说一句。',
-].join('\n');
 
 const STATUS_HINTS: readonly string[] = [
   '好了吗', '好了没', '好了没有', '好没好', '弄好了吗', '搞定了吗',
@@ -506,7 +460,7 @@ export class CascadeAgent implements AgentProvider {
         dsh, userText, image, note, `判为需要 dsh（${answer.firstTokenMs} ms 早退）`, ticket, 'delegate',
       );
     }
-    if (cleanForSpeech(parseEmotion(answer.text).rest) === '') {
+    if (spokenFromStream(answer.text) === '') {
       return await this.abandon(dsh, userText, image, note, '空答复', ticket, 'empty');
     }
     return this.commit(userText, answer.text, answer.firstTokenMs, dsh, ticket);
@@ -750,7 +704,7 @@ export class CascadeAgent implements AgentProvider {
   }
 
   private onDetachedAnswer(userText: string, answer: string, spoken: boolean): void {
-    const speech = cleanForSpeech(parseEmotion(answer).rest);
+    const speech = spokenFromStream(answer);
     if (speech === '') return;
     const question = userText.trim() === '' ? '（上一轮被打断的问题）' : userText.trim();
     this.log(
@@ -869,65 +823,9 @@ function asBuffer(pcm: Buffer | Uint8Array): Buffer {
   return Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm);
 }
 
-/** 已中止立刻兑现。调用方在 `finally` 里摘掉监听，避免一轮挂一个永久回调。 */
-function whenAborted(signal: AbortSignal): { readonly done: Promise<void>; cancel(): void } {
-  if (signal.aborted) {
-    return { done: Promise.resolve(), cancel() {} };
-  }
-  let onAbort: (() => void) | undefined;
-  const done = new Promise<void>((resolve) => {
-    onAbort = () => {
-      resolve();
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-  return {
-    done,
-    cancel() {
-      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
-    },
-  };
-}
-
 function imageOf(turn: TurnInput): AgentImage | undefined {
   if (turn.image === undefined) return undefined;
   return { mimeType: turn.image.mime, data: turn.image.bytes.toString('base64') };
-}
-
-/** 文本与音频进同一条队列，消费端看到的就是到达顺序 */
-class EventQueue implements AsyncIterable<EngineEvent> {
-  private readonly pending: EngineEvent[] = [];
-  private wake: (() => void) | null = null;
-  private closed = false;
-
-  push(event: EngineEvent): void {
-    if (this.closed) return;
-    this.pending.push(event);
-    const wake = this.wake;
-    this.wake = null;
-    wake?.();
-  }
-
-  close(): void {
-    this.closed = true;
-    const wake = this.wake;
-    this.wake = null;
-    wake?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<EngineEvent, void> {
-    for (;;) {
-      const next = this.pending.shift();
-      if (next !== undefined) {
-        yield next;
-        continue;
-      }
-      if (this.closed) return;
-      await new Promise<void>((resolve) => {
-        this.wake = resolve;
-      });
-    }
-  }
 }
 
 /**
@@ -970,7 +868,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
   }
 
   async *respond(turn: TurnInput, signal: AbortSignal): AsyncGenerator<EngineEvent> {
-    const queue = new EventQueue();
+    const queue = new EventQueue<EngineEvent>();
     const running = this.drive(turn, signal, queue);
     running.catch(() => {
       queue.close();
@@ -981,7 +879,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
     }
   }
 
-  private async drive(turn: TurnInput, signal: AbortSignal, queue: EventQueue): Promise<void> {
+  private async drive(turn: TurnInput, signal: AbortSignal, queue: EventQueue<EngineEvent>): Promise<void> {
     const tokens = new TokenQueue();
     let streamedRaw = '';
     let firstSynthAtMs: number | undefined;
@@ -1079,20 +977,20 @@ class CascadeTurnEngine implements FastVoiceEngine {
   }
 
   private emitTail(
-    queue: EventQueue,
+    queue: EventQueue<EngineEvent>,
     reply: AgentReplyView | null,
     streamedRaw: string,
     firstSynthAtMs: number | undefined,
   ): void {
     if (reply === null) {
-      const speech = cleanForSpeech(parseEmotion(streamedRaw).rest);
+      const speech = spokenFromStream(streamedRaw);
       queue.push({ type: 'done', fullText: streamedRaw, speech });
       queue.close();
       return;
     }
     // 多步答复：流里是每一步拼起来的全文，`reply.speech` 往往只是最后一步
     const raw = streamedRaw !== '' ? streamedRaw : reply.text;
-    const streamedSpeech = cleanForSpeech(parseEmotion(raw).rest);
+    const streamedSpeech = spokenFromStream(raw);
     const speech = streamedSpeech !== '' ? streamedSpeech : reply.speech;
     queue.push({
       type: 'meta',
@@ -1108,9 +1006,9 @@ class CascadeTurnEngine implements FastVoiceEngine {
   private async playIterable(
     iterable: AsyncIterable<Buffer>,
     signal: AbortSignal,
-    queue: EventQueue,
+    queue: EventQueue<EngineEvent>,
   ): Promise<void> {
-    const gate = whenAborted(signal);
+    const gate = createAbortGate(signal);
     const iter = iterable[Symbol.asyncIterator]();
     try {
       for (;;) {

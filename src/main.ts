@@ -18,7 +18,6 @@ import { pathToFileURL } from 'node:url';
 
 import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
-import { DEFAULT_CONFIRM_TIMEOUT_MS } from './photo-inbox.ts';
 import { aliyunStt } from './aliyun-asr.ts';
 import { mergeCorpusText, qwenRealtimeStt } from './qwen-realtime-asr.ts';
 import { cosyVoiceTts, DEFAULT_COSYVOICE_EMOTION_MODE } from './cosyvoice.ts';
@@ -50,9 +49,14 @@ import { runVoiceServer, UPSTREAM_SAMPLE_RATE, type VoiceSessionOptions } from '
 import { TurnJudge } from './turn-judge.ts';
  import { semanticEndpoint } from './semantic-endpoint.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
+import { DEFAULT_PET_PARAMS } from './pet/brain/registry.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
-import { DEFAULT_PROACTIVE } from './pet/proactive.ts';
 import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './http-agent.ts';
+import {
+  buildVoiceRuntimeConfig,
+  DEFAULT_IMAGE_QUESTION,
+  resolveOmniApiKey,
+} from './voice-config.ts';
 // **只借类型，不加载模块**：`legacy-pipeline.ts` 会一路拉进 `silero-vad` 与
 // `onnxruntime-node`（几十 MB、启动多几百毫秒），而生产走的是 `--stt` 流式路径，
 // 一行都用不到。真正的 `Pipeline` 在末尾的回放/旧监听分支里按需 `await import()`。
@@ -732,7 +736,7 @@ function streamingOmniShadow(
 ): NonNullable<VoiceSessionOptions['omniShadow']> | undefined {
   const model = env['OMNI_SHADOW_MODEL'];
   const modelOpt = model === undefined ? {} : { model };
-  const apiKey = (env['OMNI_API_KEY'] ?? env['DASHSCOPE_API_KEY'] ?? '').trim();
+  const apiKey = resolveOmniApiKey(env);
   if (plan.mode === 'live') {
     const requested = (env['OMNI_ANSWER'] ?? '').trim().toLowerCase();
     if (requested !== '' && requested !== 'off' && requested !== 'full' && requested !== 'clip') {
@@ -934,7 +938,7 @@ async function main(): Promise<void> {
   const asrBackend = opt('--asr', 'mimo');
   const resolvedStt = sttSpec === '' ? (asrBackend === 'aliyun' ? 'aliyun' : '') : sttSpec;
   const omniWanted = envString('OMNI_SHADOW') === '1';
-  const omniKey = process.env['DASHSCOPE_API_KEY'] ?? '';
+  const omniKey = resolveOmniApiKey(process.env);
   /** 非流式旧装配：omni 车道真的会挂上（三件事同时成立）才造 `FrontedAgent`。 */
   const omniWillEnable = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime';
 
@@ -1248,7 +1252,7 @@ async function main(): Promise<void> {
           : 'image/jpeg';
     console.log(`图片    ${askImage}  ${buf.length} B  ${mime}`);
     const t0 = Date.now();
-    const r = await agent.reply('这张图里有什么？用一两句话口语化描述。', {
+    const r = await agent.reply(DEFAULT_IMAGE_QUESTION, {
       mimeType: mime,
       data: buf.toString('base64'),
     });
@@ -1283,13 +1287,30 @@ async function main(): Promise<void> {
     );
     // 热词表 ID 留空就不下发该字段（传不存在的 ID 会被服务端静默忽略，不报错）
     const vocabularyId = opt('--vocab-id', process.env['ALIYUN_VOCAB_ID'] ?? '');
+    const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
+    const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
+    const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
+      && turnJudgePython !== '' && turnJudgeScript !== '';
+    const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
+    const semanticEnabled = envString('SEMANTIC_END_TAG') !== '0' && semanticKey !== '';
+    // 增益、门限、判停、端点、超时：CLI / 插件 / 评测沙盒同一份（`voice-config.ts`）。
+    const voice = buildVoiceRuntimeConfig({
+      env: process.env,
+      sttSpec: resolvedStt,
+      turnJudgeEnabled,
+      turnJudgePython,
+      turnJudgeScript,
+      semanticEnabled,
+    });
     // 只有阿里云实现关心 region/appkey；换成别的实现时别把无关信息印出来
+    const endpointBanner = voice.manualEndpoint
+      ? `端点由我们控（commit=${voice.gate.commitMs} ms / VOICE_COMMIT_MS，ASR 封段 ${voice.gate.sttCommitMs} ms / VOICE_STT_COMMIT_MS）`
+      : `端点由服务端 VAD（commit=${voice.gate.commitMs} ms，ASR 封段 ${voice.gate.sttCommitMs} ms；VOICE_COMMIT_MS 与 VOICE_STT_COMMIT_MS 不再生效）`;
     const sttBanner = resolvedStt === 'aliyun'
       ? `region=${region}  appkey=${appkey.slice(0, 4)}****  silence=${sentenceSilenceMs} ms`
         + (vocabularyId ? `  vocab=${vocabularyId}` : '  vocab=(未配置)')
       : resolvedStt === 'qwen-realtime'
-        ? `model=${process.env['QWEN_ASR_MODEL'] ?? 'qwen3-asr-flash-realtime'}`
-          + `  端点由我们控（commit=${envNumber('VOICE_COMMIT_MS', 20)} ms）`
+        ? `model=${process.env['QWEN_ASR_MODEL'] ?? 'qwen3-asr-flash-realtime'}  ${endpointBanner}`
         : '(外部/内置实现，无需凭据)';
     console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
@@ -1303,11 +1324,6 @@ async function main(): Promise<void> {
     });
     const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
-
-    const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
-    const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
-    const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
-      && turnJudgePython !== '' && turnJudgeScript !== '';
 
     /**
      * omni 怎么接。
@@ -1334,7 +1350,7 @@ async function main(): Promise<void> {
     }
     let omniShadow = streaming?.omniShadow;
     if (streaming !== null && streaming.mode === 'cascade' && omniShadow === undefined && omniWanted) {
-      const pipelineOmniKey = (process.env['OMNI_API_KEY'] ?? process.env['DASHSCOPE_API_KEY'] ?? '').trim();
+      const pipelineOmniKey = resolveOmniApiKey(process.env);
       const why = pipelineOmniKey === ''
         ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
         : resolvedStt !== 'qwen-realtime'
@@ -1359,7 +1375,7 @@ async function main(): Promise<void> {
       if (omniWanted && omniShadow === undefined) {
         console.log(
           '影子    OMNI_SHADOW=1 但没启用：'
-          + (omniKey === '' ? 'DASHSCOPE_API_KEY 为空' : `STT=${resolvedStt}（需要 qwen-realtime）`)
+          + (omniKey === '' ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空' : `STT=${resolvedStt}（需要 qwen-realtime）`)
           + '\n',
         );
       } else if (omniShadow !== undefined) {
@@ -1386,11 +1402,8 @@ async function main(): Promise<void> {
      * 和快车道共用一套凭据/端点（同一个 `qwen-flash`）—— 判停要的是快，不是聪明。
      * `SEMANTIC_END_TAG=0` 关掉，退回纯声学判停。
      */
-    // 快车道的 key 只在它自己那个 if 块里可见，这里按同一优先级再取一次
-    const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
-    const semantic = envString('SEMANTIC_END_TAG') === '0' || semanticKey === ''
-      ? null
-      : semanticEndpoint({
+    const semantic = semanticEnabled
+      ? semanticEndpoint({
         apiKey: semanticKey,
         ...(process.env['FAST_LANE_MODEL'] === undefined
           ? {}
@@ -1398,9 +1411,10 @@ async function main(): Promise<void> {
         ...(process.env['FAST_LANE_BASE_URL'] === undefined
           ? {}
           : { baseUrl: process.env['FAST_LANE_BASE_URL'] }),
-        timeoutMs: envNumber('SEMANTIC_END_TAG_TIMEOUT_MS', 400),
+        timeoutMs: voice.semanticTimeoutMs,
         log: (line) => { console.log(line); },
-      });
+      })
+      : null;
     if (semantic !== null) {
       console.log('语义判停  开（END 标签，与静候窗重叠，超时按「说完了」）  SEMANTIC_END_TAG=0 关闭');
     }
@@ -1426,30 +1440,11 @@ async function main(): Promise<void> {
       process.on('exit', () => { turnJudgeClient.stop(); });
     }
 
-    // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」
+    // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」。
+    // 上行倍数和门限的默认值在 `voice-config.ts`，这里只打生效值。
     const ttsGain = envNumber('MIAI_TTS_GAIN', envNumber('TTS_GAIN', 1));
-    const micGain = envNumber('MIAI_MIC_GAIN', envNumber('MIC_GAIN', 4));
-    /**
-     * 能量门限（按**放大后**算）。
-     *
-     * 实测（M2004J7AC、增益 4×、家里安静房间，84 个 2 s 窗口）：
-     * 底噪峰值集中在 −60…−51 dBFS（p10 −58.3、p50 −53.7），
-     * 说话时在 −20…0 dBFS，中间几乎空着。
-     *
-     * 原来取 −58：**低于底噪**，门一直开着 → 噪声当语音推给 ASR →
-     * 服务端判「无有效语音」踢连接 → 6 分钟里建连 45 次、同时存活 4 条。
-     * 后来取 −40：比最响的底噪高 10 dB，比最轻的说话低 10 dB。
-     *
-     * **−40 仍然太低**（线上 20261122-210720 实测）：那场有 6 段刚好擦过门
-     * （放大后 −37…−39 dBFS，电视/远处人声），ASR 把它们幻觉成「嗯。」「Thank you.」
-     * 「对。」—— omni 白答了 6 份（1.0–1.9 s 音频）又整份删掉，还顺手把「对。」做成了一轮。
-     * 同一场按段峰值重算：**开成轮的 14 段全在 −16…−6 dBFS，没开轮的 6 段全在 −51…−43**，
-     * 37 dB 的空档、零重叠。所以门抬到 −30（线上 `.env` 已设）：比垃圾段高 7 dB、
-     * 比最轻的说话低 14 dB。**这是电平判据，不是段长判据** —— 段长两侧重叠得厉害。
-     */
-    const peakDbfs = envNumber('VOICE_PEAK_DBFS', -30);
     console.log(
-      `增益    上行 ${micGain}×（能量门 ${peakDbfs} dBFS，按放大后算）  下行 ${ttsGain}×\n`,
+      `增益    上行 ${voice.micGain}×（能量门 ${voice.peakDbfs} dBFS，按放大后算）  下行 ${ttsGain}×\n`,
     );
 
     // 横幅只能先打 v1 的默认能力：真正走哪个版本要等连接时的 `Hello` 自报
@@ -1504,94 +1499,13 @@ async function main(): Promise<void> {
         }),
       // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
       ...(omniShadow === undefined ? {} : { omniShadow }),
-      turnJudge: turnJudgeEnabled
-        ? {
-          pythonPath: turnJudgePython,
-          scriptPath: turnJudgeScript,
-          // 句子定稿后先静候这么久再问 TurnJudge。350 → 150 → 80 → 40 → 0：
-          // 有了「静音一到就预跑判停」（`VOICE_PAUSE_DETECT_MS`），`SentenceEnd` 到达时
-          // 概率早就算好了，这段静候只是白等 —— 回放实测 ② 从 113 → 41 ms，
-          // 把这里归零后只剩取缓存的那一下。
-          quietMs: envNumber('TURN_JUDGE_QUIET_MS', 0),
-          // TurnJudge 判为「没说完」时再多等多久。700 → 400：日志里「没说完，再等 700 ms」
-          // 出现得极密，一轮叠 2–3 次就是 1.4–2.1 秒纯等待。400 → 200：真机 17 次 extend
-          // **全部等到放行、0 次用户接着说**，而且第二次评估的 p 与第一次几乎相同 ——
-          // 那 400 ms 没换到任何信息（见 `docs/LATENCY-CLOSURE.md`）。
-          //
-          // ⚠️ 必须在这里读，不能在模块顶层：`loadDotEnv()` 是在 `main()` 里调的，
-          // 模块顶层的 `envString()` 早于它执行，`.env` 里的值读不到 —— 2026-11-19
-          // 线上设 200 后日志仍打「再等 400 ms」，就是这个顺序问题。
-          extendMs: envNumber('TURN_JUDGE_EXTEND_MS', 200),
-          // 延长次数上限。3 → 7：业界（LiveKit `max_delay` 2.5–3 s、Pipecat
-          // TurnJudge `stop_secs` 3 s、Deepgram `eot_timeout_ms` 5 s）都留 2.5 秒以上
-          // 的兜底，而我们原来只有 3×400=1.2 s —— 触发点比人家快、兜底却只有一半，
-          // 用户说半句停下来想一下就会被强制收下。7×400 ≈ 2.8 s，对齐业界。
-          maxExtensions: envNumber('TURN_JUDGE_MAX_EXT', 2),
-          // 「判停说没说完」单独一个上限：那条分支不看任何文本信号，只按 p 再等
-          // 一拍，而 p 是噪声（同一段音频两次回放，同一句 0.549 vs 0.189）。
-          // 真机实测要 4 拍（1600 ms）才收下；这里收到 2 拍（800 ms），
-          // 仍能覆盖正常换气 200–400 ms。另三类文本判据不受影响，照旧吃 7 的额度。
-          maxUnsureExtensions: envNumber('TURN_JUDGE_MAX_UNSURE', 1),
-          // 快照尾部最多留多少静音。官方约定是「音频顶到输入向量的末尾」——
-          // 尾巴留静音等于把语音从窗口末尾推开，p 会被拉低（0 ms → 0.95，
-          // 800 ms → 0.04）。留多少在噪声里，取小值只为方向正确。
-          trailingTrimMs: envNumber('TURN_JUDGE_TRIM_MS', 20),
-          threshold: envNumber('TURN_JUDGE_THRESHOLD', 0.5),
-          // 中文单独一档：官方 benchmark 中文是最差的（85.8%，漏报 9.26% / 误报
-          // 4.95%），方向是偏向说「没说完」。真机上完整短句「嗯，对。」给 0.22–0.41，
-          // 真正没说完的「对吗？那句。」给 0.007–0.11 —— 用 0.5 会把前者判成没说完。
-          // 0.35 落在这两簇中间，但样本只有 21 轮 —— 先按这个跑，用 `judge.decide`
-          // 里的 `p` / `threshold` 复盘再定。
-          thresholdCjk: envNumber('TURN_JUDGE_THRESHOLD_CJK', 0.35),
-          // QoS：`②`（定稿→开轮）的总等待预算，兜底上限。0 = 不设。
-          // 目的不是省时间，是让 `②` 有一个可预测的天花板 —— 真机 2026-11-18
-          // 有 7/29 轮把分支额度吃干净，单轮白等 1.4 s。
-          waitBudgetMs: envNumber('TURN_JUDGE_WAIT_BUDGET_MS', 200),
-          // QoS：句尾像未完成的序列（数字/字母/「然后」…）时的豁免预算。
-          // 这类句尾 p 判「没说完」是对的（念手机号每次停顿都真没说完），
-          // 别让总预算把它掐掉。0 = 不启用。
-          waitBudgetSequenceMs: envNumber('TURN_JUDGE_SEQUENCE_BUDGET_MS', 1_200),
-          // **统一上限**：开轮静音的最大值，任何分支都不许绕过。
-          // 取 650 的依据是真机 54 轮实测（`docs/EOT-SUPPLEMENT.md` §8）：
-          // 开轮静音 500–1200 ms 的 7 轮**一次都没有**被用户接着说，而 <300 ms
-          // 的 6 轮**全部**被接着说 —— 650 落在"免费窗口"里，超过它的等待
-          // 换不来更低的误切。0 = 不设上限（回到旧行为）。
-          maxOpenSilenceMs: envNumber('TURN_JUDGE_MAX_OPEN_SILENCE_MS', 650),
-        }
-        : undefined,
+      ...(voice.turnJudge === undefined ? {} : { turnJudge: voice.turnJudge }),
       ...(turnJudgeClient === null ? {} : { turnJudgeClient }),
       ...(semantic === null
         ? {}
-        : { semantic, semanticBudgetMs: envNumber('SEMANTIC_END_TAG_BUDGET_MS', 400) }),
-      gate: {
-        thresholdDbfs: peakDbfs,
-        holdMs: envNumber('VOICE_HOLD_MS', 2000),
-        prerollMs: envNumber('VOICE_PREROLL_MS', 800),
-        // 静音多久就提前跑判停（和 ASR 的 max_sentence_silence 对齐）；0 = 关闭
-        pauseDetectMs: envNumber('VOICE_PAUSE_DETECT_MS', 200),
-    // 投机要比判停早：它的用途是给「提前合成音频」腾窗口，不是省自己的时间
-    speculateMs: envNumber('VOICE_SPECULATE_MS', 100),
-        // 端点由我们控的 ASR（qwen realtime）要宿主封段：静音到点 `commit`。
-        // 服务端自己判句的 provider（NLS）必须留 0 —— 否则会在句子中间插一刀，
-        // 把一个整句切成两段。40 ms 是标定后的默认值（配合下面的开轮门槛
-        // 300/200，有声拆句 0）；单独用 40 而不要门槛会把「换气」当句尾。
-        commitMs: envNumber('VOICE_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 20 : 0),
-        // **ASR 封段**比车道起跑晚多少。`commitMs` 同时点着两件事：omni 车道起跑
-        // （越早越好）和 ASR 切段（切早了把句子切成两半 —— 真机 2026-11-23 13:37
-        // 两轮都断在书名中间，第二个碎片被解成德语）。判停本来就要等 200–300 ms
-        // 静音，所以晚到 150 ms 不花延迟。
-        sttCommitMs: envNumber('VOICE_STT_COMMIT_MS', resolvedStt === 'qwen-realtime' ? 150 : 0),
-        // 开轮门槛：定稿到达时「截至此刻」的连续静音够不够。SOTA 那边按「40 ms 窗
-        // + 261 ms 解码 ≈ 301 ms」推的起点，中位数上几乎不增加等待；p 高的轮次用
-        // 短档（听起来完整就不必等那么久）。只对 commit 路径生效。
-        ...(resolvedStt === 'qwen-realtime'
-          ? {
-            openQuietMs: envNumber('VOICE_OPEN_QUIET_MS', 300),
-            openQuietShortMs: envNumber('VOICE_OPEN_QUIET_SHORT_MS', 200),
-          }
-          : {}),
-      },
-      playbackTailMs: 600,
+        : { semantic, semanticBudgetMs: voice.semanticBudgetMs }),
+      gate: voice.gate,
+      playbackTailMs: voice.playbackTailMs,
       /**
        * 下行增益。**默认应当是 1.0**：MiMo 的输出已经是满刻度（实测峰值 −0.5 dBFS），
        * 任何 >1 的增益都会把元音峰值压进软限幅 —— ×3 时波峰因数从 14.7 dB 掉到
@@ -1602,7 +1516,7 @@ async function main(): Promise<void> {
        * 上行增益。眼镜 mic 电平低，4.0 时小声说话才能推开能量门
        * （门限 `VOICE_PEAK_DBFS` 按**放大后**的电平算，见 `uplink-pipeline.ts`）。
        */
-      micGain,
+      micGain: voice.micGain,
       // 调音用：`MIAI_LEVEL_LOG=2000` 每 2 s 打一行上行峰值（0 = 关）
       levelLogMs: envNumber('MIAI_LEVEL_LOG', 0),
       /**
@@ -1611,8 +1525,8 @@ async function main(): Promise<void> {
        * 旧的 `DUMP_DIR`（按轮次存、只覆盖播放期）已被它取代。
        */
       archiveDir: process.env['MIAI_ARCHIVE_DIR'] ?? '',
-      archiveMaxMb: envNumber('MIAI_ARCHIVE_MAX_MB', 80),
-      archiveKeep: envNumber('MIAI_ARCHIVE_KEEP', 20),
+      archiveMaxMb: voice.archiveMaxMb,
+      archiveKeep: voice.archiveKeep,
       // 连接建立/断开时把审计（快车道 + TTS 两段）接到这条档案上（见 `auditSlot`）。
       // 两参都转发：`voice-session` 只传 `sink` 时保持「最后挂上的赢」，传了
       // `expected` 令牌时由槽位做所有权守卫（旧连接收尾摘不掉新连接的档案）。
@@ -1623,21 +1537,14 @@ async function main(): Promise<void> {
       photoDir: process.env['PHOTO_DIR'] ?? '',
       // 默认避开 `--listen` 自己，否则两条监听撞端口（EADDRINUSE）
       controlPort: envNumber('PHOTO_CTL_PORT', listen + 2),
-      // 高清链路要等手机建 P2P + 设备写相册，20 s 不够（线上实测要 50 s+，
-      // 那个 25 s 的 `MIAI_HQ_SHUTTER_TIMEOUT_MS` 只是快门，不含回传）
-      photoTimeoutMs: envNumber('MIAI_PHOTO_TIMEOUT_MS', 60_000),
-      // 要人动手的拍照只设一个兜底总时长（分段计时归设备）。
-      // 兼容旧的两段变量：给了就相加
-      confirmTimeoutMs: process.env['MIAI_CONFIRM_TIMEOUT_MS'] !== undefined
-        || (process.env['MIAI_HQ_ARM_TIMEOUT_MS'] === undefined
-          && process.env['MIAI_HQ_SHUTTER_TIMEOUT_MS'] === undefined)
-        ? envNumber('MIAI_CONFIRM_TIMEOUT_MS', DEFAULT_CONFIRM_TIMEOUT_MS)
-        : envNumber('MIAI_HQ_ARM_TIMEOUT_MS', 15_000) + envNumber('MIAI_HQ_SHUTTER_TIMEOUT_MS', 25_000),
-      imageQuestion: '这张图里有什么？用一两句话口语化描述。',
+      // 拍照超时、确认超时、识图提问的默认值在 `voice-config.ts`。
+      photoTimeoutMs: voice.photoTimeoutMs,
+      confirmTimeoutMs: voice.confirmTimeoutMs,
+      imageQuestion: voice.imageQuestion,
       announceStore,
       tls,
       authenticate,
-      idleTimeoutMs: envNumber('MIAI_IDLE_TIMEOUT_MS', 45_000),
+      idleTimeoutMs: voice.idleTimeoutMs,
       serve: argv.includes('--serve') || process.env['MIAI_SERVE'] === '1',
       // 主动开口默认关：开着它会自己说话，得人明确要
       proactive: proactiveOn
@@ -1648,7 +1555,7 @@ async function main(): Promise<void> {
             // 开麦到首帧上行音频的截止。小米实测 0.62 s，给到 1.5 s
             micOpenTimeoutMs: envNumber('PET_MIC_OPEN_TIMEOUT_MS', 1500),
           },
-          listenMs: envNumber('PET_LISTEN_MS', DEFAULT_PROACTIVE.listenMs),
+          listenMs: envNumber('PET_LISTEN_MS', DEFAULT_PET_PARAMS.listenMs),
           tickMs: envNumber('PET_TICK_MS', 3_000),
         }
         : null,

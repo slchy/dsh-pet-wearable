@@ -43,7 +43,12 @@ import { parseEmotion } from './emotion.ts';
 import type { FastVoiceEngine } from './engine-contract.ts';
 import { CascadeVoiceEngine, LiveVoiceEngine } from './engines/index.ts';
 import { FastLlmClient, type FastAnswer } from './fast-llm-client.ts';
-import { FAST_LANE_PERSONA_HEADER } from './persona.ts';
+import {
+  SYSTEM_PROMPT_PLAIN,
+  SYSTEM_PROMPT_WITH_DELEGATE,
+  TASK_RULE,
+  TASK_RULE_PLAIN,
+} from './persona.ts';
 import { normalizeForCompare, PrefetchSlot, SPEC_MIN_CHARS } from './prefetch-slot.ts';
 import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TtsProvider, TurnContext } from './providers.ts';
 import {
@@ -91,90 +96,6 @@ export { acceptsSpeculation } from './prefetch-slot.ts';
  * - 含阿拉伯数字：数字必须精确，不能让模型转述（`W8665881` 念错一次就够呛）。
  */
 
-
-/**
- * 快车道系统提示词 —— **含委派规则**（只有 `FAST_LANE_DELEGATE=1` 才用）。
- *
- * 默认是**关**的（`main.ts` 里 `(process.env['FAST_LANE_DELEGATE'] ?? '0') !== '0'`），
- * 那时走的是下面的 `SYSTEM_PROMPT_PLAIN`。别把「这个类默认 `delegate=true`」当成线上默认
- * —— 接线处显式传了 `delegateEnabled`，以那里为准。
- *
- * 原文存档见 `docs/fast-lane-prompt-archive.md`（2026-11-19 备份）。
- * 改这里之前先想清楚：这条提示词和 `SYSTEM_PROMPT_PLAIN` 是**两套人格行为**，
- * 不是同一套的细节差异 —— 切哪个由 `delegateEnabled` 决定。
- */
-const SYSTEM_PROMPT_WITH_DELEGATE = [
-  // 人设：和 L2 是同一个角色，只是话更短。少一句人设，用户就会听出「换了个人」。
-  // 身份/腔调那四行住在 `persona.ts`：两条链路（本文件与 `omni-shadow.ts`）共用一份，
-  // 谁改称呼、改口癖都只改那里。
-  ...FAST_LANE_PERSONA_HEADER,
-  '',
-  '下面是「快车道」的分流规则（这条链路只负责闲聊，**语义判断，不看字面**）：',
-  '直接回答这些（**不要委派**）：',
-  '- 招呼、寒暄、夸奖、撒娇、道别、问你是谁/叫什么名字；',
-  '- 表达感受：累、饿、冷、疼、难过、开心、烦躁 —— 只要他没要求你做事，',
-  '  就顺着他的话回应（例如「我好累啊」→「那歇会儿吧，我陪着你」）。',
-  '- **和你聊他自己、聊你已经聊过的事、问你的看法**（例如「你看过星球大战没？」',
-  '  「你觉得那部怎么样？」「为什么？」「你今天怎么样啊？」）—— 这些就是闲聊，',
-  '  照你的身份照实聊，不确定的就说不确定，**不要委派**。',
-  '只输出 [[DELEGATE]]（六个字符，不要解释、不要标点、也不要情绪标签）当且仅当：',
-  '- 需要**实时或外部**信息：天气、时间、新闻、股价、比分、路况、地图路线；',
-  '- 需要**设备**：拍照、看界面/屏幕、电量、定位、设置、打电话、导航、下单；',
-  '- 需要**动你手上的东西**：查文件、看日志、读写记忆、记下来、取消任务；',
-  '- 用户话里带着**具体数字、编号、人名、地点**，或要求你转述这类内容；',
-  '- 你心里没底，答错会让他照做（宁可委派，也别猜）。',
-  '**判断依据是这句话的意思，不是它出现了哪个字**：「你看过吗」是聊天（答），',
-  '「帮我看一下订单」是办事（委派）。',
-  '**你没有工具**。需要工具才能答的，一律 [[DELEGATE]]，不要假装查过。',
-  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown。',
-].join('\n');
-
-/**
- * 快车道系统提示词 —— **一般聊天模型**（`FAST_LANE_DELEGATE=0`）。
- *
- * 与上面那版的关系：语料**只有闲聊**，没有任何「该不该交给别人」的分支，
- * 也没有 `[[DELEGATE]]` 这个出口。切到这一版意味着快车道只做它擅长的那一件事，
- * 而「哪些句子根本不进快车道」必须由上游决定 —— 否则问天气、问订单时它会照聊。
- */
-const SYSTEM_PROMPT_PLAIN = [
-  // 身份/腔调与上面那版**共用同一份**（`persona.ts`），差别只在后面的分流规则。
-  ...FAST_LANE_PERSONA_HEADER,
-  '',
-  '你就是在陪他聊天，他说什么你接什么：',
-  '- 招呼、寒暄、夸奖、撒娇、道别 —— 接住就好，不用客套。',
-  '- 他说累、饿、冷、难过、烦躁 —— 先接情绪，别急着给建议。',
-  '- 问你看法、聊他看过的片子书、聊你俩之前说过的 —— 照实聊，',
-  '  **不确定就说不知道**，别编细节、别假装查过。',
-  '要求：一句话，不超过 20 个字，口语，不要表情符号，不要 markdown。',
-].join('\n');
-
-/**
- * 有后台任务时追加的规则。**必须给事实才追加** —— 没事实时提「后台任务」反而
- * 会诱导它编一个。
- */
-const TASK_RULE = [
-  '',
-  '【这一轮额外给了你一条「后台任务」事实】',
-  '- 用户问进度（好了吗/查到了吗/还在跑吗/怎么样了/还要多久），**不要委派**，',
-  '  直接用那条事实说一句：在跑就说还在跑，别报结果；',
-  '- 事实说没有在跑的，就别编「正在查」，也别编「刚查到」；',
-  '- 不要复述整条事实，用口语说一句。',
-].join('\n');
-
-/**
- * `FAST_LANE_DELEGATE=0` 时的同义规则：**不提委派**。
- *
- * 那版提示词里根本没有「交给别人」这个选项，还提一句「不要委派」等于把不存在的
- * 分支重新摆到模型面前 —— 它会开始琢磨要不要委派，然后写出 `[[DELEGATE]]` 被判成正文念出来。
- */
-const TASK_RULE_PLAIN = [
-  '',
-  '【这一轮额外给了你一条「后台任务」事实】',
-  '- 用户问进度（好了吗/查到了吗/还在跑吗/怎么样了/还要多久），**直接照那条事实说一句**：',
-  '  在跑就说还在跑，别报结果；',
-  '- 事实说没有在跑的，就别编「正在查」，也别编「刚查到」；',
-  '- 不要复述整条事实，用口语说一句。',
-].join('\n');
 
 /**
  * 问「进度」而不是「干活」的句子。
@@ -1008,6 +929,13 @@ export class FrontedAgent implements AgentProvider {
     // 没有票据的调用（单测、保活 ping）自己发一个本地代次 —— 去重照样成立，
     // 只是 session 层没有真票据可比对，会直接照办。
     const ticket: TurnTicket = turn?.ticket ?? { no: 0, gen: (this.localGen += 1) };
+    // 任何 await 之前先钉上票据，插话取消才能对上这一轮（委派轮也一样）。
+    // 配额按轮算：上一轮用完不能让下一轮一直没法投机。
+    this.speculateStarts = 0;
+    this.turnStartedAt = this.now();
+    this.currentGen = ticket.gen;
+    this.currentTicket = ticket;
+    this.innerMode = 'pass';
     // omni 自己发了 `tool_call`：宿主 drain 完音频才转到这儿，直接进慢车道。
     // **必须在任何路由判断之前** —— 再判一次会把它送回同一条车道，死循环。
     if (turn?.forceDelegate !== undefined) {
@@ -1025,12 +953,6 @@ export class FrontedAgent implements AgentProvider {
     if (isCancelRequest(userText) && this.cancelRunningTask()) {
       return { text: '好，不查了。', speech: '好，不查了。', path: 'fast' };
     }
-    // 新一轮：投机的次数配额按轮算（上一轮用完不能让下一轮一直没法投机）
-    this.speculateStarts = 0;
-    this.turnStartedAt = this.now();
-    this.currentGen = ticket.gen;
-    this.currentTicket = ticket;
-    this.innerMode = 'pass';
     const hasFacts = this.statusFacts !== undefined;
     // **路由一次算完**（内核纯函数 `routeTurn`）。以前这里排着三条独立的早退
     // （在等回话 / 像长期事实 / 不是候选），`willServeAudio` 那边又各算一遍 ——

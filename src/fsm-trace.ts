@@ -10,8 +10,8 @@
  * | 规则 | 依据 |
  * |---|---|
  * | 轮次不许嵌套、必须成对 | `TurnRunner.run` 由 `serialChain` 串行，`beginTurn` 只从 listening 开 |
- * | 状态转移只走白名单 | `DialogFsm.transition` 的调用点 |
- * | `closed` 之后不再动 | `transition` 里的吸收态 |
+ * | 状态转移只走白名单 | `kernel.ts` 的 `stepDialog`（`DialogFsm` 只把方法译成事件） |
+ * | `closed` 之后不再动 | `kernel.ts` 的 `step`：`closed` 是吸收态 |
  * | `tts.first` 必须落在本轮、且在 `speaking` 之后 | `emit` 里先 `audioStarted` 再下发 |
  * | 插话必须带 `audio.stop` | `SessionCore` 的 `bargeIn` 分支 |
  * | 一轮不许挂太久 | `DEFAULT_TIMEOUT_MS` + 播放上限 |
@@ -73,15 +73,17 @@ const DEFAULT_MAX_STOP_TO_FIRST_MS = 15_000;
 const DEFAULT_BARGE_STOP_WITHIN_MS = 500;
 
 /**
- * `DialogFsm` 允许的转移。
+ * `kernel.ts` 的 `stepDialog` 允许的相位转移。
  *
- * 直接照抄 `dialog-fsm.ts` 的调用点：`beginTurn` / `beginAwaitShot` / `abortAwaitShot` /
- * `audioStarted` / `receiptStarted` / `receiptEnded` / `audioDone` / `requestEnd` /
- * `bargeIn` / `close`。多一条少一条这里都会红 —— 这正是「状态轮转是否可靠」要看的。
+ * `DialogFsm` 不再自己 `transition`：它只把 `beginTurn` / `beginAwaitShot` /
+ * `abortAwaitShot` / `audioStarted` / `receiptStarted` / `receiptEnded` /
+ * `audioDone` / `requestEnd` / `bargeIn` / `close` 译成 `KernelEvent`，合法边
+ * 在 `kernel.ts` 的 `dialog` 区域。多一条少一条这里都会红。
  *
- * `speaking → thinking` 只来自 `receiptEnded()`：委派轮的回执在 `thinking` 期间
- * 出声，靠进 `speaking` 才可打断（见 `DialogFsm` 顶部约束 1）。真回答的音频
- * 结束走的是 `audioDone`，落点是 `listening` / `ending`，不会到 `thinking`。
+ * `speaking → thinking` 只来自 `receiptEnded`：委派轮的回执在 `thinking` 期间
+ * 出声，靠进 `speaking` 才可打断（见 `kernel.ts` 的 `receiptStarted` /
+ * `receiptEnded`）。真回答的音频结束走 `audioDone`，落点是 `listening` /
+ * `ending`，不会到 `thinking`。
  */
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   listening: ['thinking', 'awaiting_shot', 'ending', 'closed'],

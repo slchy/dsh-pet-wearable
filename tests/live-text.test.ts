@@ -11,7 +11,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { LiveGate } from '../src/live-text.ts';
+import { connect } from 'node:net';
+
+import { LiveGate, LiveTextRelay, type LiveMessage } from '../src/live-text.ts';
 
 function feed(gate: LiveGate, tokens: string[]): string[] {
   const out: string[] = [];
@@ -96,4 +98,60 @@ test('空 token 与重复 end 都不产生事件', () => {
   gate.finish();
   assert.deepEqual(gate.finish(), [], 'end 只算一次');
   assert.deepEqual(gate.push('迟到的 token'), [], 'end 之后的 token 不该再放出去');
+});
+
+test('ready() 等到系统分配的真实端口，重复调用还是同一个', async () => {
+  const relay = new LiveTextRelay();
+  try {
+    const syncPort = relay.start();
+    const port = await relay.ready();
+    assert.ok(port > 0 && port <= 65535, `端口应当已经绑定，实际 ${port}`);
+    if (syncPort > 0) {
+      assert.equal(syncPort, port, '同步已经读到端口时，ready 不能另绑一个');
+    }
+    assert.equal(await relay.ready(), port);
+    assert.equal(relay.port, port);
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.end();
+        resolve();
+      });
+      socket.on('error', reject);
+    });
+  } finally {
+    relay.close();
+  }
+});
+
+test('坏 JSON 行记解析失败，下一行仍交给 handler', async () => {
+  const logs: string[] = [];
+  const relay = new LiveTextRelay((line) => { logs.push(line); });
+  const seen = new Promise<LiveMessage>((resolve, reject) => {
+    const timer = setTimeout(() => { reject(new Error('合法行没有送到 handler')); }, 2000);
+    relay.onMessage((msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    });
+  });
+  try {
+    const port = await relay.ready();
+    assert.ok(port > 0);
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write('not-json\n{"t":"delta","s":"s1","text":"hi"}\n');
+        socket.end();
+        resolve();
+      });
+      socket.on('error', reject);
+    });
+    const msg = await seen;
+    assert.equal(msg.t, 'delta');
+    assert.equal(msg.text, 'hi');
+    assert.ok(
+      logs.some((line) => line.includes('解析失败') && line.includes('not-json')),
+      `应当记下坏行，实际日志：${logs.join(' | ')}`,
+    );
+  } finally {
+    relay.close();
+  }
 });
