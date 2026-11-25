@@ -158,6 +158,7 @@ export function wireAssembler(ports: AssemblerWirePorts): UtteranceAssembler {
     now: ports.now,
     // `0` 原样透传（关闭预判停 / 投机）。删掉字段会让 SilenceTriggers 用回 200 / 100。
     ...assemblerSilenceFromGate(options.gate),
+    ...(options.gate.minSpeechMs === undefined ? {} : { minSpeechMs: options.gate.minSpeechMs }),
     // 端点归我们把控的 ASR（qwen realtime）：静音到点就封段，解码那 ~260 ms
     // 与判停那一拍并行跑。`commitMs` 为 0 就不接（NLS 自己判句，别插嘴）。
     ...(options.gate.commitMs === undefined || options.gate.commitMs <= 0

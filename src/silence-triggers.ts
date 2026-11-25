@@ -38,6 +38,11 @@ export interface SilenceTriggerOptions {
   readonly speculateMs?: number;
   /** 静音满这么久就把判停**提前**跑掉，不设 = 默认 200 ms，≤0 关闭 */
   readonly silencePauseMs?: number;
+  /**
+   * 本段已确认有声累计不足这么久，封段、ASR 封段、投机、判停预跑都不触发。
+   * 缺省 `0`：不设门槛，两帧短合成仍会封段。
+   */
+  readonly minSpeechMs?: number;
   /** 车道起跑：宿主拿去 `omni.seal` */
   readonly onCommit?: (silenceMs: number) => void;
   /** ASR 封段：宿主拿去 `stt.commit()` */
@@ -92,6 +97,11 @@ export class SilenceTriggers {
    */
   private voicedRun = 0;
   /**
+   * 本段已确认有声的累计毫秒。`resetSegment` / `onUtterance` 归零。
+   * 不足 `minSpeechMs` 时四路提前触发都不开火。
+   */
+  private segmentVoicedMs = 0;
+  /**
    * 本帧若上游给了已经去过抖的静音时长，四个阈值都读它。
    *
    * `null` = 按 `atMs - lastVoicedAt` 现算（`addAudio` / 老调用）。
@@ -141,6 +151,7 @@ export class SilenceTriggers {
     atMs: number,
     frontSilenceMs?: number,
     alreadyDebounced?: boolean,
+    frameDurationMs?: number,
   ): void {
     const trustFront = alreadyDebounced === true && frontSilenceMs !== undefined;
     if (voiced) {
@@ -157,6 +168,7 @@ export class SilenceTriggers {
       } else {
         this.voicedRun = 0;
       }
+      this.segmentVoicedMs += this.confirmedFrameMs(atMs, frameDurationMs);
       this.lastVoicedAt = atMs;
       // 音频比快照长了：通知宿主作废在跑预跑、并在已有缓冲句时迁入 speaking_more
       this.host.onVoiced(atMs);
@@ -191,6 +203,29 @@ export class SilenceTriggers {
     return this.trustedSilenceMs ?? (t - this.lastVoicedAt);
   }
 
+  /**
+   * 这一帧算多少毫秒有声。调用方给了时长就用它；否则用距上一帧确认有声的间隔，
+   * 夹在 1–80 ms。还没有上一帧时按 20 ms（上行帧的历史步长）。
+   */
+  private confirmedFrameMs(atMs: number, frameDurationMs: number | undefined): number {
+    if (frameDurationMs !== undefined) return frameDurationMs;
+    if (this.lastVoicedAt !== NEVER) {
+      return Math.min(80, Math.max(1, atMs - this.lastVoicedAt));
+    }
+    return 20;
+  }
+
+  /** 本段有声累计不够 `minSpeechMs`：封段、投机、预跑都先按住。`0` 或缺省不设门槛。 */
+  private belowMinSpeech(): boolean {
+    const minSpeechMs = this.options.minSpeechMs ?? 0;
+    return minSpeechMs > 0 && this.segmentVoicedMs < minSpeechMs;
+  }
+
+  /** 新开一段音频（能量门重新开门）时把有声累计清掉，上一句的毫秒不带过来。 */
+  resetSegment(): void {
+    this.segmentVoicedMs = 0;
+  }
+
   /** 一句新定稿：投机的次数配额与去重按句重置（下一段语音可以再投机两次） */
   resetForSentence(): void {
     this.specCount = 0;
@@ -210,10 +245,14 @@ export class SilenceTriggers {
     this.sttCommitFiredAt = NEVER;
     this.specFiredAt = NEVER;
     this.resetForSentence();
+    this.resetSegment();
   }
 
   /** 两条封段闸共用的前提：这一段说过话、且还没为它动过手 */
   private canCommit(t: number, after: number | undefined, firedAt: number): boolean {
+    if (this.belowMinSpeech()) {
+      return false;
+    }
     if (after === undefined || after <= 0) {
       return false;
     }
@@ -300,6 +339,9 @@ export class SilenceTriggers {
     if (pause <= 0) {
       return;
     }
+    if (this.belowMinSpeech()) {
+      return;
+    }
     if (this.lastVoicedAt === NEVER || this.lastVoicedAt <= this.host.lastUtteranceAt()) {
       return;
     }
@@ -347,6 +389,9 @@ export class SilenceTriggers {
     // `undefined` 用默认 200。显式 ≤0 是关闭：0 落进下面的 `< pause` 会立刻预跑。
     const pause = this.options.silencePauseMs ?? 200;
     if (pause <= 0) {
+      return;
+    }
+    if (this.belowMinSpeech()) {
       return;
     }
     // 只在「这一轮说过话、且还没为这段语音预跑过」时动手

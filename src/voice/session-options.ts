@@ -19,6 +19,7 @@ import type { SemanticEndpoint } from '../semantic-endpoint.ts';
 import type { ToolControl } from '../tool-control.ts';
 import type { HelloInfo } from '../transport.ts';
 import type { PetUiEvent } from '../ui-events.ts';
+import type { SharedSpeechVad } from '../vad.ts';
 import type { EndpointDetector } from './endpoint-wire.ts';
 import type { VoiceConnection } from './connection.ts';
 
@@ -143,6 +144,11 @@ export interface VoiceSessionOptions {
   readonly micGain?: number;
   /** 电平表周期（毫秒）；> 0 时每这么久打一行上行峰值，调增益用 */
   readonly levelLogMs?: number;
+  /**
+   * 进程级共享的神经 VAD。缺省或 `null` 时这条连接用能量门。
+   * 每条连接自己 `createStream()`，不共用 LSTM 状态。
+   */
+  readonly vad?: SharedSpeechVad | null;
   /** 能量门 */
   readonly gate: {
     readonly thresholdDbfs: number;
@@ -194,6 +200,16 @@ export interface VoiceSessionOptions {
      * 见 `UtteranceAssemblerOptions.maxOpenSilenceMs`。`0` 表示不设上限。
      */
     readonly maxOpenSilenceMs?: number;
+    /**
+     * 本段有效有声不足这么久，不封段、不投机、不预跑。
+     * 缺省不传给装配器，装配器按 0 处理（短合成仍能封段）。
+     */
+    readonly minSpeechMs?: number;
+    /**
+     * 喂给 ASR 与 Omni 的预卷尾窗。小于 `prerollMs` 时从尾部裁；
+     * 缺省或大于等于 `prerollMs` 时不裁。TurnJudge 仍吃完整预卷。
+     */
+    readonly asrPrerollMs?: number;
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;

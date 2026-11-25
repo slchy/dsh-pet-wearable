@@ -12,8 +12,10 @@ import { DEFAULT_CONFIRM_TIMEOUT_MS } from '../src/photo-inbox.ts';
 import {
   buildVoiceRuntimeConfig,
   DEFAULT_BROWSER_STT_COMMIT_MS,
+  DEFAULT_ASR_PREROLL_MS,
   DEFAULT_GATE_HOLD_MS,
   DEFAULT_GATE_PREROLL_MS,
+  DEFAULT_MIN_SPEECH_MS,
   DEFAULT_GLASSES_STT_COMMIT_MS,
   DEFAULT_IMAGE_QUESTION,
   DEFAULT_PAUSE_DETECT_MS,
@@ -72,6 +74,10 @@ test('三端默认值同源：插件只改增益和控制口，沙盒只改空�
   assert.equal(cli.gate.thresholdDbfs, -30);
   assert.equal(cli.gate.holdMs, 2000);
   assert.equal(cli.gate.prerollMs, 800);
+  assert.equal(cli.gate.minSpeechMs, DEFAULT_MIN_SPEECH_MS);
+  assert.equal(cli.gate.minSpeechMs, 120);
+  assert.equal(cli.gate.asrPrerollMs, DEFAULT_ASR_PREROLL_MS);
+  assert.equal(cli.gate.asrPrerollMs, 320);
   assert.equal(cli.gate.pauseDetectMs, 200);
   assert.equal(cli.gate.speculateMs, 100);
   assert.equal(cli.gate.commitMs, 20);
@@ -384,6 +390,8 @@ test('热路径常量不读已经移出 .env 的旧旋钮', () => {
   assert.equal(cfg.gate.holdMs, 2_000);
   assert.equal(cfg.gate.prerollMs, DEFAULT_GATE_PREROLL_MS);
   assert.equal(cfg.gate.prerollMs, 800);
+  assert.equal(cfg.gate.minSpeechMs, DEFAULT_MIN_SPEECH_MS);
+  assert.equal(cfg.gate.asrPrerollMs, DEFAULT_ASR_PREROLL_MS);
   assert.equal(cfg.gate.pauseDetectMs, DEFAULT_PAUSE_DETECT_MS);
   assert.equal(cfg.gate.speculateMs, DEFAULT_SPECULATE_MS);
   assert.equal(cfg.turnJudge?.quietMs, 0);
@@ -402,6 +410,42 @@ function assertTimingRejected(run: () => void, pattern: RegExp): void {
     return true;
   });
 }
+
+test('validateVoiceTiming 拒绝越界的 ASR 预卷和最短人声', () => {
+  const cfg = buildVoiceRuntimeConfig(base);
+  assertTimingRejected(
+    () => validateVoiceTiming({
+      ...cfg,
+      gate: { ...cfg.gate, asrPrerollMs: cfg.gate.prerollMs + 1 },
+    }),
+    /gate\.asrPrerollMs=801\b[\s\S]*gate\.prerollMs=800\b[\s\S]*DEFAULT_ASR_PREROLL_MS/,
+  );
+  assertTimingRejected(
+    () => validateVoiceTiming({
+      ...cfg,
+      gate: { ...cfg.gate, asrPrerollMs: -1 },
+    }),
+    /gate\.asrPrerollMs=-1\b[\s\S]*DEFAULT_ASR_PREROLL_MS/,
+  );
+  assertTimingRejected(
+    () => validateVoiceTiming({
+      ...cfg,
+      gate: { ...cfg.gate, minSpeechMs: cfg.gate.holdMs },
+    }),
+    /gate\.minSpeechMs=2000\b[\s\S]*gate\.holdMs=2000\b[\s\S]*DEFAULT_MIN_SPEECH_MS/,
+  );
+  assertTimingRejected(
+    () => validateVoiceTiming({
+      ...cfg,
+      gate: { ...cfg.gate, minSpeechMs: -1 },
+    }),
+    /gate\.minSpeechMs=-1\b[\s\S]*DEFAULT_MIN_SPEECH_MS/,
+  );
+  validateVoiceTiming({
+    ...cfg,
+    gate: { ...cfg.gate, asrPrerollMs: cfg.gate.prerollMs, minSpeechMs: 0 },
+  });
+});
 
 test('validateVoiceTiming 拒绝会让端点互相踩踏的组合', () => {
   assertTimingRejected(

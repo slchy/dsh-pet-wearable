@@ -36,8 +36,18 @@ export const DEFAULT_PLAYBACK_TAIL_MS = 600;
 export const DEFAULT_PLAYBACK_TAIL = DEFAULT_PLAYBACK_TAIL_MS;
 /** 原 `VOICE_HOLD_MS`。停嘴后能量门还要开着，给封段和开轮静音留窗口。 */
 export const DEFAULT_GATE_HOLD_MS = 2_000;
-/** 原 `VOICE_PREROLL_MS`。开门前保留的音频，是滑窗长度，不加延迟。 */
+/** 原 `VOICE_PREROLL_MS`。开门前保留的音频，是滑窗长度，不加延迟。TurnJudge 用完整这一段。 */
 export const DEFAULT_GATE_PREROLL_MS = 800;
+/**
+ * 单段有效有声累计不足这么久，不触发 `omni.seal` / `stt.commit` / 投机 / 预跑。
+ * 短噪声尖峰停在这里；够了才进入静音门槛，本身不加等待。
+ */
+export const DEFAULT_MIN_SPEECH_MS = 120;
+/**
+ * 开门时喂给 ASR 与 Omni 的预卷只留尾部这么久。
+ * {@link DEFAULT_GATE_PREROLL_MS} 仍完整交给 TurnJudge。
+ */
+export const DEFAULT_ASR_PREROLL_MS = 320;
 /** 原 `VOICE_PAUSE_DETECT_MS`。静音多久就提前跑判停。 */
 export const DEFAULT_PAUSE_DETECT_MS = 200;
 /**
@@ -119,6 +129,16 @@ export interface VoiceGateConfig {
   readonly thresholdDbfs: number;
   readonly holdMs: number;
   readonly prerollMs: number;
+  /**
+   * 单段有效有声累计不足这么久不封段、不投机、不预跑。
+   * 缺省由 {@link DEFAULT_MIN_SPEECH_MS} 填入。直接构造装配器时不传则视为 0。
+   */
+  readonly minSpeechMs?: number;
+  /**
+   * 喂给 ASR / Omni 的预卷尾窗。必须落在 `[0, prerollMs]`。
+   * 缺省 {@link DEFAULT_ASR_PREROLL_MS}。大于等于 `prerollMs` 时不裁。
+   */
+  readonly asrPrerollMs?: number;
   readonly pauseDetectMs: number;
   readonly speculateMs: number;
   readonly commitMs: number;
@@ -206,6 +226,24 @@ export function validateVoiceTiming(config: VoiceRuntimeConfig): void {
   }
   if (!(gate.prerollMs >= 0)) {
     rejectTiming(`能量门预卷 gate.prerollMs=${gate.prerollMs} 必须 >= 0（DEFAULT_GATE_PREROLL_MS）`);
+  }
+  if (gate.asrPrerollMs !== undefined) {
+    const asrPrerollMs = gate.asrPrerollMs;
+    if (!(asrPrerollMs >= 0) || asrPrerollMs > gate.prerollMs) {
+      rejectTiming(
+        `ASR 预卷 gate.asrPrerollMs=${asrPrerollMs} 必须在 [0, gate.prerollMs=${gate.prerollMs}] 内`
+        + `（DEFAULT_ASR_PREROLL_MS / DEFAULT_GATE_PREROLL_MS）`,
+      );
+    }
+  }
+  if (gate.minSpeechMs !== undefined) {
+    const minSpeechMs = gate.minSpeechMs;
+    if (!(minSpeechMs >= 0) || !(minSpeechMs < gate.holdMs)) {
+      rejectTiming(
+        `最短有效人声 gate.minSpeechMs=${minSpeechMs} 必须在 [0, gate.holdMs=${gate.holdMs}) 内`
+        + `（DEFAULT_MIN_SPEECH_MS / DEFAULT_GATE_HOLD_MS）`,
+      );
+    }
   }
   if (!(gate.pauseDetectMs >= 0)) {
     rejectTiming(`判停预跑 gate.pauseDetectMs=${gate.pauseDetectMs} 必须 >= 0（DEFAULT_PAUSE_DETECT_MS）`);
@@ -388,6 +426,8 @@ export function buildVoiceRuntimeConfig(input: VoiceRuntimeInput): VoiceRuntimeC
     thresholdDbfs: peakDbfs,
     holdMs: DEFAULT_GATE_HOLD_MS,
     prerollMs: DEFAULT_GATE_PREROLL_MS,
+    minSpeechMs: DEFAULT_MIN_SPEECH_MS,
+    asrPrerollMs: DEFAULT_ASR_PREROLL_MS,
     pauseDetectMs: DEFAULT_PAUSE_DETECT_MS,
     speculateMs,
     // `commitMs` 只让 omni 车道起跑；ASR 封段晚一拍，免得把书名切成两段。

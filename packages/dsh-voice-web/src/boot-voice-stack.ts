@@ -39,6 +39,7 @@ import type { AgentProvider } from './voice/providers.ts'
 import { loadStaticAsrCorpus, resolveAsrLanguage } from './voice/runtime/asr-context.ts'
 import { createAuditSlot } from './voice/runtime/audit-slot.ts'
 import { loadAuthenticator, loadDotEnv } from './voice/runtime/env-bootstrap.ts'
+import { loadSharedVad } from './voice/runtime/vad-bootstrap.ts'
 import {
   assemblePipelinePlan,
   assembleStreamingAgent,
@@ -118,6 +119,7 @@ export async function bootVoiceStack(
   let streaming: AssembledStreamingPipeline | null = null
   let stopKeepalive: () => void = () => {}
   let released = false
+  let sharedVad: Awaited<ReturnType<typeof loadSharedVad>> = null
 
   const releaseVoice = async (): Promise<void> => {
     if (released) return
@@ -127,6 +129,7 @@ export async function bootVoiceStack(
     if (state.dshSession === dshSession) state.dshSession = null
     const steps: Array<() => Promise<void> | void> = [
       () => { voice.stop?.() },
+      () => sharedVad?.dispose?.(),
       () => { turnJudge?.stop() },
       () => { streaming?.dispose() },
       () => { stopKeepalive() },
@@ -403,6 +406,8 @@ export async function bootVoiceStack(
     }
     turnJudge = turnJudgeClient
 
+    sharedVad = await loadSharedVad(process.env, report)
+
     // 语音栈先起：端口 0 → `onListening` 报出真实端口，再把桥或宿主挂载接上去。
     // `runVoiceServer` 若在 `onListening` 之前就返回或抛错（端口冲突、绑定失败），
     // 必须 reject，否则这个 Promise 永远等不到。
@@ -410,6 +415,7 @@ export async function bootVoiceStack(
       runVoiceServer({
         port: 0,
         host: '127.0.0.1',
+        ...(sharedVad === null ? {} : { vad: sharedVad }),
         device: config.device,
         ffmpegPath: process.env['MIAI_FFMPEG'] ?? 'ffmpeg',
         agent,

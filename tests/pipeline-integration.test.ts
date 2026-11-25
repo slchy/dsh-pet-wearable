@@ -650,7 +650,16 @@ test('逐字汇报：TTS 原文朗读，绕开 speakFromText，并按 spoken 回
   const verbatim = '端口 63993 订单 W8665881';
   try {
     h.dsh.hold();
-    await completeUserTurn(h, '查一下订单', { transcript: '我查查。' });
+    // 动作轮没调工具：未核实音频被拦住，原 response.done 之后才排队短应声。
+    beginUser(h, '查一下订单', { transcript: '我查查。' });
+    await h.clock.drain();
+    h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+    await h.clock.drain();
+    h.socket.message({ type: 'response.created' });
+    h.socket.message({ type: 'response.audio_transcript.delta', delta: '好，我查查。' });
+    h.socket.message({ type: 'response.audio.delta', delta: PCM.toString('base64') });
+    h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+    await advance(h.clock, 300);
     assert.equal(h.dsh.calls.length, 1);
     assert.equal(h.dsh.calls[0]?.text, '查一下订单');
     assert.equal(h.runtime.core.phase, 'listening');

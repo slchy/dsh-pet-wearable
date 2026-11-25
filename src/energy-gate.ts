@@ -35,6 +35,31 @@ export interface EnergyGateOptions {
    * `silenceMs` 打回 0，门也不因此重开一段。
    */
   readonly voiceDebounceFrames?: number;
+  /**
+   * 神经 VAD 起音阈值。缺省 `0.45`。只在 `process` 传入 `speechProb` 时使用。
+   */
+  readonly vadStartThreshold?: number;
+  /** 神经 VAD 维持阈值（滞回下沿）。缺省 `0.30`。 */
+  readonly vadReleaseThreshold?: number;
+  /**
+   * 播报期起音阈值。缺省 `0.65`，比平时更高，用来挡扬声器回波。
+   * 只在还没进入本段人声、且调用方标明 `speaking` 时生效。
+   */
+  readonly vadSpeakingStartThreshold?: number;
+  /**
+   * 播报期起音去抖帧数。缺省 `4`。与 {@link voiceDebounceFrames} 取较大值。
+   */
+  readonly speakingDebounceFrames?: number;
+  /**
+   * 纯能量模式下，播报期把开门门限抬高这么多 dB。缺省 `6`。
+   * 已经确认在说话时不抬，避免把用户后半句切掉。
+   */
+  readonly energySpeakingMarginDb?: number;
+  /**
+   * 神经模式下，峰值必须高于这个底噪（dBFS）才算有声。缺省 `-62`。
+   * 概率再高，纯数字静音也不开门。
+   */
+  readonly vadNoiseFloorDbfs?: number;
   /** 可注入时钟，测试用 */
   readonly now?: () => number;
 }
@@ -105,6 +130,17 @@ export class EnergyGate {
   private open = false;
   /** 当前这一串连续过门限的块数。静音块归零。 */
   private voicedRun = 0;
+  /**
+   * 本段人声是否已经去抖确认。
+   * 神经模式用它做 0.45/0.30 滞回；能量模式在播报期用它决定要不要抬门限。
+   */
+  private inSpeech = false;
+  private readonly vadStartThreshold: number;
+  private readonly vadReleaseThreshold: number;
+  private readonly vadSpeakingStartThreshold: number;
+  private readonly speakingDebounceFrames: number;
+  private readonly energySpeakingMarginDb: number;
+  private readonly vadNoiseFloorDbfs: number;
 
   constructor(options: EnergyGateOptions) {
     this.options = options;
@@ -114,6 +150,12 @@ export class EnergyGate {
     this.voiceDebounceFrames = Number.isFinite(debounce) && debounce > 1
       ? Math.floor(debounce)
       : 1;
+    this.vadStartThreshold = options.vadStartThreshold ?? 0.45;
+    this.vadReleaseThreshold = options.vadReleaseThreshold ?? 0.30;
+    this.vadSpeakingStartThreshold = options.vadSpeakingStartThreshold ?? 0.65;
+    this.speakingDebounceFrames = options.speakingDebounceFrames ?? 4;
+    this.energySpeakingMarginDb = options.energySpeakingMarginDb ?? 6;
+    this.vadNoiseFloorDbfs = options.vadNoiseFloorDbfs ?? -62;
   }
 
   get isOpen(): boolean {
@@ -127,15 +169,41 @@ export class EnergyGate {
    * 不传则读注入时钟，且整次调用只读一次。
    *
    * 不抛异常、不记录日志 —— 日志由调用方按决策内容决定。
+   *
+   * `speechProb` 缺省时走纯能量门，判定与只传前两参的历史行为一致。
+   * 传入概率时改用神经 VAD 的双阈值滞回，并仍要求峰值高于底噪。
+   * `context.speaking` 为真且本段还没确认人声时，起音更严：神经模式抬到
+   * 播报阈值并加长去抖，能量模式把门限抬高 `energySpeakingMarginDb`。
    */
-  process(chunk: Buffer, atMs?: number): EnergyGateDecision {
+  process(
+    chunk: Buffer,
+    atMs?: number,
+    speechProb?: number,
+    context?: { readonly speaking?: boolean },
+  ): EnergyGateDecision {
     const now = atMs ?? this.now();
     const peakDbfs = pcm16PeakDbfs(chunk);
-    const hot = peakDbfs > this.options.thresholdDbfs;
+    const speaking = context?.speaking === true;
+    const echoGuard = speaking && !this.inSpeech;
+    const needFrames = echoGuard
+      ? Math.max(this.voiceDebounceFrames, this.speakingDebounceFrames)
+      : this.voiceDebounceFrames;
+
+    let hot: boolean;
+    if (speechProb !== undefined) {
+      const startThresh = speaking ? this.vadSpeakingStartThreshold : this.vadStartThreshold;
+      const probOk = this.inSpeech
+        ? speechProb >= this.vadReleaseThreshold
+        : speechProb >= startThresh;
+      hot = probOk && peakDbfs > this.vadNoiseFloorDbfs;
+    } else {
+      const margin = echoGuard ? this.energySpeakingMarginDb : 0;
+      hot = peakDbfs > this.options.thresholdDbfs + margin;
+    }
 
     if (hot) {
       this.voicedRun += 1;
-      if (this.voicedRun < this.voiceDebounceFrames) {
+      if (this.voicedRun < needFrames) {
         // 尖峰还没攒够：不算有声，也不推进 lastVoiceAt。
         // 门关着就先收进预卷，等真正开门时连同 voiced 一起交出去。
         if (!this.open) {
@@ -149,6 +217,7 @@ export class EnergyGate {
           silenceMs: now - this.lastVoiceAtMs,
         };
       }
+      this.inSpeech = true;
       this.lastVoiceAtMs = now;
       if (!this.open) {
         this.open = true;
@@ -172,6 +241,7 @@ export class EnergyGate {
     }
 
     this.voicedRun = 0;
+    this.inSpeech = false;
     if (!this.open) {
       this.preroll.push(chunk);
       return IDLE_DECISION;
@@ -182,6 +252,8 @@ export class EnergyGate {
     const gapMs = now - this.lastVoiceAtMs;
     if (gapMs > this.options.holdMs) {
       this.open = false;
+      this.inSpeech = false;
+      this.voicedRun = 0;
       return { forward: true, closed: true, voiced: false, closedGapMs: gapMs, silenceMs: gapMs };
     }
     return { forward: true, closed: false, voiced: false, silenceMs: gapMs };

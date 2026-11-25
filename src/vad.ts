@@ -15,8 +15,8 @@ import type * as ort from 'onnxruntime-node';
 /**
  * onnxruntime-node 的**惰性加载**。
  *
- * 只有 MiMo（本地 silero VAD）那条老路径才用得上它，而它装完是 300 MB 量级。
- * 阿里云路径把判停完全交给了服务端，根本用不到 —— 所以改成用到时才 import。
+ * 神经 VAD 和旧的 MiMo 本地路径才用得上它，装完是 300 MB 量级。
+ * 能量门路径（没模型、或 `VOICE_VAD=energy`）根本不 import。
  */
 let ortPromise: Promise<typeof ort> | null = null;
 const ortModule = (): Promise<typeof ort> => {
@@ -84,6 +84,114 @@ export class SileroVad {
     this.context = frame.slice(WINDOW - CONTEXT);
 
     const data = (out.output as ort.Tensor).data as Float32Array;
+    return data[0] ?? 0;
+  }
+}
+
+/**
+ * 一条连接上的神经 VAD。`process` 的帧必须恰好是 {@link WINDOW} 个 `[-1, 1]` 采样。
+ * 同一个流禁止并发调用 `process`：LSTM 状态只有一份。
+ */
+export interface SpeechVadStream {
+  /** 传入恰好 WINDOW (512) 个 [-1, 1] float32 采样点（32 ms），返回人声概率 [0, 1] */
+  process(frame: Float32Array): Promise<number>;
+  reset(): void;
+}
+
+/** 进程内共享的一份模型会话。每条连接 {@link SharedSpeechVad.createStream} 自己的状态。 */
+export interface SharedSpeechVad {
+  readonly modelPath: string;
+  createStream(): SpeechVadStream;
+  dispose?(): Promise<void> | void;
+}
+
+/**
+ * 一份共享的 Silero v5 会话，多条连接各拿一个轻量流。
+ *
+ * 会话只创建一次。每条流自己持有 `state`、64 点 context，以及复用的 `sr` 张量和
+ * 输入缓冲，避免每帧重新分配，也避免两条连接把 LSTM 状态写串。
+ */
+export class SileroVadModel implements SharedSpeechVad {
+  readonly modelPath: string;
+  private session: ort.InferenceSession | null;
+  private readonly ortApi: typeof ort;
+  private released = false;
+
+  private constructor(modelPath: string, session: ort.InferenceSession, ortApi: typeof ort) {
+    this.modelPath = modelPath;
+    this.session = session;
+    this.ortApi = ortApi;
+  }
+
+  static async load(modelPath: string): Promise<SileroVadModel> {
+    const ortApi = await ortModule();
+    const session = await ortApi.InferenceSession.create(modelPath);
+    return new SileroVadModel(modelPath, session, ortApi);
+  }
+
+  createStream(): SpeechVadStream {
+    if (this.session === null) {
+      throw new Error('SileroVadModel 已释放');
+    }
+    return new SileroVadStream(this.session, this.ortApi);
+  }
+
+  /** 释放共享会话。重复调用是空操作。 */
+  async dispose(): Promise<void> {
+    if (this.released) return;
+    this.released = true;
+    const session = this.session;
+    this.session = null;
+    if (session === null) return;
+    const release = (session as unknown as { release?: () => Promise<void> | void }).release;
+    if (typeof release === 'function') {
+      await release.call(session);
+    }
+  }
+}
+
+/** 每条连接一份：状态张量与 context 不与其它流共享。 */
+class SileroVadStream implements SpeechVadStream {
+  private readonly session: ort.InferenceSession;
+  private readonly ortApi: typeof ort;
+  private state: ort.Tensor;
+  private context: Float32Array;
+  /** 复用的输入缓冲：`[context | frame]`，长度 {@link CONTEXT} + {@link WINDOW} */
+  private readonly x: Float32Array;
+  /** 复用的采样率张量。每条流一份，避免和别的流抢同一块只读输入。 */
+  private readonly sr: ort.Tensor;
+
+  constructor(session: ort.InferenceSession, ortApi: typeof ort) {
+    this.session = session;
+    this.ortApi = ortApi;
+    this.context = new Float32Array(CONTEXT);
+    this.x = new Float32Array(CONTEXT + WINDOW);
+    this.state = new ortApi.Tensor('float32', new Float32Array(2 * 1 * 128), [2, 1, 128]);
+    this.sr = new ortApi.Tensor('int64', BigInt64Array.from([BigInt(SAMPLE_RATE)]), []);
+  }
+
+  reset(): void {
+    const data = this.state.data;
+    if (data instanceof Float32Array) {
+      data.fill(0);
+    }
+    this.context.fill(0);
+  }
+
+  async process(frame: Float32Array): Promise<number> {
+    if (frame.length !== WINDOW) {
+      throw new Error(`帧长必须是 ${WINDOW}，收到 ${frame.length}`);
+    }
+    this.x.set(this.context, 0);
+    this.x.set(frame, CONTEXT);
+    const out = await this.session.run({
+      input: new this.ortApi.Tensor('float32', this.x, [1, CONTEXT + WINDOW]),
+      state: this.state,
+      sr: this.sr,
+    });
+    this.state = out['stateN'] as ort.Tensor;
+    this.context.set(frame.subarray(WINDOW - CONTEXT));
+    const data = (out['output'] as ort.Tensor).data as Float32Array;
     return data[0] ?? 0;
   }
 }

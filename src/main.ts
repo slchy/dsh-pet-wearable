@@ -8,8 +8,9 @@
  *   node src/main.ts --listen 8766                                  # 真供应商
  *   node src/main.ts --listen 8766 --stt canned --tts silent --agent echo   # 零密钥
  *
- * 旧路径（`--replay`、本地 silero-vad、MiMo ASR）见 `legacy-pipeline.ts`。
- * 它**按需加载**：`--stt` 流式启动的依赖图里没有 VAD/ONNX（见文件末尾的说明）。
+ * 旧路径（`--replay`、本地 silero-vad、MiMo ASR）见 `legacy-pipeline.ts`，仍按需加载。
+ * 流式路径的神经 VAD 由 `runtime/vad-bootstrap.ts` 启动时加载；没模型或
+ * `VOICE_VAD=energy` 时退回能量门。顶层不静态引入 `onnxruntime-node`。
  */
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -45,6 +46,7 @@ import {
   type AssembledStreamingPipeline,
 } from './runtime/pipeline-assembly.ts';
 import { buildAgent, buildStt, buildTts } from './runtime/providers-factory.ts';
+import { loadSharedVad } from './runtime/vad-bootstrap.ts';
 import { semanticEndpoint } from './semantic-endpoint.ts';
 import type { DshSession } from './session.ts';
 import { TurnJudge } from './turn-judge.ts';
@@ -862,8 +864,12 @@ async function main(): Promise<void> {
     } catch (error) {
       fail((error as Error).message);
     }
-    const code = await runVoiceServer({
+    const sharedVad = await loadSharedVad(process.env, (line) => { console.log(line); });
+    let code = 1;
+    try {
+      code = await runVoiceServer({
       port: listen,
+      ...(sharedVad === null ? {} : { vad: sharedVad }),
       host: opt('--host', '127.0.0.1'),
       device: deviceSpec,
       ffmpegPath: ffmpeg,
@@ -942,17 +948,19 @@ async function main(): Promise<void> {
         }
         : null,
     });
-    dshSession?.stop();
+    } finally {
+      dshSession?.stop();
+      await sharedVad?.dispose?.();
+    }
     process.exit(code);
   }
 
   /**
    * 旧路径（`--replay` / 无 `--stt` 的本地监听）：**到这里才**加载 `legacy-pipeline`。
    *
-   * 它一路拉进 `silero-vad` 与 `onnxruntime-node`（几十 MB 的 native 包），而生产的
-   * 流式路径（`--stt ... --listen`）在上面那个分支就 `process.exit()` 了，永远走不到这里。
-   * 顶层 `import` 会让每次启动都付这份加载钱 —— 改成按需之后，`--stt` 启动的
-   * 依赖图里不再有 VAD/ORT（`tests/main-wiring.test.ts` 卡着这条）。
+   * 它一路拉进自己的 `SileroVad`。流式分支在上面 `process.exit()`，走不到这里。
+   * 顶层仍然只允许 `import type`（`tests/main-wiring.test.ts` 卡着这条）；
+   * 流式路径的神经 VAD 由 `loadSharedVad` 按需动态加载，失败退回能量门。
    */
   const { Pipeline } = await import('./legacy-pipeline.ts');
   const pipe = new Pipeline(ffmpeg, mode, agent);

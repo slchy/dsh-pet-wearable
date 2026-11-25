@@ -214,6 +214,11 @@ export interface UtteranceAssemblerOptions {
    */
   readonly sttCommitAfterMs?: number;
   /**
+   * 本段已确认有声累计不足这么久，不封段、不投机、不预跑。
+   * 缺省 `0`，短合成单测不受影响。生产由 `DEFAULT_MIN_SPEECH_MS` 填入。
+   */
+  readonly minSpeechMs?: number;
+  /**
    * 静音到 {@link commitAfterMs} 时调一次，宿主拿去**车道起跑**（`omni.seal`）。
    *
    * 不是 ASR 封段。`stt.commit()` 与档案里的 `asr.commit` 走 {@link onSttCommit}；
@@ -592,7 +597,8 @@ export class UtteranceAssembler {
       return;
     }
     this.audio.push(frame.pcm);
-    this.silence.noteFrame(frame.voiced, frame.tsMs, frame.silenceMs, true);
+    const frameDurationMs = Math.round((frame.pcm.length / 2 / 16_000) * 1000);
+    this.silence.noteFrame(frame.voiced, frame.tsMs, frame.silenceMs, true, frameDurationMs);
   }
 
   /**
@@ -610,6 +616,7 @@ export class UtteranceAssembler {
    */
   resetAudio(chunks: readonly Buffer[] = []): void {
     this.audio.reset(chunks);
+    this.silence.resetSegment();
   }
 
   /**

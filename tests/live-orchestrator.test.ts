@@ -1281,11 +1281,12 @@ test('问时间时车道不可用才同步问 dsh', async () => {
   assert.equal(must(dsh.calls[0], '同步').note, '只此一次');
 });
 
-test('实时事实没 delegate 时结束才补派，并保留 omni 垫话，闲聊不派', async () => {
+test('守卫轮未调工具时拦截未核实音频，改播短应声并补派，闲聊不派', async () => {
   const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
   const voice = scriptedTts();
+  const leaked = Buffer.from([7, 7, 7, 7]);
   const lane = fakeLane({
-    answer: () => audioAnswer([PCM], '我看看。'),
+    answer: () => audioAnswer([leaked], '我看看。'),
   });
   const reports: BackgroundTaskReport[] = [];
   const host = orch(dsh.agent, voice.tts, lane);
@@ -1297,37 +1298,51 @@ test('实时事实没 delegate 时结束才补派，并保留 omni 垫话，闲�
   for (let i = 0; i < phrases.length; i += 1) {
     const text = phrases[i] ?? '';
     const events = await collect(engine.respond(turnOf(text, { no: i + 1 }), new AbortController().signal));
+    assert.equal(events.some((ev) => ev.type === 'audio' && ev.pcm.equals(leaked)), false);
+    assert.equal(events.some((ev) => ev.type === 'text' && ev.delta.includes('我看看')), false);
     assert.deepEqual(audioOf(events), [PCM]);
-    assert.equal(doneOf(events).speech, '我看看。');
+    assert.equal(doneOf(events).speech, '好，我查查。');
+    assert.ok(metas(events).some((meta) =>
+      meta.path === 'omni' && meta.delegate === 'task' && meta.nonBlocking === true));
   }
-  await settle();
-  assert.deepEqual(dsh.calls.map((call) => call.text), phrases);
-  assert.equal(lane.discards, 0);
+  assert.equal(lane.discards, phrases.length);
   assert.equal(lane.claims, phrases.length);
   assert.equal(lane.textAnswers, 0);
+  assert.equal(lane.speaks.length, phrases.length);
+  assert.ok(lane.speaks.every((speak) => speak.kind === 'ack'));
   assert.equal(voice.texts.length, 0);
+  await settle();
+  assert.deepEqual(dsh.calls.map((call) => call.text), phrases);
   await settle();
   assert.equal(reports.length, phrases.length);
   assert.ok(reports.every((report) => report.source === 'early_rule'));
 
   const before = dsh.calls.length;
-  await collect(engine.respond(turnOf('今天心情不错', { no: 8 }), new AbortController().signal));
-  await collect(engine.respond(turnOf('我明天下午三点开会', { no: 9 }), new AbortController().signal));
+  const discards = lane.discards;
+  const speaks = lane.speaks.length;
+  const chat = await collect(engine.respond(turnOf('今天心情不错', { no: 8 }), new AbortController().signal));
+  const plan = await collect(engine.respond(turnOf('我明天下午三点开会', { no: 9 }), new AbortController().signal));
+  assert.deepEqual(audioOf(chat), [leaked]);
+  assert.equal(doneOf(chat).speech, '我看看。');
+  assert.deepEqual(audioOf(plan), [leaked]);
+  assert.equal(doneOf(plan).speech, '我看看。');
   await settle();
   assert.equal(dsh.calls.length, before);
-  assert.equal(lane.discards, 0);
+  assert.equal(lane.discards, discards);
+  assert.equal(lane.speaks.length, speaks);
 });
 
-test('没封段的实时事实走 answerFromText，结束才用原话补派', async () => {
+test('没封段的实时事实走 answerFromText，未委派音频不外泄并补派短应声', async () => {
   const dsh = fakeDsh({ text: '明天有雨', speech: '明天有雨' });
   dsh.hold();
   const voice = scriptedTts();
+  const leaked = Buffer.from([8, 8, 8]);
   const lane = fakeLane({
     healthy: false,
     canAnswerText: true,
     textAnswer: (userText) => {
       assert.equal(userText, '今天天气怎么样');
-      return audioAnswer([PCM], '我帮你看天气。');
+      return audioAnswer([leaked], '我帮你看天气。');
     },
   });
   const host = orch(dsh.agent, voice.tts, lane);
@@ -1338,11 +1353,16 @@ test('没封段的实时事实走 answerFromText，结束才用原话补派', as
 
   assert.equal(lane.claims, 0);
   assert.equal(lane.textAnswers, 1);
-  assert.equal(lane.discards, 0);
+  assert.equal(lane.discards, 1);
   assert.equal(voice.texts.length, 0);
+  assert.equal(events.some((ev) => ev.type === 'audio' && ev.pcm.equals(leaked)), false);
+  assert.equal(events.some((ev) => ev.type === 'text' && ev.delta.includes('我帮你看天气')), false);
   assert.deepEqual(audioOf(events), [PCM]);
-  assert.equal(doneOf(events).speech, '我帮你看天气。');
-  assert.deepEqual(metas(events).map((meta) => meta.path), ['omni']);
+  assert.equal(doneOf(events).speech, '好，我查查。');
+  assert.ok(metas(events).some((meta) =>
+    meta.path === 'omni' && meta.delegate === 'task' && meta.nonBlocking === true));
+  assert.equal(lane.speaks.length, 1);
+  assert.equal(lane.speaks[0]?.kind, 'ack');
   await settle();
   assert.equal(dsh.calls.length, 1);
   assert.equal(must(dsh.calls[0], '天气').text, '今天天气怎么样');
@@ -1386,6 +1406,8 @@ test('decideLiveTurn 把前台分支收成显式种类', () => {
   assert.equal(decideLiveTurn({ ...base, text: '查一下天气' }), 'live_with_bg_guard');
   assert.equal(decideLiveTurn({ ...base, text: '今天天气怎么样' }), 'live_with_bg_guard');
   assert.equal(decideLiveTurn({ ...base, text: '股价多少', willServe: false, canTryText: true }), 'live_with_bg_guard');
+  assert.equal(decideLiveTurn({ ...base, text: '如果明天下午不下雨的话我们就去公园走一圈。' }), 'live_direct');
+  assert.equal(decideLiveTurn({ ...base, text: '要是今天不下雨我就去跑步。' }), 'live_direct');
   assert.equal(decideLiveTurn({ ...base }), 'live_direct');
   assert.equal(decideLiveTurn({
     ...base,
@@ -1540,8 +1562,9 @@ test('守卫轮 Omni 未调工具时立刻删掉未核实助手项，核实后�
   });
   dsh.hold();
   const voice = scriptedTts();
+  const leaked = Buffer.from([6, 6, 6, 6]);
   const lane = ssotLane({
-    answer: () => answerWithIds([PCM], '空调已经打开了26度', {
+    answer: () => answerWithIds([leaked], '空调已经打开了26度', {
       userItemId: 'user-h',
       assistantItemIds: ['hallu-1', 'hallu-2'],
     }),
@@ -1557,7 +1580,12 @@ test('守卫轮 Omni 未调工具时立刻删掉未核实助手项，核实后�
     new AbortController().signal,
   ));
 
-  assert.equal(doneOf(events).speech, '空调已经打开了26度');
+  assert.equal(events.some((ev) => ev.type === 'audio' && ev.pcm.equals(leaked)), false);
+  assert.equal(lane.discards, 1);
+  assert.equal(doneOf(events).speech, '好，我查查。');
+  assert.ok(metas(events).some((meta) =>
+    meta.path === 'omni' && meta.delegate === 'task' && meta.nonBlocking === true));
+  assert.equal(lane.speaks[0]?.kind, 'ack');
   assert.deepEqual(lane.deletedItems, [['hallu-1', 'hallu-2']]);
   assert.match(lastSnapshot(lane), /未执行完/);
   assert.match(lastSnapshot(lane), /此前口头回复未经执行核实/);
@@ -1577,6 +1605,151 @@ test('守卫轮 Omni 未调工具时立刻删掉未核实助手项，核实后�
   assert.match(lastSnapshot(lane), /客厅空调实际未开，已经打开/);
   assert.match(lastSnapshot(lane), /已核实/);
   assert.equal(lane.injects.length, 0);
+  assert.deepEqual(voice.texts, []);
+});
+
+test('守卫轮首块音频前已 delegate 时直出应声，不拦截', async () => {
+  const dsh = fakeDsh({ text: '晴，二十二度', speech: '晴，二十二度' });
+  dsh.hold();
+  const voice = scriptedTts();
+  const native = Buffer.from([3, 3, 3]);
+  const lane = fakeLane({
+    answer: () => audioAnswer([native], '我查查。', { reason: 'delegate', text: '明天北京天气' }),
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const events = await collect(host.toEngine().respond(
+    turnOf('明天北京天气怎么样？', { no: 2 }),
+    new AbortController().signal,
+  ));
+
+  assert.equal(lane.discards, 0);
+  assert.equal(lane.speaks.length, 0);
+  assert.deepEqual(audioOf(events), [native]);
+  assert.equal(doneOf(events).speech, '我查查。');
+  assert.equal(metas(events).some((meta) => meta.delegate === 'task'), false);
+  assert.ok(metas(events).some((meta) => meta.delegate === 'delegate' && meta.nonBlocking === true));
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  assert.equal(must(dsh.calls[0], '天气').text, '明天北京天气怎么样？');
+  dsh.release();
+  await settle();
+  assert.equal(reports.length, 1);
+  assert.equal(must(reports[0], '工具').source, 'tool_call');
+  assert.deepEqual(voice.texts, []);
+});
+
+test('守卫轮漏调工具时原音频 0 字节外泄，改为 discard、早规则和短应声', async () => {
+  const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
+  const voice = scriptedTts();
+  const logs: string[] = [];
+  const leaked = Buffer.from([9, 8, 7, 6]);
+  const phrases = ['英伟达今天股价多少？', '记一下我明天下午三点要开会'];
+  const madeUp = ['6.24 美元', '好的，记下了'];
+  let n = 0;
+  const lane = fakeLane({
+    answer: () => {
+      const at = n;
+      n += 1;
+      return audioAnswer([leaked], madeUp[at] ?? '编的');
+    },
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane, {
+    log: (line) => {
+      logs.push(line);
+    },
+  });
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const engine = host.toEngine();
+  for (let i = 0; i < phrases.length; i += 1) {
+    const events = await collect(engine.respond(
+      turnOf(phrases[i] ?? '', { no: i + 1 }),
+      new AbortController().signal,
+    ));
+    const invented = madeUp[i] ?? '';
+    assert.equal(events.some((ev) => ev.type === 'audio' && ev.pcm.equals(leaked)), false);
+    assert.equal(events.some((ev) => ev.type === 'text' && ev.delta.includes(invented)), false);
+    assert.deepEqual(audioOf(events), [PCM]);
+    assert.equal(doneOf(events).speech, '好，我查查。');
+    assert.ok(metas(events).some((meta) =>
+      meta.path === 'omni' && meta.delegate === 'task' && meta.nonBlocking === true));
+    assert.equal(lane.speaks[i]?.kind, 'ack');
+    assert.equal(lane.speaks[i]?.query, phrases[i]);
+  }
+  assert.equal(lane.discards, phrases.length);
+  assert.equal(lane.claims, phrases.length);
+  assert.equal(voice.texts.length, 0);
+  assert.ok(logs.some((line) => line.includes('守卫轮前台未调工具，拦截未核实音频并转交后台')));
+  await settle();
+  assert.deepEqual(dsh.calls.map((call) => call.text), phrases);
+  await settle();
+  assert.equal(reports.length, phrases.length);
+  assert.ok(reports.every((report) => report.source === 'early_rule'));
+});
+
+test('闲聊和条件句不进守卫轮，不拦截，不派 dsh', async () => {
+  const dsh = fakeDsh({ text: '不该派', speech: '不该派' });
+  const voice = scriptedTts();
+  const spoken = Buffer.from([4, 4, 4, 4]);
+  const lane = fakeLane({
+    answer: () => audioAnswer([spoken], '好呀，一起去。'),
+  });
+  const host = orch(dsh.agent, voice.tts, lane);
+  const engine = host.toEngine();
+  const phrases = ['今天心情不错', '如果明天下午不下雨的话我们就去公园走一圈。'];
+  for (let i = 0; i < phrases.length; i += 1) {
+    const events = await collect(engine.respond(
+      turnOf(phrases[i] ?? '', { no: i + 1 }),
+      new AbortController().signal,
+    ));
+    assert.deepEqual(audioOf(events), [spoken]);
+    assert.equal(doneOf(events).speech, '好呀，一起去。');
+    assert.equal(metas(events).some((meta) => meta.delegate === 'task'), false);
+  }
+  await settle();
+  assert.equal(dsh.calls.length, 0);
+  assert.equal(lane.discards, 0);
+  assert.equal(lane.speaks.length, 0);
+  assert.deepEqual(voice.texts, []);
+});
+
+test('守卫轮零音频且未调工具时补派并补一句短应声', async () => {
+  const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
+  dsh.hold();
+  const voice = scriptedTts();
+  const lane = fakeLane({
+    answer: () => audioAnswer([], '我瞎编的股价是 6.24'),
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const events = await collect(host.toEngine().respond(
+    turnOf('英伟达今天股价多少？', { no: 6 }),
+    new AbortController().signal,
+  ));
+
+  assert.equal(lane.discards, 0, '没有音频块可拦，discard 留在有声那条路径');
+  assert.equal(events.some((ev) => ev.type === 'text' && ev.delta.includes('6.24')), false);
+  assert.deepEqual(audioOf(events), [PCM]);
+  assert.equal(doneOf(events).speech, '好，我查查。');
+  assert.ok(metas(events).some((meta) =>
+    meta.path === 'omni' && meta.delegate === 'task' && meta.nonBlocking === true));
+  assert.equal(lane.speaks.length, 1);
+  assert.equal(lane.speaks[0]?.kind, 'ack');
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  assert.equal(must(dsh.calls[0], '股价').text, '英伟达今天股价多少？');
+  dsh.release();
+  await settle();
+  assert.equal(must(reports[0], '早派').source, 'early_rule');
   assert.deepEqual(voice.texts, []);
 });
 
@@ -1641,6 +1814,91 @@ test('WorkBuddy 原意纠偏写进汇报、单槽快照和下一轮前文', asyn
   assert.deepEqual(voice.texts, []);
   dsh.release();
   await settle();
+});
+
+test('专名听岔且答复零重叠时派后台复核，注记带上文和听岔提示', async () => {
+  const dsh = fakeDsh({ text: '其主之声是莱姆的小说', speech: '其主之声是莱姆的小说' });
+  dsh.hold();
+  const voice = scriptedTts();
+  const replies = [
+    '知道，莱姆是波兰科幻作家。',
+    '《技术哲学》是莱姆探讨科技与人类关系的随笔集。',
+  ];
+  let cursor = 0;
+  const lane = fakeLane({
+    answer: () => audioAnswer([PCM], replies[cursor++] ?? '嗯。'),
+  });
+  const logs: string[] = [];
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane, {
+    log: (line) => {
+      logs.push(line);
+    },
+  });
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const engine = host.toEngine();
+
+  await collect(engine.respond(
+    turnOf('你知道波兰作家莱姆吗？', { no: 1 }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(dsh.calls.length, 0, '上一轮闲聊不得派单');
+
+  const events = await collect(engine.respond(
+    turnOf('奇耻之身是什么？', { no: 2 }),
+    new AbortController().signal,
+  ));
+  assert.equal(doneOf(events).speech, '《技术哲学》是莱姆探讨科技与人类关系的随笔集。');
+  await settle();
+
+  assert.equal(dsh.calls.length, 1);
+  const call = must(dsh.calls[0], '听岔复核');
+  assert.equal(call.text, '奇耻之身是什么？');
+  const note = call.note ?? '';
+  assert.ok(note.includes('用户：你知道波兰作家莱姆吗？'));
+  assert.ok(note.includes('【听岔复核提示】'));
+  assert.ok(note.includes('可能听岔成「《技术哲学》」'));
+  assert.ok(note.includes('[原意: 纠正后的用户原话]'));
+  const dialogAt = note.indexOf('用户：你知道波兰作家莱姆吗？');
+  const hintAt = note.indexOf('【听岔复核提示】');
+  assert.ok(dialogAt >= 0 && hintAt > dialogAt, '上文要写在听岔提示前面');
+  assert.ok(logs.some((line) => line.includes(
+    '检测到听岔风险（ASR「奇耻之身」与前台答复「《技术哲学》」无重叠）→ 后台派 dsh 结合上文核实',
+  )));
+
+  dsh.release();
+  await settle();
+  assert.equal(reports.length, 1);
+  assert.equal(must(reports[0], '汇报').source, 'early_rule');
+  assert.equal(must(reports[0], '汇报').query, '奇耻之身是什么？');
+  assert.deepEqual(voice.texts, []);
+});
+
+test('专名答对了有重叠时不派后台', async () => {
+  const dsh = fakeDsh({ text: '不该派', speech: '不该派' });
+  const voice = scriptedTts();
+  const logs: string[] = [];
+  const lane = fakeLane({
+    answer: () => audioAnswer([PCM], '《索拉里斯星》是莱姆的代表作。'),
+  });
+  const host = orch(dsh.agent, voice.tts, lane, {
+    log: (line) => {
+      logs.push(line);
+    },
+  });
+  const events = await collect(host.toEngine().respond(
+    turnOf('索拉里斯星是什么？', { no: 3 }),
+    new AbortController().signal,
+  ));
+
+  assert.equal(doneOf(events).speech, '《索拉里斯星》是莱姆的代表作。');
+  await settle();
+  assert.equal(dsh.calls.length, 0);
+  assert.equal(logs.some((line) => line.includes('检测到听岔风险')), false);
+  assert.deepEqual(voice.texts, []);
 });
 
 test('播报完成后单槽改为已口头告知，全程不堆积旁注也不调外部 TTS', async () => {

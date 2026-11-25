@@ -46,6 +46,7 @@ import { DshSession } from '../../src/session.ts';
 import { sampleSocket } from '../../src/socket-stats.ts';
 import { TurnJudge } from '../../src/turn-judge.ts';
 import { envNumber, envString, sleep } from '../../src/util.ts';
+import { loadSharedVad } from '../../src/runtime/vad-bootstrap.ts';
 import { buildVoiceRuntimeConfig } from '../../src/voice-config.ts';
 import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from '../../src/voice-session.ts';
 import type { BgReportRecord, DshCallRecord, EvalCase, EvalManifest } from './types.ts';
@@ -448,16 +449,19 @@ async function main(): Promise<void> {
     })
     : null;
 
-  const cleanup = (): void => {
+  const sharedVad = await loadSharedVad(process.env, log);
+  const cleanup = async (): Promise<void> => {
     turnJudgeClient?.stop();
     streaming.dispose();
     dshSession?.stop();
+    await sharedVad?.dispose?.();
   };
-  process.on('SIGINT', () => { cleanup(); process.exit(0); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+  process.on('SIGINT', () => { void cleanup().finally(() => { process.exit(0); }); });
+  process.on('SIGTERM', () => { void cleanup().finally(() => { process.exit(0); }); });
 
   const code = await runVoiceServer({
     port,
+    ...(sharedVad === null ? {} : { vad: sharedVad }),
     host: '127.0.0.1',
     ffmpegPath: env['MIAI_FFMPEG'] ?? 'ffmpeg',
     agent: streaming.agent,
@@ -496,7 +500,7 @@ async function main(): Promise<void> {
     idleTimeoutMs: voice.idleTimeoutMs,
     serve: true,
   });
-  cleanup();
+  await cleanup();
   process.exit(code);
 }
 

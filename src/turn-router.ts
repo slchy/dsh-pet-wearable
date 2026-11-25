@@ -83,6 +83,20 @@ export function isClockTimeRequest(text: string): boolean {
 const REALTIME_WEATHER =
   /(?:今天|明天|后天|现在|外面).{0,6}(?:天气|下雨|下雪|气温|温度|空气质量)|天气怎么样|下不下雨|会下雨吗/u;
 
+/**
+ * 条件假设里顺口提到下雨，不是在问天气。
+ * 「如果明天下午不下雨的话我们就去公园走一圈。」不该进守卫轮。
+ * 假设后面又显式发问（「如果今天下雨的话，明天天气怎么样？」）仍要查。
+ */
+const CONDITIONAL_WEATHER_ASIDE = /(?:如果|要是|假如).*(?:的话|就)/u;
+
+const EXPLICIT_WEATHER_QUESTION =
+  /天气怎么样|下不下雨|会下雨吗|多少度|气温|空气质量|[？?]/u;
+
+function isConditionalWeatherAside(text: string): boolean {
+  return CONDITIONAL_WEATHER_ASIDE.test(text) && !EXPLICIT_WEATHER_QUESTION.test(text);
+}
+
 const REALTIME_MARKET =
   /(?:股价|股票|汇率|比分|金价|油价).{0,4}(?:多少|怎么样|涨|跌)|今天.{0,6}(?:股价|汇率|比分)/u;
 
@@ -91,8 +105,9 @@ const REALTIME_TRAFFIC =
 
 /** 这句是不是必须查实时外部信息（含钟点/日期） */
 export function isRealtimeFactRequest(text: string): boolean {
+  const weather = REALTIME_WEATHER.test(text) && !isConditionalWeatherAside(text);
   return isClockTimeRequest(text)
-    || REALTIME_WEATHER.test(text)
+    || weather
     || REALTIME_MARKET.test(text)
     || REALTIME_TRAFFIC.test(text);
 }

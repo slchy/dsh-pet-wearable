@@ -114,10 +114,19 @@ export class OmniShadow {
    * 认领落在哪一份上。
    *
    * **不能事后去 `this.resp` 里找**：`response.done` 一到 `finish()` 就把 `this.resp`
-   * 置 null，如果消费者这时还没开始读（异步 generator 的第一个 `next()` 是微任务），
-   * 那一份就再也够不着了 —— 表现是这一轮静默等 5 s、零音频。所以引用要留在这里。
+   * 置 null。没人认领的用户回复改停在 {@link readyResp}，认领过的引用留在这里。
+   * 消费者这时还没开始读（异步 generator 的第一个 `next()` 是微任务）也够得着，
+   * 不会静默等 5 s、零音频。
    */
   private claimedResp: PendingResponse | null = null;
+  /**
+   * 已经 `response.done`、但还没人 `claim()` 的用户回复。
+   *
+   * Silero 提速后 TurnJudge 可能比 Omni 晚几十毫秒。done 一到就塞进 orphans
+   * 会把合法回复删掉，编排器只能退回 `answerFromText`。停在这里，
+   * `willServe()` / `claim()` 仍看得见；同句再封段只删助手项，新一轮开口才连用户项一起删。
+   */
+  private readyResp: PendingResponse | null = null;
   /** 在等「下一份建出来」的读端（`claim()` 的流会挂在这里） */
   private liveWaiters: Array<() => void> = [];
   /** 还没跑过任何一份 seal —— 第一条标 `warmup`，分析时排除 */
@@ -246,6 +255,8 @@ export class OmniShadow {
     this.supersededPrev = null;
     this.claimReserved = false;
     this.claimedResp = null;
+    // 新一轮开口：上一轮没人认领的已完成回复，助手项和用户项一起删。
+    this.demoteReadyResp(true);
     // 上一轮那些「答了但没人听过」的回复，趁现在删掉
     this.control.flushOrphans();
     this.wakeLive();
@@ -310,6 +321,8 @@ export class OmniShadow {
     };
     // 用户新封段优先级高于所有还没发出的提示队列，先清掉队列再接新封段。
     this.control.clearSpeech();
+    // 同句再封段、中间没有 restart：只删上一段助手项，用户音频留给这一段。
+    this.demoteReadyResp(false);
     if (this.resp !== null) {
       // 忙时 create 会被服务端拒掉且永久丢失（实测），所以先 cancel 再排队。
       // 标 `superseded`：这是**同一轮的下一段**，不是新一轮 —— 认领要跟过去（见 `sendSeal`）。
@@ -382,6 +395,9 @@ export class OmniShadow {
     this.claimEpoch = me;
     const live = this.liveResp();
     if (live !== null) {
+      if (live === this.readyResp) {
+        this.readyResp = null;
+      }
       live.claimed = true;
       this.claimedResp = live;
     } else {
@@ -463,6 +479,9 @@ export class OmniShadow {
               }
               if (next !== null && next !== active) {
                 next.claimed = true;
+                if (self.readyResp === next) {
+                  self.readyResp = null;
+                }
                 self.claimedResp = next;
                 self.log('[omni] 认领跟到下一段（并段轮）');
                 active = next;
@@ -491,6 +510,8 @@ export class OmniShadow {
     // 丢弃本轮时把还没发出的本轮补句也一并清掉；调用方随后若立刻 enqueueSpeech，
     // 新的回执会排在刚取消的这份 response.done 之后发出。
     this.control.clearSpeech('ack');
+    // 已完成但没人认领的那份：只删助手项，用户音频留下。槽位立刻让出。
+    this.demoteReadyResp(false);
     const resp = this.resp;
     if (resp !== null) {
       resp.audio.length = 0;
@@ -507,6 +528,10 @@ export class OmniShadow {
     // 本地还没发出去的帧丢掉。已经在服务端缓冲里的字节留在账上，不发 commit。
     this.uplink.discard();
     this.wakeLive();
+    // 在途回复要等 done 才有 item id。已经完成的待认领槽此刻就能把助手项删掉。
+    if (this.resp === null && this.state === 'ready') {
+      this.control.flushOrphans();
+    }
   }
 
   /**
@@ -590,6 +615,8 @@ export class OmniShadow {
     }
     // 还是 ready：先按统一顺序冲掉积压的控制帧，再占用这条会话。
     // 忙了再发 item.create，会插进别人正在生成的那一轮里。
+    // 未认领的已完成音频在这里放弃，助手项和用户项一起删。
+    this.demoteReadyResp(true);
     this.control.flushReady();
     const sentAt = this.now();
     const resp = blankPending({
@@ -648,6 +675,8 @@ export class OmniShadow {
     }
     // 还是 ready：先按统一顺序冲掉积压的控制帧，再占用这条会话。
     // 这是用户真话，`deletePromptUserOnDone` 保持 false，done 时不删这条 user 项。
+    // 未认领的已完成音频在这里放弃，助手项和用户项一起删。
+    this.demoteReadyResp(true);
     this.control.flushReady();
     const sentAt = this.now();
     const resp = blankPending({
@@ -894,6 +923,10 @@ export class OmniShadow {
     if (next === null) {
       return;
     }
+    // 即将占用会话：放弃还没人认领的已完成音频，连用户项一起删。
+    // `takeSpeech` 内部已经冲过一轮；这里先降级再冲一次，删项才赶在 response.create 之前。
+    this.demoteReadyResp(true);
+    this.control.flushReady();
     this.resp = next.resp;
     this.claimedResp = next.resp;
     this.state = 'busy';
@@ -941,14 +974,40 @@ export class OmniShadow {
     });
   }
 
-  /** 手里那份可用吗（没被取消、没被认领走、也不是后台汇报） */
+  /** 手里那份可用吗（没被取消、没被认领走、也不是后台汇报）。已完成待认领的也算。 */
   private liveResp(): PendingResponse | null {
     const resp = this.resp;
     // announce 即使忘了标 claimed，也不能交给用户的 claim()。
-    if (resp === null || isSettled(resp) || resp.claimed || resp.origin === 'announce') {
-      return null;
+    if (resp !== null && !isSettled(resp) && !resp.claimed && resp.origin !== 'announce') {
+      return resp;
     }
-    return resp;
+    if (this.readyResp !== null && !this.readyResp.claimed) {
+      return this.readyResp;
+    }
+    return null;
+  }
+
+  /**
+   * 把已完成待认领的那份降成孤儿。
+   *
+   * `deleteUser` 为假：同句再封段或 discard，只删助手项，用户音频留下。
+   * 为真：新一轮开口，或显式改走文本/播报，助手项和用户项一起删。
+   * 已经认领过的不进孤儿（用户听过）。
+   */
+  private demoteReadyResp(deleteUser: boolean): void {
+    const ready = this.readyResp;
+    if (ready === null) {
+      return;
+    }
+    this.readyResp = null;
+    if (ready.claimed) {
+      return;
+    }
+    const assistant = [...ready.itemIds];
+    const user = deleteUser && !ready.deletePromptUserOnDone ? ready.userItemId : null;
+    if (assistant.length > 0 || user !== null) {
+      this.control.rememberOrphan({ assistant, user });
+    }
   }
 
   // ---------------------------------------------------------------- 内部
@@ -1137,8 +1196,13 @@ export class OmniShadow {
           ) {
             this.resp.itemIds.push(id);
           }
-          if (item.type === 'function_call' && typeof item.call_id === 'string' && item.call_id !== '') {
-            this.resp.delegateCallId ??= item.call_id;
+          if (item.type === 'function_call') {
+            // 真服务线序：function_call 比首块音频早约 150 ms。这里就标委派，
+            // 守卫轮才能在出声前拦住胡编。
+            this.resp.delegate ??= 'delegate';
+            if (typeof item.call_id === 'string' && item.call_id !== '') {
+              this.resp.delegateCallId ??= item.call_id;
+            }
           }
         }
         return;
@@ -1245,8 +1309,11 @@ export class OmniShadow {
     // `deletePromptUserOnDone` 时即使助手项要留下（已经出过声），也删掉那条 user 项。
     // `answerFromText` 绝不设这个标记。
     //
-    // 没被 `discard()` 标、也**没人认领**的那份是「幽灵」：记进 orphans，
-    // 本段自己的孤儿要等这次冲刷之后再入队，避免回到 ready 的当下落删掉。
+    // 用户回复已完成、还没人认领、也没有同句下一段在排队：停进 `readyResp`，
+    // 不进 orphans。TurnJudge 晚到几十毫秒时 `claim()` 仍能把音频读走。
+    // 同句被后续封段顶掉的未认领回复只记助手项，用户音频留给下一段。
+    // 其余没人认领的才是「幽灵」：记进 orphans。本段自己的孤儿要等这次冲刷之后再入队，
+    // 避免回到 ready 的当下落删掉。
     let freshOrphan: { assistant: string[]; user: string | null } | null = null;
     if (resp !== null) {
       const ids = new Set([...resp.itemIds, ...assistantItemIds(ev)]);
@@ -1259,18 +1326,41 @@ export class OmniShadow {
           }
         }
       }
-      if (resp.deleteOnDone) {
+      const parkReady = resp.origin === 'user'
+        && !resp.claimed
+        && !resp.deleteOnDone
+        && !isCancelled(resp)
+        && this.pending === null
+        && this.state !== 'broken';
+      if (parkReady) {
+        if (this.readyResp !== null) {
+          this.demoteReadyResp(false);
+        }
+        this.readyResp = resp;
+      } else if (resp.deleteOnDone) {
         for (const id of ids) {
           this.send({ type: 'conversation.item.delete', item_id: id });
         }
+        // discard 已经标了 deleteOnDone，编排器可能又 deleteItems 排了同一批 id。
+        // 发两次会连着两条协议错误，把车道打成 broken。
+        if (ids.size > 0) {
+          const pending = this.control.pendingDeletes;
+          const kept = pending.filter((id) => !ids.has(id));
+          if (kept.length !== pending.length) {
+            pending.length = 0;
+            pending.push(...kept);
+          }
+        }
       } else if (!resp.claimed) {
+        const sameSentence = this.pending !== null && resp.origin === 'user';
         freshOrphan = {
           assistant: [...ids],
           // 临时提示的 user 项下面马上删，不要再排进孤儿里删第二次。
-          user: resp.deletePromptUserOnDone ? null : resp.userItemId,
+          // 同句下一段顶掉这份时，用户音频项留下，下一段还听得见前半句。
+          user: sameSentence || resp.deletePromptUserOnDone ? null : resp.userItemId,
         };
       }
-      if (resp.deletePromptUserOnDone && resp.userItemId !== null && resp.userItemId !== '') {
+      if (!parkReady && resp.deletePromptUserOnDone && resp.userItemId !== null && resp.userItemId !== '') {
         this.send({ type: 'conversation.item.delete', item_id: resp.userItemId });
       }
     }
@@ -1360,6 +1450,7 @@ export class OmniShadow {
     this.state = 'broken';
     const resp = this.resp;
     this.resp = null;
+    this.readyResp = null;
     this.pending = null;
     this.claimReserved = false;
     this.claimedResp = null;

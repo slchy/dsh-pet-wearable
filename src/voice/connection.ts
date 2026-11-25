@@ -59,6 +59,29 @@ import {
   type VoiceSessionOptions,
 } from './session-options.ts';
 
+/**
+ * 从尾部留下不超过 `budgetBytes` 的帧，至少留 1 帧。
+ * ASR / Omni 的预卷用它；TurnJudge 仍拿开门时的完整预卷。
+ */
+function tailByBytes<T>(
+  items: readonly T[],
+  sizeOf: (item: T) => number,
+  budgetBytes: number,
+): readonly T[] {
+  if (items.length <= 1) return items;
+  let bytes = 0;
+  let start = items.length;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item === undefined) continue;
+    const size = sizeOf(item);
+    if (start < items.length && bytes + size > budgetBytes) break;
+    bytes += size;
+    start = i;
+  }
+  return items.slice(start);
+}
+
 /** 对话相位收成浮层四态。`ending` / `closed` 都是空闲；等拍照仍算在想。 */
 function petPhaseOf(state: DialogState): PetUiPhase {
   switch (state) {
@@ -434,8 +457,11 @@ export class VoiceConnection {
     options.tts.warm?.();
 
     // 7. 上行。能量门、装配器、插话闸共用 `assemblerNow`。
+    const vadStream = options.vad?.createStream() ?? null;
     this.uplink = new UplinkPipeline({
       ffmpegPath: options.ffmpegPath,
+      vadStream,
+      isSpeaking: () => this.dialog.core.fsm.state === 'speaking',
       // 上行编码由能力决定：v1 是 mSBC，自报 pcm16 的设备直接进增益/能量门
       codec: this.uplinkCodec,
       sampleRate: UPSTREAM_SAMPLE_RATE,
@@ -465,13 +491,25 @@ export class VoiceConnection {
         // 新一轮开口：判停窗口只留这一句（官方也是按句裁的）。预卷就是这段的开头，
         // 前面那些静音 / 上一轮的回答都不该进模型。
         this.assembler.resetAudio(preroll);
+        // TurnJudge 吃完整预卷（默认 800 ms）。ASR 与 Omni 只补尾部一小段，
+        // 避免把开门前的长静音灌进识别。
+        const asrMs = options.gate.asrPrerollMs;
+        let asrFrames = prerollFrames;
+        let asrPcm: readonly Buffer[] = preroll;
+        if (asrMs !== undefined && asrMs < options.gate.prerollMs) {
+          const budget = Math.round((asrMs / 1000) * UPSTREAM_SAMPLE_RATE * 2);
+          if (prerollFrames !== undefined) {
+            asrFrames = tailByBytes(prerollFrames, (frame) => frame.pcm.length, budget);
+          }
+          asrPcm = tailByBytes(preroll, (chunk) => chunk.length, budget);
+        }
         // 预卷的 voiced 由能量门按同一条门限标好。这里直接喂，不再重算峰值。
-        for (const part of prerollFrames ?? []) {
+        for (const part of asrFrames ?? []) {
           this.stt.feed(part.pcm, part.voiced);
         }
         // 影子按「这一句」重新起一段。封段后到下一次开口之间的静音**一个字节都不推**
         // （见 `OmniShadow` 的 mute），所以这里只要把预卷补上就行。
-        this.omni?.restart(preroll);
+        this.omni?.restart(asrPcm);
       },
       onFrame: (frame) => {
         // 能量门周期号进共享内核（只作参考，不参与因果裁决 —— `causal.ts` 顶部）

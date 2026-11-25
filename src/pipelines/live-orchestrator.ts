@@ -48,6 +48,7 @@ import {
   type LiveSessionEvent,
   type LiveSessionState,
 } from './live-session-store.ts';
+import { detectSubjectHallucination } from './entity-divergence.ts';
 import {
   isActionRequest,
   isCancelRequest,
@@ -115,9 +116,11 @@ function turnContext(turn: TurnInput): TurnContext | undefined {
  * 这一轮前台怎么走。纯函数：不派单、不碰车道。
  *
  * `live_with_bg_guard` 是「Omni 还能开口，但这句要查外部或要动手」。
- * 调用方等 Omni 的 `delegate` 再按 `tool_call` 派：主查询是用户原话，
+ * 首块音频出去之前若 `delegateReason()` 仍是空的，未核实音频一字节都不外放：
+ * 当场 `discard`，用原话补 `early_rule`，再排队一句短应声。
+ * 已经标了 `delegate` 的，按 `tool_call` 派：主查询是用户原话，
  * 前台 `rewrittenQuery` 只在和原话不一致时写进注记当参考。
- * 整段结束仍没有 `delegate` 时，用原话补 `early_rule`。
+ * 整段 0 音频且仍没有 `delegate` 时，同样补原话并应一声。
  * 进 Omni 之前不能同步派单：总线工人晚一个微任务就开跑，
  * 会和随后的 `tool_call` 各跑一遍。
  */
@@ -173,6 +176,11 @@ function dropReason(why: string): 'barge_in' | 'delegated' | 'superseded' | null
 function primaryDelegateQuery(rawUserText: string, rewrittenQuery: string | null): string {
   if (rawUserText.trim() !== '') return rawUserText;
   return rewrittenQuery ?? '';
+}
+
+/** 听岔复核的注记。dsh 要对照最近前台主题，不要顺着 Omni 刚编的书名往下讲。 */
+function subjectHallucinationHint(asrText: string, replySubject: string, omniReply: string): string {
+  return `【听岔复核提示】用户语音转写为「${asrText}」，前台实时模型可能听岔成「${replySubject}」并回复了「${omniReply}」。请结合最近前台对话主题判断用户实际想问的专有名词；若前台确实答偏，第一行写 [原意: 纠正后的用户原话]，第二行给出简洁准确的事实结论。`;
 }
 
 /**
@@ -892,6 +900,32 @@ export class LiveOrchestrator implements AgentProvider {
     for await (const ev of source) {
       if (signal.aborted || this.disposed) break;
       if (ev.type === 'audio') {
+        // 真服务上 function_call 比首块音频早约 150 ms。到这里还没标 delegate，
+        // 就是准备把未核实的话播出去。一字节都不交出去。
+        if (
+          guardBackground
+          && audioBytes === 0
+          && !sawDelegate
+          && (answer?.delegateReason?.() ?? null) === null
+        ) {
+          this.writeLog('  直播    守卫轮前台未调工具，拦截未核实音频并转交后台');
+          this.audioLane?.discard?.();
+          const taskId = this.dispatchEarly(turn, answer?.assistantItemIds?.() ?? []);
+          await Promise.resolve();
+          if (signal.aborted || this.disposed) return;
+          yield { type: 'meta', path: 'omni', delegate: 'task', nonBlocking: true };
+          const ack = yield* this.speakViaOmni(
+            buildLiveAckPrompt('delegate', turn.text),
+            signal,
+            'ack',
+            turn.text,
+          );
+          if (signal.aborted || this.disposed) return;
+          const said = ack.spokenText.trim();
+          this.remember(turn, said, 'live', this.recordedExtra(null, taskId));
+          yield { type: 'done', fullText: said, speech: said };
+          return;
+        }
         audioBytes += ev.pcm.byteLength;
         yield ev;
         continue;
@@ -934,17 +968,49 @@ export class LiveOrchestrator implements AgentProvider {
         continue;
       }
       if (ev.type === 'done') {
+        const origSaid = (ev.speech ?? ev.fullText).trim();
         // 补派必须赶在 remember 之前入队：工人晚一个微任务开跑，注记在 dispatch 时已经封好。
+        // 有音频却没 delegate 的，已经在首块之前 return 了。这里留下的是 0 音频边界。
+        let preferAck = false;
         if (guardBackground && !sawDelegate && !signal.aborted && !this.disposed) {
           linkedTaskId = this.dispatchEarly(turn, answer?.assistantItemIds?.() ?? []);
           supplemented = true;
           await Promise.resolve();
           if (signal.aborted || this.disposed) break;
+          yield { type: 'meta', path: 'omni', delegate: 'task', nonBlocking: true };
+          if (audioBytes === 0 && !signal.aborted && !this.disposed) {
+            const ack = yield* this.speakViaOmni(
+              buildLiveAckPrompt('delegate', turn.text),
+              signal,
+              'ack',
+              turn.text,
+            );
+            audioBytes += ack.spokenBytes;
+            ackText = ack.spokenText.trim();
+            preferAck = true;
+            if (signal.aborted || this.disposed) break;
+          }
         }
-        const origSaid = (ev.speech ?? ev.fullText).trim();
-        const said = origSaid !== '' ? origSaid : ackText;
+        // 专名听岔：没调工具，也没被实时事实守卫接走。没命中则不派、不等待。
+        if (!guardBackground && !sawDelegate && !signal.aborted && !this.disposed) {
+          const divergence = detectSubjectHallucination(turn.text, origSaid);
+          if (divergence !== null) {
+            this.writeLog(
+              `  直播    检测到听岔风险（ASR「${divergence.subject}」与前台答复「${divergence.replySubject}」无重叠）→ 后台派 dsh 结合上文核实`,
+            );
+            linkedTaskId = this.dispatchEarly(
+              turn,
+              answer?.assistantItemIds?.() ?? [],
+              subjectHallucinationHint(turn.text, divergence.replySubject, origSaid),
+            );
+            await Promise.resolve();
+            if (signal.aborted || this.disposed) break;
+          }
+        }
+        if (signal.aborted || this.disposed) break;
+        const said = preferAck ? (ackText || origSaid) : (origSaid !== '' ? origSaid : ackText);
         this.remember(turn, said, 'live', this.recordedExtra(answer, linkedTaskId));
-        if (origSaid === '' && ackText !== '') {
+        if ((preferAck && ackText !== '') || (origSaid === '' && ackText !== '')) {
           yield { type: 'done', fullText: ackText, speech: ackText };
         } else {
           yield ev;
@@ -967,13 +1033,17 @@ export class LiveOrchestrator implements AgentProvider {
     return lane.willServe() || lane.canAnswerText?.() === true;
   }
 
-  private dispatchEarly(turn: TurnInput, omniAssistantItemIds?: readonly string[]): string {
+  private dispatchEarly(
+    turn: TurnInput,
+    omniAssistantItemIds?: readonly string[],
+    delegateHint?: string,
+  ): string {
     const handle = this.dispatchTracked({
       turnNo: turn.no,
       source: 'early_rule',
       query: turn.text,
       note: turn.note,
-    });
+    }, delegateHint);
     this.apply({
       type: 'turn.early_guarded',
       turnNo: turn.no,
@@ -1065,8 +1135,8 @@ export class LiveOrchestrator implements AgentProvider {
 
   /**
    * Omni 还能服务。`guardBackground` 时不在这里派单：
-   * `tool_call` 在 {@link finishLive} 里当场派，主查询是用户原话；
-   * 结束仍没有 `delegate` 才补原话。
+   * 首块音频前没有 `delegate` 就在 {@link finishLive} 里截住并补 `early_rule`；
+   * 已经 `delegate` 的按 `tool_call` 派，主查询是用户原话。
    */
   private async *playOmni(
     turn: TurnInput,

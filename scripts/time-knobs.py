@@ -77,6 +77,9 @@ CLOCK: dict[str, str] = {
     # 二级热路径常量（写死在 voice-config.ts；设备封段窗走档案）
     "DEFAULT_GATE_HOLD_MS": "wall",
     "DEFAULT_GATE_PREROLL_MS": "audio",
+    "DEFAULT_MIN_SPEECH_MS": "audio",
+    "DEFAULT_ASR_PREROLL_MS": "audio",
+    "VAD_FRAME_MS": "audio",
     "DEFAULT_PAUSE_DETECT_MS": SILENCE_FRAME_CLOCK,
     "DEFAULT_SPECULATE_MS": SILENCE_FRAME_CLOCK,
     "DEFAULT_TRAILING_TRIM_MS": "audio",
@@ -185,6 +188,13 @@ SHADED_BY: dict[str, str] = {
     ),
     "PLAYBACK_POLL_MS": "设备播报期间（轮询，不加延迟）",
     "DEFAULT_GATE_PREROLL_MS": "无（它是滑窗长度，不加延迟）",
+    "DEFAULT_MIN_SPEECH_MS": (
+        "无（单段有效有声不足 120 ms 不封段、不投机、不预跑；够了才进入静音门槛，不加额外等待）"
+    ),
+    "DEFAULT_ASR_PREROLL_MS": (
+        "无（开门时 ASR/Omni 只吃预卷尾部；TurnJudge 仍用完整 DEFAULT_GATE_PREROLL_MS，不加延迟）"
+    ),
+    "VAD_FRAME_MS": "无（神经 VAD 的帧长，时间戳按它倒推，不加额外等待）",
     "DEFAULT_GATE_HOLD_MS": "无（决定 gate.close 何时落，① 的起点；必须大于封段与开轮静音天花板）",
     "DEFAULT_TRAILING_TRIM_MS": "判停侧车输入预处理（不额外等）",
     "TURN_JUDGE_SEQUENCE_BUDGET_MS": "模型段（只对数字/字母/「然后」这类句尾生效）",
@@ -501,6 +511,14 @@ INVARIANTS: list[tuple[str, str, str, str]] = [
     (
         "TURN_JUDGE_MAX_OPEN_SILENCE_MS", ">=", "VOICE_OPEN_QUIET_MS",
         "开轮静音门槛永远够不着，只能撞上限放行",
+    ),
+    (
+        "DEFAULT_ASR_PREROLL_MS", "<=", "DEFAULT_GATE_PREROLL_MS",
+        "ASR/Omni 预卷长过能量门滑窗，尾部没有完整预卷可裁",
+    ),
+    (
+        "DEFAULT_MIN_SPEECH_MS", "<", "DEFAULT_GATE_HOLD_MS",
+        "最短有效人声不短于能量门保持，正常一句还没攒够门就关了",
     ),
     (
         "DEFAULT_GATE_HOLD_MS", ">", "VOICE_STT_COMMIT_MS",

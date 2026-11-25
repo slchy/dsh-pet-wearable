@@ -9,6 +9,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EnergyGate, type PrerollFrame } from './energy-gate.ts';
 import type { AudioFrame } from './engine-contract.ts';
 import { pcm16Gain, pcm16PeakDbfs } from './pcm.ts';
+import { WINDOW, type SpeechVadStream } from './vad.ts';
+
+/** 神经 VAD 一帧：512 个 int16 = 1024 字节 = 16 kHz 下 32 ms。 */
+const VAD_FRAME_BYTES = WINDOW * 2;
+const VAD_FRAME_MS = 32;
 
 export interface UplinkGateConfig {
   readonly thresholdDbfs: number;
@@ -71,6 +76,17 @@ export interface UplinkPipelineOptions {
    * 单帧尖峰不再把 `silenceMs` 打回 0。
    */
   readonly voiceDebounceFrames?: number;
+  /**
+   * 本连接的神经 VAD 流。`null` / 缺省时能量门保持完全同步，和旧路径逐块一致。
+   * 有流时放大后的 PCM 先切成 32 ms 再串行推理，禁止并发调用同一个流。
+   */
+  readonly vadStream?: SpeechVadStream | null;
+  /** 设备正在播报。能量门据此抬高起音门槛，挡住扬声器回波。 */
+  readonly isSpeaking?: () => boolean;
+  readonly vadStartThreshold?: number;
+  readonly vadReleaseThreshold?: number;
+  readonly vadSpeakingStartThreshold?: number;
+  readonly speakingDebounceFrames?: number;
   /** 每块解码后的 PCM：判停器、落盘都要它 */
   readonly onPcm: (pcm: Buffer) => void;
   /**
@@ -118,6 +134,17 @@ export class UplinkPipeline {
   private meterAt = 0;
   /** 能量门周期号：每次开门 +1（`AudioFrame.gateSeq`）。闭门期间不变 */
   private gateSeq = 0;
+  /** 凑不满 32 ms 的放大后 PCM。`end()` 丢掉，不拿半帧去推理。 */
+  private vadCarry: Buffer = Buffer.alloc(0);
+  private readonly vadQueue: Array<{
+    readonly frame: Buffer;
+    readonly tsMs: number;
+    readonly floatFrame: Float32Array;
+  }> = [];
+  /** 上一帧神经 VAD 的时间戳，保证一次来包切出的多帧单调不减。 */
+  private lastVadTsMs = 0;
+  private vadPumping = false;
+  private readonly vadWaiters: Array<() => void> = [];
 
   /**
    * 每 `levelLogMs` 打一行窗口峰值。
@@ -164,6 +191,18 @@ export class UplinkPipeline {
       ...(options.voiceDebounceFrames === undefined
         ? {}
         : { voiceDebounceFrames: options.voiceDebounceFrames }),
+      ...(options.vadStartThreshold === undefined
+        ? {}
+        : { vadStartThreshold: options.vadStartThreshold }),
+      ...(options.vadReleaseThreshold === undefined
+        ? {}
+        : { vadReleaseThreshold: options.vadReleaseThreshold }),
+      ...(options.vadSpeakingStartThreshold === undefined
+        ? {}
+        : { vadSpeakingStartThreshold: options.vadSpeakingStartThreshold }),
+      ...(options.speakingDebounceFrames === undefined
+        ? {}
+        : { speakingDebounceFrames: options.speakingDebounceFrames }),
     });
 
     this.ffmpeg = options.codec === 'pcm16'
@@ -208,6 +247,10 @@ export class UplinkPipeline {
   /** 关管道。ffmpeg 偶尔不肯立刻退，兜底一秒后 kill。 */
   end(): void {
     this.closed = true;
+    this.vadQueue.length = 0;
+    this.vadCarry = Buffer.alloc(0);
+    this.options.vadStream?.reset();
+    if (!this.vadPumping) this.resolveVadWaiters();
     const ffmpeg = this.ffmpeg;
     if (ffmpeg === null) {
       return;
@@ -234,11 +277,23 @@ export class UplinkPipeline {
     }, 1000).unref?.();
   }
 
+  /**
+   * 等当前神经 VAD 队列排空。没有流、或队列已空时立刻完成。
+   * `end()` 会丢掉还没开始推理的帧，这一份会在飞行中的那一帧丢弃结果后完成。
+   */
+  flushVad(): Promise<void> {
+    if (!this.vadPumping && this.vadQueue.length === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.vadWaiters.push(resolve);
+      this.kickVad();
+    });
+  }
+
   private onPcm(raw: Buffer): void {
     if (this.closed) {
       return;
     }
-    const { onPcm, onSpeechOpen, onFrame, onSpeechClose, onRawPcm, log } = this.options;
+    const { onPcm, onRawPcm } = this.options;
 
     onRawPcm?.(raw);
 
@@ -246,11 +301,22 @@ export class UplinkPipeline {
     onPcm(pcm);
 
     // 能量门的保持窗口和 `AudioFrame.tsMs` 共用这一下。同一帧再读一次时钟，
-    // 两边的「静音多久」就会差一截。
+    // 两边的「静音多久」就会差一截。有神经 VAD 时，这一下是整包的到达时刻，
+    // 切出来的 32 ms 帧再按包尾倒推。
     const tsMs = this.now();
     this.meter(pcm, tsMs);
+    if (this.options.vadStream == null) {
+      this.feedGateFrame(pcm, tsMs);
+      return;
+    }
+    this.enqueueVadFrames(pcm, tsMs);
+  }
 
-    const decision = this.gate.process(pcm, tsMs);
+  /** 无神经 VAD 与推理完成后共用：把一块 PCM 送进能量门，再按决策回调。 */
+  private feedGateFrame(pcm: Buffer, tsMs: number, speechProb?: number): void {
+    const { onSpeechOpen, onFrame, onSpeechClose, log } = this.options;
+    const speaking = this.options.isSpeaking?.() === true;
+    const decision = this.gate.process(pcm, tsMs, speechProb, { speaking });
     if (decision.opened) {
       log(
         `  上行    有声 ${decision.opened.peakDbfs.toFixed(1)} dBFS → 开始推送`
@@ -284,4 +350,67 @@ export class UplinkPipeline {
       onSpeechClose(decision.closedGapMs);
     }
   }
+
+  /** 把放大后的 PCM 切成 32 ms。一次来包切出多帧时，时间戳从包尾倒推并且单调不减。 */
+  private enqueueVadFrames(pcm: Buffer, chunkNow: number): void {
+    const pending = this.vadCarry.length === 0 ? pcm : Buffer.concat([this.vadCarry, pcm]);
+    const frameCount = Math.floor(pending.length / VAD_FRAME_BYTES);
+    for (let i = 0; i < frameCount; i += 1) {
+      const start = i * VAD_FRAME_BYTES;
+      const frame = Buffer.from(pending.subarray(start, start + VAD_FRAME_BYTES));
+      const tsMs = Math.max(this.lastVadTsMs, chunkNow - (frameCount - 1 - i) * VAD_FRAME_MS);
+      this.lastVadTsMs = tsMs;
+      this.vadQueue.push({ frame, tsMs, floatFrame: pcm16ToUnitFloat(frame) });
+    }
+    const rest = pending.subarray(frameCount * VAD_FRAME_BYTES);
+    this.vadCarry = rest.length === 0 ? Buffer.alloc(0) : Buffer.from(rest);
+    if (frameCount > 0) this.kickVad();
+  }
+
+  /** 单执行者。同一个 `SpeechVadStream.process` 绝不重叠。 */
+  private kickVad(): void {
+    if (this.vadPumping || this.closed || this.vadQueue.length === 0 || this.options.vadStream == null) {
+      return;
+    }
+    this.vadPumping = true;
+    this.drainVadQueue().finally(() => {
+      this.vadPumping = false;
+      if (!this.closed && this.vadQueue.length > 0) {
+        this.kickVad();
+        return;
+      }
+      this.resolveVadWaiters();
+    });
+  }
+
+  private async drainVadQueue(): Promise<void> {
+    const stream = this.options.vadStream;
+    if (stream == null) return;
+    while (!this.closed && this.vadQueue.length > 0) {
+      const item = this.vadQueue.shift();
+      if (item === undefined) break;
+      let prob = 0;
+      try {
+        prob = await stream.process(item.floatFrame);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        this.options.onError(`VAD ${detail}`);
+      }
+      if (this.closed) return;
+      this.feedGateFrame(item.frame, item.tsMs, prob);
+    }
+  }
+
+  private resolveVadWaiters(): void {
+    const waiters = this.vadWaiters.splice(0);
+    for (const resolve of waiters) resolve();
+  }
+}
+
+function pcm16ToUnitFloat(frame: Buffer): Float32Array {
+  const out = new Float32Array(WINDOW);
+  for (let i = 0; i < WINDOW; i += 1) {
+    out[i] = frame.readInt16LE(i * 2) / 32768;
+  }
+  return out;
 }

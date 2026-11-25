@@ -2399,3 +2399,141 @@ test('重复 claim() 不会让两个读端互相抢 audio 块', { timeout: 4000 
     `两个读端把同一份 audio 拆开了：${n1}+${n2}`,
   );
 });
+
+test('response.done 早于 claim 时已完成回复仍可认领，音频和委派字段不丢', async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.at(10);
+  h.shadow.seal(1, 10);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'user_ready', role: 'user' } });
+  h.socket.message({ type: 'response.output_item.added', item: { id: 'asst_ready', role: 'assistant' } });
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '我在。' });
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  h.socket.message({
+    type: 'response.function_call_arguments.done',
+    call_id: 'call_ready',
+    arguments: '{"request":"查天气","reason":"要查"}',
+  });
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'asst_ready', role: 'assistant' }] },
+  });
+
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '完成未认领不得立刻当孤儿删掉');
+  assert.equal(h.shadow.willServe(), true);
+  assert.equal(h.shadow.canSpeakBackground(), true, '待认领槽不挡住随后的播报');
+  assert.equal(h.shadow.canAnswerText(), true, '待认领槽不挡住随后的文本直答');
+  const answer = h.shadow.claim();
+  assert.ok(answer);
+  assert.equal(h.shadow.willServe(), false, '认领之后槽位清空');
+
+  const got: Buffer[] = [];
+  const drain = (async () => {
+    for await (const chunk of answer.chunks) got.push(chunk);
+  })();
+  assert.equal(await finishSoon(drain), 'done', '音频已经在手里，认领不得再等网络');
+  assert.equal(got.length, 1);
+  assert.equal(got[0]?.length, 480);
+  assert.equal(answer.transcript(), '我在。');
+  assert.equal(answer.delegateReason?.(), 'delegate');
+  assert.equal(answer.delegateText?.(), '查天气');
+  assert.equal(answer.delegateCallId?.(), 'call_ready');
+  assert.equal(answer.userItemId?.(), 'user_ready');
+  assert.deepEqual(answer.assistantItemIds?.(), ['asst_ready']);
+  assert.equal(h.socket.count('conversation.item.delete'), 0, '认领走了的回复不能再删');
+});
+
+test('同句 seal(2) 只删上一段助手项，保留用户音频', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 80)]);
+  h.shadow.seal(1, 10);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'user_1', role: 'user' } });
+  h.socket.message({ type: 'response.output_item.added', item: { id: 'asst_1', role: 'assistant' } });
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'asst_1', role: 'assistant' }] },
+  });
+  assert.equal(h.socket.count('conversation.item.delete'), 0);
+  assert.equal(h.shadow.willServe(), true);
+
+  h.shadow.feed(Buffer.alloc(MS * 80), true);
+  h.shadow.seal(2, 20);
+  const deleted = h.socket.sent
+    .filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.deepEqual(deleted, ['asst_1']);
+  assert.equal(deleted.includes('user_1'), false, '同句前半段用户音频必须留下');
+  assert.equal(h.socket.count('response.create'), 2);
+});
+
+test('restart 删掉未认领的已完成回复，助手项和用户项一起', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'user_1', role: 'user' } });
+  h.socket.message({ type: 'response.output_item.added', item: { id: 'asst_1', role: 'assistant' } });
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'asst_1', role: 'assistant' }] },
+  });
+  assert.equal(h.shadow.willServe(), true);
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  const deleted = h.socket.sent
+    .filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.deepEqual(deleted, ['asst_1', 'user_1']);
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.claim(), null);
+});
+
+test('discard 已完成的待认领回复：立刻不可认领，只删助手项', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'user_1', role: 'user' } });
+  h.socket.message({ type: 'response.output_item.added', item: { id: 'asst_1', role: 'assistant' } });
+  h.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'asst_1', role: 'assistant' }] },
+  });
+  assert.equal(h.shadow.willServe(), true);
+  h.shadow.discard();
+  assert.equal(h.shadow.willServe(), false);
+  assert.equal(h.shadow.claim(), null);
+  const deleted = h.socket.sent
+    .filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.deepEqual(deleted, ['asst_1']);
+  assert.equal(deleted.includes('user_1'), false);
+});
+
+test('function_call 项一加入就标 delegate，早于参数和音频', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  const answer = h.shadow.claim();
+  assert.ok(answer);
+  assert.equal(answer.delegateReason?.(), null);
+
+  h.socket.message({
+    type: 'response.output_item.added',
+    item: { id: 'fc_early', type: 'function_call', call_id: 'call_early' },
+  });
+  assert.equal(answer.delegateReason?.(), 'delegate');
+  assert.equal(answer.delegateCallId?.(), 'call_early');
+  assert.deepEqual(answer.assistantItemIds?.(), ['fc_early']);
+
+  h.socket.message({
+    type: 'response.function_call_arguments.delta',
+    delta: '{"request":"记一下"}',
+  });
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(320).toString('base64') });
+  assert.equal(answer.delegateReason?.(), 'delegate');
+  assert.equal(answer.delegateCallId?.(), 'call_early');
+});
