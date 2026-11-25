@@ -14,7 +14,7 @@
  * 每一格都能单独测：判定在 `session-core.ts`（纯决策），解码与判停在
  * `uplink-pipeline.ts`，协议在 `transport.ts`，这里只剩接线。
  */
-import type { TurnTicket } from './dialog-fsm.ts';
+import type { DialogState, TurnTicket } from './dialog-fsm.ts';
 import { SessionArchive } from './archive.ts';
 import { voicingVerdict } from './barge-voicing.ts';
 import type { AnnounceStore } from './announce-store.ts';
@@ -68,6 +68,7 @@ import { OmniShadow } from './omni-shadow.ts';
 import { startToolControl, type ToolControl, type ToolControlHandlers } from './tool-control.ts';
 import { runTransport, type Connection, type HelloInfo } from './transport.ts';
 import { TurnRunner } from './turn-runner.ts';
+import { safeEmitUi, type PetUiEvent, type PetUiPhase } from './ui-events.ts';
 import { UplinkPipeline } from './uplink-pipeline.ts';
 import { UtteranceAssembler } from './utterance-assembler.ts';
 import type { SemanticEndpoint } from './semantic-endpoint.ts';
@@ -537,7 +538,20 @@ export interface VoiceSessionOptions {
    * 语义见 `transport.ts` 的同名选项。
    */
   readonly onListening?: (info: { readonly port: number; readonly stop: () => void }) => void;
+
+  /**
+   * 浏览器浮层遥测。缺省时不发事件，CLI / 真机的协议与行为不变。
+   *
+   * 同一份配置给 `runVoiceServer` 和每条 `VoiceConnection`。监听器抛错会被吞掉。
+   */
+  readonly onUiEvent?: (ev: PetUiEvent) => void;
 }
+
+/**
+ * `runVoiceServer` 的入参。与 {@link VoiceSessionOptions} 是同一类型
+ * （浏览器宿主沿用这个名字）。
+ */
+export type VoiceServerOptions = VoiceSessionOptions;
 
 /**
  * 进程内只该有一份的共用件。
@@ -702,6 +716,26 @@ function textIfPresent(text: string | undefined): string | undefined {
   return text;
 }
 
+/** 对话相位收成浮层四态。`ending` / `closed` 都是空闲；等拍照仍算在想。 */
+function petPhaseOf(state: DialogState): PetUiPhase {
+  switch (state) {
+    case 'listening':
+      return 'listening';
+    case 'thinking':
+    case 'awaiting_shot':
+      return 'thinking';
+    case 'speaking':
+      return 'speaking';
+    case 'ending':
+    case 'closed':
+      return 'idle';
+    default: {
+      const unexpected: never = state;
+      return unexpected;
+    }
+  }
+}
+
 /**
  * 一条连接的完整状态：只负责把各模块接起来。
  *
@@ -748,6 +782,8 @@ export class VoiceConnection {
   private readonly assemblerNow = (): number => this.clock.now();
   /** 时钟接错只报一次，免得每句话刷一行 */
   private clockMismatchLogged = false;
+  /** 上一次发给浮层的相位；连续相同的不重复发 */
+  private lastPetPhase: PetUiPhase | null = null;
   /** 上行编码由能力集决定；档案与解码都要它 */
   private readonly uplinkCodec: 'msbc' | 'pcm16';
 
@@ -899,7 +935,10 @@ export class VoiceConnection {
           this.archive?.event(EVENTS.turnStart, { text_len: text.length, image: hasImage });
         },
         // 话筒占用/释放由状态机转移驱动（见 `AppSession.onDialogState`）
-        onDialogState: (state) => { this.app?.onDialogState(state); },
+        onDialogState: (state) => {
+          this.app?.onDialogState(state);
+          this.emitPetPhase(petPhaseOf(state));
+        },
       },
       log,
       ...(options.engine === undefined ? {} : { engine: options.engine }),
@@ -908,12 +947,16 @@ export class VoiceConnection {
         : {
             speakAnnounce: (item: AnnounceItem) => options.speakAnnounce!(
               item,
-              (answer) => this.runner.speakAudioAnswer(answer),
+              (answer) => this.runner.speakAudioAnswer(answer, item.emotion),
             ),
             cancelAnnounce: options.cancelAnnounce,
             onFallbackAnnounceSpoken: options.onFallbackAnnounceSpoken,
           }),
+      ...(options.pipelineMode === 'live' ? { allowTtsFallback: false } : {}),
     });
+    // 浮层钩子不进 DialogRuntime。runner 建好后再挂；缺省时 emit 都是空操作。
+    this.dialog.runner.bindUiEvent(options.onUiEvent);
+    this.emitPetPhase(petPhaseOf(this.dialog.core.fsm.state));
     // 应用层**总是**要建：话筒（user / reply / announce）必须在同一张表里仲裁，
     // 没有宠物也要（ADR-0001 §6）。宠物只是这套应用层里的一个子系统。
     this.app = this.createAppSession(proactive, this.dialog);
@@ -1078,6 +1121,9 @@ export class VoiceConnection {
         this.app?.userFinal(text);
         console.log('\n--- 本轮 ---');
         console.log(`  文本    ${JSON.stringify(text)}`);
+        if (text.trim() !== '') {
+          safeEmitUi(this.options.onUiEvent, { type: 'asr', text, final: true });
+        }
         this.dialog.dispatch({ type: 'utterance', text });
       },
       // 句子定稿那一刻就让快车道起跑，把判停那一拍从关键路径上挪走。
@@ -1411,8 +1457,12 @@ export class VoiceConnection {
       case 'capture.failed': {
         const say = this.photos.onEvent(event);
         if (say !== null) {
-          // 设备已就绪，现在轮到人动手 —— 照念设备给的提示
-          void this.runner.speakCanned(say);
+          // 设备已就绪，现在轮到人动手 —— Pure Live 走 omni 播报，不调外部 TTS
+          if (this.options.pipelineMode === 'live') {
+            this.dialog.enqueueAnnounce(say);
+          } else {
+            void this.runner.speakCanned(say);
+          }
         }
         return;
       }
@@ -1741,6 +1791,14 @@ export class VoiceConnection {
       source: report.source,
       verbatim: report.verbatim !== undefined,
     });
+    const canonical = report.canonicalUser?.trim() ?? '';
+    if (canonical !== '') {
+      safeEmitUi(this.options.onUiEvent, {
+        type: 'asr.replace',
+        text: canonical,
+        ...(report.previousUserText === undefined ? {} : { previous: report.previousUserText }),
+      });
+    }
     this.dialog.enqueueAnnounce({
       speech: report.verbatim ?? report.summary,
       emotion: report.emotion,
@@ -1831,6 +1889,18 @@ export class VoiceConnection {
     if (owner) {
       this.service.activeSlot.current = null;
     }
+    this.emitPetPhase('idle');
+  }
+
+  /**
+   * 浮层相位。同一条连接上连续相同的值不发（回执那种 thinking↔speaking 仍会发）。
+   */
+  private emitPetPhase(phase: PetUiPhase): void {
+    if (this.lastPetPhase === phase) {
+      return;
+    }
+    this.lastPetPhase = phase;
+    safeEmitUi(this.options.onUiEvent, { type: 'phase', phase });
   }
 
   // ------------------------------------------------------------------ 事件
@@ -1863,6 +1933,9 @@ export class VoiceConnection {
     if (effects.some((effect) => effect.type === 'drop' && effect.why === 'pre-turn')) {
       console.log(`  … ${text}（开轮前录的那段还在解 → 不算插话）`);
       return;
+    }
+    if (text.trim() !== '') {
+      safeEmitUi(this.options.onUiEvent, { type: 'asr', text, final: false });
     }
     // 判停的**文本判据**：中间结果在出 = 用户还在说。只传信号不拼文本，
     // 中间结果会反复改写，拼起来是乱的。
@@ -1927,6 +2000,9 @@ export class VoiceConnection {
       console.log(`  句 ${index}  ↳ 开轮前录的那段定稿 → 不当插话，也不开轮`);
       this.archive?.event(EVENTS.asrSentence, { text, index, dropped: 'pre-turn' });
       return;
+    }
+    if (text.trim() !== '') {
+      safeEmitUi(this.options.onUiEvent, { type: 'asr', text, final: true });
     }
     // 后面的 partial 拿它当「上一句」：这之后还有没有新的有声帧，决定那些 partial
     // 是真插话还是重复解码（见 `barge-voicing.ts`）
@@ -2020,11 +2096,28 @@ export class VoiceConnection {
           let aborted = false;
           const onAbort = (): void => {
             aborted = true;
+            if (this.options.pipelineMode === 'live') {
+              this.options.cancelAnnounce?.();
+            }
             this.runner.cancelCanned();
           };
           signal.addEventListener('abort', onAbort, { once: true });
           try {
-            await this.runner.speakCanned(text, emotion ?? undefined);
+            if (this.options.pipelineMode === 'live') {
+              if (this.options.speakAnnounce !== undefined) {
+                const outcome = await this.options.speakAnnounce(
+                  { speech: text, ...(emotion === null || emotion === undefined ? {} : { emotion }) },
+                  (answer) => this.runner.speakAudioAnswer(answer, emotion ?? undefined),
+                );
+                if (outcome !== 'spoken') {
+                  this.runner.emitAnnounceText(text, emotion ?? undefined);
+                }
+              } else {
+                this.runner.emitAnnounceText(text, emotion ?? undefined);
+              }
+            } else {
+              await this.runner.speakCanned(text, emotion ?? undefined);
+            }
           } catch (error) {
             console.error(`  ✗ 宠物朗读失败: ${(error as Error).message}`);
             return 'cut';
@@ -2033,7 +2126,12 @@ export class VoiceConnection {
           }
           return aborted ? 'cut' : 'done';
         },
-        stop: () => { this.runner.cancelCanned(); },
+        stop: () => {
+          if (this.options.pipelineMode === 'live') {
+            this.options.cancelAnnounce?.();
+          }
+          this.runner.cancelCanned();
+        },
       },
       ...(proactive?.params === undefined && proactive?.listenMs === undefined
         ? {}

@@ -218,6 +218,40 @@ test('取消 A 后立刻 encode B：旧 hq_image / hq_failed 不串到 B', () =>
   assert.equal(lateFail.image(), 'B');
 });
 
+test('detail 先收 hq_image 再 capture.cancel：第一帧归 A，第二帧以无 id 起识图', () => {
+  const v1 = new V1Session();
+  v1.encode(capture('A', 'detail'));
+  assert.deepEqual(v1.status({ ev: 'hq_image' }), { known: true, event: null });
+  // 公告已经占着这一帧，取消只能改种类，不能再留第二条认领
+  assert.equal(v1.encode({ op: 'capture.cancel', id: 'A' }), 'hq_cancel');
+  v1.forget('A');
+
+  const inbox = new PhotoInbox(testInboxOptions(v1));
+  const first = v1.image();
+  assert.equal(first, 'A', '公告之后才取消，迟到的那一帧仍归 A');
+  assert.equal(inbox.deliver(first, Buffer.from([1])), true, '收件箱吃掉这一帧');
+  const second = v1.image();
+  assert.equal(second, null, '第二帧不再归 A');
+  assert.equal(inbox.deliver(second, Buffer.from([2])), false, '用户自拍图应当起一轮识图');
+  inbox.dispose();
+});
+
+test('detail 先收 hq_image 再 hq_failed：公告残留清掉，下一帧不再归旧 id', () => {
+  const v1 = new V1Session();
+  v1.encode(capture('A', 'detail'));
+  assert.deepEqual(v1.status({ ev: 'hq_image' }), { known: true, event: null });
+  const event = v1.status({ ev: 'hq_failed', reason: 'timeout' }).event;
+  assert.ok(event && event.kind === 'capture.failed');
+  assert.equal(event.id, 'A');
+  v1.forget('A');
+
+  const inbox = new PhotoInbox(testInboxOptions(v1));
+  const own = v1.image();
+  assert.equal(own, null, '失败已清掉公告，用户自拍不再认成 A');
+  assert.equal(inbox.deliver(own, Buffer.from([3])), false, '应当起一轮识图');
+  inbox.dispose();
+});
+
 test('v1 失败原因 → 失败码', () => {
   assert.equal(v1FailureCode('cancelled'), 'cancelled');
   assert.equal(v1FailureCode('busy'), 'busy');

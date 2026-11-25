@@ -48,6 +48,8 @@ interface RigOptions {
   readonly awaitMicOpen?: () => Promise<boolean>;
   /** 设备有 `detail` 拍照档，用来把 capture 排进串行队列。 */
   readonly captureDetail?: boolean;
+  /** Pure Live 下传 `false`，禁止播报退回外部 TTS。 */
+  readonly allowTtsFallback?: boolean;
 }
 
 interface Rig {
@@ -131,6 +133,7 @@ function rig(options: RigOptions = {}): Rig {
     onFallbackAnnounceSpoken: (item, interrupted) => {
       fallbacks.push({ item, interrupted });
     },
+    ...(options.allowTtsFallback === undefined ? {} : { allowTtsFallback: options.allowTtsFallback }),
     env: {
       call: () => true,
       assemble: () => {},
@@ -563,5 +566,35 @@ test('awaitMicOpen 恢复后：已经 dispose 就不念', async () => {
     assert.equal(r.synth.length, 0);
   } finally {
     r.runtime.dispose();
+  }
+});
+
+test('Pure Live（allowTtsFallback=false）：verbatim 仍走 speakAnnounce，fallback 也绝不调外部 TTS', async () => {
+  const verbatimItem: AnnounceItem = {
+    speech: '端口是 8080，路径是 C:\\tmp\\app.ts',
+    verbatim: true,
+    emotion: 'calm',
+    taskId: 'live-v',
+  };
+  const r1 = rig({ allowTtsFallback: false, synthesize: oneChunk });
+  try {
+    r1.runtime.enqueueAnnounce(verbatimItem);
+    await r1.clock.drain();
+    assert.deepEqual(r1.speeches, [verbatimItem.speech], 'verbatim 必须仍交给 omni speakAnnounce');
+    assert.equal(r1.synth.length, 0, 'Pure Live 不得调用外部 TTS');
+  } finally {
+    r1.runtime.dispose();
+  }
+
+  const r2 = rig({ allowTtsFallback: false, speak: async () => 'fallback', synthesize: oneChunk });
+  try {
+    r2.runtime.enqueueAnnounce({ speech: '断线结果', taskId: 'live-fb' });
+    await r2.clock.drain();
+    assert.equal(r2.speeches.length, 1);
+    assert.equal(r2.synth.length, 0, 'speakAnnounce 返回 fallback 时也不得调用外部 TTS');
+    assert.equal(r2.fallbacks.length, 1);
+    assert.equal(r2.fallbacks[0]?.interrupted, true);
+  } finally {
+    r2.runtime.dispose();
   }
 });

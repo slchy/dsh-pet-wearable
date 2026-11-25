@@ -47,8 +47,10 @@ import { pcm16DurationMs, pcm16Gain } from './pcm.ts';
 import { remainingSpeech } from './interrupted-tail.ts';
 import type { FastVoiceEngine, TurnInput } from './engine-contract.ts';
 import { AgentEngineAdapter } from './engines/index.ts';
+import { asEmotion, cleanForSpeech, DEFAULT_EMOTION, parseEmotion } from './emotion.ts';
 import type { AgentAudioAnswer, AgentProvider, DelegateReason, TtsProvider } from './providers.ts';
 import type { ImageAttachment } from './session.ts';
+import { safeEmitUi, type PetUiEvent } from './ui-events.ts';
 
 /**
  * 等播放结束时的轮询间隔。
@@ -122,6 +124,13 @@ export interface TurnRunnerOptions {
    * 只散在 console 里，改动之后没法比快慢（见 `latency-report.ts`）。
    */
   readonly onEvent?: (name: string, fields?: Record<string, unknown>) => void;
+  /**
+   * 浏览器浮层遥测。缺省时不发任何事件，CLI / 真机的协议与时序不变。
+   *
+   * 监听器抛错会被吞掉，不能打断这一轮。`DialogRuntime` 造 runner 时不认识
+   * 这个钩子，连接层在实例建好后用 {@link TurnRunner.bindUiEvent} 挂上。
+   */
+  readonly onUiEvent?: (ev: PetUiEvent) => void;
   /** 一轮结束（落盘用），无论成功失败都会调用 */
   readonly onTurnFinished: () => void;
   /**
@@ -216,6 +225,16 @@ export class TurnRunner {
       clock: () => this.options.clock.now(),
       log: (line) => { this.log(line); },
     });
+  }
+
+  /**
+   * 把浮层钩子接到已经建好的 runner 上。
+   *
+   * 与构造参数 `onUiEvent` 写的是同一个字段。后调用的覆盖先给的。
+   * 传 `undefined` 等于摘掉。不改音频和下行协议。
+   */
+  bindUiEvent(onUiEvent: ((ev: PetUiEvent) => void) | undefined): void {
+    (this.options as { onUiEvent?: ((ev: PetUiEvent) => void) | undefined }).onUiEvent = onUiEvent;
   }
 
   /** 等 ms：走 Clock，虚拟时钟下就是推进虚拟时间。 */
@@ -335,6 +354,19 @@ export class TurnRunner {
   private lastSettlement: KernelSettlement | null = null;
 
   /**
+   * 仅把播报文本推给浮层气泡（不调用 TTS 合成）。
+   * Pure Live 下前台车道断开时仍可把后台结论显示在桌宠气泡上，同时严守「不调外部 TTS」。
+   */
+  emitAnnounceText(text: string, emotion?: string): void {
+    if (this.options.fsm.state === 'closed' || text.trim() === '') return;
+    safeEmitUi(this.options.onUiEvent, {
+      type: 'announce',
+      text,
+      emotion: asEmotion(emotion),
+    });
+  }
+
+  /**
    * 播一句**系统旁白**（不是模型的回答）。
    *
    * 高清照要等用户按下快门，这几十秒里没有「一轮」可挂 —— 但总得有人告诉他去按。
@@ -347,6 +379,13 @@ export class TurnRunner {
     const current = { text, emotion, sentBytes: 0, firstChunkAt: -1, cancelled: false, ephemeral };
     this.canned = current;
     const run = async (): Promise<void> => {
+      if (!current.cancelled && this.options.fsm.state !== 'closed' && text.trim() !== '') {
+        safeEmitUi(this.options.onUiEvent, {
+          type: 'announce',
+          text,
+          emotion: asEmotion(emotion),
+        });
+      }
       const startedAt = this.options.clock.now();
       let firstChunkAtMs = -1;
       for await (const chunk of this.options.tts.synthesize(text, emotion)) {
@@ -393,7 +432,7 @@ export class TurnRunner {
    * `speechChain` 串行链 —— 插话或双击调用 `cancelCanned()` 时，两条播报路径享受
    * 完全一致的即时掐断、`audio.stop` 下发与半句续话记录。
    */
-  speakAudioAnswer(answer: AgentAudioAnswer): Promise<{
+  speakAudioAnswer(answer: AgentAudioAnswer, emotion?: string): Promise<{
     readonly spokenBytes: number;
     readonly interrupted: boolean;
     readonly transcript: string;
@@ -449,6 +488,17 @@ export class TurnRunner {
             : 0;
           const rest = remainingSpeech(answer.transcript(), playedSeconds);
           this.cannedResidue = rest === '' ? null : { text: rest };
+        }
+        // 一个字节都没播、也没被掐：调用方会退回 `speakCanned`，别在这里先发一条空播报。
+        if (this.options.onUiEvent !== undefined && (spokenBytes > 0 || token.cancelled)) {
+          const spoken = answer.transcript();
+          if (spoken.trim() !== '') {
+            safeEmitUi(this.options.onUiEvent, {
+              type: 'announce',
+              text: spoken,
+              emotion: asEmotion(emotion),
+            });
+          }
         }
         return {
           spokenBytes,
@@ -718,6 +768,28 @@ export class TurnRunner {
   }
 
   /**
+   * 把这一轮的定稿收成浮层事件：情绪必须是合法 key，正文去掉标签和不会念的格式。
+   */
+  private emitReplyFinal(
+    fullText: string,
+    spoken: string | undefined,
+    path: 'omni' | 'fast' | 'dsh' | undefined,
+  ): void {
+    const parsedFull = parseEmotion(fullText);
+    const source = spoken !== undefined && spoken.trim() !== '' ? spoken : parsedFull.rest;
+    const parsedSpoken = parseEmotion(source);
+    const emotion = asEmotion(
+      parsedFull.emotion !== DEFAULT_EMOTION ? parsedFull.emotion : parsedSpoken.emotion,
+    );
+    safeEmitUi(this.options.onUiEvent, {
+      type: 'reply.final',
+      text: cleanForSpeech(parsedSpoken.rest),
+      emotion,
+      ...(path === undefined ? {} : { path }),
+    });
+  }
+
+  /**
    * 跑一轮。
    *
    * 返回时 `fsm` 已推进到下一状态；调用方据 `fsm.state` 决定是否挂断。
@@ -783,6 +855,8 @@ export class TurnRunner {
     let firstChunkAtMs = 0;
     let agentLatencyMs = 0;
     let speech = '';
+    /** 浮层的 `reply.final` 只发一次（`done` 或流结束时的正文，二选一） */
+    let uiFinalSent = false;
     /** 这一轮是谁答的（`AgentReplyView.path`），档案里要落下来 */
     let replyPath: 'fast' | 'dsh' | 'omni' | undefined;
     /** 交给 dsh 的原因（只有 `path === 'dsh'` 时有） */
@@ -915,19 +989,46 @@ export class TurnRunner {
           case 'text':
             streamedText += ev.delta;
             speech = streamedText;
+            // 循环头已经把作废轮挡掉了；这里只把还活着的增量送给浮层。
+            if (!this.isTurnDead(ticket)) {
+              safeEmitUi(this.options.onUiEvent, {
+                type: 'reply.delta',
+                delta: ev.delta,
+                ...(replyPath === undefined ? {} : { path: replyPath }),
+              });
+            }
             break;
           case 'delegate':
             delegated = true;
             delegateReason = ev.reason as DelegateReason;
+            safeEmitUi(this.options.onUiEvent, {
+              type: 'delegated',
+              query: ev.rewrittenQuery ?? text,
+              ...(ev.reason === '' ? {} : { reason: ev.reason }),
+            });
             break;
           case 'done':
             markAgent();
             speech = ev.speech ?? ev.fullText;
+            if (!uiFinalSent && !this.isTurnDead(ticket)) {
+              const raw = ev.fullText.trim() !== '' ? ev.fullText : speech;
+              if (raw.trim() !== '') {
+                this.emitReplyFinal(raw, ev.speech, replyPath);
+                uiFinalSent = true;
+              }
+            }
             break;
         }
       }
       if (!agentMarked) {
         markAgent();
+      }
+      if (!uiFinalSent) {
+        // `done` 若把 `speech` 收成空串，流式增量还在 `streamedText` 里。
+        const raw = speech.trim() !== '' ? speech : streamedText;
+        if (raw.trim() !== '' && !this.isTurnDead(ticket) && fsm.state !== 'closed') {
+          this.emitReplyFinal(raw, raw, replyPath);
+        }
       }
       this.log(
         `  agent   ${(agentLatencyMs / 1000).toFixed(2)} s  `

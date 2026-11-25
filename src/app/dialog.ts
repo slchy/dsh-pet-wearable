@@ -221,6 +221,11 @@ export interface DialogOptions {
   readonly cancelAnnounce?: () => void;
   /** 可选：当某条播报走回落 TTS（`verbatim` 或 `'fallback'`）播完/被打断后通知上层（用于静默回注 Omni 历史） */
   readonly onFallbackAnnounceSpoken?: (item: AnnounceItem, interrupted: boolean) => void;
+  /**
+   * 是否允许播报 / 委派回执退回外部 TTS（`runner.speakCanned` / `speakReceipt`）。
+   * 默认 `true`（Cascade）；Pure Live 必须传 `false`：live 路径绝不调用外部 TTS。
+   */
+  readonly allowTtsFallback?: boolean;
 }
 
 export class DialogRuntime {
@@ -238,7 +243,7 @@ export class DialogRuntime {
    * 现造一个新闭包摘不掉别人的（`setDelegateHook` 没有令牌参数）。
    */
   private readonly delegateHook = (reason: DelegateReason): void => {
-    if (this.disposed) {
+    if (this.disposed || this.options.allowTtsFallback === false) {
       return;
     }
     this.runner.speakReceipt(pickReceipt(reason));
@@ -251,7 +256,16 @@ export class DialogRuntime {
   private queued = 0;
 
   private readonly announceQueue: AnnounceItem[] = [];
-  private announcing = false;
+  /**
+   * 播报协程的唯一相位。队列是货，这个枚举是「现在在干什么」。
+   *
+   * - `empty` 没货
+   * - `queued` 有货，在等正题结束或用户安静
+   * - `opening_mic` 开麦窗口
+   * - `speaking` 正在念
+   * - `deferred` 让过路（前台忙，或开麦时用户说了一句），等空窗重试
+   */
+  private announcePhase: 'empty' | 'queued' | 'opening_mic' | 'speaking' | 'deferred' = 'empty';
   private disposed = false;
   /** 用户最后一次开口（中间结果也算）的时刻，用来判断「他是不是还在说」。 */
   private lastUserSpeechAt = Number.NEGATIVE_INFINITY;
@@ -488,9 +502,9 @@ export class DialogRuntime {
     });
   }
 
-  /** 队列空且没有在途任务。 */
+  /** 轮次队列空，且播报不在开麦/出声。排队与推迟重试不算占着协程。 */
   get idle(): boolean {
-    return this.queued === 0 && !this.announcing;
+    return this.queued === 0 && !this.announceBusy();
   }
 
   // ---------------------------------------------------------------- 效果
@@ -659,7 +673,11 @@ export class DialogRuntime {
       ? { speech: speechOrItem, ...(emotion === undefined ? {} : { emotion }) }
       : speechOrItem;
     this.announceQueue.push(item);
-    // 有货就要让宠物知道：它在「让位」闸门里等着这条
+    if (this.announcePhase === 'empty' || this.announcePhase === 'deferred') {
+      this.announcePhase = 'queued';
+    }
+    // 有货就要让宠物知道：它在「让位」闸门里等着这条。
+    // 这一下只报「队列非空」，抢不抢话筒由会话层按对话相位决定。
     this.options.env.onAnnounce?.(true, false);
     void this.flushAnnounce();
   }
@@ -672,30 +690,46 @@ export class DialogRuntime {
     // 双击是明确的「别念了」：残句连"要不要补"都不该再问，直接作废
     this.runner.takeCannedResidue();
     this.announceTail = null;
+    if (!this.announceBusy()) {
+      this.announcePhase = 'empty';
+    }
   }
 
   async flushAnnounce(): Promise<void> {
-    if (this.disposed || this.announcing || this.announceQueue.length === 0) {
+    if (this.disposed || this.announceBusy()) {
+      return;
+    }
+    if (this.announceQueue.length === 0) {
+      this.announcePhase = 'empty';
       return;
     }
     if (this.core.phase !== 'listening') {
-      // 等本轮结束（`onTurnFinished` 会再叫一次）
+      // 等本轮结束（`onTurnFinished` 会再叫一次）。
+      // 不再补一次 `onAnnounce(true)`：前台已经 thinking/speaking 时，那会被听成抢话筒。
+      if (this.announcePhase !== 'deferred') {
+        this.announcePhase = 'queued';
+      }
       return;
     }
     // 用户在说话时状态机也是 `listening`（要等一句话定稿才进 `thinking`），
     // 所以还得看他最近有没有出过声 —— 否则会在换气处插进来。
     const quietFor = this.options.clock.now() - this.lastUserSpeechAt;
     if (quietFor < ANNOUNCE_QUIET_MS) {
+      if (this.announcePhase !== 'deferred') {
+        this.announcePhase = 'queued';
+      }
       this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS - quietFor);
       return;
     }
     const mic = this.options.env.announceMic;
-    const { env } = this.options;
-    this.announcing = true;
+    this.announcePhase = mic === undefined ? 'speaking' : 'opening_mic';
     // 真的出声过没有 —— `onAnnounce` 的第二个参数是「刚出过声」，跳过的那条不算
     let spokeAny = false;
-    // 播报占的是 `announce`，不是 `reply`：它是后台汇报，不是对话层的一轮
-    env.onAnnounce?.(true, false);
+    /** 这一条被排回队首（车道忙或开麦时用户说了一句），不是被丢掉。 */
+    let yielded = false;
+    // 播报占的是 `announce`，不是 `reply`：它是后台汇报，不是对话层的一轮。
+    // 此刻相位仍是 `listening`，会话层才会据此申请话筒。
+    this.options.env.onAnnounce?.(true, false);
     try {
       while (this.announceQueue.length > 0) {
         const item = this.announceQueue.shift();
@@ -705,8 +739,10 @@ export class DialogRuntime {
         // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动。
         // `deferred` 由 `speak` 在 `'defer'` 时置位；两条开麦分支共用后面的结算。
         let deferred = false;
+        const allowTts = this.options.allowTtsFallback !== false;
         const speak = async (text: string): Promise<void> => {
-          if (item.verbatim !== true && this.options.speakAnnounce !== undefined) {
+          this.announcePhase = 'speaking';
+          if (this.options.speakAnnounce !== undefined && (!allowTts || item.verbatim !== true)) {
             const outcome = await this.options.speakAnnounce(item);
             if (outcome === 'spoken') {
               return;
@@ -715,7 +751,19 @@ export class DialogRuntime {
               deferred = true;
               return;
             }
-            // 'fallback' → 落到下面走 runner.speakCanned
+            if (!allowTts) {
+              this.options.log('  播报    live 路径禁用外部 TTS，仅展示文字不降级朗读');
+              this.runner.emitAnnounceText(text, item.emotion);
+              this.options.onFallbackAnnounceSpoken?.(item, true);
+              return;
+            }
+            // 'fallback' → 仅非 live 路径落到下面走 runner.speakCanned
+          }
+          if (!allowTts) {
+            this.options.log('  播报    live 路径禁用外部 TTS，跳过外部合成');
+            this.runner.emitAnnounceText(text, item.emotion);
+            this.options.onFallbackAnnounceSpoken?.(item, true);
+            return;
           }
           await this.runner.speakCanned(text, item.emotion);
           const interrupted = this.core.phase !== 'listening'
@@ -726,8 +774,10 @@ export class DialogRuntime {
         const mark = this.options.clock.now();
         let spoke = true;
         if (mic === undefined) {
+          this.announcePhase = 'speaking';
           await speak(item.speech);
         } else {
+          this.announcePhase = 'opening_mic';
           // 设备能开麦就先开：播报一开口就能被插话（ADR-0001 §6）。超时照播。
           const result = await speakAnnouncement(item.speech, {
             listenStart: mic.listenStart,
@@ -748,12 +798,14 @@ export class DialogRuntime {
           // 排回**队首**：前台正忙，这条只是被推迟。不要记成出过声，
           // `finally` 看到队列非空会自己排 `ANNOUNCE_QUIET_MS` 后再试。
           this.announceQueue.unshift(item);
+          yielded = true;
           this.options.log('  播报    前台车道正忙 → 排回队首，等空窗重试');
           break;
         }
         if (mic !== undefined && !spoke) {
           // 排回**队首**：这条只是被推迟，不是被丢掉
           this.announceQueue.unshift(item);
+          yielded = true;
           this.options.log('  播报    开麦期间用户说了一句 → 排回队首，等安静');
           break;
         }
@@ -767,20 +819,46 @@ export class DialogRuntime {
         }
       }
     } finally {
-      this.announcing = false;
       if (mic !== undefined) {
         // 整批播完关麦（与 `pet/sim/world.ts` 同一个函数）
         closeAnnounceMic({ listenStart: mic.listenStart, call: mic.call });
       }
-      // 整批播完（队列空了、用户也没在说话）就没什么要处理的；
-      // 队列里还有货说明播报期间又来了新的（或被让路推迟了）—— 得自己再排一次检查，
-      // 否则那一条会一直躺着等下一轮。
-      if (this.announceQueue.length > 0) {
-        this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS);
-      }
-      // `spoken: true`：播报出声算"最近出过声"，由 minGap 推迟下一次搭话（ADR-0001 §6）
-      env.onAnnounce?.(this.announceQueue.length > 0, spokeAny);
+      this.finishAnnounce(spokeAny, yielded);
     }
+  }
+
+  /** 开麦或出声进行中。`queued` / `deferred` 只是在等，不占着这条协程。 */
+  private announceBusy(): boolean {
+    return this.announcePhase === 'opening_mic' || this.announcePhase === 'speaking';
+  }
+
+  /**
+   * 这一轮播报协程的结算。`pending` 只反映队列里还有没有货。
+   *
+   * 前台已经是 `thinking` / `speaking` / `awaiting_shot`，或这一条主动让了路时，
+   * 剩下的条目记成 `deferred`：那是在等空窗，不是再去占麦。会话层看到相位不是
+   * `listening` 不会 `claim('announce')` —— 否则 finally 里一次 `pending: true`
+   * 会把刚交给 `reply` 的话筒抢回来，一次 `pending: false` 则会把话筒放成 `null`。
+   */
+  private finishAnnounce(spokeAny: boolean, yielded: boolean): void {
+    const pending = this.announceQueue.length > 0;
+    const foreground = this.core.phase === 'thinking'
+      || this.core.phase === 'speaking'
+      || this.core.phase === 'awaiting_shot';
+    if (!pending) {
+      this.announcePhase = 'empty';
+    } else if (yielded || foreground) {
+      this.announcePhase = 'deferred';
+    } else {
+      this.announcePhase = 'queued';
+    }
+    // 队列里还有货（播报期间又来了新的，或被让路推迟了）得自己再排一次检查，
+    // 否则那一条会一直躺着等下一轮。`onTurnFinished` 也会再叫一次。
+    if (pending) {
+      this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS);
+    }
+    // `spoken: true`：播报出声算「最近出过声」，由 minGap 推迟下一次搭话（ADR-0001 §6）
+    this.options.env.onAnnounce?.(pending, spokeAny);
   }
 
   dispose(): void {
@@ -794,6 +872,9 @@ export class DialogRuntime {
     // 端口属于「这条会话的内核」，随实例一起被丢弃，不需要显式解绑。
     this.unsubscribeState();
     this.announceQueue.length = 0;
+    if (!this.announceBusy()) {
+      this.announcePhase = 'empty';
+    }
     this.announceRetry?.();
     this.announceRetry = null;
     this.runner.cancelCanned();

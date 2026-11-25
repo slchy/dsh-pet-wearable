@@ -11,6 +11,8 @@
  * - **后台汇报只在完全空闲时开**，读端只绑自己那一份，不许跟到用户的下一段
  * - **不传静态记忆 / 日期 / 热词时 `session.update` 与基线逐字一致**；传了只追加事实
  * - **健康 ready 上 `answerFromText` 用 user 源直答**，空文本和忙时一个帧都不发
+ * - **临时 prompt user 项在 speakFromText / enqueueSpeech 结束时删掉**；answerFromText 的用户真话留下
+ * - **首次就绪会冲刷 connecting 期间排队的回注、删项、工具回执和动态事实**
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -24,11 +26,27 @@ interface Sent {
   type: string;
   audio?: string;
   item_id?: string;
-  item?: { role?: string; content?: Array<{ type?: string; text?: string }> };
+  item?: {
+    role?: string;
+    type?: string;
+    call_id?: string;
+    output?: string;
+    content?: Array<{ type?: string; text?: string }>;
+  };
   response?: { modalities?: readonly string[] };
   session?: {
     instructions?: string;
-    tools?: Array<{ name?: string; description?: string }>;
+    modalities?: string[];
+    turn_detection?: null;
+    tools?: Array<{
+      name?: string;
+      description?: string;
+      parameters?: {
+        properties?: {
+          request?: { description?: string };
+        };
+      };
+    }>;
     tool_choice?: string;
     input_audio_transcription?: {
       model?: string;
@@ -287,6 +305,19 @@ test('还没就绪就封段：记 skipped，不猜数据', () => {
   assert.equal(h.events.length, 1);
   assert.equal(h.events[0]!['skipped'], 'connecting');
   assert.equal(h.socket.count('response.create'), 0);
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 0);
+  assert.equal(
+    h.socket.count('input_audio_buffer.append'),
+    0,
+    '会话还没 updated，先别把音频推进未配置好格式的 socket',
+  );
+  // 封段作废也不能把字节账清零：就绪后预卷还在，下一次封段要能 commit。
+  h.socket.message({ type: 'session.updated' });
+  assert.equal(h.socket.count('input_audio_buffer.append'), 1, '就绪后补推 connecting 期间的预卷');
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 0);
+  h.shadow.seal(8, 10);
+  assert.equal(h.socket.count('input_audio_buffer.commit'), 1);
+  assert.equal(h.socket.count('response.create'), 1);
 });
 
 test('空缓冲封段：不发 commit', () => {
@@ -726,10 +757,17 @@ test('serve=full 的工具描述里必须带「先说一句再调」：委派轮
   assert.equal(tool?.name, 'delegate_to_assistant');
   // 真服务实测（`tmp/omni-probe/tool-leadin*.mjs`）：这句不写在**工具描述**里，
   // omni 调工具时就是 0 ms 音频 —— 整轮哑在那里等 dsh。写进 instructions 也不生效。
+  const description = tool?.description ?? '';
   assert.ok(
-    (tool?.description ?? '').includes('应一声'),
-    `缺了这句委派轮就没有声音，得退回预录回执。实际描述：${tool?.description ?? '（没有工具）'}`,
+    description.includes('应一声'),
+    `缺了这句委派轮就没有声音，得退回预录回执。实际描述：${description || '（没有工具）'}`,
   );
+  assert.ok(description.includes('不要先讲答案'), '应声之后不能先讲正文');
+  assert.equal(description.includes('查询实时信息'), false, '宽泛的实时查询会把闲聊拉去调工具');
+  assert.ok(description.includes('冷门书名'), '听不清的冷门专名要能委派核实');
+  assert.ok(description.includes('听岔'), '不能顺着近音词编造书名或电影');
+  const request = tool?.parameters?.properties?.request?.description ?? '';
+  assert.ok(request.includes('不要擅自换话题'), '用户在质疑时要照实写清要核实什么');
 });
 
 test('omni 发 tool_call → delegateReason 非空；正常答 → null', async () => {
@@ -1027,14 +1065,16 @@ test('canSpeakBackground 只在完全空闲的 ready 上为真', () => {
   assert.equal(broken.shadow.canSpeakBackground(), false);
 });
 
-test('speakFromText：先刷排队回注，再开汇报，流式音频和转写，done 回到 ready', async () => {
+test('speakFromText：就绪时已冲掉排队回注，再开汇报，流式音频和转写，done 回到 ready', async () => {
   const h = make('full');
   h.shadow.start();
   h.socket.open();
-  // 还在 connecting：回注只能排队，session.updated 自己不会刷
+  // 还在 connecting：回注只能排队。首次 session.updated 进入 ready 时统一冲刷。
   h.shadow.injectAnswer('灯关了吗', '已经关掉了。');
   assert.equal(h.socket.count('conversation.item.create'), 0);
   h.socket.message({ type: 'session.updated' });
+  assert.equal(h.socket.count('conversation.item.create'), 1);
+  assert.match(h.socket.sent.at(-1)?.item?.content?.[0]?.text ?? '', /已经关掉了/);
   assert.equal(h.shadow.canSpeakBackground(), true);
 
   const mark = h.socket.sent.length;
@@ -1046,17 +1086,13 @@ test('speakFromText：先刷排队回注，再开汇报，流式音频和转写�
   const frames = h.socket.sent.slice(mark);
   assert.deepEqual(frames.map((frame) => frame.type), [
     'conversation.item.create',
-    'conversation.item.create',
     'response.create',
   ]);
-  const inject = frames[0]?.item;
-  assert.equal(inject?.role, 'user');
-  assert.match(inject?.content?.[0]?.text ?? '', /已经关掉了/);
-  const prompt = frames[1]?.item;
+  const prompt = frames[0]?.item;
   assert.equal(prompt?.role, 'user');
   assert.equal(prompt?.content?.[0]?.type, 'input_text');
   assert.equal(prompt?.content?.[0]?.text, '用一两句告诉哥：灯已经关了。');
-  assert.deepEqual(frames[2]?.response, { modalities: ['audio', 'text'] });
+  assert.deepEqual(frames[1]?.response, { modalities: ['audio', 'text'] });
 
   assert.equal(h.shadow.currentState, 'busy');
   assert.equal(h.shadow.willServe(), false, '后台汇报不是用户这一轮的答案');
@@ -1179,7 +1215,7 @@ test('cancelBackgroundSpeech：created 之前推迟 cancel，没出声就删助�
   });
   const deleted = h.socket.sent.filter((frame) => frame.type === 'conversation.item.delete')
     .map((frame) => frame.item_id);
-  assert.deepEqual(deleted, ['note_asst'], '只删没播过的助手项，user 旁注留下');
+  assert.deepEqual(deleted, ['note_asst', 'note_user'], '没出声：删助手项，并删掉临时 prompt user');
   assert.equal(h.shadow.currentState, 'ready');
   assert.equal(h.events.length, 0);
 });
@@ -1190,6 +1226,7 @@ test('cancelBackgroundSpeech：出过声就留助手项，而且绝不取消用�
   const answer = h.shadow.speakFromText('灯已经关了');
   assert.ok(answer);
   h.socket.message({ type: 'response.created' });
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'note_user', role: 'user' } });
 
   const got: Buffer[] = [];
   let resolvePulled: (() => void) | undefined;
@@ -1222,7 +1259,9 @@ test('cancelBackgroundSpeech：出过声就留助手项，而且绝不取消用�
       ],
     },
   });
-  assert.equal(h.socket.count('conversation.item.delete'), 0, '已经出过声的助手项要留下');
+  const deleted = h.socket.sent.filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.deepEqual(deleted, ['note_user'], '出过声的助手项留下，临时 prompt user 删掉');
   assert.equal(h.events.length, 0);
 
   h.shadow.restart([Buffer.alloc(MS * 80)]);
@@ -1285,7 +1324,7 @@ test('用户开口打断后台汇报：生成器不追 next，用户封段等 an
   });
   const deleted = h.socket.sent.filter((frame) => frame.type === 'conversation.item.delete')
     .map((frame) => frame.item_id);
-  assert.deepEqual(deleted, ['note_asst'], '一个字都没播过：删助手项，留下 user 旁注');
+  assert.deepEqual(deleted, ['note_asst', 'note_user'], '一个字都没播过：删助手项，并删掉临时 prompt user');
   assert.equal(h.socket.count('response.create'), 2, '用户排队的封段在 done 之后发出');
   const creates = h.socket.sent.filter((frame) => frame.type === 'response.create');
   assert.deepEqual(creates[0]?.response, { modalities: ['audio', 'text'] });
@@ -1515,13 +1554,15 @@ test('canAnswerText 只在车道开着且 ready、没有在途回复时为真', 
   assert.equal(broken.shadow.canAnswerText(), false);
 });
 
-test('answerFromText：先刷回注，再以 user 源开答，claim 和后台取消都拿不走', () => {
+test('answerFromText：就绪时已冲掉回注，再以 user 源开答，claim 和后台取消都拿不走', () => {
   const h = make('full');
   h.shadow.start();
   h.socket.open();
   h.shadow.injectAnswer('灯关了吗', '已经关掉了。');
   assert.equal(h.socket.count('conversation.item.create'), 0);
   h.socket.message({ type: 'session.updated' });
+  assert.equal(h.socket.count('conversation.item.create'), 1);
+  assert.match(h.socket.sent.at(-1)?.item?.content?.[0]?.text ?? '', /已经关掉了/);
   assert.equal(h.shadow.canAnswerText(), true);
   assert.equal(h.shadow.willServe(), false, '没有封段时 willServe 仍是 false');
 
@@ -1531,14 +1572,12 @@ test('answerFromText：先刷回注，再以 user 源开答，claim 和后台取
   const frames = h.socket.sent.slice(mark);
   assert.deepEqual(frames.map((frame) => frame.type), [
     'conversation.item.create',
-    'conversation.item.create',
     'response.create',
   ]);
-  assert.match(frames[0]?.item?.content?.[0]?.text ?? '', /已经关掉了/);
-  assert.equal(frames[1]?.item?.role, 'user');
-  assert.equal(frames[1]?.item?.content?.[0]?.type, 'input_text');
-  assert.equal(frames[1]?.item?.content?.[0]?.text, '  今天星期几  ');
-  assert.deepEqual(frames[2]?.response, { modalities: ['audio', 'text'] });
+  assert.equal(frames[0]?.item?.role, 'user');
+  assert.equal(frames[0]?.item?.content?.[0]?.type, 'input_text');
+  assert.equal(frames[0]?.item?.content?.[0]?.text, '  今天星期几  ');
+  assert.deepEqual(frames[1]?.response, { modalities: ['audio', 'text'] });
   assert.equal(h.shadow.currentState, 'busy');
   assert.equal(h.shadow.canAnswerText(), false);
   assert.equal(h.shadow.willServe(), false);
@@ -1799,4 +1838,564 @@ test('injectAnswer 在 broken 或 socket 未打开时不计数', () => {
   const sent = broken.socket.sent.length;
   broken.shadow.injectAnswer('问', '还在吗');
   assert.equal(broken.socket.sent.length, sent);
+});
+
+test('enqueueSpeech：discard 后在途未完时入队，等 response.done 才发，不撞 busy；多条 FIFO 串行', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.shadow.seal(1, 30);
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.create'), 1);
+
+  // 模拟 clock_override / cancel_bg：先 discard（cancel 已发出，但还没 response.done），紧接着 enqueueSpeech
+  h.shadow.discard();
+  assert.equal(h.socket.count('response.cancel'), 1);
+  const first = h.shadow.enqueueSpeech('应一声：我看一眼时间', { kind: 'ack' });
+  const second = h.shadow.enqueueSpeech('再说一句：顺带报结果', { kind: 'ack' });
+  assert.ok(first !== null && second !== null);
+  assert.equal(h.socket.count('response.create'), 1, '上一份 response.done 之前绝不能抢发第二条 create');
+
+  const chunks1: Buffer[] = [];
+  const chunks2: Buffer[] = [];
+  const drain1 = (async () => { for await (const c of first.chunks) chunks1.push(c); })();
+  const drain2 = (async () => { for await (const c of second.chunks) chunks2.push(c); })();
+
+  // 被丢弃的那份收尾 → 队列第 1 条自动发出
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  assert.equal(h.socket.count('response.create'), 2);
+  h.socket.message({ type: 'response.created' });
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.from([1, 2, 3, 4]).toString('base64') });
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '我看一眼。' });
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await drain1;
+  assert.equal(first.transcript(), '我看一眼。');
+  assert.equal(chunks1.length, 1);
+
+  // 第 1 条收尾 → 队列第 2 条自动按 FIFO 发出
+  assert.equal(h.socket.count('response.create'), 3);
+  h.socket.message({ type: 'response.created' });
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.from([5, 6]).toString('base64') });
+  h.socket.message({ type: 'response.audio_transcript.delta', delta: '四点整。' });
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await drain2;
+  assert.equal(second.transcript(), '四点整。');
+  assert.equal(chunks2.length, 1);
+  assert.equal(h.shadow.currentState, 'ready');
+});
+
+test('enqueueSpeech：排队期间被 interrupt / restart / break 干净收尾不挂死', { timeout: 2000 }, async () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.shadow.seal(1, 30);
+  h.socket.message({ type: 'response.created' });
+
+  const q1 = h.shadow.enqueueSpeech('第一条', { kind: 'ack' });
+  const q2 = h.shadow.enqueueSpeech('第二条', { kind: 'announce', taskId: 't2' });
+  assert.ok(q1 !== null && q2 !== null);
+
+  q1.interrupt();
+  const got1: Buffer[] = [];
+  for await (const c of q1.chunks) got1.push(c);
+  assert.equal(got1.length, 0);
+
+  // 用户重新开口清空还没发出的队列
+  h.shadow.restart([Buffer.alloc(MS * 60)]);
+  const got2: Buffer[] = [];
+  for await (const c of q2.chunks) got2.push(c);
+  assert.equal(got2.length, 0);
+  assert.equal(h.socket.count('response.create'), 1, '被取消的排队项一帧都不许发出去');
+});
+
+test('捕获 function_call 的 call_id，answer 能读出 delegateCallId 和助手项 id', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  const answer = h.shadow.claim();
+  assert.ok(answer);
+  assert.equal(answer.delegateCallId?.(), null);
+  assert.equal(answer.userItemId?.(), null);
+  assert.deepEqual(answer.assistantItemIds?.(), []);
+
+  h.socket.message({
+    type: 'response.output_item.added',
+    item: { id: '', type: 'function_call', call_id: '' },
+  });
+  assert.equal(answer.delegateCallId?.(), null, '空 call_id / 空 item id 不记');
+  assert.deepEqual(answer.assistantItemIds?.(), []);
+
+  h.socket.message({
+    type: 'response.output_item.added',
+    item: { id: 'fc_1', type: 'function_call', call_id: 'call_added' },
+  });
+  h.socket.message({
+    type: 'response.output_item.added',
+    item: { id: 'asst_1', role: 'assistant' },
+  });
+  h.socket.message({ type: 'conversation.item.created', item: { id: 'user_1', role: 'user' } });
+  assert.equal(answer.delegateCallId?.(), 'call_added');
+  assert.deepEqual(answer.assistantItemIds?.(), ['fc_1', 'asst_1']);
+  assert.equal(answer.userItemId?.(), 'user_1');
+
+  h.socket.message({
+    type: 'response.function_call_arguments.done',
+    call_id: 'call_done',
+    arguments: '{"request":"把灯关上","reason":"要操作设备"}',
+  });
+  assert.equal(answer.delegateCallId?.(), 'call_done', 'arguments.done 覆盖 added 里的 call_id');
+  assert.equal(answer.delegateReason?.(), 'delegate');
+  assert.equal(answer.delegateText?.(), '把灯关上');
+
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'completed',
+      output: [
+        { id: 'fc_1', type: 'function_call', call_id: 'call_done' },
+        { id: 'asst_1', role: 'assistant' },
+        { id: 'fc_late', type: 'function_call', call_id: 'call_should_not_override' },
+      ],
+    },
+  });
+  assert.equal(answer.delegateCallId?.(), 'call_done', '已经有 call_id 时终态 output 不覆盖');
+  assert.deepEqual(answer.assistantItemIds?.(), ['fc_1', 'asst_1', 'fc_late']);
+
+  const backfill = make('full');
+  backfill.ready();
+  backfill.shadow.restart([Buffer.alloc(MS * 40)]);
+  backfill.shadow.seal(1, 10);
+  const late = backfill.shadow.claim();
+  assert.ok(late);
+  backfill.socket.message({
+    type: 'response.output_item.added',
+    item: { id: 'fc_only', type: 'function_call' },
+  });
+  backfill.socket.message({
+    type: 'response.function_call_arguments.done',
+    arguments: '{"request":"开灯","reason":"操作"}',
+  });
+  assert.equal(late.delegateCallId?.(), null);
+  backfill.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'completed',
+      output: [{ id: 'fc_only', type: 'function_call', call_id: 'call_from_output' }],
+    },
+  });
+  assert.equal(late.delegateCallId?.(), 'call_from_output');
+  assert.deepEqual(late.assistantItemIds?.(), ['fc_only']);
+});
+
+test('sendFunctionCallOutput：忙时排队，回到 ready 先于下一次 response.create', () => {
+  const ready = make('full');
+  ready.ready();
+  const before = ready.socket.sent.length;
+  ready.shadow.sendFunctionCallOutput('call_now', 'ok');
+  ready.shadow.sendFunctionCallOutput('', 'no');
+  ready.shadow.sendFunctionCallOutput('call_empty', '');
+  assert.equal(ready.socket.sent.length, before + 1);
+  assert.equal(ready.socket.sent[before]?.item?.type, 'function_call_output');
+  assert.equal(ready.socket.sent[before]?.item?.call_id, 'call_now');
+  assert.equal(ready.socket.sent[before]?.item?.output, 'ok');
+  ready.socket.close();
+  const closed = ready.socket.sent.length;
+  ready.shadow.sendFunctionCallOutput('call_dead', '不再发');
+  assert.equal(ready.socket.sent.length, closed);
+
+  const h = make('full');
+  h.ready();
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  assert.equal(h.socket.count('response.create'), 1);
+  const mark = h.socket.sent.length;
+  h.shadow.sendFunctionCallOutput('call_a', '第一份');
+  h.shadow.sendFunctionCallOutput('call_b', '第二份');
+  h.shadow.sendFunctionCallOutput('', '忽略');
+  h.shadow.sendFunctionCallOutput('call_c', '');
+  assert.equal(
+    h.socket.sent.slice(mark).some((frame) => frame.item?.type === 'function_call_output'),
+    false,
+    '忙时只排队',
+  );
+  const queued = h.shadow.enqueueSpeech('补一句结果', { kind: 'ack' });
+  assert.ok(queued);
+  assert.equal(h.socket.count('response.create'), 1, '上一条 response.done 之前不能抢发');
+
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const tail = h.socket.sent.slice(mark);
+  const outputs = tail.filter((frame) => frame.item?.type === 'function_call_output');
+  assert.deepEqual(
+    outputs.map((frame) => [frame.item?.call_id, frame.item?.output]),
+    [
+      ['call_a', '第一份'],
+      ['call_b', '第二份'],
+    ],
+  );
+  const createAt = tail.findIndex((frame) => frame.type === 'response.create');
+  const lastOutput = tail.reduce(
+    (acc, frame, idx) => (frame.item?.type === 'function_call_output' ? idx : acc),
+    -1,
+  );
+  assert.ok(createAt > lastOutput && lastOutput >= 0, '工具回执必须先于下一次 response.create');
+
+  const capped = make('full');
+  capped.ready();
+  capped.shadow.restart([Buffer.alloc(MS * 20)]);
+  capped.shadow.seal(1, 5);
+  for (let i = 0; i < 9; i += 1) {
+    capped.shadow.sendFunctionCallOutput(`c${i}`, `o${i}`);
+  }
+  capped.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const cappedIds = capped.socket.sent
+    .filter((frame) => frame.item?.type === 'function_call_output')
+    .map((frame) => frame.item?.call_id);
+  assert.deepEqual(cappedIds, ['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8']);
+});
+
+test('updateDynamicContext：单槽合并、去重，并发完整 session 配置', () => {
+  const h = make('full');
+  h.ready();
+  assert.equal(h.socket.count('session.update'), 1);
+  const handshake = h.socket.sent[0]?.session?.instructions;
+  assert.equal(handshake, OMNI_SHORT_INSTRUCTIONS);
+
+  h.shadow.updateDynamicContext('  事实A  ');
+  assert.equal(h.socket.count('session.update'), 2);
+  const updated = h.socket.sent.at(-1)?.session;
+  assert.equal(updated?.instructions, `${handshake}\n\n事实A`);
+  assert.equal(updated?.turn_detection, null);
+  assert.deepEqual(updated?.modalities, ['text', 'audio']);
+  assert.equal(updated?.tool_choice, 'auto');
+  assert.equal(updated?.tools?.length, 1);
+  assert.equal(updated?.tools?.[0]?.name, 'delegate_to_assistant');
+
+  h.shadow.updateDynamicContext('事实A');
+  h.shadow.updateDynamicContext('  事实A');
+  assert.equal(h.socket.count('session.update'), 2, '与已发送内容相同就不再发');
+
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  h.shadow.updateDynamicContext('第一份');
+  h.shadow.updateDynamicContext('第二份');
+  h.shadow.updateDynamicContext('  最后一份  ');
+  assert.equal(h.socket.count('session.update'), 2, '忙时多次调用只保留最后一份');
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.equal(h.socket.count('session.update'), 3);
+  const merged = h.socket.sent.at(-1)?.session;
+  assert.equal(merged?.instructions, `${handshake}\n\n最后一份`);
+  assert.equal(merged?.instructions?.includes('第一份'), false);
+  assert.equal(merged?.instructions?.includes('第二份'), false);
+  assert.equal(merged?.turn_detection, null);
+  assert.equal(merged?.tools?.[0]?.name, 'delegate_to_assistant');
+  assert.equal(merged?.tool_choice, 'auto');
+
+  h.shadow.updateDynamicContext('   ');
+  assert.equal(h.socket.count('session.update'), 4);
+  assert.equal(h.socket.sent.at(-1)?.session?.instructions, handshake, '清空后与原来逐字一致');
+
+  let clocks = 0;
+  const rich = make('full', {
+    instructions: 'BASE',
+    clockContext: () => {
+      clocks += 1;
+      return '今天';
+    },
+    memoryContext: '花生',
+  });
+  rich.ready();
+  assert.equal(clocks, 1);
+  rich.shadow.updateDynamicContext('动态');
+  assert.equal(clocks, 2, '刷新动态事实会再组一次 instructions');
+  assert.equal(
+    rich.socket.sent.at(-1)?.session?.instructions,
+    'BASE\n\n【当前日期参考】\n今天\n\n'
+      + '【关于哥的已知长期记忆（仅供如实回答，不要主动复述）】\n花生\n\n动态',
+  );
+  assert.equal(rich.socket.sent.at(-1)?.session?.turn_detection, null);
+  assert.equal(rich.socket.sent.at(-1)?.session?.tools?.[0]?.name, 'delegate_to_assistant');
+
+  const off = make('off', { instructions: 'BASE' });
+  off.ready();
+  off.shadow.updateDynamicContext('只是事实');
+  const offSession = off.socket.sent.at(-1)?.session;
+  assert.equal(offSession?.instructions, 'BASE\n\n只是事实');
+  assert.equal(offSession?.tools, undefined);
+  assert.equal(offSession?.turn_detection, null);
+});
+
+test('回到 ready 时控制帧按删除、工具回执、动态事实、回注的顺序冲刷', () => {
+  const h = make('full');
+  h.shadow.start();
+  h.socket.open();
+  h.shadow.deleteItems(['pend_del', '', 'pend_del']);
+  h.shadow.sendFunctionCallOutput('call_q', '回执');
+  h.shadow.updateDynamicContext('动态事实');
+  h.shadow.injectAnswer('问', '答');
+  assert.equal(h.socket.count('conversation.item.create'), 0);
+  assert.equal(h.socket.count('conversation.item.delete'), 0);
+  assert.equal(h.socket.count('session.update'), 1, '握手那一份还没有动态事实');
+  const mark = h.socket.sent.length;
+  h.socket.message({ type: 'session.updated' });
+  const tail = h.socket.sent.slice(mark);
+  assert.deepEqual(tail.map((frame) => {
+    if (frame.type === 'conversation.item.delete') return `delete:${frame.item_id}`;
+    if (frame.item?.type === 'function_call_output') return `output:${frame.item.call_id}`;
+    if (frame.type === 'session.update') return 'session.update';
+    if (frame.type === 'conversation.item.create') return 'inject';
+    return frame.type;
+  }), [
+    'delete:pend_del',
+    'output:call_q',
+    'session.update',
+    'inject',
+  ]);
+  assert.match(tail[2]?.session?.instructions ?? '', /\n\n动态事实$/);
+  assert.equal(tail[2]?.session?.turn_detection, null);
+  assert.equal(tail[2]?.session?.tools?.[0]?.name, 'delegate_to_assistant');
+  assert.match(tail[3]?.item?.content?.[0]?.text ?? '', /答/);
+});
+
+test('临时 prompt user 在 done 时删掉，answerFromText 的用户真话留下', () => {
+  const spoken = make('full');
+  spoken.ready();
+  const announce = spoken.shadow.speakFromText('用一两句告诉哥：灯关了。');
+  assert.ok(announce);
+  spoken.socket.message({ type: 'conversation.item.created', item: { id: 'inject_user', role: 'user' } });
+  spoken.socket.message({ type: 'conversation.item.created', item: { id: 'prompt_user', role: 'user' } });
+  spoken.socket.message({ type: 'response.output_item.added', item: { id: 'prompt_asst', role: 'assistant' } });
+  spoken.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(480).toString('base64') });
+  spoken.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'completed',
+      output: [
+        { id: 'prompt_user', role: 'user' },
+        { id: 'prompt_asst', role: 'assistant' },
+      ],
+    },
+  });
+  assert.deepEqual(
+    spoken.socket.sent.filter((frame) => frame.type === 'conversation.item.delete').map((frame) => frame.item_id),
+    ['prompt_user'],
+  );
+  assert.equal(announce.userItemId?.(), 'prompt_user');
+  assert.deepEqual(announce.assistantItemIds?.(), ['prompt_asst']);
+
+  const queuedHost = make('full');
+  queuedHost.ready();
+  const queued = queuedHost.shadow.enqueueSpeech('应一声：我看一下', { kind: 'ack' });
+  assert.ok(queued);
+  queuedHost.socket.message({ type: 'conversation.item.created', item: { id: 'ack_user', role: 'user' } });
+  queuedHost.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'ack_asst', role: 'assistant' }] },
+  });
+  assert.deepEqual(
+    queuedHost.socket.sent.filter((frame) => frame.type === 'conversation.item.delete').map((frame) => frame.item_id),
+    ['ack_user'],
+  );
+  assert.equal(queued.userItemId?.(), 'ack_user');
+  assert.deepEqual(queued.assistantItemIds?.(), ['ack_asst']);
+
+  const answerHost = make('full');
+  answerHost.ready();
+  const answer = answerHost.shadow.answerFromText('今天星期几');
+  assert.ok(answer);
+  answerHost.socket.message({ type: 'conversation.item.created', item: { id: 'real_user', role: 'user' } });
+  answerHost.socket.message({ type: 'conversation.item.created', item: { id: 'later_user', role: 'user' } });
+  answerHost.socket.message({
+    type: 'response.done',
+    response: { status: 'completed', output: [{ id: 'real_asst', role: 'assistant' }] },
+  });
+  assert.equal(answerHost.socket.count('conversation.item.delete'), 0);
+  assert.equal(answer.userItemId?.(), 'real_user', '用户真话保留第一次见到的 user 项');
+  assert.deepEqual(answer.assistantItemIds?.(), ['real_asst']);
+});
+
+test('deleteItems：忙时排队，ready 时删除；discard 删得掉 function_call 项', () => {
+  const h = make('full');
+  h.ready();
+  h.shadow.deleteItems(['ready_id', '', 'ready_id']);
+  assert.deepEqual(
+    h.socket.sent.filter((frame) => frame.type === 'conversation.item.delete').map((frame) => frame.item_id),
+    ['ready_id'],
+  );
+
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(1, 10);
+  h.shadow.deleteItems(['busy_a', '', 'busy_b', 'busy_a', 'busy_c']);
+  assert.equal(
+    h.socket.sent.filter((frame) => frame.item_id?.startsWith('busy_')).length,
+    0,
+  );
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  assert.deepEqual(
+    h.socket.sent.filter((frame) => frame.item_id?.startsWith('busy_')).map((frame) => frame.item_id),
+    ['busy_a', 'busy_b', 'busy_c'],
+  );
+
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.shadow.seal(2, 10);
+  h.socket.message({
+    type: 'response.output_item.added',
+    item: { id: 'fc_item', type: 'function_call', call_id: 'call_fc' },
+  });
+  h.shadow.discard();
+  assert.equal(
+    h.socket.sent.filter((frame) => frame.item_id === 'fc_item').length,
+    0,
+    'discard 当场还没有 done，不能先删',
+  );
+  h.socket.message({
+    type: 'response.done',
+    response: {
+      status: 'cancelled',
+      output: [{ id: 'fc_item', type: 'function_call', call_id: 'call_fc' }],
+    },
+  });
+  assert.ok(
+    h.socket.sent.some((frame) => frame.type === 'conversation.item.delete' && frame.item_id === 'fc_item'),
+  );
+
+  const capped = make('full');
+  capped.ready();
+  capped.shadow.restart([Buffer.alloc(MS * 20)]);
+  capped.shadow.seal(1, 5);
+  capped.shadow.deleteItems(Array.from({ length: 33 }, (_, i) => `id_${i}`));
+  capped.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const deletedIds = capped.socket.sent
+    .filter((frame) => frame.type === 'conversation.item.delete')
+    .map((frame) => frame.item_id);
+  assert.equal(deletedIds.length, 32);
+  assert.equal(deletedIds[0], 'id_1');
+  assert.equal(deletedIds.at(-1), 'id_32');
+
+  const dead = make('full');
+  dead.ready();
+  dead.socket.close();
+  const sent = dead.socket.sent.length;
+  dead.shadow.deleteItems(['gone']);
+  assert.equal(dead.socket.sent.length, sent);
+});
+
+test('生成期暂存的音频在 restart 时丢弃，不对空服务端缓冲发 commit', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  const commits = h.socket.count('input_audio_buffer.commit');
+  const appends = h.socket.count('input_audio_buffer.append');
+
+  // 生成期开口：只进 held，服务端缓冲仍是空的
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 80), true);
+  assert.equal(h.socket.count('input_audio_buffer.append'), appends);
+
+  h.at(30);
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  assert.equal(
+    h.socket.count('input_audio_buffer.commit'),
+    commits,
+    'held 没上过服务端，restart 不能发空 commit',
+  );
+
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1);
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  assert.equal(
+    h.socket.count('input_audio_buffer.commit'),
+    commits,
+    'response.done 也不能把上一轮 held 补 commit 掉',
+  );
+  const lengths = h.socket.sent
+    .filter((frame) => frame.type === 'input_audio_buffer.append')
+    .map((frame) => Buffer.from(frame.audio ?? '', 'base64').length);
+  assert.deepEqual(lengths, [MS * 100, MS * 40], '80ms 的 held 不能在 done 之后漏进下一轮');
+
+  h.at(40);
+  h.shadow.seal(2, 10);
+  h.at(50);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  const second = h.events.at(-1)!;
+  assert.equal(second['seq'], 2);
+  assert.equal(second['seal_s'], 0.04, '下一轮只有新预卷 40ms');
+  assert.equal(second['flushed_ms'], 0);
+});
+
+test('取消相位 starting → cancel_when_created → cancelling → done，created 之后才补一次 cancel', () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 40)]);
+  h.at(10);
+  h.shadow.seal(1, 10);
+  assert.equal(h.shadow.explain().phase, 'starting');
+
+  h.shadow.discard();
+  assert.equal(h.shadow.explain().phase, 'cancel_when_created');
+  assert.equal(h.socket.count('response.cancel'), 0, 'created 之前发会被服务端拒');
+
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.shadow.explain().phase, 'cancelling');
+  assert.equal(h.socket.count('response.cancel'), 1);
+
+  h.socket.message({ type: 'response.created' });
+  assert.equal(h.socket.count('response.cancel'), 1, '重复 created 不能再补一次 cancel');
+
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  assert.equal(h.shadow.explain().phase, 'done');
+  assert.equal(h.socket.count('response.cancel'), 1, 'done 不能再补一次 cancel');
+  assert.equal(h.events[0]!['cancelled'], true);
+  assert.equal(h.shadow.currentState, 'ready');
+});
+
+test('重复 claim() 不会让两个读端互相抢 audio 块', { timeout: 4000 }, async () => {
+  const h = make('full');
+  h.ready();
+  h.at(0);
+  h.shadow.restart([Buffer.alloc(MS * 100)]);
+  h.at(10);
+  h.shadow.seal(1, 40);
+  h.at(20);
+  h.shadow.feed(Buffer.alloc(MS * 80), true);
+  h.at(30);
+  h.shadow.seal(2, 40);
+
+  const first = h.shadow.claim();
+  const second = h.shadow.claim();
+  assert.ok(first !== null && second !== null, '排队中的下一份让两次 claim 都拿得到读端');
+
+  const got1: Buffer[] = [];
+  const got2: Buffer[] = [];
+  const drain1 = (async () => {
+    for await (const chunk of first.chunks) {
+      got1.push(chunk);
+    }
+  })();
+  const drain2 = (async () => {
+    for await (const chunk of second.chunks) {
+      got2.push(chunk);
+    }
+  })();
+
+  h.at(40);
+  h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });
+  h.at(50);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(300).toString('base64') });
+  h.at(60);
+  h.socket.message({ type: 'response.audio.delta', delta: Buffer.alloc(500).toString('base64') });
+  h.at(70);
+  h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+  await Promise.all([drain1, drain2]);
+
+  const n1 = got1.reduce((sum, chunk) => sum + chunk.length, 0);
+  const n2 = got2.reduce((sum, chunk) => sum + chunk.length, 0);
+  assert.ok(
+    (n1 === 800 && n2 === 0) || (n1 === 0 && n2 === 800),
+    `两个读端把同一份 audio 拆开了：${n1}+${n2}`,
+  );
 });

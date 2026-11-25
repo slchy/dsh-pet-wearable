@@ -30,6 +30,8 @@ import type { DownlinkSink } from '../src/transport.ts';
 
 /** 与 `src/app/dialog.ts` 的 `ANNOUNCE_QUIET_MS` 相同。 */
 const QUIET_MS = 800;
+const DELEGATE_HINT_MARK =
+  '【前台对用户意图的猜测（仅供参考，可能听岔或跑偏；若与用户原话或最近前台对话冲突，例如用户在纠正或质疑编造，一律以用户原话和上文为准）】';
 /** 24 kHz 下 96 字节 ≈ 2 ms，播放等待只占一个 100 ms 轮询。 */
 const PCM = Buffer.alloc(96, 1);
 
@@ -47,6 +49,7 @@ const CAPS: DeviceCapabilities = {
 interface Sent {
   type: string;
   item?: { role?: string; content?: Array<{ text?: string }> };
+  session?: { instructions?: string };
 }
 
 class FakeSocket {
@@ -152,6 +155,16 @@ function userItemTexts(socket: FakeSocket): string[] {
     if (text !== undefined) texts.push(text);
   }
   return texts;
+}
+
+function latestInstructions(socket: FakeSocket): string {
+  for (let i = socket.sent.length - 1; i >= 0; i -= 1) {
+    const frame = socket.sent[i];
+    if (frame?.type === 'session.update' && typeof frame.session?.instructions === 'string') {
+      return frame.session.instructions;
+    }
+  }
+  return '';
 }
 
 function turnEnds(timeline: readonly TimelineEvent[]): TimelineEvent[] {
@@ -434,9 +447,10 @@ test('tool_call 不阻塞：空窗后同一副 omni 嗓子汇报，TTS 不参与
     assert.equal(h.dsh.pending(), 1, 'dsh 还挂在后台');
     assert.equal(h.dsh.cancelCount(), 0);
     assert.equal(h.dsh.calls.length, 1);
-    assert.match(h.dsh.calls[0]?.text ?? '', /查明天的天气/);
-    assert.match(h.dsh.calls[0]?.text ?? '', /今天天气怎么样/);
-    assert.match(h.dsh.calls[0]?.note ?? '', /无头执行/);
+    assert.equal(h.dsh.calls[0]?.text, '今天天气怎么样');
+    const note = h.dsh.calls[0]?.note ?? '';
+    assert.ok(note.includes(`${DELEGATE_HINT_MARK}\n查明天的天气`));
+    assert.match(note, /无头执行/);
     assert.deepEqual(h.ttsTexts, []);
     const leadIn = turnEnds(h.timeline).at(-1);
     assert.equal(leadIn?.fields?.['path'], 'omni');
@@ -567,12 +581,23 @@ test('别查了：取消后台 dsh，迟到结果不播，回答好，不查了'
     assert.equal(h.dsh.pending(), 1);
     assert.equal(h.runtime.core.phase, 'listening');
 
+    const beforeCreates = h.socket.count('response.create');
     h.runtime.dispatch({ type: 'utterance', text: '别查了' });
-    await advance(h.clock, 500);
+    await h.clock.drain();
 
     assert.equal(h.dsh.cancelCount(), 1);
     assert.equal(h.dsh.pending(), 1, '取消只掐任务，不替 dsh 把 Promise 结算掉');
-    assert.ok(h.ttsTexts.includes('好，不查了。'));
+    assert.deepEqual(h.ttsTexts, [], 'Pure Live 取消确认不得调用外部 TTS');
+    assert.equal(h.socket.count('response.create'), beforeCreates + 1, '应通过 omni 发声队列让 omni 自己说');
+    assert.ok(userItemTexts(h.socket).some((text) => text.includes('别查了')));
+
+    h.socket.message({ type: 'response.created' });
+    h.socket.message({ type: 'response.audio.delta', delta: PCM.toString('base64') });
+    h.socket.message({ type: 'response.audio_transcript.delta', delta: '好，不查了。' });
+    h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+    await advance(h.clock, 500);
+
+    assert.deepEqual(h.ttsTexts, []);
     assert.equal(h.runtime.core.phase, 'listening');
     const ended = turnEnds(h.timeline).at(-1);
     assert.equal(ended?.fields?.['path'], 'omni');
@@ -583,7 +608,7 @@ test('别查了：取消后台 dsh，迟到结果不播，回答好，不查了'
     await advance(h.clock, QUIET_MS + 800);
 
     assert.equal(h.outcomes.length, 0, '被取消的任务不得再入播报队列');
-    assert.equal(h.ttsTexts.includes('迟到的港口结论XYZ'), false);
+    assert.deepEqual(h.ttsTexts, []);
     assert.equal(userItemTexts(h.socket).some((text) => text.includes('迟到的港口结论XYZ')), false);
     assert.equal(h.socket.sent.filter((frame) => frame.type === 'error').length, 0);
   } finally {
@@ -646,10 +671,15 @@ test('逐字汇报：TTS 原文朗读，绕开 speakFromText，并按 spoken 回
       userItemTexts(h.socket).some((text) => text.includes('用一两句口语')),
       false,
     );
-    const injected = userItemTexts(h.socket).find((text) => text.includes('已经用语音把下面这段念给他了'));
-    assert.ok(injected !== undefined, '要按 spoken 静默回注');
-    assert.match(injected ?? '', /63993/);
-    assert.match(injected ?? '', /W8665881/);
+    assert.equal(
+      userItemTexts(h.socket).some((text) => text.includes('系统旁注')),
+      false,
+      '真 Omni 车道走单槽 session.update 快照，不再堆积系统旁注 user 项',
+    );
+    const snapshot = latestInstructions(h.socket);
+    assert.match(snapshot, /已口头告知哥/);
+    assert.match(snapshot, /63993/);
+    assert.match(snapshot, /W8665881/);
     assert.equal(h.fallbacks.length, 1);
     assert.equal(h.fallbacks[0]?.interrupted, false);
     assert.equal(h.fallbacks[0]?.speech, verbatim);
@@ -659,7 +689,7 @@ test('逐字汇报：TTS 原文朗读，绕开 speakFromText，并按 spoken 回
   }
 });
 
-test('动作轮空闲总线：omni 的 rewrittenQuery 原样进 dsh', async () => {
+test('动作轮空闲总线：用户原话是 dsh 主查询，rewrittenQuery 只作注记参考', async () => {
   const h = openLive();
   try {
     h.dsh.hold();
@@ -668,16 +698,17 @@ test('动作轮空闲总线：omni 的 rewrittenQuery 原样进 dsh', async () =
       tool: '订单现在到哪了',
     });
     assert.equal(h.dsh.calls.length, 1);
-    const query = h.dsh.calls[0]?.text ?? '';
-    assert.match(query, /订单现在到哪了/);
-    assert.match(query, /查一下订单/);
-    assert.equal(query.startsWith('订单现在到哪了'), true);
+    assert.equal(h.dsh.calls[0]?.text, '查一下订单');
+    const note = h.dsh.calls[0]?.note ?? '';
+    assert.ok(note.includes(`${DELEGATE_HINT_MARK}\n订单现在到哪了`));
+    assert.match(note, /无头执行/);
+    assert.equal(note.includes('用户原话：「'), false);
   } finally {
     closeLive(h);
   }
 });
 
-test('fallback 播报确认没声之后仍按 spoken 回注', async () => {
+test('fallback 播报确认没声之后仍同步进单槽快照', async () => {
   const h = openLive();
   try {
     const outcome = await h.live.speakBackgroundReport(
@@ -689,13 +720,17 @@ test('fallback 播报确认没声之后仍按 spoken 回注', async () => {
       { speech: '港口结论', taskId: 'port-1', query: '港口到了吗' },
       false,
     );
-    const injected = userItemTexts(h.socket).find((text) => text.includes('已经用语音把下面这段念给他了'));
-    const logged = h.logs.some((line) => line.includes('回注') && line.includes('已播完') && line.includes('港口结论'));
-    assert.equal(injected !== undefined || logged, true, '没声的 fallback 仍要 spoken 回注');
-    if (injected !== undefined) {
-      assert.match(injected, /港口结论/);
-      assert.match(injected, /港口到了吗/);
-    }
+    // 真实链路里 playAudio 在 response.done 之后才返回；这里补收尾事件让排队的单槽快照冲刷出去。
+    h.socket.message({ type: 'response.done', response: { status: 'completed' } });
+    assert.equal(
+      userItemTexts(h.socket).some((text) => text.includes('系统旁注')),
+      false,
+      '真 Omni 车道走单槽 session.update 快照，不再堆积系统旁注 user 项',
+    );
+    const snapshot = latestInstructions(h.socket);
+    assert.match(snapshot, /已口头告知哥/, '没声的 fallback 播报结算后要同步进单槽快照');
+    assert.match(snapshot, /港口结论/);
+    assert.match(snapshot, /港口到了吗/);
   } finally {
     closeLive(h);
   }

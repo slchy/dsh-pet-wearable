@@ -31,6 +31,10 @@ export type VoiceEnv = { readonly [key: string]: string | undefined };
 export interface VoiceRuntimeOverrides {
   /** 浏览器 `getUserMedia` 已开 autoGainControl，插件传 1，盖掉眼镜的 4 */
   readonly micGain?: number;
+  /** 浏览器 `micGain: 1` 比眼镜 4× 低 12 dB，未显式配 `VOICE_PEAK_DBFS` 时可覆盖能量门 */
+  readonly peakDbfs?: number;
+  /** 浏览器未显式配 `VOICE_STT_COMMIT_MS` 时可覆盖 ASR 静音封段窗（非 manual 仍收 0） */
+  readonly sttCommitMs?: number;
   /** 里层没有固定端口偏移时传 0，让系统挑空闲口 */
   readonly controlPort?: number;
   readonly idleTimeoutMs?: number;
@@ -157,12 +161,13 @@ export function buildVoiceRuntimeConfig(input: VoiceRuntimeInput): VoiceRuntimeC
    * 开成轮的段在 −16…−6 dBFS，没开轮的在 −51…−43，中间空着，所以默认 −30。
    * 这是电平判据，不是段长判据。
    */
-  const peakDbfs = envNumber('VOICE_PEAK_DBFS', -30);
+  const peakDbfs = overrides.peakDbfs ?? envNumber('VOICE_PEAK_DBFS', -30);
 
   // 服务端 VAD 拿走了封段权。客户端再 commit 会和它抢同一句话。
   const manualEndpoint = sttSpec === 'qwen-realtime' && env['QWEN_ASR_TURN_DETECTION'] !== 'vad';
   const commitConfigured = envNumber('VOICE_COMMIT_MS', sttSpec === 'qwen-realtime' ? 20 : 0);
-  const sttCommitConfigured = envNumber('VOICE_STT_COMMIT_MS', sttSpec === 'qwen-realtime' ? 150 : 0);
+  const sttCommitConfigured = overrides.sttCommitMs
+    ?? envNumber('VOICE_STT_COMMIT_MS', sttSpec === 'qwen-realtime' ? 150 : 0);
   const openQuietMs = envNumber('VOICE_OPEN_QUIET_MS', 300);
   const openQuietShortMs = envNumber('VOICE_OPEN_QUIET_SHORT_MS', 200);
 

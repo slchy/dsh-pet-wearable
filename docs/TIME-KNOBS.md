@@ -22,27 +22,27 @@
 | `PET_MIC_OPEN_TIMEOUT_MS` | 1500 | wall | `src/main.ts:1556` | 无关首声（不在停嘴→出声路径上） | — |
 | `PET_LISTEN_MS` | DEFAULT_PET_PARAMS.listenMs | wall | `src/main.ts:1558` | 无关首声（不在停嘴→出声路径上） | — |
 | `PET_TICK_MS` | 3000 | wall | `src/main.ts:1559` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_CONFIRM_TIMEOUT_MS` | DEFAULT_CONFIRM_TIMEOUT_MS | wall | `src/voice-config.ts:137` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_HQ_ARM_TIMEOUT_MS` | 15000 | wall | `src/voice-config.ts:139` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_HQ_SHUTTER_TIMEOUT_MS` | 25000 | wall | `src/voice-config.ts:140` | 无关首声（不在停嘴→出声路径上） | — |
-| `VOICE_COMMIT_MS` | 20（仅 qwen-realtime） | wall→audio（见下方备注） | `src/voice-config.ts:164` | 无 —— 它就是封段的那一刻，实际门槛被上行包长盖住 | 实际门槛 = 一整个上行包（75 ms），配置值被它盖住 |
-| `VOICE_STT_COMMIT_MS` | 150（仅 qwen-realtime） | wall→audio（同 VOICE_COMMIT_MS，见下方备注） | `src/voice-config.ts:165` | 无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠） | — |
-| `VOICE_OPEN_QUIET_MS` | 300 | audio | `src/voice-config.ts:166` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
-| `VOICE_OPEN_QUIET_SHORT_MS` | 200 | audio | `src/voice-config.ts:167` | 同上（p ≥ 0.8 时走这条） | — |
-| `VOICE_HOLD_MS` | 2000 | wall | `src/voice-config.ts:171` | 无（它决定 `gate.close` 何时落，① 的起点；配大了 ① 会被算小） | — |
-| `VOICE_PREROLL_MS` | 800 | audio | `src/voice-config.ts:172` | 无（它是滑窗长度，不加延迟） | — |
-| `VOICE_PAUSE_DETECT_MS` | 200 | wall | `src/voice-config.ts:174` | ASR 解出句之前（提前起跑，不额外等） | — |
-| `VOICE_SPECULATE_MS` | 100 | wall | `src/voice-config.ts:176` | 同上（投机与 ASR 并行） | — |
-| `TURN_JUDGE_QUIET_MS` | 0 | wall | `src/voice-config.ts:190` | 模型段 | — |
-| `TURN_JUDGE_EXTEND_MS` | 200 | wall | `src/voice-config.ts:193` | 模型段（模型 >200 ms 时几乎全遮住；模型变快后变成纯成本） | TURN_JUDGE_MAX_EXT 拍 / WAIT_BUDGET_MS 预算 / MAX_OPEN_SILENCE_MS |
-| `TURN_JUDGE_TRIM_MS` | 20 | audio | `src/voice-config.ts:198` | 判停侧车输入预处理（不额外等） | — |
-| `TURN_JUDGE_WAIT_BUDGET_MS` | 200 | wall | `src/voice-config.ts:203` | 同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算 | — |
-| `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 1200 | wall | `src/voice-config.ts:205` | 模型段（只对数字/字母/「然后」这类句尾生效） | TURN_JUDGE_MAX_OPEN_SILENCE_MS |
-| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | 650 | audio | `src/voice-config.ts:207` | 无（它自己是上限） | — |
-| `SEMANTIC_END_TAG_BUDGET_MS` | 400 | wall | `src/voice-config.ts:212` | 静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行 | — |
-| `SEMANTIC_END_TAG_TIMEOUT_MS` | 400 | wall | `src/voice-config.ts:213` | 同上（它只决定这一次判定放弃得多早，不单独产生等待） | — |
-| `MIAI_PHOTO_TIMEOUT_MS` | 60000 | wall | `src/voice-config.ts:225` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_IDLE_TIMEOUT_MS` | 45000 | wall | `src/voice-config.ts:226` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_CONFIRM_TIMEOUT_MS` | DEFAULT_CONFIRM_TIMEOUT_MS | wall | `src/voice-config.ts:141` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_HQ_ARM_TIMEOUT_MS` | 15000 | wall | `src/voice-config.ts:143` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_HQ_SHUTTER_TIMEOUT_MS` | 25000 | wall | `src/voice-config.ts:144` | 无关首声（不在停嘴→出声路径上） | — |
+| `VOICE_COMMIT_MS` | 20（仅 qwen-realtime） | wall→audio（见下方备注） | `src/voice-config.ts:168` | 无 —— 它就是封段的那一刻，实际门槛被上行包长盖住 | 实际门槛 = 一整个上行包（75 ms），配置值被它盖住 |
+| `VOICE_STT_COMMIT_MS` | 150（仅 qwen-realtime） | wall→audio（同 VOICE_COMMIT_MS，见下方备注） | `src/voice-config.ts:170` | 无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠） | — |
+| `VOICE_OPEN_QUIET_MS` | 300 | audio | `src/voice-config.ts:171` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
+| `VOICE_OPEN_QUIET_SHORT_MS` | 200 | audio | `src/voice-config.ts:172` | 同上（p ≥ 0.8 时走这条） | — |
+| `VOICE_HOLD_MS` | 2000 | wall | `src/voice-config.ts:176` | 无（它决定 `gate.close` 何时落，① 的起点；配大了 ① 会被算小） | — |
+| `VOICE_PREROLL_MS` | 800 | audio | `src/voice-config.ts:177` | 无（它是滑窗长度，不加延迟） | — |
+| `VOICE_PAUSE_DETECT_MS` | 200 | wall | `src/voice-config.ts:179` | ASR 解出句之前（提前起跑，不额外等） | — |
+| `VOICE_SPECULATE_MS` | 100 | wall | `src/voice-config.ts:181` | 同上（投机与 ASR 并行） | — |
+| `TURN_JUDGE_QUIET_MS` | 0 | wall | `src/voice-config.ts:195` | 模型段 | — |
+| `TURN_JUDGE_EXTEND_MS` | 200 | wall | `src/voice-config.ts:198` | 模型段（模型 >200 ms 时几乎全遮住；模型变快后变成纯成本） | TURN_JUDGE_MAX_EXT 拍 / WAIT_BUDGET_MS 预算 / MAX_OPEN_SILENCE_MS |
+| `TURN_JUDGE_TRIM_MS` | 20 | audio | `src/voice-config.ts:203` | 判停侧车输入预处理（不额外等） | — |
+| `TURN_JUDGE_WAIT_BUDGET_MS` | 200 | wall | `src/voice-config.ts:208` | 同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算 | — |
+| `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 1200 | wall | `src/voice-config.ts:210` | 模型段（只对数字/字母/「然后」这类句尾生效） | TURN_JUDGE_MAX_OPEN_SILENCE_MS |
+| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | 650 | audio | `src/voice-config.ts:212` | 无（它自己是上限） | — |
+| `SEMANTIC_END_TAG_BUDGET_MS` | 400 | wall | `src/voice-config.ts:217` | 静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行 | — |
+| `SEMANTIC_END_TAG_TIMEOUT_MS` | 400 | wall | `src/voice-config.ts:218` | 同上（它只决定这一次判定放弃得多早，不单独产生等待） | — |
+| `MIAI_PHOTO_TIMEOUT_MS` | 60000 | wall | `src/voice-config.ts:230` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_IDLE_TIMEOUT_MS` | 45000 | wall | `src/voice-config.ts:231` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 二、布尔开关（会改变时刻或路径）
 
@@ -50,7 +50,7 @@
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
-| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1168` | 无关首声（不在停嘴→出声路径上） | — |
+| `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1284` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_SPECULATE` | 1 | —（开关） | `src/main.ts:1070` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PARTIAL_SPECULATE` | 1 | —（开关） | `src/main.ts:1088` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_PREFETCH` | 1 | —（开关） | `src/main.ts:1141` | 无关首声（不在停嘴→出声路径上） | — |
@@ -58,7 +58,7 @@
 
 ## 三、硬编码常量（改要动代码）
 
-共 31 项。
+共 32 项。
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
@@ -66,7 +66,7 @@
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:53` | 无关首声（不在停嘴→出声路径上） | — |
 | `CLOCK_MISMATCH_MS` | 1e9 | —（判据） | `src/barge-voicing.ts:52` | 无（纯判据：只用来发现两把时钟接错，不放慢任何东西） | — |
 | `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:252` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
-| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:389` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
+| `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:414` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `TRUNCATED_EPSILON_MS` | 300 | —（判据） | `src/engine-contract.ts:139` | 无（纯判据：轮末判「用户少听了没有」，不产生任何等待） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:72` | 无关首声（不在停嘴→出声路径上） | — |
@@ -80,19 +80,20 @@
 | `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:120` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
 | `DEFAULT_CAPTURE_TIMEOUT_MS` | 20000 | wall | `src/photo-inbox.ts:38` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_CONFIRM_TIMEOUT_MS` | 40000 | wall | `src/photo-inbox.ts:45` | 无关首声（不在停嘴→出声路径上） | — |
+| `DEFAULT_DECODE_TIMEOUT_MS` | 8000 | wall | `src/qwen-realtime-asr.ts:40` | 无关首声（纯防卡死看门狗：正常 ASR 定稿 ~200 ms 即拆掉，只在服务端丢回包时触发解锁） | — |
 | `DEFAULT_TIMEOUT_MS` | 400 | wall | `src/semantic-endpoint.ts:48` | 无关首声（不在停嘴→出声路径上） | — |
 | `CANCEL_GRACE_MS` | 2000 | wall | `src/session.ts:57` | 无关首声（不在停嘴→出声路径上） | — |
 | `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:66` | 无关首声（不在停嘴→出声路径上） | — |
 | `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:182` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
-| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:59` | 设备播报期间（轮询，不加延迟） | — |
-| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:67` | 无关首声（不在停嘴→出声路径上） | — |
-| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:117` | ASR 出句之后（兜底，正常不触发） | — |
-| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:130` | ASR 出句之前 | — |
-| `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:139` | 无关首声（不在停嘴→出声路径上） | — |
-| `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:150` | 无关首声（不在停嘴→出声路径上） | — |
-| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:268` | 判停侧车输入预处理（不额外等） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:597` | 无关首声（不在停嘴→出声路径上） | — |
+| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:61` | 设备播报期间（轮询，不加延迟） | — |
+| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
+| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:118` | ASR 出句之后（兜底，正常不触发） | — |
+| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | audio | `src/voice-session.ts:131` | ASR 出句之前 | — |
+| `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:140` | 无关首声（不在停嘴→出声路径上） | — |
+| `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:151` | 无关首声（不在停嘴→出声路径上） | — |
+| `ASSEMBLER_TRAILING_TRIM_MS` | 20 | audio | `src/voice-session.ts:269` | 判停侧车输入预处理（不额外等） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:611` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 四、还没标注的
 

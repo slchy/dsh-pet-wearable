@@ -196,7 +196,12 @@ export type EngineEvent =
   /** 文本增量（记账 / 逐字对齐用） */
   | { readonly type: 'text'; readonly delta: string }
   /** 引擎自己决定转交 dsh（omni 的 `tool_call` 或文本模型 `[[DELEGATE]]`） */
-  | { readonly type: 'delegate'; readonly reason: string; readonly rewrittenQuery: string | null }
+  | {
+    readonly type: 'delegate';
+    readonly reason: string;
+    readonly rewrittenQuery: string | null;
+    readonly callId?: string | null;
+  }
   /**
    * 可观测元信息（只用于档案埋点与记账，不改变控制流）：
    * - `path`：这一轮由哪条路径答的（`'omni' | 'fast' | 'dsh'`）

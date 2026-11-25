@@ -318,6 +318,36 @@ export function trimLeadingSilence(chunk: Buffer, sampleRate: number, floorDb = 
   return chunk;
 }
 
+/** 连接生死。可用性只看它是 `open` 且套接字已经 OPEN，不再另存 `closed` / `failed`。 */
+type ConnLife = 'open' | 'closed' | 'failed';
+
+/** run-task 发出那一刻的连接快照（`tts.task` 的 conn_* 字段） */
+interface ConnSnap {
+  readonly isNew: boolean;
+  readonly idleMs: number;
+  readonly tasks: number;
+}
+
+/**
+ * 这条连接上的唯一任务槽。
+ *
+ * 以前拆在 `starting`（等 task-started 的 Promise）、`pending`（预开好还没人认领）
+ * 和 `sink !== null`（正在跑）三处，`canStartTask` / `isIdle` 靠与运算拼，漏看一处
+ * 就会把新 task 送进一条还占着的连接。现在只许处于下面四相之一。
+ */
+type TaskSlot =
+  | { readonly phase: 'idle' }
+  | { readonly phase: 'starting'; readonly taskId: string; readonly ready: Promise<void> }
+  | {
+    readonly phase: 'prewarmed';
+    readonly taskId: string;
+    readonly sentAt: number;
+    readonly startedAt: number;
+    readonly emotion: Emotion;
+    readonly conn: ConnSnap;
+  }
+  | { readonly phase: 'running'; readonly taskId: string };
+
 /**
  * 一条可复用连接：串行跑 task，音频边收边吐。
  *
@@ -328,20 +358,22 @@ export function trimLeadingSilence(chunk: Buffer, sampleRate: number, floorDb = 
 class Connection {
   private readonly ws: WebSocket;
   private readonly ready: Promise<void>;
-  private closed = false;
   /**
-   * 这条连接已经不能再跑 task。
+   * 这条连接的生死，只有这一处。
    *
-   * `task-failed` 和 `beginTask` 超时都会置上，并且**同步**关掉套接字。
-   * 只等 `close` 事件把 `closed` 写成 true 的话，中间有一段 `isUsable` 仍为真，
-   * 下一次合成会把新 task 送进一条已经废掉的连接。
+   * - `open`：还没被判死。握手没完成时也是它，但 `isUsable` 还要看套接字是不是 OPEN。
+   * - `failed`：`task-failed`、`task-started` 超时、套接字 error。不能再复用，必须重连。
+   * - `closed`：主动关（空闲、弃预开、调用方中途退出、认领时发现已经不可用）。
+   *
+   * 置位必须**同步**发生，并且同一刻叫醒所有 waiter。只等 `close` 事件的话，
+   * 中间有一段看起来还能用，下一次合成会把新 task 送进一条已经废掉的连接。
    */
-  private failed = false;
+  private connState: ConnLife = 'open';
   /**
-   * 当前 task 的音频接收回调；空闲时为 null。
+   * 当前 task 的音频接收回调。
    *
    * 二进制音频帧**不带 task_id**（服务端只在 JSON 回执里带），而连接同时又只跑
-   * 一个 task，所以这一路仍然是单槽。
+   * 一个 task，所以这一路仍然是单槽。槽位占不占用看 {@link taskState}，不看它是不是 null。
    */
   private sink: ((chunk: Buffer) => void) | null = null;
   /** `task-started` 的等待者，按 task_id 分槽。`false` = 失败或超时，连接已不可用。 */
@@ -371,20 +403,13 @@ class Connection {
   /** 「首块迟迟不到」的看门狗；首块到达就拆 */
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   /**
-   * **预开好的 task**：`run-task` 已发、`task-started` 已回，但一个字都没送。
+   * 这条连接上的唯一任务槽（idle / starting / prewarmed / running）。
    *
-   * task 只绑参数、不绑文本，所以谁来认领都行（正文和回执都走 `run`/`runFeed`）。
-   * 一旦被认领就清空；到点没被认领只能**弃连接**（见 `beginTask` 的注释）。
+   * `prewarmed` 是「run-task 已发、task-started 已回，但一个字都没送」。task 只绑参数、
+   * 不绑文本，所以谁来认领都行（正文和回执都走 `run`/`runFeed`）。一旦被认领就改成
+   * `running`；到点没被认领只能**弃连接**（见 `beginTask` 的注释）。
    */
-  private pending: {
-    readonly taskId: string;
-    readonly sentAt: number;
-    readonly startedAt: number;
-    /** 预开时用的语气 —— 开 task 时定死，这一轮的语气对不上就不能认领 */
-    readonly emotion: Emotion;
-    /** 预开发出 run-task 那一刻的连接状态（见 `connSnapshot`） */
-    readonly conn: { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number };
-  } | null = null;
+  private taskState: TaskSlot = { phase: 'idle' };
   /** 预开的 task 到点没人认领就作废（探针实测空窗 4.5 s 内首包都持平，留 1.5 s 余量） */
   private static readonly PREWARM_TTL_MS = 3_000;
   private warmTimer: ReturnType<typeof setTimeout> | null = null;
@@ -397,7 +422,7 @@ class Connection {
    * 的 `task-finished`**（厂商自己说「这个 task 做完了」，不是我们的 `tts.done`
    * —— 后者之后音频还在往下发）多久。首任务报距建连多久。
    */
-  private connSnapshot(sentAt: number): { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number } {
+  private connSnapshot(sentAt: number): ConnSnap {
     const tasks = this.finishedTasks;
     if (this.lastFinishedAt === 0) {
       return {
@@ -461,7 +486,7 @@ class Connection {
     stream: boolean,
     prewarmed: boolean,
     feed = Number.NaN,
-    conn: { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number } | null = null,
+    conn: ConnSnap | null = null,
   ): void {
     if (this.onTask === undefined) return;
     this.onTask({
@@ -511,12 +536,11 @@ class Connection {
     });
     // 连接级 error 在 open 之后还要继续接住，否则会变成未处理异常
     this.ws.on('error', (error: Error) => {
-      this.failure = new CosyVoiceError(`连接异常: ${error.message}`);
-      this.failAll(this.failure);
+      this.shutdown('failed', new CosyVoiceError(`连接异常: ${error.message}`));
     });
     this.ws.on('close', () => {
-      this.closed = true;
-      this.failAll(this.failure ?? new CosyVoiceError('连接已关闭'));
+      // 套接字已经没了。若还没走过 shutdown，这里补上，把 waiter 一起叫醒。
+      this.shutdown('closed', this.failure ?? new CosyVoiceError('连接已关闭'));
     });
     this.ws.on('message', (data, isBinary) => {
       if (isBinary) {
@@ -548,20 +572,24 @@ class Connection {
       if (event === 'task-finished') {
         this.lastFinishedAt = performance.now();
         this.finishedTasks += 1;
-        this.sink = null;
+        if (
+          this.taskState.phase === 'running'
+          && (taskId === undefined || this.taskState.taskId === taskId)
+        ) {
+          this.taskState = { phase: 'idle' };
+          this.sink = null;
+        }
         this.settleTask(taskId, null);
         return;
       }
       if (event === 'task-failed') {
         const detail = message.header?.error_message ?? message.header?.error_code ?? '未知错误';
-        this.failure = new CosyVoiceError(`合成失败: ${detail}`);
-        this.failed = true;
+        const error = new CosyVoiceError(`合成失败: ${detail}`);
+        this.failure = error;
         this.lastFinishedAt = performance.now();
         this.finishedTasks += 1;
-        this.sink = null;
-        this.settleTask(taskId, this.failure);
-        this.abortStarted();
-        this.close();
+        // 一个 task 失败后这条连接上后续 task 会静默挂死，必须同步弃掉并叫醒所有 waiter。
+        this.shutdown('failed', error);
       }
     });
   }
@@ -600,52 +628,99 @@ class Connection {
       }
       return;
     }
-    for (const [id, waiter] of this.settleWaiters) {
-      this.settleWaiters.delete(id);
-      waiter(error);
-    }
+    this.settleAll(error);
   }
 
-  /** 连接断了：所有等待者一起失败，别留下永远等不到的 promise */
-  private failAll(error: Error): void {
-    this.abortStarted();
+  /** 把还在等收尾的人全部叫醒。先复制再删，免得回调里再注册/再关掉把迭代打乱。 */
+  private settleAll(error: Error | null): void {
     for (const [id, waiter] of [...this.settleWaiters]) {
       this.settleWaiters.delete(id);
       waiter(error);
     }
   }
 
-  get isUsable(): boolean {
-    return !this.closed && !this.failed && this.ws.readyState === WebSocket.OPEN;
+  /**
+   * 连接结束的唯一出口。主动 `close`、`fail`、套接字 `error` / `close` 都走这里。
+   *
+   * 第一次进来就同步标生死、清任务槽，并叫醒 `startedWaiters` 和 `settleWaiters`。
+   * 已经结束过就只补一次 `ws.close()`，不再二次叫醒 —— 否则「连接已关闭」会盖掉
+   * 前面那条真正的合成错误。
+   */
+  private shutdown(kind: 'closed' | 'failed', error: Error): void {
+    if (this.connState === 'open') {
+      this.connState = kind;
+      if (this.failure === null) this.failure = error;
+      const reason = this.failure;
+      this.taskState = { phase: 'idle' };
+      this.sink = null;
+      this.clearWarmTimer();
+      this.clearStallWatch();
+      this.abortStarted();
+      this.settleAll(reason);
+    }
+    this.closeSocket();
   }
 
-  /** 这条连接上能新开一个 task 吗（**不管**有没有预开的等着认领） */
-  get canStartTask(): boolean {
-    return this.isUsable && this.sink === null && this.settleWaiters.size === 0;
+  /** 这条连接不能再复用。超时、`task-failed`、套接字 error 都走失败而不是普通关闭。 */
+  private fail(error: Error): void {
+    if (this.failure === null) this.failure = error;
+    this.shutdown('failed', this.failure);
   }
 
-  get isIdle(): boolean {
-    // `pending` 也算「不空闲」：预开的 task 已经在服务端占着这条连接，
-    // 这时再 run-task 会撞「连接正忙」。想认领它的路走 `canStartTask`。
-    return this.canStartTask && this.pending === null && this.starting === null;
+  private closeSocket(): void {
+    const state = this.ws.readyState;
+    if (state === WebSocket.CLOSING || state === WebSocket.CLOSED) return;
+    try { this.ws.close(); } catch { /* 已经关了 */ }
   }
 
-  get hasPending(): boolean {
-    return this.pending !== null;
-  }
-
-  /** 预开那条 task 的语气（没预开给 `null`）。语气对不上就得弃连接，见 `pump` */
-  get pendingEmotion(): Emotion | null {
-    return this.pending?.emotion ?? null;
+  /** 登记一个收尾等待者。连接已经结束时立刻 resolve，避免晚到的登记再也等不到 close。 */
+  private bindSettle(taskId: string): Promise<Error | null> {
+    return new Promise((resolve) => {
+      if (this.connState !== 'open') {
+        resolve(this.failure ?? new CosyVoiceError('连接已关闭'));
+        return;
+      }
+      this.settleWaiters.set(taskId, resolve);
+    });
   }
 
   /**
-   * 预开的那趟还在等 `task-started`（run-task 已发出、`pending` 还没落地）。
+   * 预开那趟还在等 `task-started`（槽位是 `starting`）。
    *
    * 这段空窗里谁都不能再 run-task —— 服务端会认为连接正忙。所以 `run`/`runFeed`
    * 先 `await` 它，之后多半就能直接认领刚落地的那条 task。
    */
-  private starting: Promise<void> | null = null;
+  private async waitForStarting(): Promise<void> {
+    const slot = this.taskState;
+    if (slot.phase === 'starting') await slot.ready;
+  }
+
+  get isUsable(): boolean {
+    return this.connState === 'open' && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * 能新开一个 task，或认领一条已经 `prewarmed` 的。
+   * `starting` / `running` 都不行：服务端一条连接同时只跑一个 task。
+   */
+  get canStartTask(): boolean {
+    if (!this.isUsable) return false;
+    const phase = this.taskState.phase;
+    return phase === 'idle' || phase === 'prewarmed';
+  }
+
+  get isIdle(): boolean {
+    return this.isUsable && this.taskState.phase === 'idle';
+  }
+
+  get hasPending(): boolean {
+    return this.taskState.phase === 'prewarmed';
+  }
+
+  /** 预开那条 task 的语气（没预开给 `null`）。语气对不上就得弃连接，见 `pump` */
+  get pendingEmotion(): Emotion | null {
+    return this.taskState.phase === 'prewarmed' ? this.taskState.emotion : null;
+  }
 
   /**
    * **预开一个 task**：只发 `run-task` 并等 `task-started`，一个字都不送。
@@ -665,81 +740,105 @@ class Connection {
     readonly useInstruction: boolean;
     readonly emotion: Emotion;
   }): Promise<boolean> {
-    if (!this.isIdle || this.starting !== null) return false;
+    if (!this.isIdle) return false;
     const taskId = hex32();
     const sentAt = performance.now();
-    this.ws.send(JSON.stringify({
-      header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
-      payload: {
-        task_group: 'audio',
-        task: 'tts',
-        function: 'SpeechSynthesizer',
-        model: opts.model,
-        parameters: {
-          text_type: 'PlainText',
-          voice: opts.voice,
-          format: 'pcm',
-          sample_rate: opts.sampleRate,
-          volume: DEFAULT_VOLUME,
-          rate: EMOTION_PROSODY[opts.emotion].rate,
-          pitch: EMOTION_PROSODY[opts.emotion].pitch,
-          ...(opts.useInstruction ? { instruction: EMOTION_INSTRUCTIONS[opts.emotion] } : {}),
-        },
-        input: {},
-      },
-    }));
     let markReady!: () => void;
-    this.starting = new Promise<void>((resolve) => { markReady = resolve; });
+    const ready = new Promise<void>((resolve) => { markReady = resolve; });
+    this.taskState = { phase: 'starting', taskId, ready };
     try {
+      this.ws.send(JSON.stringify({
+        header: { action: 'run-task', task_id: taskId, streaming: 'duplex' },
+        payload: {
+          task_group: 'audio',
+          task: 'tts',
+          function: 'SpeechSynthesizer',
+          model: opts.model,
+          parameters: {
+            text_type: 'PlainText',
+            voice: opts.voice,
+            format: 'pcm',
+            sample_rate: opts.sampleRate,
+            volume: DEFAULT_VOLUME,
+            rate: EMOTION_PROSODY[opts.emotion].rate,
+            pitch: EMOTION_PROSODY[opts.emotion].pitch,
+            ...(opts.useInstruction ? { instruction: EMOTION_INSTRUCTIONS[opts.emotion] } : {}),
+          },
+          input: {},
+        },
+      }));
       const started = await new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => { resolve(false); }, 3000);
         this.startedWaiters.set(taskId, (ok) => { clearTimeout(timer); resolve(ok); });
       });
       this.startedWaiters.delete(taskId);
-      if (!started || this.failed) {
-        this.failed = true;
-        if (!this.closed) this.close();
+      if (!started || this.connState !== 'open') {
+        // 超时或中途断线：这条连接不能再复用，同步关掉并叫醒等待者。
+        this.fail(this.failure ?? new CosyVoiceError('task 未能开始'));
         return false;
       }
-      this.pending = { taskId, sentAt, startedAt: performance.now(), emotion: opts.emotion, conn: this.connSnapshot(sentAt) };
+      this.taskState = {
+        phase: 'prewarmed',
+        taskId,
+        sentAt,
+        startedAt: performance.now(),
+        emotion: opts.emotion,
+        conn: this.connSnapshot(sentAt),
+      };
       // 到点没人要：**不能** finish-task（空 task 会被服务端判非法，之后整条连接
       // 静默挂死），只能弃连接。定时器挂在这里而不是工厂里，才不会出现「预开了却
-      // 没有回收」的窗口。
+      // 没有回收」的窗口。先不摘槽，close 里和套接字一起收掉。
       this.warmTimer = setTimeout(() => {
         this.warmTimer = null;
-        if (this.pending === null) return;
-        this.pending = null;
+        if (this.taskState.phase !== 'prewarmed' || this.taskState.taskId !== taskId) return;
         this.close();
       }, Connection.PREWARM_TTL_MS);
       this.warmTimer.unref?.();
       return true;
     } finally {
-      this.starting = null;
-      // 必须在 `pending` 落地**之后**才放开：`run`/`runFeed` 等的就是这一刻
+      if (this.taskState.phase === 'starting' && this.taskState.taskId === taskId) {
+        this.taskState = { phase: 'idle' };
+      }
+      // 必须在 prewarmed 落地（或已经失败清槽）之后才放开：`run`/`runFeed` 等的就是这一刻
       markReady();
     }
   }
 
-  /** 认领预开的 task；没有（或连接已经不可用）就给 `null` */
+  /**
+   * 认领预开的 task；没有就给 `null`。
+   *
+   * 先看连接还能不能用。不能用就直接关掉 —— 任务槽和套接字一起收，不能先把
+   * `prewarmed` 摘成 idle 再返回 null。那样服务端的空 task 还挂在连接上，本地账本
+   * 却已经把它忘了，下一次 run-task 会撞上一条没人记账的忙连接。
+   */
   takePending(): {
     readonly taskId: string;
     readonly sentAt: number;
     readonly startedAt: number;
-    readonly conn: { readonly isNew: boolean; readonly idleMs: number; readonly tasks: number };
+    readonly conn: ConnSnap;
   } | null {
-    const picked = this.pending;
-    this.pending = null;
+    if (!this.isUsable) {
+      this.shutdown('closed', this.failure ?? new CosyVoiceError('连接已关闭'));
+      return null;
+    }
+    if (this.taskState.phase !== 'prewarmed') return null;
+    const slot = this.taskState;
     this.clearWarmTimer();
-    if (picked === null || !this.isUsable) return null;
-    return picked;
+    this.taskState = { phase: 'idle' };
+    return {
+      taskId: slot.taskId,
+      sentAt: slot.sentAt,
+      startedAt: slot.startedAt,
+      conn: slot.conn,
+    };
   }
 
   /** 丢掉预开的 task（返回有没有丢掉）。**调用方负责弃连接**，别在这发 finish-task */
   clearPending(): boolean {
-    const had = this.pending !== null;
-    this.pending = null;
+    if (this.taskState.phase !== 'prewarmed') return false;
+    this.taskState = { phase: 'idle' };
     this.clearWarmTimer();
-    return had;
+    return true;
   }
 
   private clearWarmTimer(): void {
@@ -768,14 +867,18 @@ class Connection {
     useInstruction: boolean,
   ): Promise<void> {
     // 预开那趟可能正等着 `task-started`：等它落地，多半就能直接认领
-    if (this.starting !== null) await this.starting;
+    await this.waitForStarting();
     // 判「能不能开新 task」用 `canStartTask`，不用 `isIdle` —— 后者把预开的 task
     // 算作忙，而预开的那个正是要在这里认领的。
     if (!this.canStartTask) {
       throw new CosyVoiceError('连接正忙');
     }
     const adopted = this.takePending();
+    if (!this.isUsable) {
+      throw new CosyVoiceError('连接已不可用');
+    }
     const taskId = adopted?.taskId ?? hex32();
+    this.taskState = { phase: 'running', taskId };
     // 探针（`COSYVOICE_TRACE=1`）：把 346 ms 拆成「task 建立」与「首包合成」。
     // 连接已复用（见类注释），所以这段全是服务端时间，只能靠提前 run-task 或
     // 流式 continue-task 重叠掉。
@@ -786,7 +889,7 @@ class Connection {
     this.traceSentAt = adopted?.sentAt ?? performance.now();
     this.traceStartedAt = adopted?.startedAt ?? 0;
     this.traceFirstAt = null;
-    const connState = adopted?.conn ?? this.connSnapshot(this.traceSentAt);
+    const linkSnap = adopted?.conn ?? this.connSnapshot(this.traceSentAt);
     const probed = (chunk: Buffer): void => {
       if (this.traceFirstAt === null) {
         this.traceFirstAt = performance.now();
@@ -799,13 +902,13 @@ class Connection {
             + `合计 ${(this.traceFirstAt - this.traceSentAt).toFixed(0)} ms`,
           );
         }
-        this.reportTask(setup, first, false, adopted !== null, Number.NaN, connState);  // 非流式没有「供给」段
+        this.reportTask(setup, first, false, adopted !== null, Number.NaN, linkSnap);  // 非流式没有「供给」段
       }
       onChunk(chunk);
     };
     const prosody = EMOTION_PROSODY[args.emotion];
     this.sink = probed;
-    const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
+    const done = this.bindSettle(taskId);
     // 从这里开始算「等首块」：预开的 task 早就 run-task 了，但等音频是从这一刻起
     this.armStallWatch(taskId);
 
@@ -841,6 +944,9 @@ class Connection {
     }));
 
     const error = await done;
+    if (this.taskState.phase === 'running' && this.taskState.taskId === taskId) {
+      this.taskState = { phase: 'idle' };
+    }
     this.sink = null;
     this.clearStallWatch();
     if (error) {
@@ -879,7 +985,7 @@ class Connection {
     onChunk: (chunk: Buffer) => void,
   ): Promise<void> {
     // 同 `run()`：不能用 `isIdle`，预开的 task 正等着被认领
-    if (this.starting !== null) await this.starting;
+    await this.waitForStarting();
     if (!this.canStartTask) {
       throw new CosyVoiceError('连接正忙');
     }
@@ -892,7 +998,13 @@ class Connection {
       throw new CosyVoiceError('流式无正文（侧通道一个字都没放出来）');
     }
     const adopted = this.takePending();
+    // 等第一批文本的这段时间里连接可能已经断了。takePending 不可用时会把连接和
+    // 预开槽一起关掉；这里不能当成「没有预开」再发一个新 run-task。
+    if (!this.isUsable) {
+      throw new CosyVoiceError('连接已不可用');
+    }
     const taskId = adopted?.taskId ?? hex32();
+    this.taskState = { phase: 'running', taskId };
     const prosody = EMOTION_PROSODY[emotion];
     // 探针（`COSYVOICE_TRACE=1`），和 `run` 打同一行、同样两段，两条路才比得了：
     //   建立 = run-task → task-started
@@ -903,7 +1015,7 @@ class Connection {
     // 认领了预开的 task 时起点仍是当初那一趟 run-task（理由同 `run`）
     const sentAt = adopted?.sentAt ?? performance.now();
     this.traceStartedAt = adopted?.startedAt ?? 0;
-    const connState = adopted?.conn ?? this.connSnapshot(sentAt);
+    const linkSnap = adopted?.conn ?? this.connSnapshot(sentAt);
     let firstTextAt = 0;
     let lastTextAt = 0;
     let reported = false;
@@ -931,11 +1043,11 @@ class Connection {
             + `首包 ${firstMs.toFixed(0)} ms（流式：首包自首批文本送出起算）`,
           );
         }
-        this.reportTask(setupMs, firstMs, true, adopted !== null, feedMs, connState);
+        this.reportTask(setupMs, firstMs, true, adopted !== null, feedMs, linkSnap);
       }
       onChunk(chunk);
     };
-    const done = new Promise<Error | null>((resolve) => { this.settleWaiters.set(taskId, resolve); });
+    const done = this.bindSettle(taskId);
 
     if (adopted === null) {
       this.ws.send(JSON.stringify({
@@ -990,16 +1102,20 @@ class Connection {
       // 认领了预开的 task 就**不用等** —— 它的 task-started 早就回来了，这正是预热省下的那段。
       if (adopted === null) {
         const startedOk = await new Promise<boolean>((resolve) => {
-          const timer = setTimeout(() => { resolve(true); }, 3000);
+          // 超时必须是 false，和 beginTask 同一口径。曾经写成 true：
+          // `!startedOk` 不成立，文本照发，而下面的 `await done` 又没有超时。
+          // 服务端不回 task-finished / task-failed 时，sink 和 settleWaiters 永远非空，
+          // pump 的 chain 就永久卡死。
+          const timer = setTimeout(() => { resolve(false); }, 3000);
           // 按 task_id 注册：回执与正文在同一条连接上先后跑，共用一个槽位会让
           // 前一个 task 的 task-started 落到后一个头上，于是后者在自己的 task
           // 尚未 started 时就送文本，服务端报上面那个错（生产 7 天 2 次）。
           this.startedWaiters.set(taskId, (ok) => { clearTimeout(timer); resolve(ok); });
         });
         this.startedWaiters.delete(taskId);
-        if (!startedOk || this.failed) {
-          this.failed = true;
-          if (!this.closed) this.close();
+        if (!startedOk || this.connState !== 'open') {
+          // 立刻标失败并 settle，释放 sink 和所有 waiter。绝不能继续往下发文本。
+          this.fail(this.failure ?? new CosyVoiceError('task 未能开始'));
           throw new CosyVoiceError('task 未能开始');
         }
       }
@@ -1013,7 +1129,7 @@ class Connection {
       feedError = error instanceof Error ? error : new CosyVoiceError(String(error));
     }
     const finishAt = performance.now();
-    if (!this.closed) {
+    if (this.connState === 'open' && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({
         header: { action: 'finish-task', task_id: taskId, streaming: 'duplex' },
         payload: { input: {} },
@@ -1021,6 +1137,9 @@ class Connection {
     }
 
     const error = await done;
+    if (this.taskState.phase === 'running' && this.taskState.taskId === taskId) {
+      this.taskState = { phase: 'idle' };
+    }
     this.sink = null;
     this.clearStallWatch();
     // 有正文才报：一批都没送出去的 task 会把 -1 混进「首包」统计里
@@ -1054,10 +1173,7 @@ class Connection {
   }
 
   close(): void {
-    this.closed = true;
-    this.clearWarmTimer();
-    this.clearStallWatch();
-    try { this.ws.close(); } catch { /* 已经关了 */ }
+    this.shutdown('closed', this.failure ?? new CosyVoiceError('连接已关闭'));
   }
 }
 

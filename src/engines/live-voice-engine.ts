@@ -35,6 +35,25 @@ export interface LiveAudioLane extends FastLaneAudioLane {
    * 返回的活流与 `claim()` 同一形状：`chunks` / `transcript` / `delegateReason` / `delegateText`。
    */
   answerFromText?(userText: string): AgentAudioAnswer | null;
+  /**
+   * 排队让 omni 按文本提示开口（委派零音频补句、取消/看图/看时间回执、后台汇报）。
+   * 服务端同一时间只许一个在途 response；车道正忙（例如刚 `discard()` 还在等
+   * `response.done`）时进 FIFO 队列，等当前 response 收尾后再发，不撞 active response。
+   */
+  enqueueSpeech?(
+    promptText: string,
+    meta?: {
+      readonly kind?: 'ack' | 'announce';
+      readonly taskId?: string;
+      readonly query?: string;
+    },
+  ): (AgentAudioAnswer & { interrupt?(): void }) | null;
+  /** 回传 function_call_output 闭环工具调用（忙时排队，回到 ready 立刻发出）。 */
+  sendFunctionCallOutput?(callId: string, output: string): void;
+  /** 用唯一单槽动态事实刷新 session.update 的 instructions（去重 + 忙时只保留最新一份）。 */
+  updateDynamicContext?(snapshot: string): void;
+  /** 从服务端历史中删除指定 item_id（例如未核实的守卫轮幻觉回复）。 */
+  deleteItems?(itemIds: readonly string[]): void;
 }
 
 /**
@@ -87,7 +106,13 @@ export async function* streamLiveAnswer(
   // omni 自己决定转 dsh（`tool_call`）：音频可能已经说过一句垫话，照常播完了
   const reason = answer.delegateReason?.() ?? null;
   if (reason !== null) {
-    yield { type: 'delegate', reason, rewrittenQuery: answer.delegateText?.() ?? null };
+    const callId = answer.delegateCallId?.() ?? null;
+    yield {
+      type: 'delegate',
+      reason,
+      rewrittenQuery: answer.delegateText?.() ?? null,
+      ...(callId === null ? {} : { callId }),
+    };
   }
   const finalText = answer.transcript();
   yield { type: 'done', fullText: finalText, speech: finalText };

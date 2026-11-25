@@ -20,6 +20,14 @@ const DEFAULT_MAX_QUEUE = 16;
 const FAILURE_SUMMARY = '刚才那个任务没跑成，稍后可以再让我试一次。';
 
 const VERBATIM_TAG = /[\[【]\s*VERBATIM\s*[\]】]/;
+/**
+ * 首行原意标签。只认文本开头那一个，标签本身必须在同一行。
+ *
+ * 括号、冒号中英文都行，标签内外允许空白。后面的一个换行或空格是分隔，
+ * 不算进正文。内容 trim 后为空则当作没有原意。
+ */
+const CANONICAL_USER_TAG =
+  /^\s*[\[【][^\S\r\n]*原意[^\S\r\n]*[:：][^\S\r\n]*([^\r\n\]】]*?)[^\S\r\n]*[\]】][^\S\r\n]*(?:\r?\n)?/u;
 const LONG_DIGITS = /\d{5,}/;
 const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
 /** 订单号一类：1–4 个大写字母接至少 4 位数字，例如 `W8665881`、`AB1234`。 */
@@ -60,6 +68,26 @@ export function needsVerbatimRead(text: string): boolean {
 /** 去掉 `[VERBATIM]` / `【VERBATIM】`，其余字符原样留下。 */
 export function stripVerbatimTag(text: string): string {
   return text.replace(/[\[【]\s*VERBATIM\s*[\]】]/g, '');
+}
+
+/**
+ * 剥掉开头的 `[原意: …]` / `【原意：…】`。
+ *
+ * 没有这个标签时原样返回 `{ body: text }`。标签里的字 trim 后为空，
+ * 就只剥标签、不带 `canonicalUser`。
+ */
+export function parseCanonicalUserTag(text: string): {
+  readonly canonicalUser?: string;
+  readonly body: string;
+} {
+  const match = CANONICAL_USER_TAG.exec(text);
+  if (match === null) return { body: text };
+  const matched = match[0] ?? '';
+  if (matched === '') return { body: text };
+  const canonicalUser = (match[1] ?? '').trim();
+  const body = text.slice(matched.length);
+  if (canonicalUser === '') return { body };
+  return { canonicalUser, body };
 }
 
 /** 按码点截断。没超过上限时返回原字符串。 */
@@ -118,9 +146,71 @@ export interface BackgroundTaskRunner {
   cancelRunning?(reason: string): void;
 }
 
+/**
+ * 总线状态迁移。监听抛错会被吃掉，不能打断工人循环。
+ *
+ * `completed` / `failed` 的 `report` 只在这条任务要播报时带上：
+ * 静默任务、以及洗完没有可说正文的完成，都不带。
+ */
+export type BackgroundTaskLifecycleEvent =
+  | {
+      readonly type: 'queued';
+      readonly taskId: string;
+      readonly turnNo?: number;
+      readonly source: BackgroundTaskSource;
+      readonly query: string;
+      readonly silent: boolean;
+    }
+  | {
+      readonly type: 'upgraded';
+      readonly taskId: string;
+      readonly turnNo?: number;
+      readonly source: BackgroundTaskSource;
+      readonly query: string;
+      readonly silent: boolean;
+    }
+  | {
+      readonly type: 'running';
+      readonly taskId: string;
+      readonly turnNo?: number;
+      readonly source: BackgroundTaskSource;
+      readonly query: string;
+      readonly silent: boolean;
+    }
+  | {
+      readonly type: 'completed';
+      readonly taskId: string;
+      readonly turnNo?: number;
+      readonly source: BackgroundTaskSource;
+      readonly query: string;
+      readonly silent: boolean;
+      readonly report?: BackgroundTaskReport;
+    }
+  | {
+      readonly type: 'failed';
+      readonly taskId: string;
+      readonly turnNo?: number;
+      readonly source: BackgroundTaskSource;
+      readonly query: string;
+      readonly silent: boolean;
+      readonly error: string;
+      readonly report?: BackgroundTaskReport;
+    }
+  | {
+      readonly type: 'cancelled';
+      readonly taskId: string;
+      readonly turnNo?: number;
+      readonly source: BackgroundTaskSource;
+      readonly query: string;
+      readonly silent: boolean;
+      readonly reason: string;
+    };
+
 export interface BackgroundTaskBusOptions {
   readonly runner: BackgroundTaskRunner;
   readonly onReport: (report: BackgroundTaskReport) => void;
+  /** 状态迁移通知。抛错只记日志，不影响入队、执行和播报。 */
+  readonly onLifecycle?: (event: BackgroundTaskLifecycleEvent) => void;
   readonly now?: () => number;
   readonly log?: (line: string) => void;
   /** 队列上限（防异常洪峰，默认 16）。只数还在排队的，不算正在跑的那条。 */
@@ -145,6 +235,8 @@ interface Spoken {
   readonly clean: string;
   readonly emotion: string;
   readonly verbatim: boolean;
+  /** 模型纠正后的用户原话。没有 `[原意]`，或标签是空的，就不带。 */
+  readonly canonicalUser?: string;
 }
 
 function isSilentRequest(req: BackgroundTaskRequest): boolean {
@@ -184,34 +276,48 @@ function readResult(result: unknown): { text: string; speech?: string; emotion?:
 }
 
 /**
- * `[VERBATIM]` 比情绪标签长，`parseEmotion` 的括号只认 1–4 个字，剥不掉它。
- * 它若挡在 `[开心]` 前面，情绪会丢，所以先剥逐字标签再解析情绪。
+ * `[原意]` 和 `[VERBATIM]` 都比情绪标签长，`parseEmotion` 的括号只认 1–4 个字，剥不掉。
+ * 原意若留在正文里会被朗读，也会混进 `summary` / `verbatim`；逐字标签若挡在
+ * `[开心]` 前面，情绪会丢。所以先剥原意，再剥逐字标签，然后解析情绪。
+ * 原意优先用 `text` 里非空的那条，没有再看 `speech`。
  */
 function speakable(text: string, speech: string | undefined, emotionHint: string | undefined): Spoken {
-  const parsed = parseEmotion(stripVerbatimTag(text));
+  const fromText = parseCanonicalUserTag(text);
+  const fromSpeech = speech === undefined ? undefined : parseCanonicalUserTag(speech);
+  const canonicalUser = fromText.canonicalUser ?? fromSpeech?.canonicalUser;
+  const textBody = fromText.body;
+  const speechBody = fromSpeech?.body;
+  const parsed = parseEmotion(stripVerbatimTag(textBody));
   let body = parsed.rest;
   let emotion = parsed.emotion;
-  if (speech !== undefined && speech.trim() !== '') {
-    const parsedSpeech = parseEmotion(stripVerbatimTag(speech));
+  if (speechBody !== undefined && speechBody.trim() !== '') {
+    const parsedSpeech = parseEmotion(stripVerbatimTag(speechBody));
     body = parsedSpeech.rest;
     if (parsedSpeech.emotion !== DEFAULT_EMOTION) emotion = parsedSpeech.emotion;
   }
   if (emotionHint !== undefined) emotion = asEmotion(emotionHint);
-  const verbatim = needsVerbatimRead(text)
-    || (speech !== undefined && speech !== text && needsVerbatimRead(speech));
-  return { clean: cleanForSpeech(body), emotion, verbatim };
+  const verbatim = needsVerbatimRead(textBody)
+    || (speechBody !== undefined && speechBody !== textBody && needsVerbatimRead(speechBody));
+  const clean = cleanForSpeech(body);
+  if (canonicalUser === undefined) return { clean, emotion, verbatim };
+  return { clean, emotion, verbatim, canonicalUser };
 }
 
 export class BackgroundTaskBus {
   private readonly runner: BackgroundTaskRunner;
   private readonly onReport: (report: BackgroundTaskReport) => void;
+  private readonly onLifecycle: ((event: BackgroundTaskLifecycleEvent) => void) | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   private readonly maxQueue: number;
 
-  private disposed = false;
-  private scheduled = false;
-  private draining = false;
+  /**
+   * 工人循环相位。三个平级布尔收成这一份，避免「已释放但仍在排空」。
+   *
+   * 合法迁移只有：`idle → scheduled → draining → idle|scheduled`，
+   * 以及任意态 → `disposed`（吸收态，不可再离开）。
+   */
+  private phase: 'idle' | 'scheduled' | 'draining' | 'disposed' = 'idle';
   private seq = 0;
   private running: TaskRecord | null = null;
   private readonly reportable: TaskRecord[] = [];
@@ -227,6 +333,7 @@ export class BackgroundTaskBus {
   constructor(options: BackgroundTaskBusOptions) {
     this.runner = options.runner;
     this.onReport = options.onReport;
+    this.onLifecycle = options.onLifecycle;
     this.now = options.now ?? (() => Date.now());
     this.log = options.log ?? (() => {});
     const requested = options.maxQueue;
@@ -234,7 +341,7 @@ export class BackgroundTaskBus {
   }
 
   dispatch(req: BackgroundTaskRequest): BackgroundTaskHandle {
-    if (this.disposed) return this.deadHandle(req);
+    if (this.phase === 'disposed') return this.deadHandle(req);
     const existing = this.findLive(req);
     if (existing !== undefined) {
       // 已经 running / completed 的查询冻住。tool_call 的改写只在还排队时生效，
@@ -247,6 +354,9 @@ export class BackgroundTaskBus {
       this.writeLog(
         `  后台    去重 ${existing.taskId} turn=${String(req.turnNo)}${upgraded ? ' 升级查询' : ''}`,
       );
+      if (upgraded) {
+        this.emitLifecycle({ type: 'upgraded', ...this.taskLifecycle(existing) });
+      }
       return this.toHandle(existing, true);
     }
     if (this.queuedCount() >= this.maxQueue) {
@@ -260,6 +370,7 @@ export class BackgroundTaskBus {
     this.writeLog(
       `  后台    入队 ${task.taskId} ${task.source}${task.silent ? ' 静默' : ''} turn=${task.turnNo ?? '-'}`,
     );
+    this.emitLifecycle({ type: 'queued', ...this.taskLifecycle(task) });
     this.kick();
     return this.toHandle(task, false);
   }
@@ -269,7 +380,7 @@ export class BackgroundTaskBus {
    * 只把正文收成和 `dispatch` 一样的汇报。
    */
   ingestExternalAnnouncement(rawText: string, emotion?: string, query?: string): void {
-    if (this.disposed) return;
+    if (this.phase === 'disposed') return;
     if (typeof rawText !== 'string' || rawText.trim() === '') {
       this.writeLog('  后台    外部播报为空，忽略');
       return;
@@ -291,7 +402,13 @@ export class BackgroundTaskBus {
     return this.reportable.some((task) => task.state === 'queued');
   }
 
-  /** 排队中 + 正在跑。终态不算。 */
+  /**
+   * 排队中 + 正在跑。终态不算。
+   *
+   * `cancelAll` 把 `running.state` 写成 `cancelled` 之后，`runTask` 的 `finally`
+   * 还没把槽位摘掉。这里只认 `queued` / `running`，不能见槽位非空就 +1，
+   * 否则取消瞬间会把已经取消的那条再算成活跃。
+   */
   activeCount(): number {
     let n = this.queuedCount();
     const running = this.running;
@@ -307,7 +424,7 @@ export class BackgroundTaskBus {
    * 返回 true 当且仅当至少取消了一条要播报的任务。
    */
   cancelAll(reason = 'user_cancel', options?: { readonly includeSilent?: boolean }): boolean {
-    if (this.disposed) return false;
+    if (this.phase === 'disposed') return false;
     const n = this.stopTasks(reason, options?.includeSilent === true, true);
     if (n > 0) this.writeLog(`  后台    取消 ${n} 个播报任务（${reason}）`);
     return n > 0;
@@ -332,8 +449,7 @@ export class BackgroundTaskBus {
    * resolution 不会再变成这条连接的汇报。
    */
   dispose(): void {
-    if (this.disposed) return;
-    this.disposed = true;
+    if (!this.movePhase('disposed')) return;
     this.stopTasks('dispose', true, false);
     this.writeLog('  后台    已释放');
   }
@@ -410,12 +526,37 @@ export class BackgroundTaskBus {
     return this.reportable.length + this.silentQueue.length;
   }
 
+  /** 重新读吸收态。两次检查之间的纯函数调用不会被当成「相位可能变了」。 */
+  private isDisposed(): boolean {
+    return this.phase === 'disposed';
+  }
+
+  /**
+   * 相位迁移。非法边（含 `disposed` 再离开）直接拒绝，调用方不得继续排空。
+   */
+  private movePhase(next: 'idle' | 'scheduled' | 'draining' | 'disposed'): boolean {
+    const from = this.phase;
+    if (from === 'disposed' || from === next) return false;
+    const allowed = next === 'disposed'
+      || (from === 'idle' && next === 'scheduled')
+      || (from === 'scheduled' && next === 'draining')
+      || (from === 'draining' && (next === 'idle' || next === 'scheduled'));
+    if (!allowed) return false;
+    this.phase = next;
+    return true;
+  }
+
   private kick(): void {
-    if (this.disposed || this.draining || this.scheduled) return;
-    this.scheduled = true;
+    // 正在 `draining` 时不能改成 `scheduled`：那会让当前循环提前退出，
+    // 并让下一条微任务跟还没结束的 `execute` 叠在一起。新任务留在队列里，
+    // 由这一轮循环或 `finally` 接走。
+    if (this.phase !== 'idle') return;
+    if (!this.movePhase('scheduled')) return;
+    this.queueDrain();
+  }
+
+  private queueDrain(): void {
     queueMicrotask(() => {
-      this.scheduled = false;
-      if (this.disposed) return;
       void this.drain().catch((err: unknown) => {
         this.writeLog(`  后台    循环异常：${errorText(err)}`);
       });
@@ -423,10 +564,10 @@ export class BackgroundTaskBus {
   }
 
   private async drain(): Promise<void> {
-    if (this.draining || this.disposed) return;
-    this.draining = true;
+    // `dispose()` 若赶在微任务之前把 `scheduled` 收成吸收态，这里进不了 `draining`。
+    if (!this.movePhase('draining')) return;
     try {
-      while (!this.disposed) {
+      while (this.phase === 'draining') {
         const task = this.reportable.shift() ?? this.silentQueue.shift();
         if (task === undefined) break;
         if (task.state !== 'queued') continue;
@@ -437,13 +578,17 @@ export class BackgroundTaskBus {
         }
       }
     } finally {
-      this.draining = false;
-      if (!this.disposed && this.queuedCount() > 0) this.kick();
+      if (this.phase !== 'draining') return;
+      if (this.queuedCount() > 0) {
+        if (this.movePhase('scheduled')) this.queueDrain();
+      } else {
+        this.movePhase('idle');
+      }
     }
   }
 
   private async runTask(task: TaskRecord): Promise<void> {
-    if (this.disposed || task.state !== 'queued') return;
+    if (this.phase === 'disposed' || task.state !== 'queued') return;
     const controller = new AbortController();
     task.controller = controller;
     if (!move(task, 'running')) {
@@ -451,6 +596,7 @@ export class BackgroundTaskBus {
       return;
     }
     this.running = task;
+    this.emitLifecycle({ type: 'running', ...this.taskLifecycle(task) });
     try {
       const result = await this.runner.execute({
         taskId: task.taskId,
@@ -470,39 +616,46 @@ export class BackgroundTaskBus {
   }
 
   private finishOk(task: TaskRecord, result: unknown): void {
-    if (task.state !== 'running' || this.disposed) return;
+    if (task.state !== 'running' || this.isDisposed()) return;
     const raw = readResult(result);
     const spoken = speakable(raw.text, raw.speech, raw.emotion);
-    if (task.state !== 'running' || this.disposed) return;
+    if (task.state !== 'running' || this.isDisposed()) return;
     if (!move(task, 'completed')) return;
+    const report = task.silent || spoken.clean === ''
+      ? undefined
+      : this.toReport(task.taskId, task.source, task.query, spoken, task.turnNo);
     if (task.silent) {
       this.writeLog(`  后台    静默完成 ${task.taskId}（不播报）`);
-      return;
-    }
-    if (spoken.clean === '') {
+    } else if (report === undefined) {
       this.writeLog(`  后台    完成 ${task.taskId} 但清洗后为空，不播报`);
-      return;
+    } else {
+      this.writeLog(`  后台    完成 ${task.taskId} → ${preview(report.summary)}`);
     }
-    const report = this.toReport(task.taskId, task.source, task.query, spoken);
-    this.writeLog(`  后台    完成 ${task.taskId} → ${preview(report.summary)}`);
-    this.deliver(report);
+    this.emitLifecycle(
+      report === undefined
+        ? { type: 'completed', ...this.taskLifecycle(task) }
+        : { type: 'completed', ...this.taskLifecycle(task), report },
+    );
+    if (report !== undefined) this.deliver(report);
   }
 
   private finishErr(task: TaskRecord, err: unknown): void {
-    if (task.state !== 'running' || this.disposed) return;
+    if (task.state !== 'running' || this.phase === 'disposed') return;
     if (!move(task, 'failed')) return;
     this.dropTurn(task);
+    const error = errorText(err);
+    const report = task.silent ? undefined : this.failureReport(task);
     if (task.silent) {
-      this.writeLog(`  后台    静默失败 ${task.taskId}：${errorText(err)}（不播报）`);
-      return;
+      this.writeLog(`  后台    静默失败 ${task.taskId}：${error}（不播报）`);
+    } else {
+      this.writeLog(`  后台    失败 ${task.taskId}：${error}`);
     }
-    this.writeLog(`  后台    失败 ${task.taskId}：${errorText(err)}`);
-    this.deliver({
-      taskId: task.taskId,
-      source: task.source,
-      query: task.query,
-      summary: FAILURE_SUMMARY,
-    });
+    this.emitLifecycle(
+      report === undefined
+        ? { type: 'failed', ...this.taskLifecycle(task), error }
+        : { type: 'failed', ...this.taskLifecycle(task), error, report },
+    );
+    if (report !== undefined) this.deliver(report);
   }
 
   private toReport(
@@ -510,19 +663,71 @@ export class BackgroundTaskBus {
     source: BackgroundTaskSource,
     query: string,
     spoken: Spoken,
+    turnNo?: number,
   ): BackgroundTaskReport {
     const summary = spoken.verbatim ? clipSummary(spoken.clean, SUMMARY_LIMIT) : spoken.clean;
-    if (spoken.verbatim) {
-      return {
-        taskId,
-        source,
-        query,
-        summary,
-        verbatim: spoken.clean,
-        emotion: spoken.emotion,
-      };
+    const report: BackgroundTaskReport = spoken.verbatim
+      ? {
+          taskId,
+          source,
+          query,
+          summary,
+          verbatim: spoken.clean,
+          emotion: spoken.emotion,
+        }
+      : { taskId, source, query, summary, emotion: spoken.emotion };
+    return this.withMeta(report, turnNo, spoken.canonicalUser);
+  }
+
+  private failureReport(task: TaskRecord): BackgroundTaskReport {
+    return this.withMeta({
+      taskId: task.taskId,
+      source: task.source,
+      query: task.query,
+      summary: FAILURE_SUMMARY,
+    }, task.turnNo, undefined);
+  }
+
+  /**
+   * `turnNo` / `canonicalUser` 由并行改动加在 `BackgroundTaskReport` 上。
+   * 这里只在有值时挂上，避免把空原意或未编号的轮次写成 `undefined`。
+   */
+  private withMeta(
+    report: BackgroundTaskReport,
+    turnNo: number | undefined,
+    canonicalUser: string | undefined,
+  ): BackgroundTaskReport {
+    const meta: { turnNo?: number; canonicalUser?: string } = {};
+    if (turnNo !== undefined) meta.turnNo = turnNo;
+    if (canonicalUser !== undefined && canonicalUser !== '') meta.canonicalUser = canonicalUser;
+    if (meta.turnNo === undefined && meta.canonicalUser === undefined) return report;
+    return Object.assign({}, report, meta);
+  }
+
+  private taskLifecycle(task: TaskRecord): {
+    readonly taskId: string;
+    readonly turnNo?: number;
+    readonly source: BackgroundTaskSource;
+    readonly query: string;
+    readonly silent: boolean;
+  } {
+    const base = {
+      taskId: task.taskId,
+      source: task.source,
+      query: task.query,
+      silent: task.silent,
+    };
+    if (task.turnNo === undefined) return base;
+    return { ...base, turnNo: task.turnNo };
+  }
+
+  private emitLifecycle(event: BackgroundTaskLifecycleEvent): void {
+    if (this.onLifecycle === undefined) return;
+    try {
+      this.onLifecycle(event);
+    } catch (err) {
+      this.writeLog(`  后台    生命周期回调异常：${errorText(err)}`);
     }
-    return { taskId, source, query, summary, emotion: spoken.emotion };
   }
 
   private deliver(report: BackgroundTaskReport): void {
@@ -535,14 +740,15 @@ export class BackgroundTaskBus {
 
   /** @returns 这次实际取消掉的「要播报」任务数。静默任务不算。 */
   private stopTasks(reason: string, includeSilent: boolean, cancelRunner: boolean): number {
-    let reportableCancelled = this.cancelQueued(this.reportable);
-    if (includeSilent) this.cancelQueued(this.silentQueue);
+    let reportableCancelled = this.cancelQueued(this.reportable, reason);
+    if (includeSilent) this.cancelQueued(this.silentQueue, reason);
     const running = this.running;
     if (running === null || running.state !== 'running') return reportableCancelled;
     if (running.silent && !includeSilent) return reportableCancelled;
     if (!move(running, 'cancelled')) return reportableCancelled;
     this.dropTurn(running);
     running.controller?.abort(reason);
+    this.emitLifecycle({ type: 'cancelled', ...this.taskLifecycle(running), reason });
     if (!running.silent) reportableCancelled += 1;
     if (cancelRunner) {
       try {
@@ -554,7 +760,7 @@ export class BackgroundTaskBus {
     return reportableCancelled;
   }
 
-  private cancelQueued(queue: TaskRecord[]): number {
+  private cancelQueued(queue: TaskRecord[], reason: string): number {
     let n = 0;
     const keep: TaskRecord[] = [];
     for (const task of queue) {
@@ -563,6 +769,7 @@ export class BackgroundTaskBus {
         continue;
       }
       this.dropTurn(task);
+      this.emitLifecycle({ type: 'cancelled', ...this.taskLifecycle(task), reason });
       if (!task.silent) n += 1;
     }
     queue.length = 0;

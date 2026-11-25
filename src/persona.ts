@@ -186,10 +186,50 @@ export const TASK_RULE_PLAIN = [
 export const LIVE_BACKEND_TASK_DIRECTIVE =
   `你是${PERSONA_NAME}的无头执行与记忆后端，不直接对用户说话。`
   + '直接返回简洁的事实结论，不要寒暄、不要垫话、不要情绪标签。'
-  + '若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。';
+  + '若输出里有必须逐字朗读的精确数字、端口、标识或代码，保持准确并尽量简短。'
+  + '仅当用户语音转写存在明显同音字或误听错字时，在第一行写 [原意: 纠正后的用户原话]，第二行再写简洁事实结论；若原话本身准确则不要写该标签。';
 
 /**
- * 交给 `OmniShadow.speakFromText` 的 `role: 'user'` 提示。
+ * Pure Live 下需要 omni 自己口头应一声的四种短回执类型。
+ *
+ * live 路径绝不调用外部 TTS（CosyVoice / MiMo）；哪怕 omni 偶发零音频 tool_call，
+ * 或者 `clock_override` / `photo_delegate` / `cancel_bg` 需要丢掉原回复再应声，
+ * 也统一走提示词排队让 omni 用同一副嗓子自己说。
+ */
+export type LiveAckKind = 'delegate' | 'clock' | 'photo' | 'cancel';
+
+/**
+ * 交给 `OmniShadow.enqueueSpeech` 的短回执提示。
+ */
+export function buildLiveAckPrompt(kind: LiveAckKind, query?: string): string {
+  const topic = (query ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  switch (kind) {
+    case 'delegate':
+      return [
+        `用一句极短的口语（三到八个字，比如「好，我查查」），以${PERSONA_NAME}的身份应哥一声，说明你已经接下这件事正在后台处理。`,
+        '不要调用任何工具，不要先猜答案，也不要把这段提示再念一遍。',
+        ...(topic === '' ? [] : [`哥要办的事：${topic}`]),
+      ].join('\n');
+    case 'clock':
+      return [
+        `哥刚问了时间，后台正在核对准确时间。用一句极短的口语（三到八个字，比如「我看一眼时间」），以${PERSONA_NAME}的身份应哥一声。`,
+        '不要自己猜几点，不要调用任何工具，也不要把这段提示再念一遍。',
+      ].join('\n');
+    case 'photo':
+      return [
+        `哥刚让你看图，后台正在看画面。用一句极短的口语（三到八个字，比如「我看看」），以${PERSONA_NAME}的身份应哥一声。`,
+        '不要编造画面内容，不要调用任何工具，也不要把这段提示再念一遍。',
+      ].join('\n');
+    case 'cancel':
+      return [
+        `哥让你别查了，后台任务已经停掉了。用一句极短的口语（三到八个字，比如「好，不查了」），以${PERSONA_NAME}的身份应哥一声。`,
+        '不要调用任何工具，也不要把这段提示再念一遍。',
+      ].join('\n');
+  }
+}
+
+/**
+ * 交给 `OmniShadow.speakFromText` / `enqueueSpeech` 的 `role: 'user'` 提示。
  *
  * 让 omni 以 {@link PERSONA_NAME} 的身份，用一两句口语把后台结论告诉「哥」。
  * 会话里已经有短人设，这里不再重复那段 instructions，也不许它再调工具。
@@ -198,10 +238,12 @@ export function buildLiveReportPrompt(input: {
   readonly query: string;
   readonly summary: string;
   readonly needsConfirm?: string;
+  readonly verbatim?: boolean;
 }): string {
   const lines = [
     `用一两句口语，以${PERSONA_NAME}的身份直接告诉哥下面这件事的结果。`,
     '不要调用任何工具，也不要把这段提示再念一遍。',
+    ...(input.verbatim === true ? ['结果里的精确数字、端口、路径或编号要念准确，其余用简洁口语概括。'] : []),
     `哥要办的事：${input.query}`,
     `结果：${input.summary}`,
   ];

@@ -89,6 +89,13 @@ export class AppSession {
   private readonly stopHeartbeat: () => void;
   /** 对话层实体；没有就是"只有宠物环"（不开主动开口时） */
   private readonly dialog: DialogRuntime | null;
+  /**
+   * 对话相位的唯一副本，**只**由 {@link onDialogState} 写入。
+   *
+   * 播报能不能占 `announce`、思考期能不能把话筒放空，都看这一份。
+   * 另存一个布尔会和状态机各说各的，finally 一释放就把思考期的话筒放成 `null`。
+   */
+  private dialogPhase: DialogState = 'listening';
   private closed = false;
 
   constructor(options: AppSessionOptions) {
@@ -187,22 +194,20 @@ export class AppSession {
    *
    * | FSM 状态 | 话筒 |
    * |---|---|
-   * | `thinking` | `reply`（从 `user` 移交过来） |
-   * | `speaking` | `reply`（整段播放都算应答在说话） |
+   * | `thinking` / `speaking` | 必为 `reply`。当前是 `user` 或 `announce` 时移交，不许申请失败后留在原地 |
    * | `listening` / `ending` / `closed` | 释放 `reply` |
-   * | `awaiting_shot` | 不动（用户随时可以说话，话筒本来就该空着等他） |
+   * | `awaiting_shot` | 空着就空着；`user` / `announce` 移交成 `reply`，免得播报占着等快门 |
    */
   onDialogState(state: DialogState): void {
     if (this.closed) {
       return;
     }
+    this.dialogPhase = state;
     switch (state) {
       case 'thinking':
-        this.handToReply();
-        return;
       case 'speaking':
-        // 首块音频写出：正常该是 reply，兜一下（直接 prompt 进来的轮次没有 user 阶段）
-        this.claim('reply');
+        // 直接 prompt 进来的轮次没有 user 阶段，`handToReply` 会自己去申请
+        this.handToReply();
         return;
       case 'listening':
       case 'ending':
@@ -210,6 +215,7 @@ export class AppSession {
         this.release('reply');
         return;
       case 'awaiting_shot':
+        this.handForegroundMic();
         return;
     }
   }
@@ -229,18 +235,35 @@ export class AppSession {
     this.release('reply');
   }
 
-  /** 后台汇报排队状态。`spoken` = 刚刚播完一条（算"出过声"，推迟下次搭话）。 */
+  /**
+   * 后台汇报排队状态。`spoken` = 刚刚播完一条（算"出过声"，推迟下次搭话）。
+   *
+   * `pending` 只说明队列里还有没有货，不是「现在去抢话筒」：
+   *
+   * - 只有前台真的空闲（`listening`）才申请 `announce`
+   * - `thinking` / `speaking` 期间话筒必须是 `reply`，不许放成 `null`，也不许被播报抢回去
+   * - 宠物只在真正占上、或合法排队等待时才收到 `announcePending`
+   */
   announce(pending: boolean, spoken = false): void {
     if (this.closed) {
       return;
     }
-    this.pet?.announce(pending, spoken);
-    if (pending) {
-      // `announce` 抢不动 `reply`（ADR-0001 §6）：正题没说完之前不插播
-      this.claim('announce');
-    } else {
-      this.release('announce');
+    if (!pending) {
+      this.releaseAnnounceKeepingReply();
+      this.pet?.announce(false, spoken);
+      return;
     }
+    if (this.dialogPhase === 'listening') {
+      const held = this.claim('announce');
+      // 没占上但话筒在别人手里：播报在排队，不是被丢掉
+      if (held || this.currentOwner() !== null) {
+        this.pet?.announce(true, spoken);
+      }
+      return;
+    }
+    this.keepReplyWhileForegroundBusy();
+    // 前台正忙，队列还在：合法等待。告诉宠物让位，但不去 `claim('announce')`
+    this.pet?.announce(true, spoken);
   }
 
   /** 快反射之类的短音占用。 */
@@ -296,13 +319,17 @@ export class AppSession {
 
   // ---------------------------------------------------------------- 话筒
 
-  /** 申请（会走抢占表）。宠物在的时候经它转一手，好让它看到 `floorBusy` 变化。 */
-  private claim(owner: FloorOwner): void {
+  /**
+   * 申请（会走抢占表）。宠物在的时候经它转一手，好让它看到 `floorBusy` 变化。
+   *
+   * @returns 拿到话筒没有。失败必须交还给调用方 —— 吞掉的话，思考期申请
+   * `reply` 失败后播报一释放，话筒就是 `null`，宠物会叠着抢话。
+   */
+  private claim(owner: FloorOwner): boolean {
     if (this.pet === null) {
-      this.floor.acquire(owner);
-      return;
+      return this.floor.acquire(owner);
     }
-    this.pet.acquireFloor(owner);
+    return this.pet.acquireFloor(owner);
   }
 
   private release(owner: FloorOwner): void {
@@ -313,20 +340,82 @@ export class AppSession {
     this.pet.releaseFloor(owner);
   }
 
-  /** 定稿后的移交：`user → reply`；没有 `user` 占着就走普通申请。 */
-  private handToReply(): void {
-    if (this.currentOwner() === 'reply') {
+  /** `from` 主动交给 `to`，不走抢占表，中间不经过 `null`。 */
+  private transfer(from: FloorOwner, to: FloorOwner): boolean {
+    if (this.pet === null) {
+      return this.floor.handoff(from, to);
+    }
+    return this.pet.handoffFloor(from, to);
+  }
+
+  /**
+   * 前台应答占住话筒。
+   *
+   * 当前是 `user` 或 `announce` 时**无条件移交**（`user` 不可抢；`announce` 若先
+   * 释放再申请，会闪一帧 `null`）。其它占用者才走抢占表。
+   */
+  private handToReply(): boolean {
+    const owner = this.currentOwner();
+    if (owner === 'reply') {
+      return true;
+    }
+    if (owner === 'user' || owner === 'announce') {
+      if (this.transfer(owner, 'reply')) {
+        return true;
+      }
+    }
+    return this.claim('reply');
+  }
+
+  /** `awaiting_shot`：只把 `user` / `announce` 交出去，空话筒保持空。 */
+  private handForegroundMic(): boolean {
+    const owner = this.currentOwner();
+    if (owner === 'user' || owner === 'announce') {
+      return this.transfer(owner, 'reply');
+    }
+    return owner === 'reply';
+  }
+
+  /**
+   * 播报说完了。思考 / 播音 / 等快门时，若手里还是 `announce`，移交给 `reply`，
+   * 不许 `release` 成 `null`。本来就空着的 `thinking` / `speaking` 也要补上 `reply`。
+   */
+  private releaseAnnounceKeepingReply(): void {
+    const cover = this.dialogPhase === 'thinking'
+      || this.dialogPhase === 'speaking'
+      || this.dialogPhase === 'awaiting_shot';
+    if (this.currentOwner() === 'announce' && cover) {
+      this.transfer('announce', 'reply');
       return;
     }
-    if (this.currentOwner() === 'user') {
-      if (this.pet === null) {
-        this.floor.handoff('user', 'reply');
-      } else {
-        this.pet.handoffFloor('user', 'reply');
+    this.release('announce');
+    if (
+      (this.dialogPhase === 'thinking' || this.dialogPhase === 'speaking')
+      && this.currentOwner() === null
+    ) {
+      this.claim('reply');
+    }
+  }
+
+  /**
+   * 队列还有货，但前台已经不是 `listening`：不要去抢 `announce`。
+   * `thinking` / `speaking` 若空着或仍被播报占着，补成 `reply`。
+   */
+  private keepReplyWhileForegroundBusy(): void {
+    const owner = this.currentOwner();
+    if (this.dialogPhase === 'thinking' || this.dialogPhase === 'speaking') {
+      if (owner === 'announce') {
+        this.transfer('announce', 'reply');
+        return;
+      }
+      if (owner === null) {
+        this.claim('reply');
       }
       return;
     }
-    this.claim('reply');
+    if (this.dialogPhase === 'awaiting_shot' && owner === 'announce') {
+      this.transfer('announce', 'reply');
+    }
   }
 
   private currentOwner(): FloorOwner | null {

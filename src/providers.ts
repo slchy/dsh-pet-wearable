@@ -98,6 +98,15 @@ export interface AgentAudioAnswer {
    * 和 {@link delegateReason} 分开：那个只回答「要不要转」，这个带上**内容**。
    */
   delegateText?(): string | null;
+  /**
+   * 这一轮 `function_call` 的 `call_id`。没有就是 `null`。
+   * 编排层用它回 `function_call_output`，把工具结果写回同一条会话。
+   */
+  delegateCallId?(): string | null;
+  /** 这一轮对应的 user 项 id；还没创建出来就是 `null`。 */
+  userItemId?(): string | null;
+  /** 这一轮助手项（含 `function_call` 项）的 id。 */
+  assistantItemIds?(): readonly string[];
 }
 
 /**
@@ -255,6 +264,12 @@ export interface BackgroundTaskReport {
   readonly needsConfirm?: string;
   /** 可选情绪标签（透传给回落 TTS） */
   readonly emotion?: string;
+  /** 产生这份汇报的对话轮次号 */
+  readonly turnNo?: number;
+  /** 归一后的用户原话 */
+  readonly canonicalUser?: string;
+  /** 上一轮用户原话 */
+  readonly previousUserText?: string;
 }
 
 /**

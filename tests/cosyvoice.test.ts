@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, type WebSocket } from 'ws';
 
 import { COSYVOICE_SAMPLE_RATE, CosyVoiceError, DEFAULT_COSYVOICE_EMOTION_MODE, EMOTION_INSTRUCTIONS, EMOTION_PROSODY, cosyVoiceTts, isSilentChunk, splitStreamBatch, trimLeadingSilence, streamBatchReady } from '../src/cosyvoice.ts';
 import { EMOTIONS, type Emotion } from '../src/emotion.ts';
@@ -781,6 +781,207 @@ test('beginTask 超时后这条连接不能再复用', { timeout: 8000 }, async 
     for await (const chunk of tts.synthesize('在。')) bytes += chunk.length;
     assert.ok(bytes > 0);
     assert.equal(connections, 2);
+  } finally {
+    if (prev === undefined) delete process.env['COSYVOICE_PREWARM'];
+    else process.env['COSYVOICE_PREWARM'] = prev;
+    for (const client of wss.clients) client.terminate();
+    await new Promise<void>((resolve) => { wss.close(() => { resolve(); }); });
+  }
+});
+
+/**
+ * `runFeed` 等 `task-started` 的超时曾经 resolve 成 true：文本照发，
+ * 随后 `await done` 没有超时。服务端再不回 task-finished，sink / settleWaiters
+ * 就不空，pump 的 chain 永久卡死，后面每一句都排不上。
+ */
+test('流式：task-started 一直不来就记失败并放开泵，下一句走新连接', { timeout: 12000 }, async () => {
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((resolve) => { wss.once('listening', resolve); });
+  let connections = 0;
+  const actions: string[][] = [];
+  wss.on('connection', (socket) => {
+    const mine = ++connections;
+    const log: string[] = [];
+    actions.push(log);
+    socket.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      let msg: { header?: { action?: string; task_id?: string } };
+      try {
+        msg = JSON.parse(String(data)) as { header?: { action?: string; task_id?: string } };
+      } catch {
+        return;
+      }
+      const action = msg.header?.action ?? '';
+      log.push(action);
+      // 第一条连接永远不回 task-started，用来打超时那条死锁。
+      if (mine === 1) return;
+      const reply = (event: string): void => {
+        if (socket.readyState !== socket.OPEN) return;
+        socket.send(JSON.stringify({ header: { event, task_id: msg.header?.task_id } }));
+      };
+      if (action === 'run-task') reply('task-started');
+      if (action === 'continue-task') {
+        const loud = Buffer.alloc(4800);
+        for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(3000, i);
+        socket.send(loud);
+      }
+      if (action === 'finish-task') reply('task-finished');
+    });
+  });
+  const address = wss.address();
+  assert.ok(address !== null && typeof address === 'object');
+  const tts = cosyVoiceTts({ apiKey: 'sk-test', url: `ws://127.0.0.1:${address.port}` });
+  try {
+    const started = Date.now();
+    const queue = new TokenQueue();
+    queue.push('在，哥。');
+    queue.close();
+    await assert.rejects(
+      (async () => {
+        for await (const chunk of tts.synthesizeStream!(queue)) void chunk;
+      })(),
+      (error: unknown) => {
+        assert.ok(error instanceof CosyVoiceError);
+        assert.match(error.message, /task 未能开始/);
+        return true;
+      },
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 2500, `应当真的等到 task-started 超时，实际 ${elapsed} ms`);
+    assert.ok(elapsed < 6000, `超时后不能再干等 task-finished，实际 ${elapsed} ms`);
+    assert.equal(connections, 1, '失败的这句不能偷偷再开一条连接');
+    assert.deepEqual(actions[0], ['run-task'], '超时后不能再发 continue-task / finish-task');
+
+    const queue2 = new TokenQueue();
+    queue2.push('第二句。');
+    queue2.close();
+    const second = (async (): Promise<number> => {
+      let bytes = 0;
+      for await (const chunk of tts.synthesizeStream!(queue2)) bytes += chunk.length;
+      return bytes;
+    })();
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    const raced = await Promise.race([
+      second.then((bytes) => ({ kind: 'ok' as const, bytes })),
+      new Promise<{ kind: 'timeout' }>((resolve) => {
+        stallTimer = setTimeout(() => { resolve({ kind: 'timeout' }); }, 2000);
+      }),
+    ]);
+    if (stallTimer !== undefined) clearTimeout(stallTimer);
+    assert.equal(raced.kind, 'ok', '泵链被上一句卡死，下一句没有开始');
+    if (raced.kind === 'ok') {
+      assert.ok(raced.bytes > 0, '新连接上应当出声');
+    }
+    assert.equal(connections, 2);
+    const secondActions = actions[1] ?? [];
+    assert.ok(secondActions.includes('continue-task'), `新连接没送到文本：${secondActions.join(',')}`);
+  } finally {
+    for (const client of wss.clients) client.terminate();
+    await new Promise<void>((resolve) => { wss.close(() => { resolve(); }); });
+  }
+});
+
+/**
+ * 预开的空 task 在连接已经不可用时被认领：以前先把 pending 摘掉再发现不可用、
+ * 返回 null。本地账本忘了这单，套接字上却还挂着服务端的空 task；接着又被当成
+ * 「没有预开」去发新 run-task，`await done` 也没人叫醒。
+ */
+test('连接不可用时认领预开 task 会整条关掉，不把空 task 留成半悬空', { timeout: 8000 }, async () => {
+  const prev = process.env['COSYVOICE_PREWARM'];
+  delete process.env['COSYVOICE_PREWARM'];
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((resolve) => { wss.once('listening', resolve); });
+  const actions: string[][] = [];
+  const sockets: WebSocket[] = [];
+  wss.on('connection', (socket) => {
+    sockets.push(socket);
+    const mine = sockets.length;
+    const log: string[] = [];
+    actions.push(log);
+    socket.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      let msg: { header?: { action?: string; task_id?: string }; payload?: { input?: { text?: string } } };
+      try {
+        msg = JSON.parse(String(data)) as {
+          header?: { action?: string; task_id?: string };
+          payload?: { input?: { text?: string } };
+        };
+      } catch {
+        return;
+      }
+      const action = msg.header?.action ?? '';
+      log.push(action === 'continue-task' ? `continue:${msg.payload?.input?.text ?? ''}` : action);
+      if (mine === 1) {
+        if (action === 'run-task') {
+          socket.send(JSON.stringify({ header: { event: 'task-started', task_id: msg.header?.task_id } }));
+        }
+        return;
+      }
+      const reply = (event: string): void => {
+        if (socket.readyState !== socket.OPEN) return;
+        socket.send(JSON.stringify({ header: { event, task_id: msg.header?.task_id } }));
+      };
+      if (action === 'run-task') reply('task-started');
+      if (action === 'continue-task') {
+        const loud = Buffer.alloc(4800);
+        for (let i = 0; i < loud.length; i += 2) loud.writeInt16LE(3000, i);
+        socket.send(loud);
+      }
+      if (action === 'finish-task') reply('task-finished');
+    });
+  });
+  const address = wss.address();
+  assert.ok(address !== null && typeof address === 'object');
+  const tts = cosyVoiceTts({
+    apiKey: 'sk-test',
+    url: `ws://127.0.0.1:${address.port}`,
+    useInstruction: false,
+  });
+  try {
+    tts.prewarm?.();
+    await new Promise((resolve) => { setTimeout(resolve, 200); });
+    assert.equal(sockets.length, 1);
+    assert.deepEqual(actions[0], ['run-task'], '预开应当只发出 run-task 并已经 task-started');
+
+    const queue = new TokenQueue();
+    const consuming = (async () => {
+      for await (const chunk of tts.synthesizeStream!(queue)) void chunk;
+    })();
+    // 停在 runFeed 等第一批文本：预开槽还在，随后把连接打成不可用再喂文本。
+    await new Promise((resolve) => { setTimeout(resolve, 100); });
+    const first = sockets[0];
+    assert.ok(first);
+    first.close();
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+    const started = Date.now();
+    queue.push('在，哥。');
+    queue.close();
+    await assert.rejects(consuming, (error: unknown) => {
+      assert.ok(error instanceof CosyVoiceError);
+      assert.match(error.message, /连接已不可用/);
+      return true;
+    });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1000, `不可用连接上的认领应当马上失败，实际 ${elapsed} ms`);
+    assert.deepEqual(
+      actions[0],
+      ['run-task'],
+      '不能在死连接上再发 run/continue/finish，否则空 task 已经脱离账本',
+    );
+    assert.notEqual(first.readyState, first.OPEN);
+
+    const queue2 = new TokenQueue();
+    queue2.push('第二句。');
+    queue2.close();
+    let bytes = 0;
+    for await (const chunk of tts.synthesizeStream!(queue2)) bytes += chunk.length;
+    assert.ok(bytes > 0, '下一句应当在新连接上出声');
+    assert.equal(sockets.length, 2);
+    const secondActions = actions[1] ?? [];
+    assert.ok(
+      secondActions.some((item) => item.startsWith('continue:')),
+      `新连接没送到文本：${secondActions.join(',')}`,
+    );
   } finally {
     if (prev === undefined) delete process.env['COSYVOICE_PREWARM'];
     else process.env['COSYVOICE_PREWARM'] = prev;

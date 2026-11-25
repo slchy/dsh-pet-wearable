@@ -28,9 +28,16 @@ import WebSocket from 'ws';
 import type { SttProvider } from './providers.ts';
 
 const OPEN = 1;
+const CLOSING = 2;
 const CLOSED = 3;
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
 const DEFAULT_MODEL = 'qwen3-asr-flash-realtime';
+/**
+ * `commit` 之后等 `.completed` / `.failed` 的上限。
+ * 服务端漏回定稿时，看门狗到点就解除 `awaitingDecode`，避免整条会话卡死。
+ * `decodeTimeoutMs <= 0` 关闭。
+ */
+const DEFAULT_DECODE_TIMEOUT_MS = 8_000;
 /** 解码窗口内最多暂存多少音频（正常解码 ~261 ms；2 s 是防挂死的上限） */
 const MAX_HELD_BYTES = 32 * 2000;
 /** 解码窗口内「还没开口」时保留的最近音频（150 ms，与 omni-shadow 一致） */
@@ -80,6 +87,11 @@ export interface QwenRealtimeAsrOptions {
   /** `vad` 模式下的静音窗（服务端下限 200，填更小不生效 —— 见探针） */
   readonly vadSilenceMs?: number;
   /**
+   * 等这一发 `commit` 的定稿最多多久（毫秒）。缺省 {@link DEFAULT_DECODE_TIMEOUT_MS}。
+   * `<= 0` 关闭看门狗。到点只解除等待并按解码结束冲刷，不另造一句转写。
+   */
+  readonly decodeTimeoutMs?: number;
+  /**
    * 一句封段后的定稿。
    *
    * @param commitSeq 产出这句的那一发 commit 的**因果出生证**（见 `causal.ts`）。
@@ -114,9 +126,16 @@ export class QwenRealtimeAsr {
   private readonly opts: QwenRealtimeAsrOptions;
   private readonly log: (line: string) => void;
   private ws: RealtimeSocket | null = null;
-  private ready = false;
-  private connecting = false;
-  private dropping = false;
+  /**
+   * 连接相位。`isReady` 只认 `live`，不再用 ready / connecting / dropping 三处布尔。
+   *
+   * - `down`：没有连接，`feed()` 可以重建
+   * - `connecting`：WebSocket 还在握手
+   * - `handshaking`：套接字已开，已发 `session.update`，等 `session.updated`
+   * - `live`：可以推音频、可以 commit
+   * - `closed`：`close()` 之后的吸收态，不再重连
+   */
+  private linkPhase: 'down' | 'connecting' | 'handshaking' | 'live' | 'closed' = 'down';
   /** 每次 `connect()` 加一。旧 socket 的回调看见代次不对就直接返回。 */
   private wsGen = 0;
   /**
@@ -143,11 +162,14 @@ export class QwenRealtimeAsr {
    * 反证在同一批档案里：那 5 次的定稿文本**全部完整**——多出来的那 200–300 ms
    * 早就被上一发解掉了。
    *
-   * 清空点有两个，缺一个就会永久卡住：
+   * 清空点有三个，缺一个就会永久卡住：
    * - `.completed` → 解码结束，之后来的音频才算新的一段
-   * - `.error` → 这一发废了，得重新武装，否则后面再也 commit 不出去
+   * - `.failed` / `.error` → 这一发废了，得重新武装，并吃掉对应的 `discardLeft`
+   * - 看门狗超时 → 服务端漏回定稿时也不能一直挂着
    */
   private awaitingDecode = false;
+  /** `awaitingDecode` 的一次性看门狗。`.completed` / 失败 / `drop` / `close` 都要清掉。 */
+  private decodeTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * **解码窗口内的 PCM 先存本地**，定稿之后再推上去。
    *
@@ -225,16 +247,34 @@ export class QwenRealtimeAsr {
     this.log = opts.log ?? (() => {});
   }
 
+  /**
+   * 唯一就绪判定：相位是 `live`，而且当前套接字确实还开着。
+   * `CLOSING` / `CLOSED` 不算就绪，避免把音频推进死连接。
+   */
   get isReady(): boolean {
-    return this.ready && this.ws?.readyState === OPEN;
+    return this.linkPhase === 'live' && this.ws !== null && this.ws.readyState === OPEN;
+  }
+
+  /** `closed` 是吸收态：一旦 `close()`，后面任何迁移都不再改相位。 */
+  private setLink(next: 'down' | 'connecting' | 'handshaking' | 'live' | 'closed'): void {
+    if (this.linkPhase === 'closed') return;
+    this.linkPhase = next;
+  }
+
+  /**
+   * 重新读相位。直接写 `this.linkPhase === …` 时，函数开头的收窄会跨过 `await`
+   * 一直生效，把后面 `close()` / `drop()` 改过的相位判成不可能。
+   */
+  private linkIs(phase: 'down' | 'connecting' | 'handshaking' | 'live' | 'closed'): boolean {
+    return this.linkPhase === phase;
   }
 
   async connect(): Promise<void> {
-    if (this.ws !== null || this.connecting) return;
-    this.connecting = true;
+    if (!this.linkIs('down') || this.ws !== null) return;
+    this.setLink('connecting');
     const myGen = ++this.wsGen;
     try {
-      this.backlog = [];
+      // 不清 backlog：`drop()` 留下的未发送音频要在这条新连接上补发。
       const factory: RealtimeSocketFactory = this.opts.socketFactory
         ?? ((url, apiKey) => new WebSocket(url, {
           headers: { Authorization: `Bearer ${apiKey}` },
@@ -242,26 +282,27 @@ export class QwenRealtimeAsr {
         }) as unknown as RealtimeSocket);
       const url = `${this.opts.url ?? DEFAULT_URL}?model=${encodeURIComponent(this.opts.model ?? DEFAULT_MODEL)}`;
       const ws = factory(url, this.opts.apiKey);
-      if (myGen !== this.wsGen || this.dropping) {
+      if (myGen !== this.wsGen || this.linkIs('closed')) {
         try { ws.close(); } catch { /* 已断 */ }
         return;
       }
       this.ws = ws;
-      this.ready = false;
 
+      let settle: (() => void) | null = null;
       try {
         await new Promise<void>((resolve, reject) => {
+          settle = resolve;
           this.settleConnect = resolve;
           ws.on('open', () => {
-            if (myGen !== this.wsGen || this.dropping) return;
+            if (myGen !== this.wsGen || this.linkPhase === 'closed') return;
             resolve();
           });
           ws.on('error', (...args: never[]) => {
-            if (myGen !== this.wsGen || this.dropping) return;
+            if (myGen !== this.wsGen || this.linkPhase === 'closed') return;
             reject(new QwenRealtimeAsrError(`WebSocket 连接失败: ${String(args[0])}`));
           });
           ws.on('close', () => {
-            if (myGen !== this.wsGen || this.dropping) return;
+            if (myGen !== this.wsGen || this.linkPhase === 'closed') return;
             reject(new QwenRealtimeAsrError('连接在就绪前关闭'));
           });
         });
@@ -271,24 +312,27 @@ export class QwenRealtimeAsr {
         try { ws.close(); } catch { /* 已断 */ }
         throw error;
       } finally {
-        this.settleConnect = null;
+        // 只摘自己的 settle。`feed()` 可能已经 drop 掉这条并建了下一条，
+        // 无条件清空会把新连接的 await 一起拆掉。
+        if (settle !== null && this.settleConnect === settle) this.settleConnect = null;
       }
-      if (myGen !== this.wsGen || this.dropping) {
+      if (myGen !== this.wsGen || this.linkIs('closed')) {
         if (this.ws === ws) this.drop(ws);
         return;
       }
 
+      this.setLink('handshaking');
       ws.on('message', (...args: never[]) => {
-        if (myGen !== this.wsGen || this.dropping) return;
+        if (myGen !== this.wsGen || this.linkPhase === 'closed') return;
         if (this.ws === ws) this.onMessage(args[0]);
       });
       ws.on('error', (...args: never[]) => {
-        if (myGen !== this.wsGen || this.dropping) return;
+        if (myGen !== this.wsGen || this.linkPhase === 'closed') return;
         if (this.ws !== ws) return;
         this.opts.onError?.(new QwenRealtimeAsrError(`WebSocket error: ${String(args[0])}`));
       });
       ws.on('close', () => {
-        if (myGen !== this.wsGen || this.dropping) return;
+        if (myGen !== this.wsGen || this.linkPhase === 'closed') return;
         this.log('[asr] 连接关闭');
         // 只有这条就是当前连接时才清状态：迟到的 close 不能影响后来者
         this.drop(ws);
@@ -296,17 +340,25 @@ export class QwenRealtimeAsr {
 
       this.startSession();
     } finally {
-      this.connecting = false;
+      // 代次已经不是这一次时，相位归后来的 connect / close 管，这里不能改回 down。
+      if (myGen === this.wsGen && this.linkIs('connecting')) this.setLink('down');
     }
   }
 
-  /** 摘掉**指定**这条连接的状态（迟到的 close 不能影响新连接）。 */
+  /**
+   * 摘掉**指定**这条连接的状态（迟到的 close 不能影响新连接）。
+   *
+   * 主动断旧链是为了重连：还没发出去的 `backlog` 留给下一条。
+   * 只有已经 `close()` 的吸收态才把 backlog 一起清掉。
+   */
   private drop(ws: RealtimeSocket | null): boolean {
     if (ws === null || this.ws !== ws) return false;
+    const terminal = this.linkPhase === 'closed';
     this.ws = null;
     this.wsGen += 1;
     this.abandonConnectAttempt();
-    this.resetSessionState();
+    this.resetSessionState(terminal);
+    this.setLink('down');
     return true;
   }
 
@@ -323,12 +375,16 @@ export class QwenRealtimeAsr {
    * 连接没了之后，静音门、丢弃计数和「等解码」的人都必须回到初值，
    * 否则下一条连接会把上一句的尾巴或一张作废票带过去，
    * `whenDecoded()` 也会一直挂着。
+   *
+   * `clearBacklog` 只在 `close()` 彻底结束会话时为真。
+   * `drop()` 重连时要留下还没发出去的音频，否则 `CLOSING` / `CLOSED`
+   * 期间攒下的帧会在摘链时被整表丢掉。
    */
-  private resetSessionState(): void {
-    this.ready = false;
-    this.backlog = [];
+  private resetSessionState(clearBacklog: boolean): void {
+    if (clearBacklog) this.backlog = [];
     this.dirty = false;
     this.awaitingDecode = false;
+    this.clearDecodeWatchdog();
     this.pendingVoice = false;
     this.holdActive = false;
     this.commitDeferred = false;
@@ -374,13 +430,18 @@ export class QwenRealtimeAsr {
   }
 
   feed(pcm: Buffer, voiced?: boolean): void {
-    if (this.dropping) return;
-    // 只摘**已经关掉**的连接。CONNECTING / OPEN 都不是「死了」——
-    // 早期版本这里写的是 `readyState !== OPEN`，结果第一个音频块就在建连
-    // 期间把 `this.ws` 摘空，会话从此再也建不起来（表现为连接超时）。
-    if (this.ws !== null && this.ws.readyState === CLOSED) this.drop(this.ws);
+    if (this.linkPhase === 'closed') return;
+    // `CLOSING` / `CLOSED` 都已经不是 live。先摘掉这条死链，未发送的 backlog
+    // 留给重连，不要推进这个 socket。
+    // `CONNECTING` / `OPEN` 不能摘 —— 早期版本这里写的是 `readyState !== OPEN`，
+    // 结果第一个音频块就在建连期间把 `this.ws` 摘空，会话从此再也建不起来
+    // （表现为连接超时）。
+    if (this.ws !== null && (this.ws.readyState === CLOSING || this.ws.readyState === CLOSED)) {
+      const dead = this.ws;
+      if (this.drop(dead)) this.log('[asr] 套接字已结束，未发送音频留给重连');
+    }
     // 懒连接：服务端没有 IDLE 超时，但空连接纯属浪费，有音频再建
-    if (this.ws === null && !this.connecting) {
+    if (this.ws === null && this.linkPhase === 'down') {
       void this.connect().catch((e: Error) => { this.opts.onError?.(e); });
     }
     if (!this.isReady) {
@@ -501,7 +562,7 @@ export class QwenRealtimeAsr {
    * 没有新音频就**什么都不发** —— 空 commit 会报错，而且只会白挨一发。
    */
   commit(): void {
-    if (this.dropping) return;
+    if (this.linkPhase === 'closed') return;
     if (!this.isReady) {
       this.commitWhenReady = true;
       return;
@@ -527,6 +588,7 @@ export class QwenRealtimeAsr {
     // 这段人声已经交出去了：之后灌进来的尾静音不再算「新的一段」
     this.pendingVoice = false;
     this.awaitingDecode = true;
+    this.armDecodeWatchdog();
     this.log('[asr] commit');
   }
 
@@ -562,11 +624,76 @@ export class QwenRealtimeAsr {
     return new Promise<void>((resolve) => { this.decodeWaiters.push(resolve); });
   }
 
-  /** 唤醒所有等解码的调用方（`.completed` / `.error` 都要调，否则会挂着） */
+  /** 唤醒所有等解码的调用方（`.completed` / `.failed` / `.error` / 超时都要调，否则会挂着） */
   private resolveDecode(): void {
     for (const wake of this.decodeWaiters.splice(0)) {
       wake();
     }
+  }
+
+  private armDecodeWatchdog(): void {
+    this.clearDecodeWatchdog();
+    const ms = this.opts.decodeTimeoutMs ?? DEFAULT_DECODE_TIMEOUT_MS;
+    if (!(ms > 0)) return;
+    const timer = setTimeout(() => {
+      if (this.decodeTimer !== timer) return;
+      this.decodeTimer = null;
+      if (this.linkPhase === 'closed' || !this.awaitingDecode) return;
+      this.releaseInFlightDecode('解码超时，未收到定稿，解除等待');
+    }, ms);
+    timer.unref?.();
+    this.decodeTimer = timer;
+  }
+
+  private clearDecodeWatchdog(): void {
+    const timer = this.decodeTimer;
+    if (timer === null) return;
+    clearTimeout(timer);
+    this.decodeTimer = null;
+  }
+
+  /**
+   * 这一发等不到正常定稿了（失败、服务端错误、看门狗）。
+   *
+   * 只有真的结束了一次 `awaitingDecode` 才吃 `discardLeft`：被挂断丢掉的那一发
+   * 若没出 `.completed`，计数留着会把下一句真定稿吞掉。
+   * 冲刷放在清计时器之后 —— `flushHeld()` 可能立刻补发下一发并重新 arm。
+   */
+  private releaseInFlightDecode(reason: string): void {
+    const ending = this.awaitingDecode;
+    this.awaitingDecode = false;
+    this.clearDecodeWatchdog();
+    if (ending && this.discardLeft > 0) {
+      this.discardLeft -= 1;
+      this.log(`[asr] ${reason}，消耗一次丢弃（剩余 ${this.discardLeft}）`);
+    } else if (ending) {
+      this.log(`[asr] ${reason}`);
+    }
+    this.flushHeld();
+    this.resolveDecode();
+  }
+
+  /**
+   * 把未就绪时攒下的音频按到达顺序补发出去。
+   * 套接字中途不再是 `OPEN` 就把剩下的放回队头，绝不推进死连接后再整表丢掉。
+   */
+  private flushBacklog(): void {
+    if (!this.isReady) return;
+    const pending = this.backlog.splice(0);
+    const kept: Array<{ pcm: Buffer; voiced: boolean }> = [];
+    for (let i = 0; i < pending.length; i += 1) {
+      const item = pending[i];
+      if (item === undefined) continue;
+      if (!this.isReady) {
+        for (let j = i; j < pending.length; j += 1) {
+          const rest = pending[j];
+          if (rest !== undefined) kept.push(rest);
+        }
+        break;
+      }
+      this.sendAudio(item.pcm, item.voiced);
+    }
+    if (kept.length > 0) this.backlog = kept.concat(this.backlog);
   }
 
   /**
@@ -580,12 +707,12 @@ export class QwenRealtimeAsr {
   }
 
   close(): void {
-    this.dropping = true;
+    this.setLink('closed');
     this.wsGen += 1;
     const ws = this.ws;
     this.ws = null;
     this.abandonConnectAttempt();
-    this.resetSessionState();
+    this.resetSessionState(true);
     try {
       ws?.close();
     } catch {
@@ -612,12 +739,17 @@ export class QwenRealtimeAsr {
     }
 
     if (ev.type === 'session.updated') {
-      this.ready = true;
+      if (this.linkPhase !== 'handshaking' && this.linkPhase !== 'live') return;
+      if (this.ws === null || this.ws.readyState !== OPEN) {
+        this.log('[asr] session.updated 时连接已不可用，backlog 保留给重连');
+        if (this.ws !== null) this.drop(this.ws);
+        return;
+      }
+      this.setLink('live');
       this.log(this.opts.turnDetection === 'vad'
         ? '[asr] 已就绪（服务端 VAD 开，端点归服务端）'
         : '[asr] 已就绪（服务端 VAD 关闭）');
-      for (const item of this.backlog) this.sendAudio(item.pcm, item.voiced);
-      this.backlog = [];
+      this.flushBacklog();
       if (this.commitWhenReady) {
         this.commitWhenReady = false;
         this.commit();
@@ -628,6 +760,10 @@ export class QwenRealtimeAsr {
       // 增量在 stash（`text` 恒为空串），见文件头
       const t = ev.stash ?? ev.text;
       if (typeof t === 'string' && t) {
+        if (this.opts.corpusText && isCorpusEcho(t, this.opts.corpusText)) {
+          this.log(`[asr] 丢弃热词回声增量（${t.length} 字）`);
+          return;
+        }
         // 出生证：正在解码 → 属于**正在解的那一发**（可能是旧段）；
         // 空闲 → 用户新开口还没封段，属于**下一发**。
         // 取 `+1` 是安全的：开轮时锁存的水位线 `baseCommitSeq <= _commitSeq`，
@@ -642,8 +778,10 @@ export class QwenRealtimeAsr {
       //
       // 1. 出生证先取走。`flushHeld()` 若补发延后的 commit，会立刻把
       //    `decodingCommitSeq` 改写成**下一段**的号 —— 那之后再取就指错了。
+      //    看门狗也要在补发之前清掉，否则会拆掉下一发刚 arm 的那只。
       const completedSeq = this.decodingCommitSeq;
       this.awaitingDecode = false;
+      this.clearDecodeWatchdog();
       const t = (ev.transcript ?? '').trim();
       const index = this.seq;
       this.seq += 1;
@@ -651,6 +789,8 @@ export class QwenRealtimeAsr {
       if (this.discardLeft > 0) {
         this.discardLeft -= 1;
         this.log(`[asr] 丢弃第 ${index} 段（迟到 ${t.length} 字）`);
+      } else if (t !== '' && this.opts.corpusText && isCorpusEcho(t, this.opts.corpusText)) {
+        this.log(`[asr] 丢弃第 ${index} 段热词回声幻觉（${t.length} 字）`);
       } else if (t !== '') {
         this.opts.onSentence(t, index, completedSeq);
       }
@@ -662,13 +802,16 @@ export class QwenRealtimeAsr {
       this.resolveDecode();
       return;
     }
-    if (ev.type === 'error') {
-      // 这一发废了：重新武装，否则 `awaitingDecode` 永远挂着，后面再也 commit 不出去
-      this.awaitingDecode = false;
-      this.flushHeld();
-      this.resolveDecode();
+    if (
+      ev.type === 'error'
+      || ev.type === 'conversation.item.input_audio_transcription.failed'
+    ) {
+      // 这一发废了：重新武装，否则 `awaitingDecode` 永远挂着，后面再也 commit 不出去。
+      // `.failed` 同样要吃掉 `discardLeft` —— 挂断丢掉的那一发常常没有 `.completed`。
+      const failed = ev.type === 'conversation.item.input_audio_transcription.failed';
+      this.releaseInFlightDecode(failed ? '转写失败' : '服务端错误，本段解码作废');
       const msg = ev.error?.message ?? text.slice(0, 200);
-      this.opts.onError?.(new QwenRealtimeAsrError(`服务端错误: ${msg}`));
+      this.opts.onError?.(new QwenRealtimeAsrError(failed ? `转写失败: ${msg}` : `服务端错误: ${msg}`));
     }
   }
 }
@@ -699,6 +842,38 @@ export function mergeCorpusText(parts: readonly string[], maxChars = 800): strin
   if (maxChars <= 0 || joined === '') return '';
   if (joined.length <= maxChars) return joined;
   return joined.slice(0, maxChars).trimEnd();
+}
+
+const ECHO_SPLIT = /[\s，。、；：！？,.;:!?]+/u;
+
+/**
+ * 判别 `qwen3-asr-flash-realtime` 在弱音/静音封段时把 `corpus.text` 原样吐出来的回声幻觉。
+ *
+ * 线上实测：传入 50 词热词表后，轻微噪声封段会吐出整串空格分隔的热词原文，若不拦截会直接
+ * 喂进前台对话与 dsh 会话记录。正常含 1–2 个热词的口语不会被误杀。
+ */
+export function isCorpusEcho(text: string, corpusText: string): boolean {
+  const corpus = corpusText.trim();
+  const sample = text.trim();
+  if (corpus === '' || sample === '') return false;
+
+  const corpusTokens = corpus.toLowerCase().split(ECHO_SPLIT).filter(Boolean);
+  if (corpusTokens.length < 4) return false;
+
+  const compactCorpus = corpusTokens.join('');
+  const sampleTokens = sample.toLowerCase().split(ECHO_SPLIT).filter(Boolean);
+  const compactSample = sampleTokens.join('');
+  if (compactSample.length >= 12 && compactCorpus.includes(compactSample)) {
+    return true;
+  }
+
+  if (sampleTokens.length < 4) return false;
+  const corpusSet = new Set(corpusTokens);
+  let hits = 0;
+  for (const token of sampleTokens) {
+    if (corpusSet.has(token)) hits += 1;
+  }
+  return hits >= 4 && hits / sampleTokens.length >= 0.6;
 }
 
 /** 把 DashScope realtime 包成 {@link SttProvider}。 */

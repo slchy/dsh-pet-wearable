@@ -9,6 +9,7 @@ import { test } from 'node:test';
 
 import {
   QwenRealtimeAsr,
+  isCorpusEcho,
   mergeCorpusText,
   qwenRealtimeStt,
   type RealtimeSocket,
@@ -69,7 +70,10 @@ class FakeSocket {
 
 const asSocket = (s: FakeSocket): RealtimeSocket => s as unknown as RealtimeSocket;
 
-function make(options: { onSentence?: (t: string, i: number) => void } = {}) {
+function make(options: {
+  onSentence?: (t: string, i: number) => void;
+  decodeTimeoutMs?: number;
+} = {}) {
   const socket = new FakeSocket();
   const sentences: Array<{ text: string; index: number }> = [];
   /** 每条定稿带出来的因果出生证（`undefined` = provider 不提供） */
@@ -89,14 +93,17 @@ function make(options: { onSentence?: (t: string, i: number) => void } = {}) {
       partialStamps.push(commitSeq);
     },
     onError: (e) => { errors.push(e.message); },
+    decodeTimeoutMs: options.decodeTimeoutMs,
     socketFactory: () => asSocket(socket),
   });
   return { asr, socket, sentences, sentenceStamps, partials, partialStamps, errors };
 }
 
 /** 连上并等到就绪（服务端回 `session.updated`）。 */
-async function ready(): Promise<ReturnType<typeof make>> {
-  const h = make();
+async function ready(
+  options: { decodeTimeoutMs?: number } = {},
+): Promise<ReturnType<typeof make>> {
+  const h = make(options);
   const connecting = h.asr.connect();
   h.socket.open();
   await connecting;
@@ -801,4 +808,235 @@ test('close 在建连途中让 open 回调失效', async () => {
   socket.open();
   await connecting;
   assert.equal(socket.types().includes('session.update'), false);
+});
+
+test('isCorpusEcho 拦截热词回声幻觉且不误杀正常口语', () => {
+  const corpus = '审计 市值 代码 挂断 dsh MiMo Copilot Claude 小米 小爱同学 仓库 分支 提交 推送';
+  assert.equal(isCorpusEcho(corpus, corpus), true);
+  assert.equal(isCorpusEcho('审计，市值，代码，挂断，dsh', corpus), true);
+  assert.equal(isCorpusEcho('审计市值代码挂断dshMiMoCopilot', corpus), true);
+  assert.equal(isCorpusEcho('帮我看一下 dsh 日志', corpus), false);
+  assert.equal(isCorpusEcho('请帮我提交这个分支的代码', corpus), false);
+  assert.equal(isCorpusEcho('今天天气怎么样', corpus), false);
+});
+
+test('弱音复读 corpus.text 时，partial 与 completed 均被拦截不回调上层', async () => {
+  const corpus = '审计 市值 代码 挂断 dsh MiMo Copilot Claude 小米 小爱同学';
+  const socket = new FakeSocket();
+  const sentences: string[] = [];
+  const partials: string[] = [];
+  const asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    corpusText: corpus,
+    socketFactory: () => socket,
+    onSentence: (t) => { sentences.push(t); },
+    onPartial: (t) => { partials.push(t); },
+  });
+  const connecting = asr.connect();
+  socket.open();
+  socket.message({ type: 'session.updated' });
+  await connecting;
+
+  asr.feed(Buffer.alloc(320), true);
+  asr.commit();
+  socket.message({ type: 'conversation.item.input_audio_transcription.text', stash: corpus });
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: corpus });
+  assert.deepEqual(partials, []);
+  assert.deepEqual(sentences, []);
+
+  // 正常话仍照常通过
+  asr.feed(Buffer.alloc(320), true);
+  asr.commit();
+  socket.message({ type: 'conversation.item.input_audio_transcription.completed', transcript: '帮我看下 dsh 端口' });
+  assert.deepEqual(sentences, ['帮我看下 dsh 端口']);
+  asr.close();
+});
+
+test('hangup 后 .failed / .error 消耗 discardLeft，下一句定稿不被吞', async () => {
+  const run = async (kind: 'failed' | 'error'): Promise<void> => {
+    const h = await ready();
+    try {
+      h.asr.feed(Buffer.alloc(640), true);
+      h.asr.hangup();
+      h.asr.discard();
+      assert.equal(h.asr.decoding(), true);
+      if (kind === 'failed') {
+        h.socket.message({
+          type: 'conversation.item.input_audio_transcription.failed',
+          error: { message: 'hangup' },
+        });
+        assert.deepEqual(h.errors, ['转写失败: hangup']);
+      } else {
+        h.socket.message({ type: 'error', error: { message: 'hangup' } });
+        assert.deepEqual(h.errors, ['服务端错误: hangup']);
+      }
+      assert.equal(h.asr.decoding(), false, `${kind} 也要结束这次等待`);
+      h.asr.feed(Buffer.alloc(640), true);
+      h.asr.commit();
+      assert.equal(
+        h.socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+        2,
+        `${kind} 之后新的 commit 必须真的发出去`,
+      );
+      h.socket.message({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: '下一句。',
+      });
+      assert.deepEqual(
+        h.sentences.map((s) => s.text),
+        ['下一句。'],
+        `${kind} 没吃掉 discardLeft，下一句真定稿被吞了`,
+      );
+    } finally {
+      h.asr.close();
+    }
+  };
+  await run('failed');
+  await run('error');
+});
+
+test('awaitingDecode 超时看门狗解锁新 commit 并唤醒 whenDecoded', async () => {
+  const h = await ready({ decodeTimeoutMs: 30 });
+  try {
+    h.asr.feed(Buffer.alloc(640), true);
+    h.asr.commit();
+    h.asr.discard();
+    const pending = h.asr.whenDecoded();
+    assert.ok(pending);
+    let woke = false;
+    const wait = pending.then(() => { woke = true; });
+    await wait;
+    assert.equal(woke, true);
+    assert.equal(h.asr.decoding(), false);
+    h.asr.feed(Buffer.alloc(640), true);
+    h.asr.commit();
+    assert.equal(
+      h.socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+      2,
+      '超时之后要能再封一段',
+    );
+    h.socket.message({
+      type: 'conversation.item.input_audio_transcription.completed',
+      transcript: '超时后的下一句。',
+    });
+    assert.deepEqual(h.sentences.map((s) => s.text), ['超时后的下一句。']);
+  } finally {
+    h.asr.close();
+  }
+});
+
+test('解码超时按结束流程冲刷暂存并补发延后的 commit', async () => {
+  const h = await ready({ decodeTimeoutMs: 30 });
+  try {
+    h.asr.feed(Buffer.alloc(640), true);
+    h.asr.commit();
+    const commits = (): number => h.socket.types().filter((t) => t === 'input_audio_buffer.commit').length;
+    const appends = (): number => h.socket.types().filter((t) => t === 'input_audio_buffer.append').length;
+    const before = appends();
+    assert.equal(commits(), 1);
+    h.asr.feed(Buffer.alloc(640), true);
+    h.asr.commit();
+    assert.equal(commits(), 1, '解码期只能延后');
+    const pending = h.asr.whenDecoded();
+    assert.ok(pending);
+    await pending;
+    assert.equal(appends(), before + 1, '超时也要把窗口里的语音补推上去');
+    assert.equal(commits(), 2, '延后的 commit 要补发');
+    assert.equal(h.asr.decoding(), true, '补发的那一发重新进入等待');
+  } finally {
+    h.asr.close();
+    assert.equal(h.asr.decoding(), false, 'close 清掉看门狗和等待');
+  }
+});
+
+test('decodeTimeoutMs <= 0 不启动看门狗', async () => {
+  const h = await ready({ decodeTimeoutMs: 0 });
+  try {
+    h.asr.feed(Buffer.alloc(640), true);
+    h.asr.commit();
+    const pending = h.asr.whenDecoded();
+    assert.ok(pending);
+    await new Promise((resolve) => { setTimeout(resolve, 40); });
+    assert.equal(h.asr.decoding(), true, '关闭看门狗时不能自己解锁');
+    assert.equal(
+      h.socket.types().filter((t) => t === 'input_audio_buffer.commit').length,
+      1,
+    );
+    h.socket.message({
+      type: 'conversation.item.input_audio_transcription.completed',
+      transcript: '还在。',
+    });
+    assert.deepEqual(h.sentences.map((s) => s.text), ['还在。']);
+  } finally {
+    h.asr.close();
+  }
+});
+
+test('CLOSING/CLOSED 不把未发送 backlog 推进死 socket，drop 留给重连', async () => {
+  const sockets: FakeSocket[] = [];
+  const asr = new QwenRealtimeAsr({
+    apiKey: 'k',
+    onSentence: () => {},
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return asSocket(socket);
+    },
+  });
+  try {
+    const firstConnect = asr.connect();
+    const first = sockets[0];
+    assert.ok(first);
+    first.open();
+    await firstConnect;
+    asr.feed(Buffer.from([1]), true);
+    asr.feed(Buffer.from([2]), true);
+    assert.deepEqual(first.types(), ['session.update']);
+
+    first.readyState = 2;
+    asr.feed(Buffer.from([3]), true);
+    assert.equal(
+      first.types().filter((t) => t === 'input_audio_buffer.append').length,
+      0,
+      'CLOSING 不能把 backlog 推进去',
+    );
+    assert.equal(sockets.length, 2);
+
+    const second = sockets[1];
+    assert.ok(second);
+    second.open();
+    await new Promise((resolve) => { setImmediate(resolve); });
+    second.message({ type: 'session.updated', session: {} });
+    assert.equal(
+      second.types().filter((t) => t === 'input_audio_buffer.append').length,
+      3,
+      '三帧未发送音频要在新连接补发',
+    );
+
+    second.readyState = 3;
+    asr.feed(Buffer.from([4]), true);
+    assert.equal(
+      second.types().filter((t) => t === 'input_audio_buffer.append').length,
+      3,
+      'CLOSED 同样不能再推进这个 socket',
+    );
+    assert.equal(sockets.length, 3);
+
+    const third = sockets[2];
+    assert.ok(third);
+    third.open();
+    await new Promise((resolve) => { setImmediate(resolve); });
+    third.message({ type: 'session.updated', session: {} });
+    assert.equal(
+      third.types().filter((t) => t === 'input_audio_buffer.append').length,
+      1,
+      'CLOSED 时新到的那一帧要留给重连',
+    );
+  } finally {
+    const before = sockets.length;
+    asr.close();
+    asr.feed(Buffer.from([5]), true);
+    await new Promise((resolve) => { setImmediate(resolve); });
+    assert.equal(sockets.length, before, 'close 之后不再重连');
+  }
 });

@@ -128,6 +128,7 @@ CLOCK: dict[str, str] = {
     "DEFAULT_POLL_MS": "wall",
     "DEFAULT_CAPTURE_TIMEOUT_MS": "wall",
     "DEFAULT_CONFIRM_TIMEOUT_MS": "wall",
+    "DEFAULT_DECODE_TIMEOUT_MS": "wall",
     "SUPERSEDED_TTL_MS": "wall",
 }
 
@@ -146,6 +147,7 @@ SHADED_BY: dict[str, str] = {
     "VOICE_SPECULATE_MS": "同上（投机与 ASR 并行）",
     "PREWARM_TTL_MS": "定稿→开轮之间（正常 0–600 ms，用不完）",
     "STALL_PROBE_MS": "无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待）",
+    "DEFAULT_DECODE_TIMEOUT_MS": "无关首声（纯防卡死看门狗：正常 ASR 定稿 ~200 ms 即拆掉，只在服务端丢回包时触发解锁）",
     "CLOCK_MISMATCH_MS": "无（纯判据：只用来发现两把时钟接错，不放慢任何东西）",
     "SEMANTIC_SKIP_P": "无（纯判据：声学已经很确定时**省掉**一段等待）",
     "SEMANTIC_PREFIX_SLACK_CHARS": "无（纯判据：决定定稿要不要再问一趟语义判停）",

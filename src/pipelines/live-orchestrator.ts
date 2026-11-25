@@ -5,18 +5,29 @@
  * `run_in_background` / 子代理；完成品经 {@link BackgroundTaskBus} 回到同一条
  * 会话里说出来。
  *
+ * 前台轮次、后台任务和 Omni 单槽快照只活在 {@link LiveSessionState}。
+ * 这里是解释器：收事件、执行意图，不再自己留第二份账。
+ *
  * 不走文本快车道，不做投机预跑，也不把后台任务退回另一副嗓子。
  * 整段会话只有在 omni 接不上（没车道，`willServe()` 为假，且
  * `answerFromText()` 也拿不到答案）时才同步问 dsh，
- * 再用本层的 TTS 把那句说出来 —— 那是断线兜底，不是第二条人格。
+ * 再用本层让 omni 把那句说出来 —— 那是断线兜底，不是第二条人格。
  */
-import { BackgroundTaskBus } from '../background-task-bus.ts';
-import { ConversationLedger, type LedgerTurn } from '../conversation-ledger.ts';
+import {
+  BackgroundTaskBus,
+  type BackgroundTaskLifecycleEvent,
+  type BackgroundTaskRequest,
+} from '../background-task-bus.ts';
 import type { AudioFrame, EngineEvent, FastVoiceEngine, TurnInput } from '../engine-contract.ts';
-import { LiveVoiceEngine, streamLiveAnswer, type LiveAudioLane } from '../engines/live-voice-engine.ts';
+import { streamLiveAnswer, type LiveAudioLane } from '../engines/live-voice-engine.ts';
 import { createAbortGate } from '../engines/stream-utils.ts';
 import type { TurnTicket } from '../kernel.ts';
-import { LIVE_BACKEND_TASK_DIRECTIVE, buildLiveReportPrompt } from '../persona.ts';
+import {
+  LIVE_BACKEND_TASK_DIRECTIVE,
+  buildLiveAckPrompt,
+  buildLiveReportPrompt,
+  type LiveAckKind,
+} from '../persona.ts';
 import type {
   AgentAudioAnswer,
   AgentImage,
@@ -28,6 +39,16 @@ import type {
   TurnContext,
 } from '../providers.ts';
 import {
+  initialLiveSessionState,
+  listUnspokenReports,
+  projectDshRecentDialog,
+  projectLastAnsweredLane,
+  reduceLiveSession,
+  type LiveSessionEffect,
+  type LiveSessionEvent,
+  type LiveSessionState,
+} from './live-session-store.ts';
+import {
   isActionRequest,
   isCancelRequest,
   isClockTimeRequest,
@@ -35,18 +56,14 @@ import {
   looksMemorable,
 } from '../turn-router.ts';
 
-/** 用户明说取消时的短确认。只在真有要汇报的后台任务时说。 */
+/** 文本入口（无音频 `reply()`）用户取消时的返回值。语音轮一律由 omni 自己开口。 */
 const CANCEL_LINE = '好，不查了。';
-/** 识图轮的短回执。图是 dsh 看的，omni 没看见，所以先把在途音频丢掉。 */
-const PHOTO_LINE = '我看看。';
-/** omni 决定转交但一个采样都没吐时的垫话，避免用户对着静音干等。 */
-const DELEGATE_LINE = '我查查。';
 
 export interface LiveOrchestratorOptions {
   /** 后台执行器（dsh） */
   readonly inner: AgentProvider;
-  /** 仅用于短回执（omni 0 字节委派 / 识图应声 / 取消确认）与断线兜底 */
-  readonly tts: TtsProvider;
+  /** 保留向后兼容签名；Pure Live 路径绝不调用任何外部 TTS。 */
+  readonly tts?: TtsProvider;
   /** 建连时可读一次的长期记忆摘要，用于拼入后台注记或观测 */
   readonly memory?: (text: string) => string;
   readonly now?: () => number;
@@ -70,6 +87,13 @@ interface FallbackItem {
   readonly query?: string;
 }
 
+interface RecordedExtra {
+  readonly omniUserItemId?: string | null;
+  readonly omniAssistantItemIds?: readonly string[];
+  readonly toolCallId?: string | null;
+  readonly taskId?: string;
+}
+
 type MetaEvent = Extract<EngineEvent, { type: 'meta' }>;
 
 /**
@@ -87,18 +111,15 @@ function turnContext(turn: TurnInput): TurnContext | undefined {
   return { ticket: turn.ticket };
 }
 
-function asBuffer(pcm: Buffer | Uint8Array): Buffer {
-  return Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm);
-}
-
 /**
  * 这一轮前台怎么走。纯函数：不派单、不碰车道。
  *
  * `live_with_bg_guard` 是「Omni 还能开口，但这句要查外部或要动手」。
- * 调用方必须等 Omni 的 `delegate`：有改写查询就按 `tool_call` 派，
- * 整段结束仍没有 `delegate` 才用原话补 `early_rule`。
- * 不能在进 Omni 之前同步派单 —— 总线工人晚一个微任务就开跑，
- * 改写查询赶不上，dsh 会拿着 ASR 原话跑完。
+ * 调用方等 Omni 的 `delegate` 再按 `tool_call` 派：主查询是用户原话，
+ * 前台 `rewrittenQuery` 只在和原话不一致时写进注记当参考。
+ * 整段结束仍没有 `delegate` 时，用原话补 `early_rule`。
+ * 进 Omni 之前不能同步派单：总线工人晚一个微任务就开跑，
+ * 会和随后的 `tool_call` 各跑一遍。
  */
 export type LiveTurnDecision =
   | 'photo_delegate'
@@ -146,6 +167,27 @@ function dropReason(why: string): 'barge_in' | 'delegated' | 'superseded' | null
 }
 
 /**
+ * 委派给 dsh 的主查询。用户原话非空就用原话；转写是空的才回落前台改写。
+ * Omni 的 `rewrittenQuery` 会听岔，也会顺着自己刚编的内容跑偏。
+ */
+function primaryDelegateQuery(rawUserText: string, rewrittenQuery: string | null): string {
+  if (rawUserText.trim() !== '') return rawUserText;
+  return rewrittenQuery ?? '';
+}
+
+/**
+ * 前台改写只作低权重参考。空的、或和用户原话（去首尾空白后）相同的，不另附。
+ */
+function composeDelegateHint(rewrittenQuery: string, rawUserText: string): string | undefined {
+  const guess = rewrittenQuery.trim();
+  if (guess === '' || guess === rawUserText.trim()) return undefined;
+  return [
+    '【前台对用户意图的猜测（仅供参考，可能听岔或跑偏；若与用户原话或最近前台对话冲突，例如用户在纠正或质疑编造，一律以用户原话和上文为准）】',
+    rewrittenQuery,
+  ].join('\n');
+}
+
+/**
  * `VOICE_PIPELINE=live` 的唯一前台。
  *
  * 热路径是 {@link LiveOrchestrator.toEngine}。`reply()` 留给保活和无音频调用方，
@@ -153,15 +195,18 @@ function dropReason(why: string): 'barge_in' | 'delegated' | 'superseded' | null
  */
 export class LiveOrchestrator implements AgentProvider {
   private readonly inner: AgentProvider;
-  private readonly tts: TtsProvider;
   private readonly memory: ((text: string) => string) | undefined;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   private readonly backendDirective: string;
   private readonly bus: BackgroundTaskBus;
-  private readonly ledger = new ConversationLedger();
-  private readonly pendingReports = new Map<string, BackgroundTaskReport>();
-  private readonly injectedTaskIds = new Set<string>();
+  private state: LiveSessionState = initialLiveSessionState();
+  /**
+   * 不支持 `updateDynamicContext` 的旧假车道，仍然靠 `injectAnswer` 把结论补进下一轮。
+   * 这两个集合只记「已经补过 / 已经由本层直接播过」，不保存汇报正文。
+   */
+  private readonly legacyInjectedIds = new Set<string>();
+  private readonly directSpokenTaskIds = new Set<string>();
 
   private audioLane: LiveAudioLane | null = null;
   private taskReporter: ((report: BackgroundTaskReport) => void) | null = null;
@@ -175,7 +220,7 @@ export class LiveOrchestrator implements AgentProvider {
 
   constructor(options: LiveOrchestratorOptions) {
     this.inner = options.inner;
-    this.tts = options.tts;
+    void options.tts;
     this.memory = options.memory;
     this.now = options.now ?? (() => Date.now());
     this.log = options.log ?? (() => {});
@@ -185,20 +230,27 @@ export class LiveOrchestrator implements AgentProvider {
       log: this.log,
       runner: {
         execute: async (req) => {
-          const reply = await this.inner.reply(
-            req.query,
-            req.image,
-            this.composeBackendNote(this.backendDirective, req.note, req.query),
-          );
+          const reply = await this.inner.reply(req.query, req.image, req.note);
           return { text: reply.text, speech: reply.speech, emotion: reply.emotion };
         },
         cancelRunning: () => {
           this.inner.cancelTurn?.();
         },
       },
+      onLifecycle: (ev) => {
+        this.onBusLifecycle(ev);
+      },
       onReport: (report) => {
-        this.pendingReports.set(report.taskId, report);
-        this.deliverReport(report);
+        // 总线内任务的终态已经由 onLifecycle 写过；这里再来一次 `task.completed`
+        // 会被状态机当成重复事件丢掉，不会第二次 deliverReport。
+        // dsh 自己的外部公告只走这条，没有生命周期事件。
+        this.apply({
+          type: 'task.completed',
+          report,
+          ...(report.turnNo !== undefined ? { turnNo: report.turnNo } : {}),
+          ...(report.canonicalUser !== undefined ? { canonicalUser: report.canonicalUser } : {}),
+          silent: false,
+        });
       },
     });
     // dsh 自己的后台作业不另开嗓子：收进同一条总线，再由空窗交给 omni。
@@ -227,7 +279,7 @@ export class LiveOrchestrator implements AgentProvider {
     turn?: TurnContext,
   ): Promise<AgentReplyView> {
     if (isCancelRequest(userText) && this.bus.hasActiveReportable()) {
-      this.bus.cancelAll('user_cancel');
+      this.cancelReportable();
       return { text: CANCEL_LINE, speech: CANCEL_LINE, path: 'omni' };
     }
     return this.inner.reply(userText, image, note, turn);
@@ -247,8 +299,9 @@ export class LiveOrchestrator implements AgentProvider {
     this.audioLane = next;
     if (!replaced) return;
     this.bus.resetSession();
-    this.pendingReports.clear();
-    this.injectedTaskIds.clear();
+    this.legacyInjectedIds.clear();
+    this.directSpokenTaskIds.clear();
+    this.apply({ type: 'lane.replaced' });
   }
 
   /** 纯健康事实，不做路由。宿主用来决定要不要预开一条用不上的合成。 */
@@ -266,7 +319,7 @@ export class LiveOrchestrator implements AgentProvider {
 
   /** 显式「别查了」。插话不走这里。 */
   cancelBackgroundTasks(): boolean {
-    return this.bus.cancelAll('user_cancel');
+    return this.cancelReportable();
   }
 
   /**
@@ -299,13 +352,10 @@ export class LiveOrchestrator implements AgentProvider {
   }
 
   /**
-   * 上一轮谁答的，原样来自账本。
-   * 同步兜底记的是 `'dsh'`，omni 记的是 `'live'`。还没答过、或只有 `pet`，是 `null`。
+   * 上一轮谁答的。同步兜底记的是 `'dsh'`，omni 记的是 `'live'`。还没答过是 `null`。
    */
   lastLedgerLane(): 'live' | 'cascade' | 'dsh' | null {
-    const last = this.ledger.lastAnswered();
-    if (last === null || last.lane === 'pet') return null;
-    return last.lane;
+    return projectLastAnsweredLane(this.state);
   }
 
   reconcileTurnOutcome(info: {
@@ -313,7 +363,12 @@ export class LiveOrchestrator implements AgentProvider {
     readonly truncated: boolean;
     readonly endedAtMs: number;
   }): void {
-    this.ledger.reconcileOutcome(info.ticket, info.truncated, info.endedAtMs);
+    this.apply({
+      type: 'turn.reconciled',
+      ticket: info.ticket,
+      truncated: info.truncated,
+      endedAtMs: info.endedAtMs,
+    });
   }
 
   /** 唯一出话泵。内核只认 {@link FastVoiceEngine}，不知道后面是不是 omni。 */
@@ -339,13 +394,12 @@ export class LiveOrchestrator implements AgentProvider {
   /**
    * 空窗里让 omni 把后台结论说出来。
    *
-   * - `verbatim`：精确数字走 TTS / 朗读连接，这里不念。
-   * - 车道不能说：`'defer'`，调用方排回队首，等下一个安静窗。
-   * - 开口前就没了声音、也不是被打断：`'fallback'`，交给 TTS，别让结论丢了。
+   * Pure Live 路径禁止切去外部 TTS：哪怕 `verbatim: true`（含精确数字、端口、
+   * 路径或长报告）也交给 omni 自己用同一副嗓子说出来（提示里要求把关键数字念准）。
+   * - 车道正忙或有未提交用户音频：`'defer'`，排回队首，等下一个安静窗。
+   * - 车道已断/未挂：`'fallback'`（调用方在 Pure Live 下只做静默文字提示，不调外部 TTS）。
    *
-   * `markInjected` 只在 `playAudio` 确认已经说出有效音频（返回 `'spoken'`）之后。
-   * 提前标记会让 `'fallback'` 的 `noteFallbackAnnounceSpoken` 以为注过了，
-   * `injectAnswer(..., 'spoken')` 被吞掉。
+   * 播报成功（返回 `'spoken'`）之后才记进单槽：已说出或被打断。
    */
   async speakBackgroundReport(
     item: SpokenItem,
@@ -356,34 +410,58 @@ export class LiveOrchestrator implements AgentProvider {
     }>,
   ): Promise<'spoken' | 'defer' | 'fallback'> {
     if (this.disposed) return 'defer';
-    if (item.verbatim === true) return 'fallback';
     const lane = this.audioLane;
-    if (lane === null || typeof lane.speakFromText !== 'function') return 'fallback';
+    if (
+      lane === null
+      || (typeof lane.enqueueSpeech !== 'function' && typeof lane.speakFromText !== 'function')
+    ) {
+      return 'fallback';
+    }
     if (lane.canSpeakBackground?.() !== true) return 'defer';
     const prompt = buildLiveReportPrompt({
       query: item.query ?? '',
       summary: item.speech,
       needsConfirm: item.needsConfirm,
+      verbatim: item.verbatim,
     });
-    const answer = lane.speakFromText(prompt, { taskId: item.taskId, query: item.query });
+    const answer = typeof lane.enqueueSpeech === 'function'
+      ? lane.enqueueSpeech(prompt, { kind: 'announce', taskId: item.taskId, query: item.query })
+      : lane.speakFromText?.(prompt, { taskId: item.taskId, query: item.query }) ?? null;
     if (answer === null) return 'defer';
     const res = await playAudio(answer);
     if (res.spokenBytes === 0 && !res.interrupted) {
       return this.disposed ? 'defer' : 'fallback';
     }
-    this.markInjected(item.taskId);
+    if (item.taskId !== undefined) this.directSpokenTaskIds.add(item.taskId);
+    this.apply({
+      type: 'announce.settled',
+      taskId: item.taskId,
+      outcome: res.interrupted ? 'interrupted' : 'spoken',
+      ...(item.query === undefined ? {} : { query: item.query }),
+      summary: item.speech,
+    });
     return 'spoken';
   }
 
   /**
-   * TTS 把后台结论念完了（或被打断）。没被打断、而且 omni 还不知道这句话时，
-   * 按「已经念给用户听了」回注。已经注入过的不再注第二遍。
+   * 后台结论已经由某一侧念完（或被打断）。
+   * 真车道靠单槽快照，不再 `injectAnswer`。
+   * 旧假车道没有 `updateDynamicContext` 时，没被打断且还没补过，才按 spoken 回注一次。
    */
   noteFallbackAnnounceSpoken(item: FallbackItem, interrupted: boolean): void {
-    if (item.taskId !== undefined) this.pendingReports.delete(item.taskId);
+    this.apply({
+      type: 'announce.settled',
+      taskId: item.taskId,
+      outcome: interrupted ? 'interrupted' : 'spoken',
+      ...(item.query === undefined ? {} : { query: item.query }),
+      summary: item.speech,
+    });
+    if (this.laneUsesSnapshot()) return;
     if (interrupted) return;
-    if (item.taskId !== undefined && this.injectedTaskIds.has(item.taskId)) return;
-    if (item.taskId !== undefined) this.injectedTaskIds.add(item.taskId);
+    if (item.taskId !== undefined) {
+      if (this.directSpokenTaskIds.has(item.taskId) || this.legacyInjectedIds.has(item.taskId)) return;
+      this.legacyInjectedIds.add(item.taskId);
+    }
     this.audioLane?.injectAnswer?.(item.query ?? '后台任务', item.speech, 'spoken');
   }
 
@@ -397,7 +475,8 @@ export class LiveOrchestrator implements AgentProvider {
     this.foregroundActive = false;
     this.activeForegroundTicket = null;
     this.bus.dispose();
-    this.pendingReports.clear();
+    this.legacyInjectedIds.clear();
+    this.directSpokenTaskIds.clear();
   }
 
   /**
@@ -412,6 +491,123 @@ export class LiveOrchestrator implements AgentProvider {
     this.audioLane?.discard?.();
   }
 
+  private apply(event: LiveSessionEvent): void {
+    const reduced = reduceLiveSession(this.state, event);
+    this.state = reduced.state;
+    for (const effect of reduced.effects) this.runEffect(effect);
+  }
+
+  private runEffect(effect: LiveSessionEffect): void {
+    switch (effect.type) {
+      case 'send_tool_output':
+        this.audioLane?.sendFunctionCallOutput?.(effect.callId, effect.output);
+        return;
+      case 'delete_omni_items':
+        if (effect.itemIds.length > 0) this.audioLane?.deleteItems?.(effect.itemIds);
+        return;
+      case 'sync_omni_snapshot':
+        this.audioLane?.updateDynamicContext?.(effect.snapshot);
+        return;
+      case 'emit_ui_asr_replace':
+        // 纠偏字幕已经附在 deliver_report 上，交给 taskReporter，这里不再单发。
+        return;
+      case 'deliver_report':
+        this.deliverReport(this.reportForDelivery(effect));
+        return;
+      default: {
+        const neverEffect: never = effect;
+        return neverEffect;
+      }
+    }
+  }
+
+  private reportForDelivery(
+    effect: Extract<LiveSessionEffect, { type: 'deliver_report' }>,
+  ): BackgroundTaskReport {
+    const patch: {
+      turnNo?: number;
+      canonicalUser?: string;
+      previousUserText?: string;
+    } = {};
+    if (effect.turnNo !== undefined) patch.turnNo = effect.turnNo;
+    if (effect.canonicalUser !== undefined) patch.canonicalUser = effect.canonicalUser;
+    if (effect.previousUserText !== undefined) patch.previousUserText = effect.previousUserText;
+    if (
+      patch.turnNo === undefined
+      && patch.canonicalUser === undefined
+      && patch.previousUserText === undefined
+    ) {
+      return effect.report;
+    }
+    return { ...effect.report, ...patch };
+  }
+
+  private onBusLifecycle(ev: BackgroundTaskLifecycleEvent): void {
+    switch (ev.type) {
+      case 'queued':
+      case 'upgraded':
+      case 'running':
+      case 'cancelled':
+        this.apply({
+          type: 'task.lifecycle',
+          taskId: ev.taskId,
+          status: ev.type,
+          ...(ev.turnNo !== undefined ? { turnNo: ev.turnNo } : {}),
+          source: ev.source,
+          query: ev.query,
+          silent: ev.silent,
+        });
+        return;
+      case 'completed':
+        if (ev.report !== undefined) {
+          this.apply({
+            type: 'task.completed',
+            report: ev.report,
+            ...(ev.turnNo !== undefined ? { turnNo: ev.turnNo } : {}),
+            ...(ev.report.canonicalUser !== undefined ? { canonicalUser: ev.report.canonicalUser } : {}),
+            silent: ev.silent,
+          });
+          return;
+        }
+        this.apply({
+          type: 'task.completed',
+          report: {
+            taskId: ev.taskId,
+            source: ev.source,
+            query: ev.query,
+            summary: '',
+          },
+          ...(ev.turnNo !== undefined ? { turnNo: ev.turnNo } : {}),
+          silent: true,
+        });
+        return;
+      case 'failed':
+        if (ev.report !== undefined) {
+          this.apply({
+            type: 'task.failed',
+            report: ev.report,
+            ...(ev.turnNo !== undefined ? { turnNo: ev.turnNo } : {}),
+          });
+          return;
+        }
+        this.apply({
+          type: 'task.failed',
+          report: {
+            taskId: ev.taskId,
+            source: ev.source,
+            query: ev.query,
+            summary: '',
+          },
+          ...(ev.turnNo !== undefined ? { turnNo: ev.turnNo } : {}),
+        });
+        return;
+      default: {
+        const neverEv: never = ev;
+        return neverEv;
+      }
+    }
+  }
+
   private deliverReport(report: BackgroundTaskReport): void {
     const reporter = this.taskReporter;
     if (reporter !== null) {
@@ -421,53 +617,62 @@ export class LiveOrchestrator implements AgentProvider {
     this.announcer?.(report.summary, report.emotion);
   }
 
-  private markInjected(taskId: string | undefined): void {
-    if (taskId === undefined) return;
-    this.injectedTaskIds.add(taskId);
-    this.pendingReports.delete(taskId);
+  private laneUsesSnapshot(): boolean {
+    return typeof this.audioLane?.updateDynamicContext === 'function';
   }
 
-  /** 用户先开口、安静窗还没到：每个任务只回注一次，免得 omni 被问「跑完没」时编。 */
+  private cancelReportable(): boolean {
+    const cancelled = this.bus.cancelAll('user_cancel');
+    if (cancelled) this.apply({ type: 'task.cancelled_all' });
+    return cancelled;
+  }
+
+  /** 用户先开口。真车道的未播结论已在单槽里；旧假车道才把每条补进下一轮一次。 */
   private flushUnspoken(): void {
     const lane = this.audioLane;
-    if (lane === null || this.pendingReports.size === 0) return;
+    if (lane === null || this.laneUsesSnapshot()) return;
     if (typeof lane.injectAnswer !== 'function') return;
-    for (const [taskId, report] of this.pendingReports) {
-      if (this.injectedTaskIds.has(taskId)) continue;
-      this.injectedTaskIds.add(taskId);
-      lane.injectAnswer(report.query, report.summary, 'unspoken');
+    for (const task of listUnspokenReports(this.state)) {
+      if (this.legacyInjectedIds.has(task.taskId)) continue;
+      this.legacyInjectedIds.add(task.taskId);
+      lane.injectAnswer(task.query, task.summary ?? '', 'unspoken');
     }
   }
 
-  private composeBackendNote(directive: string, note: string | undefined, query: string): string {
+  /**
+   * 在 `dispatch` 里就把后台注记拼好。工人要晚一个微任务才开跑，
+   * 而这一轮的 `turn.delegated` / `turn.early_guarded` 会在返回后立刻写进状态。
+   * 注记若拖到执行时再读，正在派的这一轮会被当成前文。
+   */
+  private dispatchTracked(
+    req: BackgroundTaskRequest,
+    delegateHint?: string,
+  ): ReturnType<BackgroundTaskBus['dispatch']> {
+    return this.bus.dispatch({
+      ...req,
+      note: this.composeBackendNote(this.backendDirective, req.note, req.query, delegateHint),
+    });
+  }
+
+  private composeBackendNote(
+    directive: string,
+    note: string | undefined,
+    query: string,
+    delegateHint?: string,
+  ): string {
     const parts: string[] = [directive];
     const memory = this.readMemory(query);
     if (memory !== '') parts.push(memory);
-    // 前台 0 ms：账本已在这一进程里，拼进后台注记只为让 dsh 看懂「它」。
     const recent = this.recentDialogNote();
     if (recent !== '') parts.push(recent);
+    if (delegateHint !== undefined && delegateHint.trim() !== '') parts.push(delegateHint);
     if (note !== undefined && note.trim() !== '') parts.push(note);
     return parts.join('\n\n');
   }
 
   /** 最近四轮有内容的前台对话。空轮跳过；被打断的那句在米馍行末尾标明。 */
   private recentDialogNote(): string {
-    const lines: string[] = [];
-    for (const turn of this.ledger.recent(4)) {
-      this.appendDialogTurn(lines, turn);
-    }
-    if (lines.length === 0) return '';
-    return `【最近前台对话（仅供理解代词与指代，不要重复回答）】\n${lines.join('\n')}`;
-  }
-
-  private appendDialogTurn(lines: string[], turn: LedgerTurn): void {
-    const user = turn.userText.trim();
-    const assistant = turn.assistantText.trim();
-    if (user === '' && assistant === '') return;
-    if (user !== '') lines.push(`用户：${user}`);
-    if (assistant !== '' || turn.truncated) {
-      lines.push(`米馍：${assistant}${turn.truncated ? '（被打断）' : ''}`);
-    }
+    return projectDshRecentDialog(this.state, 4);
   }
 
   private readMemory(query: string): string {
@@ -480,16 +685,41 @@ export class LiveOrchestrator implements AgentProvider {
     }
   }
 
-  private remember(turn: TurnInput, speech: string, lane: 'live' | 'dsh'): void {
+  private remember(
+    turn: TurnInput,
+    speech: string,
+    lane: 'live' | 'dsh',
+    extra?: RecordedExtra,
+  ): void {
     const ticket = turn.ticket;
-    this.ledger.record({
-      userText: turn.text,
-      assistantText: speech,
+    this.apply({
+      type: 'turn.recorded',
+      turnNo: turn.no,
+      rawAsr: turn.text,
       lane,
-      truncated: false,
+      assistantSpoken: speech,
       endedAtMs: this.now(),
       ...(ticket === undefined ? {} : { ticket: { no: ticket.no, gen: ticket.gen } }),
+      ...(extra?.omniUserItemId !== undefined ? { omniUserItemId: extra.omniUserItemId } : {}),
+      ...(extra?.omniAssistantItemIds !== undefined ? { omniAssistantItemIds: extra.omniAssistantItemIds } : {}),
+      ...(extra?.toolCallId !== undefined ? { toolCallId: extra.toolCallId } : {}),
+      ...(extra?.taskId !== undefined ? { taskId: extra.taskId } : {}),
     });
+  }
+
+  /** 轮末再读一次 Omni 项。空的 `callId` 不写，免得把委派时已经记下的盖掉。 */
+  private recordedExtra(answer: AgentAudioAnswer | null, taskId: string | undefined): RecordedExtra | undefined {
+    const callId = answer?.delegateCallId?.() ?? null;
+    const hasCall = typeof callId === 'string' && callId !== '';
+    if (answer === null && taskId === undefined && !hasCall) return undefined;
+    const userItemId = answer === null ? undefined : (answer.userItemId?.() ?? null);
+    const assistantItemIds = answer === null ? undefined : (answer.assistantItemIds?.() ?? []);
+    return {
+      ...(userItemId !== undefined ? { omniUserItemId: userItemId } : {}),
+      ...(assistantItemIds !== undefined ? { omniAssistantItemIds: assistantItemIds } : {}),
+      ...(hasCall ? { toolCallId: callId } : {}),
+      ...(taskId !== undefined ? { taskId } : {}),
+    };
   }
 
   private async askForeground(
@@ -511,50 +741,91 @@ export class LiveOrchestrator implements AgentProvider {
     }
   }
 
-  private async *synth(text: string, signal: AbortSignal): AsyncGenerator<EngineEvent> {
-    if (signal.aborted || this.disposed || text.trim() === '') return;
-    const iter = this.tts.synthesize(text)[Symbol.asyncIterator]();
+  /**
+   * 用提示词排队让 omni 自己说一句（绝不调外部 TTS）。
+   *
+   * 优先走 `lane.enqueueSpeech`（在 `discard()` 刚发 cancel 还在等 `response.done`
+   * 时自动排进 FIFO 队列）；测试假车道只实现 `speakFromText` 时兼容走它。
+   */
+  private async *speakViaOmni(
+    prompt: string,
+    signal: AbortSignal,
+    kind: 'ack' | 'announce',
+    query?: string,
+  ): AsyncGenerator<EngineEvent, { readonly spokenBytes: number; readonly spokenText: string }> {
+    if (signal.aborted || this.disposed || prompt.trim() === '') {
+      return { spokenBytes: 0, spokenText: '' };
+    }
+    const lane = this.audioLane;
+    if (lane === null) {
+      return { spokenBytes: 0, spokenText: '' };
+    }
+    const answer: (AgentAudioAnswer & { interrupt?(): void }) | null = typeof lane.enqueueSpeech === 'function'
+      ? lane.enqueueSpeech(prompt, { kind, ...(query === undefined ? {} : { query }) })
+      : (lane.canSpeakBackground?.() !== false
+        ? lane.speakFromText?.(prompt, query === undefined ? undefined : { query }) ?? null
+        : null);
+    if (answer === null) {
+      return { spokenBytes: 0, spokenText: '' };
+    }
+
     const gate = createAbortGate(signal);
+    const iter = answer.chunks[Symbol.asyncIterator]();
+    let spokenBytes = 0;
+    let said = 0;
     try {
       for (;;) {
-        if (signal.aborted) return;
-        const next = iter.next();
-        const winner = await Promise.race([
-          next.then(
-            (step) => ({ kind: 'step' as const, step }),
-            (error: unknown) => ({ kind: 'error' as const, error }),
-          ),
-          gate.done.then(() => ({ kind: 'aborted' as const })),
-        ]);
-        if (winner.kind === 'aborted' || signal.aborted || this.disposed) {
-          void Promise.resolve(next).catch(() => {});
-          return;
+        if (signal.aborted || this.disposed) {
+          answer.interrupt?.();
+          return { spokenBytes, spokenText: answer.transcript() };
         }
-        if (winner.kind === 'error') throw winner.error;
-        if (winner.step.done === true) return;
+        const step = iter.next();
+        const winner = await Promise.race([step, gate.done]);
+        if (winner === undefined || signal.aborted || this.disposed) {
+          answer.interrupt?.();
+          void Promise.resolve(step).catch(() => {});
+          void Promise.resolve(iter.return?.()).catch(() => {});
+          return { spokenBytes, spokenText: answer.transcript() };
+        }
+        if (winner.done === true) {
+          break;
+        }
+        spokenBytes += winner.value.byteLength;
         yield {
           type: 'audio',
-          pcm: asBuffer(winner.step.value),
-          sampleRate: this.tts.sampleRate,
+          pcm: winner.value,
+          sampleRate: answer.sampleRate,
         };
+        const text = answer.transcript();
+        if (text.length > said) {
+          const delta = text.slice(said);
+          said = text.length;
+          yield { type: 'text', delta };
+        }
       }
     } finally {
       gate.cancel();
-      if (signal.aborted) void Promise.resolve(iter.return?.()).catch(() => {});
     }
+    const finalText = answer.transcript();
+    if (finalText.length > said && !signal.aborted && !this.disposed) {
+      yield { type: 'text', delta: finalText.slice(said) };
+    }
+    return { spokenBytes, spokenText: finalText };
   }
 
-  private async *speakFixed(
+  private async *speakAck(
     turn: TurnInput,
     signal: AbortSignal,
-    text: string,
+    kind: LiveAckKind,
     meta: MetaEvent,
   ): AsyncGenerator<EngineEvent> {
     yield meta;
-    if (!signal.aborted && !this.disposed) yield* this.synth(text, signal);
+    const prompt = buildLiveAckPrompt(kind, turn.text);
+    const res = yield* this.speakViaOmni(prompt, signal, 'ack', turn.text);
     if (signal.aborted || this.disposed) return;
-    this.remember(turn, text, 'live');
-    yield { type: 'done', fullText: text, speech: text };
+    const said = res.spokenText.trim();
+    this.remember(turn, said, 'live');
+    yield { type: 'done', fullText: said, speech: said };
   }
 
   private async *fallbackDsh(
@@ -571,7 +842,11 @@ export class LiveOrchestrator implements AgentProvider {
     );
     if (signal.aborted || this.disposed) return;
     yield meta;
-    yield* this.synth(reply.speech, signal);
+    // Pure Live 禁止调用外部 TTS：车道若已恢复则尝试让 omni 自己说，否则仅下发文本收尾。
+    if (reply.speech.trim() !== '') {
+      const prompt = buildLiveReportPrompt({ query: turn.text, summary: reply.speech });
+      yield* this.speakViaOmni(prompt, signal, 'announce', turn.text);
+    }
     if (signal.aborted || this.disposed) return;
     this.remember(turn, reply.speech, 'dsh');
     yield { type: 'done', fullText: reply.text, speech: reply.speech };
@@ -584,8 +859,12 @@ export class LiveOrchestrator implements AgentProvider {
   ): AsyncGenerator<EngineEvent> {
     const lane = this.audioLane;
     if (lane === null) return;
-    const live = new LiveVoiceEngine(lane);
-    yield* this.finishLive(turn, signal, live.respond(turn, signal), guardBackground);
+    const answer = lane.claim();
+    if (answer === null) {
+      yield { type: 'done', fullText: '' };
+      return;
+    }
+    yield* this.finishLive(turn, signal, streamLiveAnswer(answer, signal), guardBackground, answer);
   }
 
   /** `answerFromText()` 已经拿到活流：事件与 `tool_call` 处理和封段认领同一条。 */
@@ -595,7 +874,7 @@ export class LiveOrchestrator implements AgentProvider {
     answer: AgentAudioAnswer,
     guardBackground = false,
   ): AsyncGenerator<EngineEvent> {
-    yield* this.finishLive(turn, signal, streamLiveAnswer(answer, signal), guardBackground);
+    yield* this.finishLive(turn, signal, streamLiveAnswer(answer, signal), guardBackground, answer);
   }
 
   private async *finishLive(
@@ -603,11 +882,13 @@ export class LiveOrchestrator implements AgentProvider {
     signal: AbortSignal,
     source: AsyncIterable<EngineEvent>,
     guardBackground = false,
+    answer: AgentAudioAnswer | null = null,
   ): AsyncGenerator<EngineEvent> {
     let audioBytes = 0;
-    let spokeReceipt = false;
+    let ackText = '';
     let sawDelegate = false;
     let supplemented = false;
+    let linkedTaskId: string | undefined;
     for await (const ev of source) {
       if (signal.aborted || this.disposed) break;
       if (ev.type === 'audio') {
@@ -617,44 +898,65 @@ export class LiveOrchestrator implements AgentProvider {
       }
       if (ev.type === 'delegate') {
         sawDelegate = true;
-        const query = ev.rewrittenQuery
-          ? `${ev.rewrittenQuery}\n用户原话：「${turn.text}」`
-          : turn.text;
-        this.bus.dispatch({
+        // 主查询、播报提示、turn.delegated 共用这一份：用户原话。改写只进注记。
+        const query = primaryDelegateQuery(turn.text, ev.rewrittenQuery);
+        const handle = this.dispatchTracked({
           turnNo: turn.no,
           source: 'tool_call',
           query,
           note: turn.note,
+        }, composeDelegateHint(ev.rewrittenQuery ?? '', turn.text));
+        linkedTaskId = handle.taskId;
+        this.apply({
+          type: 'turn.delegated',
+          turnNo: turn.no,
+          rawAsr: turn.text,
+          query,
+          taskId: handle.taskId,
+          toolCallId: ev.callId ?? answer?.delegateCallId?.() ?? null,
+          omniUserItemId: answer?.userItemId?.() ?? null,
+          omniAssistantItemIds: answer?.assistantItemIds?.() ?? [],
+          nowMs: this.now(),
         });
         yield ev;
         yield { type: 'meta', path: 'omni', delegate: ev.reason, nonBlocking: true };
-        if (audioBytes === 0 && !signal.aborted) {
-          spokeReceipt = true;
-          this.writeLog('  直播    omni 转交但没有音频，补一句短回执');
-          yield* this.synth(DELEGATE_LINE, signal);
+        if (audioBytes === 0 && !signal.aborted && !this.disposed) {
+          this.writeLog('  直播    omni 转交但没有音频，排队用提示词让 omni 自己补一句');
+          const ack = yield* this.speakViaOmni(
+            buildLiveAckPrompt('delegate', query),
+            signal,
+            'ack',
+            query,
+          );
+          audioBytes += ack.spokenBytes;
+          ackText = ack.spokenText.trim();
         }
         continue;
       }
       if (ev.type === 'done') {
-        // 补派必须赶在 remember 之前让工人读到账本：注记只带更早的前台对话，
-        // 正在派的这一轮还不是前文。queueMicrotask 比这次 await 更早入队。
+        // 补派必须赶在 remember 之前入队：工人晚一个微任务开跑，注记在 dispatch 时已经封好。
         if (guardBackground && !sawDelegate && !signal.aborted && !this.disposed) {
-          this.dispatchEarly(turn);
+          linkedTaskId = this.dispatchEarly(turn, answer?.assistantItemIds?.() ?? []);
           supplemented = true;
           await Promise.resolve();
           if (signal.aborted || this.disposed) break;
         }
-        const said = ev.speech ?? ev.fullText;
-        this.remember(turn, said !== '' ? said : (spokeReceipt ? DELEGATE_LINE : ''), 'live');
-        yield ev;
+        const origSaid = (ev.speech ?? ev.fullText).trim();
+        const said = origSaid !== '' ? origSaid : ackText;
+        this.remember(turn, said, 'live', this.recordedExtra(answer, linkedTaskId));
+        if (origSaid === '' && ackText !== '') {
+          yield { type: 'done', fullText: ackText, speech: ackText };
+        } else {
+          yield ev;
+        }
         continue;
       }
       yield ev;
     }
-    // 守卫轮：Omni 自己发了 delegate 就只用那条改写查询。
+    // 守卫轮：Omni 自己发了 delegate 就走上面的 tool_call，主查询仍是用户原话。
     // 整段结束仍没有，才用原话补一笔 early_rule。中止或已释放不再派。
     if (guardBackground && !sawDelegate && !supplemented && !signal.aborted && !this.disposed) {
-      this.dispatchEarly(turn);
+      this.dispatchEarly(turn, answer?.assistantItemIds?.() ?? []);
     }
   }
 
@@ -665,13 +967,22 @@ export class LiveOrchestrator implements AgentProvider {
     return lane.willServe() || lane.canAnswerText?.() === true;
   }
 
-  private dispatchEarly(turn: TurnInput): void {
-    this.bus.dispatch({
+  private dispatchEarly(turn: TurnInput, omniAssistantItemIds?: readonly string[]): string {
+    const handle = this.dispatchTracked({
       turnNo: turn.no,
       source: 'early_rule',
       query: turn.text,
       note: turn.note,
     });
+    this.apply({
+      type: 'turn.early_guarded',
+      turnNo: turn.no,
+      rawAsr: turn.text,
+      query: turn.text,
+      taskId: handle.taskId,
+      ...(omniAssistantItemIds === undefined ? {} : { omniAssistantItemIds }),
+    });
+    return handle.taskId;
   }
 
   private async *respond(turn: TurnInput, signal: AbortSignal): AsyncGenerator<EngineEvent> {
@@ -691,26 +1002,26 @@ export class LiveOrchestrator implements AgentProvider {
     });
 
     if (decision !== 'cancel_bg' && decision !== 'photo_delegate' && looksMemorable(turn.text)) {
-      this.bus.dispatch({ source: 'memory_silent', silent: true, query: turn.text });
+      this.dispatchTracked({ source: 'memory_silent', silent: true, query: turn.text });
     }
 
     switch (decision) {
       case 'cancel_bg':
-        this.bus.cancelAll('user_cancel');
+        this.cancelReportable();
         this.audioLane?.discard?.();
         this.writeLog('  直播    用户取消后台任务');
-        yield* this.speakFixed(turn, signal, CANCEL_LINE, { type: 'meta', path: 'omni' });
+        yield* this.speakAck(turn, signal, 'cancel', { type: 'meta', path: 'omni' });
         return;
       case 'photo_delegate':
         this.audioLane?.discard?.();
-        this.bus.dispatch({
+        this.dispatchTracked({
           turnNo: turn.no,
           source: 'image',
           query: turn.text,
           image: toAgentImage(turn),
           note: turn.note,
         });
-        yield* this.speakFixed(turn, signal, PHOTO_LINE, {
+        yield* this.speakAck(turn, signal, 'photo', {
           type: 'meta',
           path: 'omni',
           delegate: 'task',
@@ -718,11 +1029,11 @@ export class LiveOrchestrator implements AgentProvider {
         });
         return;
       case 'clock_override':
-        // 钟点 Omni 会直接编。立刻丢掉在途音频，当场派后台，前台只应一声。
+        // 钟点 Omni 会直接编。立刻丢掉在途音频，当场派后台，再排队让 omni 自己简短应一声。
         this.audioLane?.discard?.();
         this.dispatchEarly(turn);
-        this.writeLog('  直播    钟点问题交给后台，前台只应一声');
-        yield* this.speakFixed(turn, signal, DELEGATE_LINE, {
+        this.writeLog('  直播    钟点问题交给后台，排队让 omni 简短应一声');
+        yield* this.speakAck(turn, signal, 'clock', {
           type: 'meta',
           path: 'omni',
           delegate: 'task',
@@ -754,7 +1065,7 @@ export class LiveOrchestrator implements AgentProvider {
 
   /**
    * Omni 还能服务。`guardBackground` 时不在这里派单：
-   * `tool_call` 在 {@link finishLive} 里当场派改写查询，
+   * `tool_call` 在 {@link finishLive} 里当场派，主查询是用户原话；
    * 结束仍没有 `delegate` 才补原话。
    */
   private async *playOmni(

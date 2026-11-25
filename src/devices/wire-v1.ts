@@ -14,8 +14,8 @@
  *
  * 因为拿不到 id，归属只能靠「上一趟请求的图一定先于下一趟到达」这条顺序假设。
  * `status()` 和 `image()` 共用 {@link V1Session.ownerId}：
- * **已公告 → 已取消残留 → 在途**。取消 A 之后立刻 encode B，迟到的
- * `hq_image` / `hq_failed` 仍记在 A 上。
+ * **待消费的那一帧高清（公告或取消，同一时刻只有一条）→ 在途**。
+ * 取消 A 之后立刻 encode B，迟到的 `hq_image` / `hq_failed` 仍记在 A 上。
  * 一句话：**宁可让新请求超时，也不把旧图当新图交出去。**
  */
 import type {
@@ -73,10 +73,13 @@ export class V1Session {
   private readonly phrases: V1Phrases;
   /** 正在等的拍照 */
   private inflight: { readonly id: string; readonly intent: CaptureIntent } | null = null;
-  /** 收到过 `hq_image`：下一帧图属于这个 id */
-  private announcedId: string | null = null;
-  /** 取消过一次高清：下一帧迟到的图归这个已作废的 id（让收件箱吃掉） */
-  private cancelledId: string | null = null;
+  /**
+   * 正在等的那一帧高清图归属。同一时刻只有一条，消费一次即清零：
+   * `announced` = 收到过 `hq_image`，下一帧归这个 id；
+   * `cancelled` = 取消之后迟到的那一帧要吃掉。
+   * 同一个 id 不能同时占两条——公告之后再取消，只把这一条从 `announced` 改成 `cancelled`。
+   */
+  private pendingHqFrame: { readonly id: string; readonly kind: 'announced' | 'cancelled' } | null = null;
 
   constructor(phrases: V1Phrases = {}) {
     this.phrases = phrases;
@@ -99,26 +102,33 @@ export class V1Session {
         return null;
       case 'capture':
         this.inflight = { id: call.id, intent: call.intent };
-        // 上一次的公告与取消残留**不清**：那两帧可能还在链路上，清掉就会把旧图
+        // 上一次还没消费的高清帧**不清**：那一帧可能还在链路上，清掉就会把旧图
         // 认给这个新请求。顺序假设见类注释。
         return call.intent === 'detail' ? 'take_photo_hq' : 'take_photo';
-      case 'capture.cancel':
+      case 'capture.cancel': {
+        const inflight = this.inflight;
         // id 对不上就是作废的取消：不能下发 —— 否则设备侧取消的是**新**请求
-        if (this.inflight?.id !== call.id) {
+        if (inflight?.id !== call.id) {
           return null;
         }
-        if (this.inflight.intent === 'detail') {
-          this.cancelledId = call.id;
+        if (inflight.intent === 'detail') {
+          const pending = this.pendingHqFrame;
+          // 空槽，或这一帧已经记在同一个 id 上：改成（或保持）取消残留。
+          // 槽里若是别的 id，不动它——新请求不清上一次的公告 / 取消残留。
+          if (pending === null || pending.id === inflight.id) {
+            this.pendingHqFrame = { id: inflight.id, kind: 'cancelled' };
+          }
         }
         this.inflight = null;
         return 'hq_cancel';
+      }
     }
   }
 
   /**
    * 请求已经有了结局（成功 / 超时 / 失败），它不再等在途。
    *
-   * **只清 `inflight`**：公告过或取消掉的图可能还在链路上，那一帧仍旧要归旧 id
+   * **只清 `inflight`**：待消费的高清帧可能还在链路上，那一帧仍旧要归旧 id
    * （让收件箱吃掉），清掉残留就会把它认给下一个请求。
    */
   forget(id: string): void {
@@ -130,12 +140,12 @@ export class V1Session {
   /**
    * 这一帧状态、下一帧图该归谁。
    *
-   * 顺序只有这一处：已公告的高清 → 取消后还在路上的旧请求 → 当前在途。
+   * 顺序只有这一处：待消费的那一帧高清（公告或取消，互斥）→ 当前在途。
    * `inflight` 放最后，是为了取消 A 后立刻 encode B 时，旧的 `hq_image` /
    * `hq_failed` 不会被写成 B。
    */
   private ownerId(): string | null {
-    return this.announcedId ?? this.cancelledId ?? this.inflight?.id ?? null;
+    return this.pendingHqFrame?.id ?? this.inflight?.id ?? null;
   }
 
   /** `Status` 帧（JSON）→ 原语事件。 */
@@ -158,22 +168,33 @@ export class V1Session {
           },
         };
       }
-      case 'hq_image':
-        // 公告落在 ownerId 上，不是「谁正在 inflight」。
-        // 同一 id 的取消残留和公告指的是同一帧：叠成两次认领，
-        // 会把下一帧（新请求的图）再吃掉。
-        this.announcedId = id;
-        if (id !== null && this.cancelledId === id) {
-          this.cancelledId = null;
+      case 'hq_image': {
+        // 公告落在「还没消费的那一帧」上，不是后来才 inflight 的请求。
+        // 槽里若是别的 id（典型：取消 A 后立刻 encode B，B 还没有自己的公告），
+        // 这条迟到的 hq_image 仍记在旧 id 上，不串到 B。
+        // 同一 id 的取消残留收成公告：仍然只有一条，消费一次即清零。
+        const pending = this.pendingHqFrame;
+        const inflight = this.inflight;
+        if (pending !== null && pending.id !== inflight?.id) {
+          if (pending.kind !== 'announced') {
+            this.pendingHqFrame = { id: pending.id, kind: 'announced' };
+          }
+          return { known: true, event: null };
+        }
+        if (inflight?.intent === 'detail') {
+          this.pendingHqFrame = { id: inflight.id, kind: 'announced' };
         }
         return { known: true, event: null };
+      }
       case 'hq_failed': {
         if (id === null) {
           return { known: true, event: null };
         }
-        // 设备给了结局：这一趟不会再有迟到的图，取消残留到此为止
-        if (this.cancelledId === id) {
-          this.cancelledId = null;
+        // 设备给了结局：这一帧不会再来。announced 和 cancelled 都要清，
+        // 否则下一帧用户自己拍的图会被认成已经结束的旧请求。
+        const pending = this.pendingHqFrame;
+        if (pending !== null && (pending.id === id || this.inflight === null)) {
+          this.pendingHqFrame = null;
         }
         const reason = typeof json['reason'] === 'string' ? json['reason'] : 'timeout';
         const say = this.phrases.failureSay?.(reason);
@@ -195,21 +216,21 @@ export class V1Session {
   /**
    * 一帧图属于哪个请求。
    *
-   * 认领顺序就是 {@link ownerId}：**公告的高清 → 取消后的迟到图 → 在途 glance 的第一帧**。
-   * detail 在公告之前的低清回图不认领（`ownerId` 会指向在途 detail，这里故意不取）。
+   * 认领顺序：**待消费的高清帧（公告或取消，只此一条）→ 在途 glance 的第一帧**。
+   * detail 在公告之前的低清回图不认领（在途 detail 故意不取）。
+   * 高清帧消费一次即清零；在途请求若就是这一帧的 id，一并清掉，避免再吃下一帧。
    * v1 按序处理命令，旧请求的回图一定先于新请求到达，所以先认领旧请求的。
    *
    * @returns 请求 id；`null` = 不属于任何请求（用户自己拍的，或等快门时的低清回图）
    */
   image(): string | null {
-    const id = this.ownerId();
-    if (this.announcedId !== null) {
-      this.announcedId = null;
-      return id;
-    }
-    if (this.cancelledId !== null) {
-      this.cancelledId = null;
-      return id;
+    const pending = this.pendingHqFrame;
+    if (pending !== null) {
+      this.pendingHqFrame = null;
+      if (this.inflight?.id === pending.id) {
+        this.inflight = null;
+      }
+      return pending.id;
     }
     const inflight = this.inflight;
     if (inflight !== null && inflight.intent === 'glance') {

@@ -813,3 +813,339 @@ test('旧进程 close 不杀死新进程的 RPC，也不提前结束新一轮', 
     h.dispose();
   }
 });
+
+interface DetachedLeaseView {
+  turnNo: number | null;
+  userText: string;
+  text: string;
+}
+
+/** 测试里看放手租约有没有残留。这些字段是私有的，行为测完还得核对「一个都不剩」。 */
+function turnView(session: DshSession): {
+  detachedLease: DetachedLeaseView | null;
+  tailSwallow: { phase: string; turnNo: number | null } | null;
+  assistantText: string;
+  activeUserText: string;
+  turnPhase: string;
+  spontaneous: { readonly isActive: boolean };
+} {
+  return session as unknown as {
+    detachedLease: DetachedLeaseView | null;
+    tailSwallow: { phase: string; turnNo: number | null } | null;
+    assistantText: string;
+    activeUserText: string;
+    turnPhase: string;
+    spontaneous: { readonly isActive: boolean };
+  };
+}
+
+/**
+ * 假 dsh：第一轮 `turn/start` 之后停住。第二条 prompt **不排队**，先把新轮的
+ * 文本吐出来，再结算旧轮，最后才给新轮那条 idle。
+ * 旧实现会把新轮文本写进放手缓冲区，并在旧 `turn/end` 上把这条 idle 吞掉。
+ */
+function fakeOverlappedTurns(dir: string): string {
+  const source = `
+process.stdin.setEncoding('utf8');
+let buf = '';
+let prompts = 0;
+const send = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); };
+const event = (sessionId, type, seq, data) => {
+  send({ jsonrpc: '2.0', method: 'session.event', params: { sessionId, event: { type, seq, data } } });
+};
+const status = (sessionId, s) => {
+  send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: s } });
+};
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (line === '') continue;
+    const msg = JSON.parse(line);
+    const { id, method, params } = msg;
+    if (method === 'session/prompt') {
+      prompts += 1;
+      send({ jsonrpc: '2.0', id, result: {} });
+      const sessionId = params.sessionId;
+      process.stderr.write('PROMPT ' + prompts + '\\n');
+      if (prompts === 1) {
+        status(sessionId, 'running');
+        event(sessionId, 'turn/start', 10, { turn: 1 });
+        continue;
+      }
+      status(sessionId, 'running');
+      event(sessionId, 'turn/start', 20, { turn: 2 });
+      event(sessionId, 'assistant/message', 21, {
+        turn: 2,
+        message: { content: [{ type: 'text', text: '新轮答案' }] },
+      });
+      event(sessionId, 'assistant/message', 11, {
+        turn: 1,
+        message: { content: [{ type: 'text', text: '旧轮答案' }] },
+      });
+      event(sessionId, 'turn/end', 12, { turn: 1, reason: { kind: 'completed' } });
+      status(sessionId, 'idle');
+      event(sessionId, 'turn/end', 22, { turn: 2, reason: { kind: 'completed' } });
+      continue;
+    }
+    send({ jsonrpc: '2.0', id, result: {} });
+  }
+});
+`;
+  return installProgram(dir, 'fake-overlap.mjs', source);
+}
+
+test('放手后紧接新轮：新轮文本不覆盖旧租约，旧 turn/end 不吞新轮 idle', async () => {
+  const h = makeSession('不用', 0, [], (dir) => fakeOverlappedTurns(dir), 4_000);
+  try {
+    const first = h.session.ask('查一下机器', undefined, { ticket });
+    await h.waitPrompt(1);
+    h.session.detachTurn(ticket);
+    const detached = await first;
+    assert.equal(detached.text, '');
+    assert.equal(detached.detached, true);
+
+    const second = await h.session.ask('那别的事了', undefined, { ticket: { no: 2, gen: 1 } });
+    assert.equal(second.text, '新轮答案', '新轮 assistant/message 必须留在前台，不能被旧租约收走');
+    assert.equal(second.detached, undefined);
+    assert.deepEqual(h.announced, [], '旧轮结算时新轮还在等，不能把旧答案再播一遍');
+    assert.deepEqual(h.recalled, [['查一下机器', '旧轮答案', false]]);
+    assert.ok(
+      h.logs.some((line) => line.includes('不补播')),
+      '旧 turn/end 应在新轮 idle 之前结算，并且没有把那条 idle 吃掉',
+    );
+    assert.equal(h.session.isBusy(), false);
+    assert.equal(turnView(h.session).detachedLease, null);
+  } finally {
+    h.dispose();
+  }
+});
+
+/** 假 dsh：放手之后再发一次 `status=running`，并且 idle 先于 `turn/end`。 */
+function fakeDetachStatus(dir: string): string {
+  const source = `
+process.stdin.setEncoding('utf8');
+let buf = '';
+const send = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); };
+const event = (sessionId, type, seq, data) => {
+  send({ jsonrpc: '2.0', method: 'session.event', params: { sessionId, event: { type, seq, data } } });
+};
+const status = (sessionId, s) => {
+  send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: s } });
+};
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (line === '') continue;
+    const msg = JSON.parse(line);
+    const { id, method, params } = msg;
+    if (method === 'session/prompt') {
+      send({ jsonrpc: '2.0', id, result: {} });
+      const sessionId = params.sessionId;
+      process.stderr.write('PROMPT 1\\n');
+      status(sessionId, 'running');
+      event(sessionId, 'turn/start', 10, { turn: 1 });
+      setTimeout(() => {
+        status(sessionId, 'running');
+        event(sessionId, 'assistant/message', 11, {
+          turn: 1,
+          message: { content: [{ type: 'text', text: '只该播一次' }] },
+        });
+        status(sessionId, 'idle');
+        event(sessionId, 'turn/end', 12, { turn: 1, reason: { kind: 'completed' } });
+      }, 120);
+      continue;
+    }
+    send({ jsonrpc: '2.0', id, result: {} });
+  }
+});
+`;
+  return installProgram(dir, 'fake-detach-status.mjs', source);
+}
+
+test('放手期间的 status=running 不会把 SpontaneousTurn 打开造成双播', async () => {
+  const h = makeSession('不用', 0, [], (dir) => fakeDetachStatus(dir), 4_000);
+  try {
+    const pending = h.session.ask('查一下机器', undefined, { ticket });
+    await h.waitPrompt(1);
+    h.session.detachTurn(ticket);
+    const result = await pending;
+    assert.equal(result.detached, true);
+    await wait(400);
+    assert.equal(
+      h.logs.some((line) => line.includes('自发开了一轮')),
+      false,
+      '委派轮还在跑时的 running 不是自发汇报',
+    );
+    assert.equal(turnView(h.session).spontaneous.isActive, false);
+    assert.deepEqual(h.announced, ['只该播一次']);
+    assert.deepEqual(h.recalled, [['查一下机器', '只该播一次', true]]);
+  } finally {
+    h.dispose();
+  }
+});
+
+test('reset 之后放手租约和用户原话归零，迟到的答案不再回注', async () => {
+  const h = makeSession('迟到的答案', 300);
+  try {
+    const pending = h.session.ask('用户原话', undefined, { ticket });
+    await h.waitPrompt(1);
+    h.session.detachTurn(ticket);
+    await pending;
+    const before = turnView(h.session);
+    assert.equal(before.detachedLease?.userText, '用户原话');
+    assert.equal(h.session.isBusy(), true);
+
+    h.session.reset();
+    const after = turnView(h.session);
+    assert.equal(after.detachedLease, null);
+    assert.equal(after.tailSwallow, null);
+    assert.equal(after.assistantText, '');
+    assert.equal(after.activeUserText, '');
+    assert.equal(after.turnPhase, 'idle');
+    assert.equal(after.spontaneous.isActive, false);
+    assert.equal(h.session.isBusy(), false);
+
+    await wait(500);
+    assert.equal(turnView(h.session).detachedLease, null);
+    assert.deepEqual(h.recalled, [], '租约已经清掉，迟到的 turn/end 不能再回注用户原话');
+    assert.deepEqual(h.announced, []);
+  } finally {
+    h.dispose();
+  }
+});
+
+/**
+ * 假 dsh：旧进程答完才退出；`second-life` 出现后拉起的进程把答案扣到 `release-answer`。
+ * shutdown 之后不再吐旧轮的答案，避免和换代断言抢同一条 stdout。
+ */
+function fakeGeneration(dir: string): string {
+  const source = `
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const dir = ${JSON.stringify(dir)};
+process.stdin.setEncoding('utf8');
+let buf = '';
+let exiting = false;
+const send = (o) => { process.stdout.write(JSON.stringify(o) + '\\n'); };
+const event = (sessionId, type, seq, data) => {
+  send({ jsonrpc: '2.0', method: 'session.event', params: { sessionId, event: { type, seq, data } } });
+};
+const status = (sessionId, s) => {
+  send({ jsonrpc: '2.0', method: 'session.status', params: { sessionId, status: s } });
+};
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (line === '') continue;
+    const msg = JSON.parse(line);
+    const { id, method, params } = msg;
+    if (method === 'shutdown') {
+      exiting = true;
+      const timer = setInterval(() => {
+        if (!existsSync(join(dir, 'kill-old'))) return;
+        clearInterval(timer);
+        try { writeFileSync(join(dir, 'old-exiting'), '1'); } catch { /* 测试目录还在 */ }
+        process.exit(0);
+      }, 15);
+      continue;
+    }
+    if (method === 'session/prompt') {
+      send({ jsonrpc: '2.0', id, result: {} });
+      const sessionId = params.sessionId;
+      const second = existsSync(join(dir, 'second-life'));
+      process.stderr.write('PROMPT ' + (second ? '2' : '1') + '\\n');
+      if (!second) {
+        status(sessionId, 'running');
+        event(sessionId, 'turn/start', 10, { turn: 1 });
+        continue;
+      }
+      const timer = setInterval(() => {
+        if (exiting || !existsSync(join(dir, 'release-answer'))) return;
+        clearInterval(timer);
+        status(sessionId, 'running');
+        event(sessionId, 'turn/start', 10, { turn: 1 });
+        event(sessionId, 'assistant/message', 11, {
+          turn: 1,
+          message: { content: [{ type: 'text', text: '新进程答案' }] },
+        });
+        event(sessionId, 'turn/end', 12, { turn: 1, reason: { kind: 'completed' } });
+        status(sessionId, 'idle');
+      }, 15);
+      continue;
+    }
+    send({ jsonrpc: '2.0', id, result: {} });
+  }
+});
+`;
+  return installProgram(dir, 'fake-generation.mjs', source);
+}
+
+test('stop 与进程换代之后放手租约和用户原话归零', async () => {
+  const h = makeSession('不用', 0, [], (dir) => fakeGeneration(dir), 8_000);
+  try {
+    const first = h.session.ask('上一轮的原话', undefined, { ticket });
+    await h.waitPrompt(1);
+    h.session.detachTurn(ticket);
+    const detached = await first;
+    assert.equal(detached.detached, true);
+    assert.equal(turnView(h.session).detachedLease?.userText, '上一轮的原话');
+
+    writeFileSync(join(h.dir, 'second-life'), '1');
+    h.session.stop();
+    const cleared = turnView(h.session);
+    assert.equal(cleared.detachedLease, null, 'stop 必须清掉放手租约，不能等旧进程 close');
+    assert.equal(cleared.tailSwallow, null);
+    assert.equal(cleared.assistantText, '');
+    assert.equal(cleared.activeUserText, '', '用户原话不能留在 activeUserText 里跨过 stop');
+    assert.equal(cleared.turnPhase, 'idle');
+    assert.equal(cleared.spontaneous.isActive, false);
+    assert.equal(h.session.isBusy(), false);
+
+    const prompts = (): number => h.logs.filter((line) => line.includes('PROMPT')).length;
+    const before = prompts();
+    const pending = h.session.ask('新进程的问题', undefined, { ticket: { no: 2, gen: 1 } });
+    for (let waited = 0; waited < 15_000 && prompts() <= before; waited += 20) {
+      await wait(20);
+    }
+    assert.ok(prompts() > before, `新进程没收到 prompt：${JSON.stringify(h.logs)}`);
+    assert.equal(
+      turnView(h.session).detachedLease,
+      null,
+      '新一轮 prompt 发出后，过期租约不能还挂着',
+    );
+
+    writeFileSync(join(h.dir, 'kill-old'), '1');
+    for (let waited = 0; waited < 5_000 && !existsSync(join(h.dir, 'old-exiting')); waited += 20) {
+      await wait(20);
+    }
+    assert.equal(existsSync(join(h.dir, 'old-exiting')), true, '旧进程应该已经退出');
+    await wait(200);
+    assert.equal(
+      turnView(h.session).detachedLease,
+      null,
+      '旧进程 close 被代次挡住时，不能把上一轮用户原话留回来',
+    );
+    assert.deepEqual(h.recalled, []);
+
+    writeFileSync(join(h.dir, 'release-answer'), '1');
+    const result = await pending;
+    assert.equal(result.text, '新进程答案');
+    assert.equal(result.detached, undefined, '漏过来的放手标志不能把新进程这一轮标成 detached');
+    assert.deepEqual(h.recalled, [], '旧用户原话不能在换代之后被回注');
+    assert.deepEqual(h.announced, []);
+    assert.equal(h.session.isBusy(), false);
+  } finally {
+    try { writeFileSync(join(h.dir, 'kill-old'), '1'); } catch { /* 目录可能已经收掉 */ }
+    try { writeFileSync(join(h.dir, 'release-answer'), '1'); } catch { /* 同上 */ }
+    h.dispose();
+  }
+});

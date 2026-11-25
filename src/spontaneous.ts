@@ -17,6 +17,11 @@
  */
 export class SpontaneousTurn {
   private active = false;
+  /**
+   * 放手租约还在时为真。这段 `running` / `idle` 属于委派轮，不是「没人催的汇报」。
+   * 和 `active` 分开：按住只禁止自发轮，不代表前台 `ask` 正在等。
+   */
+  private suppressed = false;
 
   /**
    * 喂一条 `session.status`。
@@ -28,6 +33,11 @@ export class SpontaneousTurn {
    *          `null` = 与自发轮次无关
    */
   onStatus(status: string, hasPromptWaiter: boolean): 'begin' | 'settle' | null {
+    if (this.suppressed) {
+      // 放手轮的 status=running 不能再开一条自发轮，否则同一段文本会播两次
+      this.active = false;
+      return null;
+    }
     if (status === 'running') {
       if (hasPromptWaiter) {
         // 这是我们自己催的那一轮，不是自发的
@@ -48,7 +58,19 @@ export class SpontaneousTurn {
     return this.active;
   }
 
-  /** 自己发 prompt 前调用：接下来那一轮的 idle 归 prompt 等待者，不算自发。 */
+  /**
+   * 放手租约占用会话时按住。已经误开的自发轮一并灭掉，避免和委派轮叠成双播。
+   * 解除之后下一条没人等的 `running` 仍可以正常开始。
+   */
+  suppress(on: boolean): void {
+    this.suppressed = on;
+    if (on) this.active = false;
+  }
+
+  /**
+   * 自己发 prompt 前调用：接下来那一轮的 idle 归 prompt 等待者，不算自发。
+   * 不碰 `suppress` —— 放手租约还在不在，由调用方按租约另行 `suppress`。
+   */
   reset(): void {
     this.active = false;
   }

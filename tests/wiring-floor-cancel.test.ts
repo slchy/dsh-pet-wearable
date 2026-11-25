@@ -484,3 +484,122 @@ test('生产装配（直播）：tool_call 异步派 dsh 后立刻放回话筒�
     app.close();
   }
 });
+
+test('后台播报被掐断：thinking/speaking 期间话筒始终是 reply，回到 listening 才放空', async () => {
+  const { voice, device, agent: petAgent } = petStubs();
+  const app = new AppSession({
+    clock,
+    caps: CAPS,
+    voice,
+    device,
+    agent: petAgent,
+    pet: false,
+  });
+
+  let releaseSpeak: (outcome: 'spoken' | 'defer' | 'fallback') => void = () => {};
+  const speakGate = new Promise<'spoken' | 'defer' | 'fallback'>((resolve) => {
+    releaseSpeak = resolve;
+  });
+  let releaseReply: (view: AgentReplyView) => void = () => {};
+  const replyGate = new Promise<AgentReplyView>((resolve) => {
+    releaseReply = resolve;
+  });
+
+  const states: DialogState[] = [];
+  const leaks: string[] = [];
+  let releasedDuringThink = false;
+  const speeches: string[] = [];
+
+  const watch = (where: string): void => {
+    const phase = states.at(-1);
+    if ((phase === 'thinking' || phase === 'speaking') && app.floor.owner !== 'reply') {
+      leaks.push(`${where} @ ${phase} → ${String(app.floor.owner)}`);
+    }
+  };
+
+  const runtime = new DialogRuntime({
+    clock,
+    caps: CAPS,
+    agent: {
+      name: 'fake',
+      reply: () => replyGate,
+    },
+    tts,
+    downlink,
+    imageQuestion: '',
+    photoDir: '',
+    photoTimeoutMs: 1_000,
+    confirmTimeoutMs: 1_000,
+    playbackTailMs: 0,
+    speakAnnounce: (item) => {
+      speeches.push(item.speech);
+      return speakGate;
+    },
+    cancelAnnounce: () => {},
+    env: {
+      call: () => true,
+      assemble: () => {},
+      end: () => {},
+      // 生产：`DialogRuntime.onAnnounce` → `AppSession.announce`
+      onAnnounce: (pending, spoken) => {
+        app.announce(pending, spoken);
+        if (states.at(-1) === 'thinking' && pending === false) {
+          releasedDuringThink = true;
+        }
+        watch(`announce(${String(pending)},${String(spoken)})`);
+      },
+      onDialogState: (state) => {
+        states.push(state);
+        app.onDialogState(state);
+        watch(`state ${state}`);
+      },
+    },
+    log: () => {},
+  });
+
+  try {
+    runtime.enqueueAnnounce('后台结论');
+    assert.equal(speeches.length, 1, '播报应该已经开口');
+    assert.equal(app.floor.owner, 'announce', '开口时话筒在播报上');
+
+    // 生产顺序（`voice-session` 的 onUtterance）：先定稿移交话筒，再送进状态机。
+    // 短句常常没有 partial，话筒会一直停在 announce 上，直到这次移交。
+    app.userFinal('我想问别的');
+    assert.equal(app.floor.owner, 'reply', '定稿必须从 announce 移交给 reply');
+    runtime.dispatch({ type: 'utterance', text: '我想问别的' });
+    assert.ok(
+      await until(() => runtime.core.fsm.state === 'thinking'),
+      `没进 thinking，实际 ${runtime.core.fsm.state}`,
+    );
+    assert.equal(app.floor.owner, 'reply');
+
+    releaseSpeak('spoken');
+    for (let step = 0; step < 8; step += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(releasedDuringThink, true, '播报 finally 必须在 thinking 期间把 pending=false 交回来');
+    assert.equal(runtime.core.fsm.state, 'thinking');
+    assert.equal(app.floor.owner, 'reply', 'finally 释放 announce 后不能变成 null');
+
+    releaseReply({ text: '好', speech: '好' });
+    assert.ok(
+      await until(() => {
+        watch('poll');
+        return states.includes('speaking')
+          && states.at(-1) === 'listening'
+          && app.floor.owner === null;
+      }),
+      `话筒没在 listening 放空，states=${JSON.stringify(states)} owner=${String(app.floor.owner)}`
+      + ` leaks=${JSON.stringify(leaks)}`,
+    );
+    assert.deepEqual(leaks, [], `thinking/speaking 期间话筒离开了 reply：${JSON.stringify(leaks)}`);
+    assert.ok(states.includes('thinking'));
+    assert.ok(states.includes('speaking'));
+    assert.equal(app.floor.owner, null, '整轮回到 listening 才放空');
+  } finally {
+    releaseSpeak('spoken');
+    releaseReply({ text: '好', speech: '好' });
+    runtime.dispose();
+    app.close();
+  }
+});

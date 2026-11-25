@@ -429,17 +429,32 @@ export class DshSession {
   /** 当前在途那一轮是不是**被我们主动取消**的（是的话收成空答复，不抛错） */
   private cancelRequested = false;
   /**
-   * 当前在途那一轮被**放手**了（见 `detachTurn`）：`ask` 立刻收尾，但 dsh 那一轮
-   * 还在跑，答完之后没有等待者 —— 由 `onAnnounce` 播出去。
+   * 当前前台 `askSdk` 正在跑（已经挂上 `onIdle`，在等这一轮自己的 `idle`）。
+   *
+   * 和 {@link detachedLease} 分开记。放手只摘掉等待者，下一轮 `ask` 可以马上再把这里
+   * 置上。两条同时为真是合法的：文本按 `turn` 各写各的，不许混进同一份缓冲区。
    */
-  private detached = false;
+  private foregroundActive = false;
+  /** 当前前台轮已经见到的 `turn/start` 轮号；还没开轮是 `null`。 */
+  private foregroundTurn: number | null = null;
   /**
-   * 放手那一轮的答复文本（独立一份：新一轮开起来会清 `assistantText`）
+   * 当前这一次 `askSdk` 的等待者是不是被 `detachTurn` 摘掉了。
+   * 只决定这次返回值带不带 `detached`，不代表旧租约还在。
    */
-  private detachedText = '';
-  /** 放手那一轮的用户原话（回注记忆要成对，见 `onDetachedAnswer`） */
-  private detachedUserText = '';
-  /** 正在跑的那一轮的用户原话（`detachTurn` 时抄进 `detachedUserText`） */
+  private foregroundDetached = false;
+  /**
+   * 放手轮的租约。`null` = 没有还在跑的委派轮。
+   *
+   * `turnNo` 在放手时抄当时的前台轮号（还没 `turn/start` 就是 `null`，认下一次
+   * `turn/end`）。`text` 只收**这一轮**的 `assistant/message`。前台 `askSdk` 正在跑时，
+   * 新轮的文本写 `assistantText`，绝不能覆盖这里。
+   */
+  private detachedLease: {
+    readonly turnNo: number | null;
+    readonly userText: string;
+    text: string;
+  } | null = null;
+  /** 正在跑的那一轮的用户原话（`detachTurn` 时抄进租约的 `userText`） */
   private activeUserText = '';
   /**
    * 轮号：`turn/start` / `turn/end` 的 `data.turn`（dsh 自己发的单调递增整数）。
@@ -450,17 +465,19 @@ export class DshSession {
    * `turn/start` / `turn/end` 是**逐轮**事件，轮号对得上才结算。
    */
   private currentTurn: number | null = null;
-  /** 放手那一轮要认领的轮号（`null` = 放手时还没有 turn/start，下一次 turn/end 就是它） */
-  private detachedTurn: number | null = null;
   /**
-   * 上一轮残留尾巴的吞噬相位（仅用于主会话串行边界，`idle` 不带轮号只能靠显式相位区分）：
-   * - `'none'`：没有上一轮未收尾的尾巴
-   * - `'awaiting_old_idle'`：旧轮的 `turn/start` 已过（放手轮已 `turn/end`，或自发轮已 `turn/start`），
-   *   只剩旧轮的一条 `status=idle` 待吞；一旦新的 `turn/start` 来了说明旧 `idle` 没发，直接归 `'none'`
-   * - `'awaiting_old_turn_start'`：自发轮只到了 `status=running`，它自己的 `turn/start` 还在管道里；
-   *   先吃掉那条旧 `turn/start` 转入 `'awaiting_old_idle'`，绝不能被旧 `turn/start` 提前解除 `idle` 保护
+   * 上一轮那条不带轮号的 `idle`（或还没到的 `turn/start`）。`null` = 没有尾巴。
+   *
+   * `turnNo` 绑的是**该被吞的那一轮**。新前台轮的 `turn/start` 已经出现，或者即将
+   * 发出的 prompt 对不上这个轮号时，尾巴作废 —— 不能把新轮的 `idle` 当成旧轮尾巴吞掉。
+   *
+   * - `awaiting_old_turn_start`：自发轮只到了 `status=running`，它自己的 `turn/start` 还在管道里
+   * - `awaiting_old_idle`：旧轮的 `turn/start` 已过，只等那一条 `idle`
    */
-  private tailSwallow: 'none' | 'awaiting_old_turn_start' | 'awaiting_old_idle' = 'none';
+  private tailSwallow: {
+    readonly phase: 'awaiting_old_turn_start' | 'awaiting_old_idle';
+    readonly turnNo: number | null;
+  } | null = null;
   /**
    * 后台作业 / 子代理的实时状态。喂的是 dsh 自己发的事件，**不额外发请求** ——
    * 快车道要「报进度」时读它，而不是再问 dsh 一轮（那要 690 ms 外加一条会话历史）。
@@ -563,8 +580,10 @@ export class DshSession {
 
   /** 主动丢弃会话，下次 ask 会开新的。 */
   reset(): void {
-    // 换会话了：账本里的 seq 和待撤回的切点都属于旧会话，一起丢掉
+    // 换会话了：账本里的 seq 和待撤回的切点都属于旧会话，一起丢掉。
+    // 放手租约也是旧会话的，留着会把下一轮的文本和 idle 认成上一轮。
     this.rollback.reset();
+    this.clearTurnState();
     try {
       if (existsSync(this.sessionFile)) writeFileSync(this.sessionFile, '{}');
     } catch {
@@ -626,7 +645,7 @@ export class DshSession {
     const sessionId = this.openSessionId ?? this.readSession();
     const waiter = this.onIdle;
     // 放手的委派轮没有等待者，但它**还在跑** —— 那里也要能取消（用户显式下令取消）
-    if (this.proc === null || sessionId === null || (waiter === null && !this.detached)) {
+    if (this.proc === null || sessionId === null || (waiter === null && this.detachedLease === null)) {
       return;
     }
     // **有票据就必须对上当前在途轮**。`activeTicket === null`（这一轮已经收尾，
@@ -659,11 +678,9 @@ export class DshSession {
     }, CANCEL_GRACE_MS).unref?.();
     // 放手那一轮被取消：它不会再结算了，把等着回注的那份也一起清掉 ——
     // 用户说了"不要了"，答案就不该再回注记忆
-    if (this.detached) {
-      this.detached = false;
-      this.detachedTurn = null;
-      this.detachedText = '';
-      this.detachedUserText = '';
+    if (this.detachedLease !== null) {
+      this.detachedLease = null;
+      this.syncSpontaneous();
       if (this.turnPhase === 'detached_running') {
         this.turnPhase = 'idle';
       }
@@ -723,7 +740,7 @@ export class DshSession {
    * 最后那一步总结，丢掉的却是用户唯一能听到的答案。之后用户还得把问题重问一遍。
    *
    * 放手之后：`ask` 立刻收成空答复（这一轮已经作废了，没人要），dsh 继续跑完；
-   * 回来的那条 `assistant/message` 记在 {@link detachedText}，`idle` 时交给
+   * 回来的那条 `assistant/message` 记在 {@link detachedLease}，结算时交给
    * `onAnnounce` —— 与「后台任务结算」同一口播报，用户照样能听到答案。
    *
    * 票据按代次校验，规则与 `cancelTurn` 一致：迟到的放手不能摘掉下一轮的等待者。
@@ -737,11 +754,17 @@ export class DshSession {
       this.log(`  放手    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
       return;
     }
-    this.detached = true;
-    this.detachedTurn = this.currentTurn;
-    this.detachedText = this.assistantText.trim();
-    this.detachedUserText = this.activeUserText;
-    if (this.detachedTurn === null) {
+    const turnNo = this.foregroundTurn ?? this.currentTurn;
+    this.detachedLease = {
+      turnNo,
+      userText: this.activeUserText,
+      text: this.assistantText.trim(),
+    };
+    this.foregroundDetached = true;
+    // 相位跟着走：只改布尔、不改相位的话，下一轮 ask 进来时 isBusy / 自发轮都会误判
+    this.turnPhase = 'detached_running';
+    this.syncSpontaneous();
+    if (turnNo === null) {
       // 还没收到 turn/start：下一次 turn/end 就是它的（dsh 串行，不会有别人的）
       this.log('  放手    放手的时刻还没开轮 → 认下一次 turn/end');
     }
@@ -769,41 +792,86 @@ export class DshSession {
     const data = e['data'] as Record<string, unknown> | undefined;
     const turn = typeof data?.['turn'] === 'number' ? data['turn'] : null;
     if (type === 'turn/start') {
-      this.currentTurn = turn;
-      if (this.tailSwallow === 'awaiting_old_turn_start') {
-        // 这是被顶掉的旧自发轮自己的 turn/start，它的 idle 还在后面，不能现在解除保护
-        this.tailSwallow = 'awaiting_old_idle';
-      } else if (this.tailSwallow === 'awaiting_old_idle') {
-        // 新一轮开起来了：上一轮那条 idle 要么已经来过、要么不会来了
-        this.tailSwallow = 'none';
+      this.noteTurnStart(turn);
+      return;
+    }
+    this.noteTurnEnd(turn, data);
+  }
+
+  /** `turn/start`：把轮号安到前台、放手租约或吞尾上，三处不会抢同一个号。 */
+  private noteTurnStart(turn: number | null): void {
+    const oldSpontaneousStart = this.tailSwallow?.phase === 'awaiting_old_turn_start';
+    if (!oldSpontaneousStart) {
+      this.bindUnscopedLease(turn);
+      const leaseTurn = this.detachedLease?.turnNo ?? null;
+      const thisIsLease = leaseTurn !== null && turn === leaseTurn;
+      // 旧委派轮自己的 start 不能算成新前台轮，否则新轮的 idle 会被当成它的尾巴
+      if (this.foregroundActive && !this.foregroundDetached && !thisIsLease) {
+        this.foregroundTurn = turn;
       }
+    }
+    this.currentTurn = turn;
+    if (oldSpontaneousStart && this.tailSwallow !== null) {
+      // 这是被顶掉的旧自发轮自己的 turn/start，它的 idle 还在后面，不能现在解除保护
+      this.tailSwallow = {
+        phase: 'awaiting_old_idle',
+        turnNo: this.tailSwallow.turnNo ?? turn,
+      };
       return;
     }
-    // turn/end
-    const settles = this.detached
-      && (this.detachedTurn === null || this.detachedTurn === turn);
-    this.currentTurn = null;
-    if (!settles) {
-      return;
+    if (this.tailSwallow?.phase === 'awaiting_old_idle') {
+      // 新一轮开起来了：上一轮那条 idle 要么已经来过、要么不会来了
+      this.tailSwallow = null;
     }
-    this.detached = false;
-    this.detachedTurn = null;
+  }
+
+  /**
+   * 放手时还没有轮号：下一条不是「已经绑上的前台轮」的 `turn/start` 就是它。
+   * 前台已经有自己的轮号时不再改租约，避免把新轮认成旧轮。
+   */
+  private bindUnscopedLease(turn: number | null): void {
+    const lease = this.detachedLease;
+    if (lease === null || lease.turnNo !== null || turn === null) return;
+    const foregroundBound = this.foregroundActive
+      && !this.foregroundDetached
+      && this.foregroundTurn !== null;
+    if (foregroundBound) return;
+    this.detachedLease = { turnNo: turn, userText: lease.userText, text: lease.text };
+  }
+
+  /** `turn/end`：轮号对得上才结算租约。新前台轮已经开始时，不再武装会吞掉它 idle 的尾巴。 */
+  private noteTurnEnd(turn: number | null, data: Record<string, unknown> | undefined): void {
+    const newerForeground = this.foregroundActive
+      && !this.foregroundDetached
+      && this.foregroundTurn !== null
+      && turn !== null
+      && this.foregroundTurn !== turn;
+    if (!newerForeground && (turn === null || this.currentTurn === null || this.currentTurn === turn)) {
+      this.currentTurn = null;
+    }
+    const lease = this.detachedLease;
+    const settles = lease !== null && (lease.turnNo === null || lease.turnNo === turn);
+    if (!settles || lease === null) return;
+
+    const userText = lease.userText;
+    const text = lease.text.trim();
+    this.detachedLease = null;
+    this.syncSpontaneous();
     // 新一轮如果已经臂上（`prompting_rpc` / `awaiting_idle`），别把它的相位打回 idle。
     if (this.turnPhase === 'detached_running') {
       this.turnPhase = 'idle';
     }
-    // 同一轮的 idle 紧跟着就来，它属于这一轮（不是新一轮的）
-    this.tailSwallow = 'awaiting_old_idle';
-    const text = (this.detachedText || this.assistantText).trim();
-    this.detachedText = '';
-    this.assistantText = '';
-    if (text === '') {
-      this.detachedUserText = '';
-      return;
+    if (newerForeground) {
+      // 新前台轮的 turn/start 已经来过：下一条 idle 是它的，旧尾巴不能再武装
+      if (this.tailSwallow !== null && this.tailSwallow.turnNo !== this.foregroundTurn) {
+        this.tailSwallow = null;
+      }
+    } else {
+      // 同一轮的 idle 紧跟着就来，它属于这一轮（不是新一轮的）
+      this.tailSwallow = { phase: 'awaiting_old_idle', turnNo: turn };
     }
+    if (text === '') return;
     // 回注记忆**先于**「要不要补播」这个判断：答案是真的，用户听没听到是另一回事
-    const userText = this.detachedUserText;
-    this.detachedUserText = '';
     // `onIdle === null` 表示没有新一轮在等 → 下面会走播报，用户能听到
     const willSpeak = this.onIdle === null && this.onAnnounce !== null;
     try {
@@ -822,6 +890,101 @@ export class DshSession {
       this.log(`  放手    委派轮跑完了${kind === '' ? '' : `（${kind}）`} → 答案转成播报`);
       this.onAnnounce(text);
     }
+  }
+
+  /**
+   * 这条 `assistant/message` 归放手租约（写 `detachedLease.text`）还是前台轮。
+   *
+   * @returns `true` = 写进了前台 `assistantText`，调用方可以累加 usage / 首 token
+   */
+  private acceptAssistantText(data: Record<string, unknown> | undefined, text: string): boolean {
+    const explicit = typeof data?.['turn'] === 'number' ? data['turn'] : null;
+    const turn = explicit ?? this.currentTurn;
+    if (this.leaseOwns(explicit, turn)) {
+      const lease = this.detachedLease;
+      if (lease !== null) lease.text = text;
+      return false;
+    }
+    if (this.tailSwallow !== null) {
+      // 被顶掉的旧自发轮（或刚结算放手轮）残余消息：绝不污染新一轮的 assistantText 与用量
+      return false;
+    }
+    this.assistantText = text;
+    return true;
+  }
+
+  /** `data.turn`（没有就用当前 `turn/start`）是不是放手租约那一轮，且不是正在跑的另一条前台轮。 */
+  private leaseOwns(explicit: number | null, turn: number | null): boolean {
+    const lease = this.detachedLease;
+    if (lease === null) return false;
+    if (this.foregroundOwns(turn)) return false;
+    if (lease.turnNo !== null) {
+      return (explicit ?? turn) === lease.turnNo;
+    }
+    // 还没绑上轮号。前台 ask 已经在跑时，未分轮的文本一律不进旧租约。
+    if (this.foregroundActive && !this.foregroundDetached) return false;
+    if (this.tailSwallow !== null) return false;
+    return true;
+  }
+
+  /** 当前前台轮正在跑，且这条文本的轮号就是它（不是刚放手的那一轮）。 */
+  private foregroundOwns(turn: number | null): boolean {
+    if (!this.foregroundActive || this.foregroundDetached) return false;
+    if (this.foregroundTurn === null || turn === null) return false;
+    return turn === this.foregroundTurn;
+  }
+
+  /**
+   * 发 `session/prompt` 之前：自发轮的尾巴重新武装；对不上轮号的旧尾巴作废。
+   * 放手租约留着（还没 `turn/end`），但自发轮不能跟它叠在一起。
+   */
+  private prepareIncomingPrompt(): void {
+    if (this.spontaneous.isActive) {
+      this.tailSwallow = {
+        phase: this.currentTurn === null ? 'awaiting_old_turn_start' : 'awaiting_old_idle',
+        turnNo: this.currentTurn,
+      };
+    } else if (this.tailSwallowIsStale()) {
+      this.tailSwallow = null;
+    }
+    this.spontaneous.reset();
+    this.syncSpontaneous();
+  }
+
+  /** 这条吞尾如果还留着，会把即将开始的前台轮的 `idle` 吃掉。 */
+  private tailSwallowIsStale(): boolean {
+    const swallow = this.tailSwallow;
+    if (swallow === null) return false;
+    const bound = swallow.turnNo;
+    if (bound === null) return true;
+    if (this.currentTurn !== null && this.currentTurn !== bound) return true;
+    const leaseTurn = this.detachedLease?.turnNo ?? null;
+    if (leaseTurn !== null && leaseTurn !== bound) return true;
+    return false;
+  }
+
+  /** 有放手租约时按住自发轮，没有时放开。 */
+  private syncSpontaneous(): void {
+    this.spontaneous.suppress(this.detachedLease !== null);
+  }
+
+  /**
+   * 停进程、换会话、进程退出、握手换代共用这一处。
+   * 只清一轮对话的在途态，不动 `onIdle`（调用方还要用它把等待者叫醒）。
+   */
+  private clearTurnState(): void {
+    this.detachedLease = null;
+    this.tailSwallow = null;
+    this.assistantText = '';
+    this.activeTicket = null;
+    this.activeUserText = '';
+    this.foregroundActive = false;
+    this.foregroundTurn = null;
+    this.foregroundDetached = false;
+    this.currentTurn = null;
+    this.turnPhase = 'idle';
+    this.spontaneous.suppress(false);
+    this.spontaneous.reset();
   }
 
   /**
@@ -860,12 +1023,14 @@ export class DshSession {
   /** 关掉常驻进程（有的话）。headless 模式无副作用。 */
   stop(): void {
     const proc = this.proc;
+    // 先清在途态：handshake 会在 bump `procGen` 之前调用这里，旧进程的 close
+    // 随后会被代次挡住，清不掉的字段会漏进新进程。
+    this.clearTurnState();
     if (!proc) return;
     const myGen = this.procGen;
     this.proc = null;
     this.sdkReady = false;
     this.openSessionId = null;
-    this.turnPhase = 'idle';
     try {
       proc.stdin?.write(
         `${JSON.stringify({ jsonrpc: '2.0', id: this.nextId++, method: 'shutdown', params: {} })}\n`,
@@ -931,20 +1096,18 @@ export class DshSession {
     this.firstTokenMs = null;
     this.exitError = null;
     // 自发轮还没收尾时，它的 idle 不带轮号。先按是否已收到旧 turn/start 切入吞尾相位，
-    // 免得旧自发轮的 turn/start 或 idle 提前把本轮等待者叫醒。
+    // 对不上轮号的旧尾巴在这里作废，免得新轮的 idle 被当成上一轮的。
     // 放在臂 `onIdle` 之前、且中间没有 await：idle 不可能插进这个窗口。
-    if (this.spontaneous.isActive) {
-      this.tailSwallow = this.currentTurn === null
-        ? 'awaiting_old_turn_start'
-        : 'awaiting_old_idle';
-    }
-    // 接下来这一轮的 idle 归 prompt 等待者，不算自发轮次
-    this.spontaneous.reset();
+    this.prepareIncomingPrompt();
 
     // 从写票据 / 等待者 / 相位之前就进 try：`session/prompt` 抛错也要走 finally，
     // 否则 `onIdle` 留下，`isBusy()` 永远为真。
     let timer: NodeJS.Timeout | undefined;
+    let detachedThisAsk = false;
     try {
+      this.foregroundActive = true;
+      this.foregroundTurn = null;
+      this.foregroundDetached = false;
       this.turnPhase = 'prompting_rpc';
       this.activeTicket = ticket ?? null;
       this.activeUserText = text;
@@ -971,14 +1134,20 @@ export class DshSession {
       await Promise.race([idle, timeout]);
     } finally {
       clearTimeout(timer);
+      detachedThisAsk = this.foregroundDetached;
       this.onIdle = null;
       this.activeTicket = null;
-      this.turnPhase = this.detached ? 'detached_running' : 'idle';
+      this.foregroundActive = false;
+      this.foregroundTurn = null;
+      this.foregroundDetached = false;
+      // 旧租约可能还在（这一轮没放手，上一轮的委派还没 turn/end）。
+      // 相位只在「还有放手轮」时留在 detached_running，不能把没放手的返回值标成 detached。
+      this.turnPhase = this.detachedLease !== null ? 'detached_running' : 'idle';
     }
 
     const answer = this.assistantText.trim();
     const cancelled = this.cancelRequested;
-    const detached = this.detached;
+    const detached = detachedThisAsk;
     this.cancelRequested = false;
     if (this.exitError !== null) {
       const reason = this.exitError;
@@ -1198,6 +1367,9 @@ export class DshSession {
     // dsh 里的 `voice-live` 插件启动时读它，读不到就整个不启用。
     await this.ensureLiveRelay();
 
+    // stop() 已经清过一轮。proc 本来就是 null 时 stop 不会被调用，这里再清一次，
+    // 然后才 bump 代次 —— 旧进程晚到的 close 会因代次对不上直接返回，清不了残留。
+    this.clearTurnState();
     // 每次 spawn 加一代。close / error 抓住的是这一代，不是「当前这个字段」。
     this.procGen += 1;
     const myGen = this.procGen;
@@ -1224,14 +1396,8 @@ export class DshSession {
       this.sdkReady = false;
       // 进程没了，里面的会话也就不在了；下次必须重新 resume
       this.openSessionId = null;
-      // 放手状态一起归零：进程都没了，那一轮的 turn/end 再也不会来
-      this.detached = false;
-      this.detachedText = '';
-      this.detachedTurn = null;
-      this.currentTurn = null;
-      this.tailSwallow = 'none';
-      this.turnPhase = 'idle';
-      this.activeTicket = null;
+      // 放手租约、吞尾、用户原话一起归零：这一代的 turn/end 再也不会来
+      this.clearTurnState();
       if (this.proc === proc) this.proc = null;
       // 没收到 shutdown 就退出，说明崩了；挂起的请求全部失败
       for (const [, p] of this.pending) p.reject(new DshError(`sdk 进程退出（code=${code}）`));
@@ -1477,16 +1643,8 @@ export class DshSession {
       }
       if (parts.length > 0) {
         const text = parts.join('');
-        if (this.detached) {
-          this.assistantText = text;
-          // 被放手那一轮的答复可能在这之后才到，而新一轮的开头会清 `assistantText`
-          // —— 单独留一份，否则「放手」的答案会被下一轮冲掉
-          this.detachedText = text;
-        } else if (this.tailSwallow !== 'none') {
-          // 被顶掉的旧自发轮（或刚结算放手轮）残余消息：绝不污染新一轮的 assistantText 与用量
+        if (!this.acceptAssistantText(data, text)) {
           return;
-        } else {
-          this.assistantText = text;
         }
         // 没挂流式桥时（bench 就是这样）拿不到 token 级时刻，退一步记「首条 assistant
         // 消息到达」。它晚于真正的首 token，但仍是"模型开始产出"的可比口径。
@@ -1510,9 +1668,24 @@ export class DshSession {
         return;
       }
       const status = typeof p['status'] === 'string' ? p['status'] : '';
-      // 这条 idle 属于刚结算的「放手」轮或被顶掉的旧自发轮 —— 吃掉它，别去唤醒新一轮的等待者
-      if (status === 'idle' && this.tailSwallow !== 'none') {
-        this.tailSwallow = 'none';
+      // 这条 idle 属于刚结算的「放手」轮或被顶掉的旧自发轮 —— 吃掉它，别去唤醒新一轮的等待者。
+      // 吞尾绑的轮号已经不是当前前台轮时，这条 idle 是新轮自己的，不能吞。
+      if (status === 'idle' && this.tailSwallow !== null) {
+        const bound = this.tailSwallow.turnNo;
+        const superseded = this.foregroundActive
+          && this.foregroundTurn !== null
+          && bound !== this.foregroundTurn;
+        this.tailSwallow = null;
+        if (!superseded) return;
+      }
+      // 放手轮还在：它的 running 不是自发汇报。idle 只负责叫醒前台等待者。
+      if (this.detachedLease !== null) {
+        this.syncSpontaneous();
+        if (status === 'idle' && this.onIdle !== null) {
+          const fire = this.onIdle;
+          this.onIdle = null;
+          fire();
+        }
         return;
       }
       const waiting = this.onIdle !== null;
