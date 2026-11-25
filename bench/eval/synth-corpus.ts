@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { cosyVoiceTts } from '../../src/cosyvoice.ts';
-import { isMainModule } from '../../src/main.ts';
+import { isMainModule } from '../../src/runtime/is-main.ts';
 import { pcm16PeakDbfs } from '../../src/pcm.ts';
 import type { TtsProvider } from '../../src/providers.ts';
 import type { CorpusItemMeta, CorpusMeta, EvalCase, EvalManifest } from './types.ts';

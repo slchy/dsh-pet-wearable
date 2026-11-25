@@ -3,15 +3,17 @@
  * 中文数字未 ITN 与真听错要能分开计，后台汇报不能因为播得慢被下一窗吃掉。
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
+  asSummaryReport,
   computeCer,
   hasForeignHallucination,
   normalizeDigitsForMatch,
+  renderCompare,
   renderMarkdown,
   scoreArtifact,
   type EvalSummaryReport,
@@ -465,4 +467,100 @@ test('scoreArtifact：tool_call 改写后的「rewritten\\n用户原话：「...
   assert.equal(got.get('s3_m4_02')?.pass, true);
   assert.equal(report.s3ContextMemory.verbatimPassed, 2);
   assert.equal(report.s3ContextMemory.verbatimTotal, 2);
+});
+
+function summaryFixture(runId: string): EvalSummaryReport {
+  const band = { count: 1, median: 100, p90: 200, max: 300, min: 50 };
+  return {
+    version: 'eval-v1',
+    runId,
+    startedAt: ARCHIVE_STARTED_AT,
+    hourCst: 8,
+    pipeline: 'live',
+    backend: 'stub',
+    totalCases: 1,
+    s1Routing: {
+      chitchatTotal: 0,
+      chitchatFalseDelegate: 0,
+      actionTotal: 0,
+      actionDelegated: 0,
+      actionDualAnswerConflict: 1,
+      realtimeTotal: 4,
+      realtimeDelegated: 2,
+      trapTotal: 0,
+      trapClean: 0,
+      precision: 1,
+      recall: 1,
+      f1: 0.5,
+    },
+    s2Asr: {
+      total: 0,
+      meanCer: 0,
+      termHits: 0,
+      termTotal: 0,
+      termHitRate: 0.25,
+      itnTermHits: 0,
+      itnTermHitRate: 0.5,
+      foreignHallucinations: 0,
+    },
+    s3ContextMemory: {
+      memoryStaticPassed: 1,
+      memoryStaticTotal: 2,
+      crossLaneContextPassed: 0,
+      crossLaneContextTotal: 1,
+      reportFollowupPassed: 0,
+      reportFollowupTotal: 0,
+      verbatimPassed: 1,
+      verbatimTotal: 1,
+    },
+    s4Eot: {
+      pauseMerged: 3,
+      pauseTotal: 4,
+      completeNoOverExtend: 1,
+      completeTotal: 1,
+    },
+    s5Latency: {
+      firstWord: band,
+      silenceToAsr: band,
+      asrToTurn: band,
+      turnToAudio: band,
+      omniAudioMs: { ...band, median: 250 },
+      bgReportCount: 0,
+    },
+    cases: [],
+  };
+}
+
+test('asSummaryReport：平铺报告原样返回，归档包解开 sharedServerRun', () => {
+  const flat = summaryFixture('flat-run');
+  assert.equal(asSummaryReport(flat), flat);
+
+  const wrapped = { baselineId: 'wrap', sharedServerRun: flat };
+  assert.equal(asSummaryReport(wrapped), flat);
+  const emptyWrap = { baselineId: 'empty', sharedServerRun: {} };
+  assert.equal(asSummaryReport(emptyWrap), emptyWrap);
+  const nullWrap = { sharedServerRun: null };
+  assert.equal(asSummaryReport(nullWrap), nullWrap);
+  const arrayWrap = { sharedServerRun: [] };
+  assert.equal(asSummaryReport(arrayWrap), arrayWrap);
+
+  const flatTable = renderCompare(flat, asSummaryReport(wrapped));
+  assert.match(flatTable, /# A\/B 对比：flat-run → flat-run/);
+  assert.match(flatTable, /\| S1 委派 F1 \| 50\.0% \| 50\.0% \| 0\.0% \|/);
+
+  const archive = JSON.parse(readFileSync(
+    new URL('./baseline/20261124-live-v1-wave-ab.json', import.meta.url),
+    'utf8',
+  )) as { baselineId: string; sharedServerRun: EvalSummaryReport };
+  assert.equal(typeof archive.baselineId, 'string');
+  assert.equal(archive.baselineId.length > 0, true);
+  const report = asSummaryReport(archive);
+  assert.equal(report, archive.sharedServerRun);
+  assert.equal(typeof report.runId, 'string');
+  assert.equal(report.runId.length > 0, true);
+  const table = renderCompare(report, report);
+  assert.match(table, new RegExp(`# A/B 对比：${report.runId} → ${report.runId}`));
+  assert.match(table, /\| 指标 \| Baseline \| Candidate \| Δ \|/);
+  assert.match(table, /S1 委派 F1/);
+  assert.equal(table.includes('undefined'), false);
 });

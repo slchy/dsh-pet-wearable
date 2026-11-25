@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +34,8 @@ import { silentTts, type AgentProvider } from '../src/providers.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const MAIN_TS = fileURLToPath(new URL('../src/main.ts', import.meta.url));
+const PIPELINE_TS = fileURLToPath(new URL('../src/runtime/pipeline-assembly.ts', import.meta.url));
+const PROVIDERS_TS = fileURLToPath(new URL('../src/runtime/providers-factory.ts', import.meta.url));
 
 // ---------------------------------------------------------------- 审计槽位
 
@@ -160,15 +162,30 @@ test('main.ts 只在末尾按需加载 legacy-pipeline（顶层不许值导入�
 });
 
 test('情绪模式默认值只有一处（cosyvoice.ts 的常量）', () => {
-  const source = readFileSync(MAIN_TS, 'utf8');
+  const source = readFileSync(PROVIDERS_TS, 'utf8');
   assert.match(
     source,
     /DEFAULT_COSYVOICE_EMOTION_MODE/u,
-    'main.ts 又自己写死了默认情绪模式 —— 两处默认值迟早漂移',
+    'providers-factory.ts 又自己写死了默认情绪模式 —— 两处默认值迟早漂移',
   );
   // 老写法：直接与字面量比较，等于把默认值复制了一份
   const drifted = /process\.env\['COSYVOICE_EMOTION_MODE'\]\s*===\s*'instruction'/u;
   assert.equal(drifted.test(source), false, '必须 `?? DEFAULT_COSYVOICE_EMOTION_MODE` 之后再比');
+  assert.equal(/auditSlot/u.test(source), false, 'buildTts 不引用 CLI 单例 auditSlot');
+});
+
+test('src/runtime 不反向依赖 CLI main.ts', () => {
+  const dir = fileURLToPath(new URL('../src/runtime/', import.meta.url));
+  const names = readdirSync(dir).filter((name) => name.endsWith('.ts'));
+  assert.ok(names.length >= 6, `runtime 模块不全：${names.join(', ')}`);
+  for (const name of names) {
+    const text = readFileSync(join(dir, name), 'utf8');
+    assert.equal(
+      /from\s+['"](?:\.\.\/)+main\.ts['"]/u.test(text),
+      false,
+      `${name} 反向依赖了 src/main.ts`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------- 入口自检
@@ -221,26 +238,32 @@ test('assemblePipelinePlan：非法值、live 缺 key、STT 不对，都直接�
 
 test('main.ts 按 VOICE_PIPELINE 互斥装配 live / cascade，不把两副脑子焊在一起', () => {
   const source = readFileSync(MAIN_TS, 'utf8');
+  const assembly = readFileSync(PIPELINE_TS, 'utf8');
   assert.match(source, /assemblePipelinePlan\(process\.env/u);
-  assert.match(source, /resolveVoicePipelineFromEnv/u);
+  assert.match(assembly, /resolveVoicePipelineFromEnv/u);
   assert.match(source, /Pure Live（Omni 单前台 \+ dsh 纯异步后台）/u);
   assert.match(source, /Pure Cascade（ASR \+ 级联快车道\/dsh \+ TTS）/u);
   assert.match(source, /\[VOICE_PIPELINE\]/u);
   assert.match(source, /\[兼容推断\]/u);
   assert.match(source, /pipelineMode: plan\.mode/u);
-  assert.match(source, /speakBackgroundReport/u);
-  assert.match(source, /cancelBackgroundSpeech/u);
-  assert.match(source, /noteFallbackAnnounceSpoken/u);
-  assert.match(source, /serve: 'full'/u);
-  assert.match(source, /useOmniProbeOnly/u);
-  assert.equal(
-    /from\s+['"][^'"]*fast-llm-client\.ts['"]/u.test(source),
-    false,
-    'main.ts 不要自己 import FastLlmClient：live 不该加载它，cascade 只在 CascadeAgent 里面用',
-  );
+  assert.match(assembly, /speakBackgroundReport/u);
+  assert.match(assembly, /cancelBackgroundSpeech/u);
+  assert.match(assembly, /noteFallbackAnnounceSpoken/u);
+  assert.match(assembly, /serve: 'full'/u);
+  assert.match(assembly, /useOmniProbeOnly/u);
+  for (const [label, text] of [
+    ['src/main.ts', source],
+    ['src/runtime/pipeline-assembly.ts', assembly],
+  ] as const) {
+    assert.equal(
+      /from\s+['"][^'"]*fast-llm-client\.ts['"]/u.test(text),
+      false,
+      `${label} 不要自己 import FastLlmClient：live 不该加载它，cascade 只在 CascadeAgent 里面用`,
+    );
+  }
 
-  const live = source.split('// pure-live-assembly')[1]?.split('// pure-cascade-assembly')[0] ?? '';
-  const cascade = source.split('// pure-cascade-assembly')[1]?.split('// legacy-fronted-assembly')[0] ?? '';
+  const live = assembly.split('// pure-live-assembly')[1]?.split('// pure-cascade-assembly')[0] ?? '';
+  const cascade = assembly.split('// pure-cascade-assembly')[1]?.split('// legacy-fronted-assembly')[0] ?? '';
   assert.notEqual(live, '', '找不到 pure-live-assembly 标记');
   assert.notEqual(cascade, '', '找不到 pure-cascade-assembly 标记');
 
@@ -252,7 +275,7 @@ test('main.ts 按 VOICE_PIPELINE 互斥装配 live / cascade，不把两副脑�
   assert.match(cascade, /\.toEngine\(tts/u);
   assert.equal(/new LiveOrchestrator\(|new FrontedAgent\(/u.test(cascade), false);
 
-  // 非流式旧路径还在，回放 / 识图不会被热路径替换掉
+  // 非流式旧路径还在 main()，回放 / 识图不会被热路径替换掉
   assert.match(source, /new FrontedAgent\(/u);
 });
 

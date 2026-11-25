@@ -21,14 +21,13 @@ import { EVENTS } from '../../src/events.ts';
 import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from '../../src/http-agent.ts';
 import { newActivityState } from '../../src/keepalive.ts';
 import {
-  assemblePipelinePlan,
-  assembleStreamingAgent,
-  createAuditSlot,
   formatCurrentDateContext,
-  isMainModule,
   loadStaticAsrCorpus,
   resolveAsrLanguage,
-} from '../../src/main.ts';
+} from '../../src/runtime/asr-context.ts';
+import { createAuditSlot } from '../../src/runtime/audit-slot.ts';
+import { isMainModule } from '../../src/runtime/is-main.ts';
+import { assemblePipelinePlan, assembleStreamingAgent } from '../../src/runtime/pipeline-assembly.ts';
 import { MemoryFile } from '../../src/memory-file.ts';
 import { omniTts } from '../../src/omni-tts.ts';
 import {

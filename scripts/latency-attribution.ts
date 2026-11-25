@@ -25,7 +25,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { isMainModule } from '../src/main.ts';
+import { isMainModule } from '../src/runtime/is-main.ts';
 import {
   FIRST_WORD_BUDGET_MS,
   computeTurns,

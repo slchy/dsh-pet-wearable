@@ -14,8 +14,8 @@
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
-| `FAST_LANE_TIMEOUT_MS` | 1200 | wall | `src/main.ts:852` | 模型段（它就是那一轮的上限） | FAST_LANE > 0 时固定；超时转 dsh |
-| `KEEPALIVE_MINUTES` | 180 | wall | `src/main.ts:1054` | 无关首声（不在停嘴→出声路径上） | — |
+| `KEEPALIVE_MINUTES` | 180 | wall | `src/main.ts:415` | 无关首声（不在停嘴→出声路径上） | — |
+| `FAST_LANE_TIMEOUT_MS` | 1200 | wall | `src/runtime/pipeline-assembly.ts:328` | 模型段（它就是那一轮的上限） | FAST_LANE > 0 时固定；超时转 dsh |
 | `VOICE_COMMIT_MS` | 20（仅 qwen-realtime） | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:377` | 无 —— 它就是封段的那一刻，实际门槛被上行包长盖住 | 眼镜 mSBC + 手动端点下实际门槛 = 一整个上行包（75 ms）；浏览器 20 ms PCM 帧可按帧触发；服务端 VAD / 非 qwen-realtime 归 0 |
 | `VOICE_STT_COMMIT_MS` | 150（glasses）/ 320（browser） | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:378` | 无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠） | — |
 | `VOICE_OPEN_QUIET_MS` | 300 | wall | `src/voice-config.ts:379` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
@@ -35,11 +35,11 @@
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
 | `COSYVOICE_PREWARM` | 1 | —（开关） | `src/cosyvoice.ts:1284` | 直接省首声（Cascade 路径：定稿→开轮间提前建 TTS task，把建连/开流藏进判停等待；关掉首块多付冷开开销；Pure Live 不走 CosyVoice） | — |
-| `FAST_LANE_DELEGATE` | 0 | —（开关） | `src/main.ts:843` | 直接改路径（Cascade 路径：0=纯聊天模型直答不委派；1=短句直答、复杂任务委派 dsh，开启后委派轮走慢车道；Pure Live 不走） | — |
-| `FAST_LANE_PREFETCH` | 1 | —（开关） | `src/main.ts:856` | 直接省首声（Cascade 路径：ASR 定稿即提前起跑快模型，与判停静候窗重叠；关掉退回开轮才发请求，直接增加首声延迟；Pure Live 不走） | — |
-| `FAST_LANE_PARTIAL_SPECULATE` | 1 | —（开关） | `src/main.ts:857` | 直接省首声（Cascade 路径：在 ASR 定稿前 100 ms 用中间结果提前发快模型，给提前合成音频腾窗口；关掉丢失这段重叠窗口；Pure Live 不走） | — |
-| `FAST_LANE_SPECULATE` | 1 | —（开关） | `src/main.ts:1074` | 直接省首声（Cascade 路径：快模型与 dsh 并行投机，把委派轮的快车道判定藏进 dsh 首字里；关掉退回串行，委派轮白等一次判定；Pure Live 不走） | — |
-| `PET_PROACTIVE` | 0 | —（开关） | `src/main.ts:1474` | 无关首声（控制宠物主动开口，不在用户停嘴→出声路径上） | — |
+| `FAST_LANE_SPECULATE` | 1 | —（开关） | `src/main.ts:435` | 直接省首声（Cascade 路径：快模型与 dsh 并行投机，把委派轮的快车道判定藏进 dsh 首字里；关掉退回串行，委派轮白等一次判定；Pure Live 不走） | — |
+| `PET_PROACTIVE` | 0 | —（开关） | `src/main.ts:838` | 无关首声（控制宠物主动开口，不在用户停嘴→出声路径上） | — |
+| `FAST_LANE_DELEGATE` | 0 | —（开关） | `src/runtime/pipeline-assembly.ts:318` | 直接改路径（Cascade 路径：0=纯聊天模型直答不委派；1=短句直答、复杂任务委派 dsh，开启后委派轮走慢车道；Pure Live 不走） | — |
+| `FAST_LANE_PREFETCH` | 1 | —（开关） | `src/runtime/pipeline-assembly.ts:332` | 直接省首声（Cascade 路径：ASR 定稿即提前起跑快模型，与判停静候窗重叠；关掉退回开轮才发请求，直接增加首声延迟；Pure Live 不走） | — |
+| `FAST_LANE_PARTIAL_SPECULATE` | 1 | —（开关） | `src/runtime/pipeline-assembly.ts:333` | 直接省首声（Cascade 路径：在 ASR 定稿前 100 ms 用中间结果提前发快模型，给提前合成音频腾窗口；关掉丢失这段重叠窗口；Pure Live 不走） | — |
 
 ## 三、二级热路径内部常量（写死代码，受不变量约束）
 
@@ -47,13 +47,15 @@
 
 | 参数 | 默认 | 时钟 | 持有者 | 被谁遮住 | 上限 |
 |:---|:---:|:---|:---|:---|:---|
+| `SEMANTIC_MORE_MIN_WAIT_MS` | 350 | wall | `src/assembler/semantic-gate.ts:58` | 普通静音上限下语义 `more` 的单拍下限（受 `TURN_JUDGE_MAX_OPEN_SILENCE_MS - quietNow` 与短碎片上限夹住） | — |
+| `SEMANTIC_MORE_SEQUENCE_WAIT_MS` | 550 | wall | `src/assembler/semantic-gate.ts:64` | 序列预算大于普通静音上限时语义 `more` 的单拍等待（受 `TURN_JUDGE_SEQUENCE_BUDGET_MS - quietNow` 夹住） | — |
 | `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:414` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
-| `DEFAULT_RING_MS` | 150 | audio | `src/omni-shadow.ts:103` | 无（Omni 影子旁路静音期环形预卷长度，防软起音被裁，不加延迟） | — |
-| `DEFAULT_DECODE_WAIT_MS` | 240 | wall | `src/utterance-assembler.ts:356` | 开轮前硬等在途 ASR 解码收尾上限（直接计入首声；超时按当前文本放行） | — |
-| `DEFAULT_SHORT_FRAGMENT_WAIT_MS` | 400 | wall | `src/utterance-assembler.ts:362` | 短碎片与语义 more 的单拍兜底上限（实际受 `TURN_JUDGE_WAIT_BUDGET_MS` / `TURN_JUDGE_MAX_OPEN_SILENCE_MS` 夹住） | — |
-| `DEFAULT_SHORT_FRAGMENT_WINDOW_MS` | 1200 | wall | `src/utterance-assembler.ts:365` | 距上一轮收下多久内的极短句算碎片（时间邻接判据，命中后触发短碎片等待） | — |
-| `SEMANTIC_MORE_MIN_WAIT_MS` | 350 | wall | `src/utterance-assembler.ts:372` | 普通静音上限下语义 `more` 的单拍下限（受 `TURN_JUDGE_MAX_OPEN_SILENCE_MS - quietNow` 与短碎片上限夹住） | — |
-| `SEMANTIC_MORE_SEQUENCE_WAIT_MS` | 550 | wall | `src/utterance-assembler.ts:378` | 序列预算大于普通静音上限时语义 `more` 的单拍等待（受 `TURN_JUDGE_SEQUENCE_BUDGET_MS - quietNow` 夹住） | — |
+| `DEFAULT_RING_MS` | 150 | audio | `src/omni/protocol.ts:43` | 无（Omni 影子旁路静音期环形预卷长度，防软起音被裁，不加延迟） | — |
+| `DEFAULT_DECODE_WAIT_MS` | 240 | wall | `src/utterance-assembler.ts:366` | 开轮前硬等在途 ASR 解码收尾上限（直接计入首声；超时按当前文本放行） | — |
+| `DEFAULT_SHORT_FRAGMENT_WAIT_MS` | 400 | wall | `src/utterance-assembler.ts:372` | 短碎片与语义 more 的单拍兜底上限（实际受 `TURN_JUDGE_WAIT_BUDGET_MS` / `TURN_JUDGE_MAX_OPEN_SILENCE_MS` 夹住） | — |
+| `DEFAULT_SHORT_FRAGMENT_WINDOW_MS` | 1200 | wall | `src/utterance-assembler.ts:375` | 距上一轮收下多久内的极短句算碎片（时间邻接判据，命中后触发短碎片等待） | — |
+| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice/endpoint-wire.ts:50` | 仅在无判停器且未设开轮静音门槛（服务端 VAD / NLS）时生效；手动端点配了 `VOICE_OPEN_QUIET_MS` 时不再盲等 600 ms | — |
+| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | wall | `src/voice/endpoint-wire.ts:63` | ASR 出句之前 | — |
 | `DEFAULT_GATE_HOLD_MS` | 2000 | wall | `src/voice-config.ts:38` | 无（决定 gate.close 何时落，① 的起点；必须大于封段与开轮静音天花板） | — |
 | `DEFAULT_GATE_PREROLL_MS` | 800 | audio | `src/voice-config.ts:40` | 无（它是滑窗长度，不加延迟） | — |
 | `DEFAULT_PAUSE_DETECT_MS` | 200 | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:42` | ASR 解出句之前（提前起跑，不额外等） | — |
@@ -61,8 +63,6 @@
 | `DEFAULT_TRAILING_TRIM_MS` | 20 | audio | `src/voice-config.ts:49` | 判停侧车输入预处理（不额外等） | — |
 | `DEFAULT_GLASSES_STT_COMMIT_MS` | 150 | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:51` | 无（glasses 档案的 VOICE_STT_COMMIT_MS 默认值，仍早于 200–300 ms 开轮静音门槛） | — |
 | `DEFAULT_BROWSER_STT_COMMIT_MS` | 320 | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:53` | 无（browser 档案的 VOICE_STT_COMMIT_MS 默认值，浏览器开 AGC 后放宽防词中切断） | — |
-| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice-session.ts:119` | 仅在无判停器且未设开轮静音门槛（服务端 VAD / NLS）时生效；手动端点配了 `VOICE_OPEN_QUIET_MS` 时不再盲等 600 ms | — |
-| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | wall | `src/voice-session.ts:132` | ASR 出句之前 | — |
 
 ## 四、三级看门狗、运维超时与离线诊断阈值（无关首声热路径）
 
@@ -72,6 +72,7 @@
 |:---|:---:|:---|:---|:---|:---|
 | `TAIL_TTL_MS` | 120000 | wall | `src/app/dialog.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
 | `ANNOUNCE_QUIET_MS` | 800 | wall | `src/app/dialog.ts:53` | 无关首声（不在停嘴→出声路径上） | — |
+| `DEFAULT_SEMANTIC_BUDGET_MS` | 300 | wall | `src/assembler/semantic-gate.ts:70` | 模块兜底默认（生产由 `SEMANTIC_END_TAG_BUDGET_MS` 覆写；仅直接调 `UtteranceAssembler` 未传 `semanticBudgetMs` 时生效） | — |
 | `CLOCK_MISMATCH_MS` | 1e9 | —（判据） | `src/barge-voicing.ts:52` | 无（纯判据：只用来发现两把时钟接错，不放慢任何东西） | — |
 | `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:252` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
 | `TRUNCATED_EPSILON_MS` | 300 | —（判据） | `src/engine-contract.ts:139` | 无（纯判据：轮末判「用户少听了没有」，不产生任何等待） | — |
@@ -83,27 +84,26 @@
 | `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:614` | 无（它是报警线，不约束任何环节） | — |
 | `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:617` | 无（报告里的「慢轮」门槛） | — |
 | `RESOLUTION_MS` | 25 | wall | `src/loop-lag.ts:29` | 无关首声（不在停嘴→出声路径上） | — |
-| `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio（服务端） | `src/main.ts:433` | 仅旧 NLS 路径（`--stt aliyun`）：服务端判句纯静音等待；`qwen-realtime` 与 Pure Live 不用 | — |
-| `DEFAULT_PET_TICK_MS` | 3000 | wall | `src/main.ts:436` | 无关首声（不在停嘴→出声路径上） | — |
-| `DEFAULT_PET_MIC_OPEN_TIMEOUT_MS` | 1500 | wall | `src/main.ts:438` | 无关首声（不在停嘴→出声路径上） | — |
+| `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio（服务端） | `src/main.ts:197` | 仅旧 NLS 路径（`--stt aliyun`）：服务端判句纯静音等待；`qwen-realtime` 与 Pure Live 不用 | — |
+| `DEFAULT_PET_TICK_MS` | 3000 | wall | `src/main.ts:200` | 无关首声（不在停嘴→出声路径上） | — |
+| `DEFAULT_PET_MIC_OPEN_TIMEOUT_MS` | 1500 | wall | `src/main.ts:202` | 无关首声（不在停嘴→出声路径上） | — |
 | `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:120` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
 | `DEFAULT_CAPTURE_TIMEOUT_MS` | 20000 | wall | `src/photo-inbox.ts:38` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_CONFIRM_TIMEOUT_MS` | 40000 | wall | `src/photo-inbox.ts:45` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_DECODE_TIMEOUT_MS` | 8000 | wall | `src/qwen-realtime-asr.ts:40` | 无关首声（纯防卡死看门狗：正常 ASR 定稿 ~200 ms 即拆掉，只在服务端丢回包时触发解锁） | — |
 | `DEFAULT_TIMEOUT_MS` | 400 | wall | `src/semantic-endpoint.ts:48` | 模块兜底默认（生产由 `SEMANTIC_END_TAG_BUDGET_MS` 覆写；仅直接调 `semanticEndpoint` 未传 `timeoutMs` 时生效） | — |
-| `CANCEL_GRACE_MS` | 2000 | wall | `src/session.ts:57` | 无关首声（不在停嘴→出声路径上） | — |
-| `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:66` | 无关首声（不在停嘴→出声路径上） | — |
-| `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session.ts:182` | 无关首声（不在停嘴→出声路径上） | — |
+| `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session/superseded.ts:10` | 无关首声（不在停嘴→出声路径上） | — |
+| `CANCEL_GRACE_MS` | 2000 | wall | `src/session.ts:84` | 无关首声（不在停嘴→出声路径上） | — |
+| `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:93` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
 | `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:61` | 设备播报期间（轮询，不加延迟） | — |
 | `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
-| `SPEAKING_WATCHDOG_MIN_MS` | 350 | wall | `src/utterance-assembler.ts:384` | 无关首声（`speaking_more` 断流兜底定时器最短等待；持续说话期间每帧刷新，仅彻底停帧时防卡死） | — |
-| `SPEAKING_WATCHDOG_MARGIN_MS` | 100 | wall | `src/utterance-assembler.ts:390` | 无关首声（`speaking_more` 断流兜底相对静默/延长门槛的余量，确保晚于正常静音收口） | — |
-| `DEFAULT_SEMANTIC_BUDGET_MS` | 300 | wall | `src/utterance-assembler.ts:396` | 模块兜底默认（生产由 `SEMANTIC_END_TAG_BUDGET_MS` 覆写；仅直接调 `UtteranceAssembler` 未传 `semanticBudgetMs` 时生效） | — |
+| `SPEAKING_WATCHDOG_MIN_MS` | 350 | wall | `src/utterance-assembler.ts:381` | 无关首声（`speaking_more` 断流兜底定时器最短等待；持续说话期间每帧刷新，仅彻底停帧时防卡死） | — |
+| `SPEAKING_WATCHDOG_MARGIN_MS` | 100 | wall | `src/utterance-assembler.ts:387` | 无关首声（`speaking_more` 断流兜底相对静默/延长门槛的余量，确保晚于正常静音收口） | — |
+| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice/handshake.ts:21` | 无关首声（不在停嘴→出声路径上） | — |
+| `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice/mic-phase.ts:22` | 无关首声（不在停嘴→出声路径上） | — |
+| `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice/mic-phase.ts:33` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_PLAYBACK_TAIL_MS` | 600 | wall | `src/voice-config.ts:35` | 无关首声（播完后等扬声器尾音散尽，防回声） | — |
-| `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice-session.ts:141` | 无关首声（不在停嘴→出声路径上） | — |
-| `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice-session.ts:152` | 无关首声（不在停嘴→出声路径上） | — |
-| `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice-session.ts:607` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 五、还没标注的
 

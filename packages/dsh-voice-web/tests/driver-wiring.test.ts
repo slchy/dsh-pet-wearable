@@ -1,6 +1,7 @@
 /**
- * `driver.ts` 必须调用同一份运行时配置，不能再自抄一套默认值。
- * 宿主相位、语音后端、语音栈释放与 Pure Live 改写也从这里的纯函数取，避免布尔各自漂移。
+ * 插件入口拆成 driver / driver-policy / host-lifecycle / standalone-bridge / boot-voice-stack。
+ * 运行时配置仍只走 buildVoiceRuntimeConfig；公开纯函数从 driver.ts 再导出。
+ * 这五个文件都不得再 import CLI 入口 ./voice/main.ts。
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -19,28 +20,114 @@ import {
   shouldEnableSemanticEndpoint,
   shouldUsePureLiveAudio,
   type HostPhase,
+  type HostVoiceBackendView,
+  type StackEvent,
   type StackPhase,
+  type StackTransition,
+  type VoiceBackendState,
+  type VoiceWebConfig,
 } from '../src/driver.ts';
 import { buildVoiceRuntimeConfig } from '../src/voice/voice-config.ts';
 
-test('driver.ts 调用同一份配置，不再自抄默认值', () => {
-  const driver = readFileSync(new URL('../src/driver.ts', import.meta.url), 'utf8');
+const PLUGIN_FILES = [
+  'driver.ts',
+  'driver-policy.ts',
+  'host-lifecycle.ts',
+  'standalone-bridge.ts',
+  'boot-voice-stack.ts',
+] as const;
 
-  assert.match(driver, /buildVoiceRuntimeConfig\(/u);
-  assert.match(driver, /profile:\s*'browser'/u);
-  assert.match(driver, /pipelineMode:\s*plan\.mode/u);
-  assert.match(driver, /shouldEnableSemanticEndpoint\(/u);
-  assert.match(driver, /isLoopbackHost\(config\.host\)/u);
-  assert.match(driver, /installHttpAgent\(DEFAULT_KEEPALIVE_MS\)/u);
-  assert.equal(/MIAI_HTTP_KEEPALIVE_MS/u.test(driver), false);
-  assert.match(driver, /expiryWarning\(cert\)/u);
-  assert.match(driver, /loadStaticAsrCorpus\(memoryFile\.hotwordHints\(\)/u);
-  assert.match(driver, /resolveAsrLanguage\(process\.env\)/u);
-  assert.match(driver, /memorySummary:\s*\(\)\s*=>\s*memoryFile\.summary\(\)/u);
-  assert.match(driver, /\.then\(\(code\) => \{[\s\S]*reject\(/u);
-  assert.equal(/config\.host !== '127\.0\.0\.1'/u.test(driver), false);
-  assert.equal(/SEMANTIC_END_TAG_BUDGET_MS',\s*300/u.test(driver), false);
-  assert.equal(/30_000/u.test(driver), false);
+type PluginFile = (typeof PLUGIN_FILES)[number];
+
+function readPlugin(name: PluginFile): string {
+  return readFileSync(new URL(`../src/${name}`, import.meta.url), 'utf8');
+}
+
+const pluginSource = Object.fromEntries(
+  PLUGIN_FILES.map((name) => [name, readPlugin(name)]),
+) as Record<PluginFile, string>;
+
+const pluginUnion = PLUGIN_FILES.map((name) => pluginSource[name]).join('\n');
+
+test('boot-voice-stack.ts 调用同一份配置，并直连 voice/runtime', () => {
+  const boot = pluginSource['boot-voice-stack.ts'];
+
+  assert.match(boot, /buildVoiceRuntimeConfig\(/u);
+  assert.match(boot, /profile:\s*'browser'/u);
+  assert.match(boot, /pipelineMode:\s*plan\.mode/u);
+  assert.match(boot, /shouldEnableSemanticEndpoint\(/u);
+  assert.match(boot, /installHttpAgent\(DEFAULT_KEEPALIVE_MS\)/u);
+  assert.match(boot, /loadStaticAsrCorpus\(memoryFile\.hotwordHints\(\)/u);
+  assert.match(boot, /resolveAsrLanguage\(process\.env\)/u);
+  assert.match(boot, /memorySummary:\s*\(\)\s*=>\s*memoryFile\.summary\(\)/u);
+  assert.match(boot, /\.then\(\(code\) => \{[\s\S]*reject\(/u);
+  assert.match(boot, /resolveArchiveDir\(process\.env\['MIAI_ARCHIVE_DIR'\], homedir\(\)\)/u);
+  assert.match(boot, /formatArchiveBanner\(archiveDir\)/u);
+  assert.match(boot, /state\.backend = \{ status: 'stopped' \}/u);
+  assert.match(boot, /const effectiveStt = usePureLiveAudio \? 'qwen-realtime' : config\.stt/u);
+  assert.match(boot, /const effectiveTts = usePureLiveAudio \? 'silent' : config\.tts/u);
+  assert.match(
+    boot,
+    /import\s*\{[^}]*\bbuildAgent\b[^}]*\bbuildStt\b[^}]*\bbuildTts\b[^}]*\}\s*from\s*'\.\/voice\/runtime\/providers-factory\.ts'/u,
+  );
+  assert.match(
+    boot,
+    /import\s*\{[^}]*\bloadAuthenticator\b[^}]*\bloadDotEnv\b[^}]*\}\s*from\s*'\.\/voice\/runtime\/env-bootstrap\.ts'/u,
+  );
+  assert.match(
+    boot,
+    /import\s*\{\s*createAuditSlot\s*\}\s*from\s*'\.\/voice\/runtime\/audit-slot\.ts'/u,
+  );
+  assert.match(
+    boot,
+    /import\s*\{[^}]*\bassemblePipelinePlan\b[^}]*\bassembleStreamingAgent\b[^}]*\bAssembledStreamingPipeline\b[^}]*\}\s*from\s*'\.\/voice\/runtime\/pipeline-assembly\.ts'/u,
+  );
+  assert.match(
+    boot,
+    /import\s*\{[^}]*\bloadStaticAsrCorpus\b[^}]*\bresolveAsrLanguage\b[^}]*\}\s*from\s*'\.\/voice\/runtime\/asr-context\.ts'/u,
+  );
+});
+
+test('standalone-bridge.ts 检查环回、证书到期，并直连 env-bootstrap', () => {
+  const bridge = pluginSource['standalone-bridge.ts'];
+  assert.match(bridge, /isLoopbackHost\(config\.host\)/u);
+  assert.match(bridge, /expiryWarning\(cert\)/u);
+  assert.match(
+    bridge,
+    /import\s*\{\s*loadAuthenticator\s*\}\s*from\s*'\.\/voice\/runtime\/env-bootstrap\.ts'/u,
+  );
+});
+
+test('driver-policy.ts 用 ?? 解析档案目录，关闭时打出「档案 关闭」', () => {
+  const policy = pluginSource['driver-policy.ts'];
+  assert.match(policy, /return configured \?\? join\(homeDir, '\.voice-agent', 'archives'\)/u);
+  assert.match(policy, /档案 关闭/u);
+});
+
+test('五个插件文件都不回退到旧默认、旧状态字段或 || 档案目录', () => {
+  assert.equal(/MIAI_HTTP_KEEPALIVE_MS/u.test(pluginUnion), false);
+  assert.equal(/config\.host !== '127\.0\.0\.1'/u.test(pluginUnion), false);
+  assert.equal(/SEMANTIC_END_TAG_BUDGET_MS',\s*300/u.test(pluginUnion), false);
+  assert.equal(/30_000/u.test(pluginUnion), false);
+  assert.equal(/MIAI_ARCHIVE_DIR'\] \|\|/u.test(pluginUnion), false);
+  assert.equal(/let hostMounted/u.test(pluginUnion), false);
+  assert.equal(/stackStarted/u.test(pluginUnion), false);
+  assert.equal(/fallbackRelease/u.test(pluginUnion), false);
+  assert.equal(/state\.voicePort/u.test(pluginUnion), false);
+  assert.equal(/state\.voiceError/u.test(pluginUnion), false);
+  assert.equal(/state\.pipelineMode/u.test(pluginUnion), false);
+  assert.equal(/effectiveTts = wantsLive && hasOmniKey/u.test(pluginUnion), false);
+});
+
+test('五个插件文件不再 import ./voice/main.ts', () => {
+  const voiceMain = /(?:from|import)\s*\(?\s*['"][^'"]*voice\/main(?:\.ts|\.js)?['"]/u;
+  for (const name of PLUGIN_FILES) {
+    assert.equal(voiceMain.test(pluginSource[name]), false, `${name} 不得 import ./voice/main.ts`);
+  }
+  assert.equal(/function bootVoiceStack/u.test(pluginSource['driver.ts']), false);
+  assert.equal(/function mountHostPlugin/u.test(pluginSource['driver.ts']), false);
+  assert.equal(/function bootStandalone/u.test(pluginSource['driver.ts']), false);
+  assert.match(pluginSource['driver.ts'], /export default \{ name, Config, apply \}/u);
 });
 
 test('语义判停：Pure Live 默认关，Cascade 与直连非 dsh 默认开', () => {
@@ -104,25 +191,6 @@ test('档案目录默认落到 ~/.voice-agent/archives，显式空字符串仍�
   assert.equal(formatArchiveBanner(join('tmp', 'arc')), `档案 ${join('tmp', 'arc')}`);
 });
 
-test('driver 用 ?? 解析档案目录，并在关闭时打出「档案 关闭」', () => {
-  const driver = readFileSync(new URL('../src/driver.ts', import.meta.url), 'utf8');
-  assert.match(driver, /return configured \?\? join\(homeDir, '\.voice-agent', 'archives'\)/u);
-  assert.match(driver, /resolveArchiveDir\(process\.env\['MIAI_ARCHIVE_DIR'\], homedir\(\)\)/u);
-  assert.match(driver, /formatArchiveBanner\(archiveDir\)/u);
-  assert.match(driver, /档案 关闭/u);
-  assert.equal(/MIAI_ARCHIVE_DIR'\] \|\|/u.test(driver), false);
-  assert.equal(/let hostMounted/u.test(driver), false);
-  assert.equal(/stackStarted/u.test(driver), false);
-  assert.equal(/fallbackRelease/u.test(driver), false);
-  assert.equal(/state\.voicePort/u.test(driver), false);
-  assert.equal(/state\.voiceError/u.test(driver), false);
-  assert.equal(/state\.pipelineMode/u.test(driver), false);
-  assert.match(driver, /state\.backend = \{ status: 'stopped' \}/u);
-  assert.match(driver, /const effectiveStt = usePureLiveAudio \? 'qwen-realtime' : config\.stt/u);
-  assert.match(driver, /const effectiveTts = usePureLiveAudio \? 'silent' : config\.tts/u);
-  assert.equal(/effectiveTts = wantsLive && hasOmniKey/u.test(driver), false);
-});
-
 test('HostPhase 只有 discovering 能进入 host 或 standalone', () => {
   assert.equal(nextHostPhase('discovering', 'host'), 'host');
   assert.equal(nextHostPhase('discovering', 'standalone'), 'standalone');
@@ -163,13 +231,14 @@ test('VoiceBackend 的面板字段只从当前状态派生，stopped 不残留 l
   assert.equal(failed.port, null);
   assert.equal(getVoicePort({ status: 'failed', reason: '没有密钥' }), null);
 
-  const stopped = resolveHostVoiceBackendView({ status: 'stopped' });
+  const stoppedState: VoiceBackendState = { status: 'stopped' };
+  const stopped: HostVoiceBackendView = resolveHostVoiceBackendView(stoppedState);
   assert.equal(stopped.voiceReady, false);
   assert.equal(stopped.voiceError, null);
   assert.equal(stopped.pipelineMode, 'stopped');
   assert.equal(stopped.port, null);
   assert.notEqual(stopped.pipelineMode, 'live');
-  assert.equal(getVoicePort({ status: 'stopped' }), null);
+  assert.equal(getVoicePort(stoppedState), null);
 
   const cascade = resolveHostVoiceBackendView({ status: 'ready', port: 7, mode: 'cascade' });
   assert.equal(cascade.pipelineMode, 'cascade');
@@ -305,4 +374,29 @@ test('显式 VOICE_PIPELINE=live 且 QWEN_ASR_TURN_DETECTION=vad 时拒绝，避
     voicePipeline: undefined,
     turnDetection: 'vad',
   }), null);
+});
+
+test('公开类型仍从 driver.ts 导出', () => {
+  const backend: VoiceBackendState = { status: 'starting' };
+  const view: HostVoiceBackendView = resolveHostVoiceBackendView(backend);
+  const event: StackEvent = { type: 'stop' };
+  const transition: StackTransition = reduceStackPhase({ kind: 'waiting' }, event);
+  const config: VoiceWebConfig = {
+    mode: 'host',
+    sessionId: '',
+    port: 8767,
+    host: '127.0.0.1',
+    origins: [],
+    servePage: false,
+    tls: { keyPath: '', certPath: '' },
+    stt: 'aliyun',
+    tts: 'cosyvoice',
+    agent: 'dsh',
+    workDir: '',
+    device: '',
+  };
+  assert.equal(view.pipelineMode, 'starting');
+  assert.equal(transition.phase.kind, 'stopped');
+  assert.equal(transition.releaseNow, null);
+  assert.equal(config.mode, 'host');
 });

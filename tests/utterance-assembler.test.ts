@@ -2700,6 +2700,326 @@ test('无判停器 + openQuietMs：假时钟不推进时受 maxOpenSilenceMs 封
   }
 });
 
+// ------------------------------------------------ S4：650 ms 不得截胡已落定的 semantic=more
+//
+// 第 1 拍 unsure（200 ms）期间语义已经落成 `more`。第 2 拍静音走到 752/761 ms 时，
+// 顶部闸门若仍读 650，会在 `semanticAllowsFlush` 之前 `whyAccept: 'cap'` 把
+// 1200 ms 的序列天花板压成死代码。假时钟要在真实 `setTimeout` 到期前拨过去。
+
+interface S4Run {
+  assembler: UtteranceAssembler;
+  utterances: Array<{ text: string; at: number }>;
+  facts: Array<{ why?: string; whyAccept?: string; waitMs: number; action: string }>;
+  logs: string[];
+  /** 把假时钟拨到「距最初那两帧有声」这么久。必须早于真实定时器到期。 */
+  silence(ms: number): void;
+}
+
+function makeS4(overrides: Partial<UtteranceAssemblerOptions> = {}): S4Run {
+  const clock = { t: 20_000 };
+  const facts: S4Run['facts'] = [];
+  const logs: string[] = [];
+  const { assembler, utterances } = makeAssembler({
+    silenceDb: -40,
+    extendMs: 200,
+    maxExtensions: 2,
+    maxUnsureExtensions: 1,
+    waitBudgetMs: 200,
+    waitBudgetSequenceMs: 1_200,
+    maxOpenSilenceMs: 650,
+    now: () => clock.t,
+    predict: async () => 0.02,
+    onJudge: (fact) => {
+      facts.push({
+        why: fact.why,
+        whyAccept: fact.whyAccept,
+        waitMs: fact.waitMs,
+        action: fact.action,
+      });
+    },
+    log: (line) => { logs.push(line); },
+    ...overrides,
+  });
+  assembler.addAudio(voiced());
+  clock.t += 20;
+  assembler.addAudio(voiced());
+  const voicedAt = clock.t;
+  return {
+    assembler,
+    utterances,
+    facts,
+    logs,
+    silence(ms: number) {
+      clock.t = voicedAt + ms;
+    },
+  };
+}
+
+/** 第 1 拍 unsure，再把时钟拨到第 2 拍静音，等到 meaning / cap 那次 evaluate 跑完。 */
+async function secondBeat(s: S4Run, text: string, firstSilenceMs: number, secondSilenceMs: number): Promise<void> {
+  s.silence(firstSilenceMs);
+  s.assembler.addSentence(text);
+  await delay(80);
+  s.silence(secondSilenceMs);
+  await delay(320);
+}
+
+function meaningWaits(s: S4Run): number[] {
+  return s.facts.filter((fact) => fact.why === 'meaning').map((fact) => fact.waitMs);
+}
+
+test('s4_p_700：第 2 拍静音 752 ms 不按 cap 放行，语义 more 延长 448 ms', { timeout: 5_000 }, async () => {
+  const s = makeS4({ semanticEndpoint: async () => 'more' });
+  try {
+    s.silence(552);
+    s.assembler.addSentence('你帮我讲讲那本书里。');
+    await delay(80);
+    const unsure = s.facts.filter((fact) => fact.why === 'unsure');
+    assert.equal(unsure.length, 1);
+    assert.equal(unsure[0]?.waitMs, 200);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), false);
+    assert.equal(s.assembler.phase, 'extending');
+
+    s.silence(752);
+    await delay(320);
+    assert.deepEqual(meaningWaits(s), [448]);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), false);
+    assert.equal(s.assembler.phase, 'extending');
+    assert.equal(s.utterances.length, 0);
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('s4_p_900：第 2 拍静音 761 ms 语义 more 延长 439 ms', { timeout: 5_000 }, async () => {
+  const s = makeS4({ semanticEndpoint: async () => 'more' });
+  try {
+    await secondBeat(s, '如果明天下午不下雨的话。', 561, 761);
+    assert.deepEqual(meaningWaits(s), [439]);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), false);
+    assert.equal(s.assembler.phase, 'extending');
+    assert.equal(s.utterances.length, 0);
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('s4_p_700 续说：静音 775 ms 重新开口，并成单轮完整句', { timeout: 8_000 }, async () => {
+  const s = makeS4({
+    semanticEndpoint: async (text) => (text.includes('离开城市') ? 'end' : 'more'),
+  });
+  try {
+    await secondBeat(s, '你帮我讲讲那本书里。', 552, 752);
+    assert.deepEqual(meaningWaits(s), [448]);
+    assert.equal(s.assembler.phase, 'extending');
+
+    s.silence(775);
+    s.assembler.addAudio(voiced());
+    s.assembler.addAudio(voiced());
+    assert.equal(s.assembler.phase, 'speaking_more');
+    assert.equal(s.utterances.length, 0);
+
+    s.assembler.addSentence('主角最后为什么离开城市啦？');
+    await delay(500);
+    assert.deepEqual(
+      s.utterances.map((item) => item.text),
+      ['你帮我讲讲那本书里。主角最后为什么离开城市啦？'],
+    );
+    assert.deepEqual(meaningWaits(s), [448]);
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('s4_p_900 续说：静音 900 ms 重新开口，并成单轮完整句', { timeout: 8_000 }, async () => {
+  const s = makeS4({
+    semanticEndpoint: async (text) => (text.includes('公园') ? 'end' : 'more'),
+  });
+  try {
+    await secondBeat(s, '如果明天下午不下雨的话。', 561, 761);
+    assert.deepEqual(meaningWaits(s), [439]);
+
+    s.silence(900);
+    s.assembler.addAudio(voiced());
+    s.assembler.addAudio(voiced());
+    assert.equal(s.assembler.phase, 'speaking_more');
+
+    s.assembler.addSentence('我们就去公园走一圈。');
+    await delay(500);
+    assert.deepEqual(
+      s.utterances.map((item) => item.text),
+      ['如果明天下午不下雨的话我们就去公园走一圈。'],
+    );
+    assert.deepEqual(meaningWaits(s), [439]);
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('s4 第 3 拍：延长到 1200 ms 后收口，语义 more 只延长一次', { timeout: 8_000 }, async () => {
+  const s = makeS4({ semanticEndpoint: async () => 'more' });
+  try {
+    await secondBeat(s, '你帮我讲讲那本书里。', 552, 752);
+    assert.deepEqual(meaningWaits(s), [448]);
+    assert.equal(s.assembler.phase, 'extending');
+
+    s.silence(1_200);
+    await delay(520);
+    assert.deepEqual(s.utterances.map((item) => item.text), ['你帮我讲讲那本书里。']);
+    assert.deepEqual(meaningWaits(s), [448]);
+    assert.equal(s.assembler.phase, 'idle');
+    assert.ok(
+      s.logs.some((line) => line.includes('上限 650')),
+      `第 3 拍应回到 650 ms 收口，实际 ${JSON.stringify(s.logs)}`,
+    );
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('semantic=end：静音 752 ms 按 650 cap 放行，不再等 550 ms', { timeout: 5_000 }, async () => {
+  const s = makeS4({ semanticEndpoint: async () => 'end' });
+  try {
+    await secondBeat(s, '今天天气真不错。', 552, 752);
+    assert.deepEqual(meaningWaits(s), []);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), true);
+    assert.equal(s.facts.reduce((sum, fact) => sum + fact.waitMs, 0), 200);
+    assert.deepEqual(s.utterances.map((item) => item.text), ['今天天气真不错。']);
+    assert.ok(s.logs.some((line) => line.includes('752 ms ≥ 上限 650')));
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('无 semanticEndpoint：静音 752 ms 按 650 cap 放行', { timeout: 5_000 }, async () => {
+  const s = makeS4();
+  try {
+    await secondBeat(s, '今天天气真不错。', 552, 752);
+    assert.deepEqual(meaningWaits(s), []);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), true);
+    assert.equal(s.facts.reduce((sum, fact) => sum + fact.waitMs, 0), 200);
+    assert.deepEqual(s.utterances.map((item) => item.text), ['今天天气真不错。']);
+    assert.ok(s.logs.some((line) => line.includes('752 ms ≥ 上限 650')));
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('已经因语义延长过：静音 800 ms 回到 650 cap，不再第二次 meaning', { timeout: 8_000 }, async () => {
+  const s = makeS4({ semanticEndpoint: async () => 'more' });
+  try {
+    await secondBeat(s, '你帮我讲讲那本书里。', 552, 752);
+    assert.deepEqual(meaningWaits(s), [448]);
+
+    s.silence(800);
+    await delay(520);
+    assert.deepEqual(meaningWaits(s), [448]);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), true);
+    assert.deepEqual(s.utterances.map((item) => item.text), ['你帮我讲讲那本书里。']);
+    assert.ok(
+      s.logs.some((line) => line.includes('800 ms ≥ 上限 650')),
+      `已延长过仍应按 650 放行，实际 ${JSON.stringify(s.logs)}`,
+    );
+    assert.equal(s.logs.some((line) => line.includes('上限 1200')), false);
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('more 已落定但 maxExtensions 为 0：静音 700 ms 仍按 650 cap 放行', { timeout: 5_000 }, async () => {
+  const s = makeS4({
+    maxExtensions: 0,
+    semanticEndpoint: async () => 'more',
+  });
+  try {
+    s.silence(700);
+    s.assembler.addSentence('你帮我讲讲那本书里。');
+    await delay(80);
+    assert.deepEqual(meaningWaits(s), []);
+    assert.equal(s.facts.filter((fact) => fact.why === 'unsure').length, 0);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), true);
+    assert.deepEqual(s.utterances.map((item) => item.text), ['你帮我讲讲那本书里。']);
+    assert.ok(s.logs.some((line) => line.includes('700 ms ≥ 上限 650')));
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('s4_p_700 在途竞态：第 2 拍 795 ms 时语义仍在途，27 ms 后落定 more 应延长并合并成单轮', { timeout: 8_000 }, async () => {
+  let releaseFirst: (verdict: 'more') => void = () => {};
+  let calls = 0;
+  const s = makeS4({
+    predict: async () => 0.009,
+    semanticBudgetMs: 400,
+    semanticEndpoint: (text) => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise<'more'>((resolve) => { releaseFirst = resolve; });
+      }
+      return Promise.resolve(text.includes('离开城市') ? 'end' : 'more');
+    },
+  });
+  try {
+    // 第 1 拍（499 ms 定稿，p=0.009 → unsure 等 200 ms），语义仍在途
+    s.silence(499);
+    s.assembler.addSentence('你帮我讲讲那本书里。');
+    await delay(80);
+    assert.equal(s.assembler.phase, 'extending');
+
+    // 第 2 拍醒来时静音已到 795 ms（超过基础 cap 650），语义仍在途
+    s.silence(795);
+    await delay(180);
+    assert.equal(s.utterances.length, 0, '在途语义未回前不得抢先按 650 cap 截断');
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), false);
+
+    // 27 ms 后语义落定 more（静音 822 ms），应给出 378 ms 续等窗到 1200 ms
+    s.silence(822);
+    releaseFirst('more');
+    await delay(60);
+    assert.deepEqual(meaningWaits(s), [378]);
+    assert.equal(s.assembler.phase, 'extending');
+    assert.equal(s.utterances.length, 0);
+
+    // 用户续说后半句，并成单轮
+    s.silence(860);
+    s.assembler.addAudio(voiced());
+    s.assembler.addAudio(voiced());
+    assert.equal(s.assembler.phase, 'speaking_more');
+    s.assembler.addSentence('主角最后为什么离开城市啦？');
+    await delay(500);
+    assert.deepEqual(
+      s.utterances.map((item) => item.text),
+      ['你帮我讲讲那本书里。主角最后为什么离开城市啦？'],
+    );
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
+test('s4_p_700 在途竞态对照：第 2 拍 795 ms 在途语义返回 end 时仍按 cap 放行', { timeout: 5_000 }, async () => {
+  let release: (verdict: 'end') => void = () => {};
+  const s = makeS4({
+    predict: async () => 0.009,
+    semanticBudgetMs: 400,
+    semanticEndpoint: () => new Promise<'end'>((resolve) => { release = resolve; }),
+  });
+  try {
+    s.silence(499);
+    s.assembler.addSentence('外面现在在下雨吗？');
+    await delay(80);
+    s.silence(795);
+    await delay(180);
+    s.silence(820);
+    release('end');
+    await delay(80);
+    assert.deepEqual(meaningWaits(s), []);
+    assert.equal(s.facts.some((fact) => fact.whyAccept === 'cap'), true);
+    assert.deepEqual(s.utterances.map((item) => item.text), ['外面现在在下雨吗？']);
+  } finally {
+    s.assembler.dispose();
+  }
+});
+
 test('无判停器且未设 openQuietMs：保留 fallbackWindowMs', { timeout: 2_000 }, async () => {
   const { assembler, utterances } = makeAssembler({
     predict: undefined,

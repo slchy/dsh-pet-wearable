@@ -15,7 +15,7 @@ import { createConnection, type Socket } from 'node:net';
 import { join, resolve } from 'node:path';
 
 import { DownstreamFrameType, FrameDecoder, UpstreamFrameType } from '../../src/frame.ts';
-import { isMainModule } from '../../src/main.ts';
+import { isMainModule } from '../../src/runtime/is-main.ts';
 import { sleep } from '../../src/util.ts';
 import { makeFloorNoise } from './synth-corpus.ts';
 import type {
@@ -144,11 +144,20 @@ async function runSession(options: {
         if (tracker.firstAt === null) tracker.firstAt = now;
         tracker.totalBytes += frame.payload.length;
         tracker.lastAt = now;
-        if (tracker.burstStartAt === null) tracker.burstStartAt = now;
+        // 插话掐掉前一段后台播报后，新轮次首块音频与旧段相隔 > 600 ms：重新锚定媒体播放起点，
+        // 避免拿被掐掉的旧播报起点算 playEnd 导致新轮次还没播完就被 runner 提前断开。
+        if (tracker.burstStartAt === null || (tracker.burstLastAt !== null && now - tracker.burstLastAt > 600)) {
+          tracker.burstStartAt = now;
+          tracker.burstBytes = 0;
+        }
         tracker.burstBytes += frame.payload.length;
         tracker.burstLastAt = now;
       } else if (frame.type === DownstreamFrameType.Call) {
-        tracker.calls.push(frame.payload.toString('utf8'));
+        const payload = frame.payload.toString('utf8');
+        tracker.calls.push(payload);
+        if (payload.includes('"audio.stop"')) {
+          resetBurst(tracker);
+        }
       } else if (frame.type === DownstreamFrameType.Control) {
         tracker.controls.push(frame.payload.toString('utf8'));
       }

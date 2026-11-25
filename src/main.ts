@@ -3,6 +3,7 @@
  *
  * STT / TTS / agent 都是**注入的**（见 `providers.ts`），这里只做装配：
  * 按 `--stt` / `--tts` / `--agent` 选实现，其余全是编排。
+ * 可复用的那一层在 `src/runtime/`；本文件是 CLI（参数、横幅、进程级审计槽）。
  *
  *   node src/main.ts --listen 8766                                  # 真供应商
  *   node src/main.ts --listen 8766 --stt canned --tts silent --agent echo   # 零密钥
@@ -10,315 +11,78 @@
  * 旧路径（`--replay`、本地 silero-vad、MiMo ASR）见 `legacy-pipeline.ts`。
  * 它**按需加载**：`--stt` 流式启动的依赖图里没有 VAD/ONNX（见文件末尾的说明）。
  */
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
 
-import { VoiceAgent } from './agent.ts';
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './announce-store.ts';
-import { aliyunStt } from './aliyun-asr.ts';
-import { mergeCorpusText, qwenRealtimeStt } from './qwen-realtime-asr.ts';
-import { cosyVoiceTts, DEFAULT_COSYVOICE_EMOTION_MODE } from './cosyvoice.ts';
-import { omniTts } from './omni-tts.ts';
-import { mimoTts } from './mimo.ts';
-import { EMOTIONS } from './emotion.ts';
-import { EVENTS } from './events.ts';
-import { sampleSocket } from './socket-stats.ts';
-import { BASE_STYLE, DEFAULT_TTS_VOICE } from './mimo.ts';
-import {
-  cannedStt,
-  echoAgent,
-  noopStt,
-  silentTts,
-  type AgentProvider,
-  type BackgroundTaskReport,
-  type SttProvider,
-  type TtsProvider,
-} from './providers.ts';
-import { DshSession } from './session.ts';
-import { KEEPALIVE_PROMPT, newActivityState, startKeepalive, systemClock, trackActivity, type ActivityState } from './keepalive.ts';
-import type { EngineEvent, FastVoiceEngine } from './engine-contract.ts';
-import { FrontedAgent } from './fronted-agent.ts';
-import { MemoryFile } from './memory-file.ts';
-import { resolveVoicePipelineFromEnv, type PipelinePlan, type VoicePipelineMode } from './pipeline-mode.ts';
-import { CascadeAgent, LiveOrchestrator } from './pipelines/index.ts';
-import { expiryWarning } from './tls-cert.ts';
-import { runVoiceServer, UPSTREAM_SAMPLE_RATE, type VoiceSessionOptions } from './voice-session.ts';
-import { TurnJudge } from './turn-judge.ts';
- import { semanticEndpoint } from './semantic-endpoint.ts';
 import { DEVICE_MODELS, describeCapabilities, resolveV1Device } from './devices/index.ts';
+import { FrontedAgent } from './fronted-agent.ts';
+import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './http-agent.ts';
+import {
+  KEEPALIVE_PROMPT,
+  newActivityState,
+  startKeepalive,
+  systemClock,
+  trackActivity,
+  type ActivityState,
+} from './keepalive.ts';
+import type { Pipeline, ReplyMode } from './legacy-pipeline.ts';
+import { MemoryFile } from './memory-file.ts';
 import { DEFAULT_PET_PARAMS } from './pet/brain/registry.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
-import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './http-agent.ts';
+import type { PipelinePlan } from './pipeline-mode.ts';
+import { silentTts, type AgentProvider, type TtsProvider } from './providers.ts';
+import { loadStaticAsrCorpus, resolveAsrLanguage } from './runtime/asr-context.ts';
+import { createAuditSlot } from './runtime/audit-slot.ts';
+import { loadAuthenticator, loadDotEnv, loadTls } from './runtime/env-bootstrap.ts';
+import { isMainModule } from './runtime/is-main.ts';
+import {
+  assemblePipelinePlan,
+  assembleStreamingAgent,
+  shouldCreateFrontedAgent,
+  type AssembledStreamingPipeline,
+} from './runtime/pipeline-assembly.ts';
+import { buildAgent, buildStt, buildTts } from './runtime/providers-factory.ts';
+import { semanticEndpoint } from './semantic-endpoint.ts';
+import type { DshSession } from './session.ts';
+import { TurnJudge } from './turn-judge.ts';
+import { envNumber, envString, sleep } from './util.ts';
 import {
   buildVoiceRuntimeConfig,
   DEFAULT_IMAGE_QUESTION,
   resolveOmniApiKey,
 } from './voice-config.ts';
-// **只借类型，不加载模块**：`legacy-pipeline.ts` 会一路拉进 `silero-vad` 与
-// `onnxruntime-node`（几十 MB、启动多几百毫秒），而生产走的是 `--stt` 流式路径，
-// 一行都用不到。真正的 `Pipeline` 在末尾的回放/旧监听分支里按需 `await import()`。
-import type { Pipeline, ReplyMode } from './legacy-pipeline.ts';
-import {
-  describeTokenProblem,
-  readTokenFile,
-  tokenFilePath,
-  TokenGate,
-} from './tokens.ts';
-import { envNumber, envString, sleep } from './util.ts';
-/**
- * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` 工厂（或 default）。
- *
- * 这是 `cloud/` 唯一的扩展点 —— 换厂商不用改本文件，也不用 fork。将来开源时
- * 别人照这个签名写自己的模块即可（见 `docs/BACKLOG.md` B-004）。
- */
-async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
-  const isPath = /^[./]/.test(spec) || /^[A-Za-z]:[\\/]/.test(spec);
-  const url = isPath ? pathToFileURL(resolve(spec)).href : spec;
-  const mod = (await import(url)) as Record<string, unknown>;
-  const factory = (mod.default ?? mod[exportName]) as (() => T) | undefined;
-  if (typeof factory !== 'function') {
-    throw new Error(`${spec} 必须导出 ${exportName}() 工厂（或 default 导出工厂）`);
-  }
-  return factory();
-}
+import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
 
-/** `--stt aliyun|qwen-realtime|noop|canned|<path>` */
-export async function buildStt(
-  spec: string,
-  creds: {
-    akId: string; akSecret: string; appkey: string; region: string;
-    maxSentenceSilenceMs: number; vocabularyId?: string; corpusText?: string; language?: string;
-  },
-): Promise<SttProvider> {
-  if (spec === 'noop') return noopStt();
-  if (spec === 'canned') return cannedStt();
-  if (spec === 'aliyun') {
-    return aliyunStt(creds, (line) => { console.log(`  [asr] ${line}`); });
-  }
-  if (spec === 'qwen-realtime') {
-    const apiKey = process.env['DASHSCOPE_API_KEY'] ?? '';
-    if (!apiKey) {
-      throw new Error('STT=qwen-realtime 需要 DASHSCOPE_API_KEY（和 CosyVoice 用的是同一个 key）');
-    }
-    // 端点由谁判：默认我们控（`turn_detection: null`，静音窗见 `VOICE_COMMIT_MS`）；
-    // `QWEN_ASR_TURN_DETECTION=vad` 交给服务端（`speech_stopped → 定稿` 139–204 ms，
-    // 比手动 commit 的 261 ms 快，但拿走了封段权，`VOICE_COMMIT_MS` 等旋钮全部失效）
-    const turnDetection = process.env['QWEN_ASR_TURN_DETECTION'] === 'vad' ? 'vad' : 'manual'; const { corpusText, language } = creds;
-    return qwenRealtimeStt(
-      {
-        apiKey,
-        ...(process.env['QWEN_ASR_URL'] ? { url: process.env['QWEN_ASR_URL'] } : {}),
-        ...(process.env['QWEN_ASR_MODEL'] ? { model: process.env['QWEN_ASR_MODEL'] } : {}),
-        turnDetection,
-        ...(corpusText ? { corpusText } : {}), ...(language ? { language } : {}),
-      },
-      (line) => { console.log(`  [asr] ${line}`); },
-    );
-  }
-  return loadProvider<SttProvider>(spec, 'stt');
-}
-
-/**
- * `--tts cosyvoice|omni|mimo|silent|<path>`
- *
- * `audit` 是 `tts.*` 事件的出口。CLI 不传，落到进程级 {@link auditSlot}；
- * 插件宿主自己 `createAuditSlot()` 传进来 —— 同一个进程里可能有多份宿主，
- * 不该共用同一个全局槽（谁先挂上谁就写走了别人的档案）。
- */
-export async function buildTts(spec: string, audit?: AuditSink): Promise<TtsProvider> {
-  const emit = audit
-    ?? ((name: string, data: Record<string, unknown>): void => { auditSlot.emit(name, data); });
-  if (spec === 'silent') return silentTts(24_000);
-  if (spec === 'cosyvoice') {
-    if (!process.env['DASHSCOPE_API_KEY']) {
-      throw new Error('DASHSCOPE_API_KEY 未设置（CosyVoice 用的是 DashScope API key，不是阿里云 AK/SK）');
-    }
-    // 情绪表达有两档，见 `cosyvoice.ts` 顶部；模式由 COSYVOICE_EMOTION_MODE 选：
-    //   prosody（默认）：rate/pitch 缩放，系统音色可用，最省延迟
-    //   instruction：自由指令，只有复刻/设计音色吃，首包多 ~90 ms
-    // 系统音色配 instruction 会被服务端拒（428）。
-    // **默认值只有一处**：`cosyvoice.ts` 的 `DEFAULT_COSYVOICE_EMOTION_MODE`。
-    // （以前这里写死 `=== 'instruction'`，等于默认值在两处「碰巧一致」，
-    // 那边一改就漂成「main 说关、provider 说开」。）
-    return cosyVoiceTts({
-      apiKey: process.env['DASHSCOPE_API_KEY'],
-      url: process.env['COSYVOICE_URL'],
-      model: process.env['COSYVOICE_MODEL'],
-      voice: process.env['COSYVOICE_VOICE'],
-      useInstruction:
-        (process.env['COSYVOICE_EMOTION_MODE'] ?? DEFAULT_COSYVOICE_EMOTION_MODE) === 'instruction',
-      // 每个 task 的「建立 / 首包」两段，常开落到当前档案（见 `tts.task`）
-      onTask: (info) => { emit(EVENTS.ttsTask, { ...info }); },
-      // 流式 task 的分批送达明细，收尾时落一次（见 `tts.done`）
-      onDone: (info) => { emit(EVENTS.ttsDone, { ...info }); },
-      // 首块 600 ms 还没回来：**当场**采这一条 socket（`unacked`/`rto` 只在那一瞬有意义）
-      onStall: (info) => {
-        void sampleSocket(info.local_port).then((socket) => {
-          emit(EVENTS.ttsStall, { ...info, socket });
-        });
-      },
-    });
-  }
-  if (spec === 'omni') {
-    if (!process.env['DASHSCOPE_API_KEY']) {
-      throw new Error('DASHSCOPE_API_KEY 未设置（omni 朗读机用的是 DashScope API key）');
-    }
-    // 用 omni 念 dsh 的答案 —— 全链路单一音色（S5）。
-    // 代价与门槛见 `omni-tts.ts` 文件头：语速 ~4.0–4.4 字/秒（CosyVoice 5.45–5.66）、
-    // 首块 629–781 ms（CosyVoice 350–390）。
-    return omniTts({
-      apiKey: process.env['DASHSCOPE_API_KEY'],
-      model: process.env['OMNI_SHADOW_MODEL'],
-      log: (line) => { console.log(line); },
-    });
-  }
-  if (spec === 'mimo') {
-    if (!process.env['MIMO_API_KEY']) {
-      throw new Error('MIMO_API_KEY 未设置（用 --tts silent 可跳过 TTS）');
-    }
-    // 风格提示词：MiMo 的 TTS 是「聊天式」的 —— 风格放进 user 消息，要念的文本放进
-    // assistant 消息。基础音色 + 五种情绪的变体都由 `emotion.ts` 提供，可用环境变量覆盖。
-    return mimoTts({
-      voice: process.env['MIMO_TTS_VOICE'] ?? DEFAULT_TTS_VOICE,
-      baseStyle: process.env['MIMO_TTS_STYLE'] ?? BASE_STYLE,
-      // 每个情绪一个可选覆盖；key 从单一事实来源来，加情绪不用改这里
-      overrides: Object.fromEntries(
-        Object.keys(EMOTIONS).map((key) => [
-          key,
-          process.env[`MIMO_TTS_STYLE_${key.toUpperCase()}`],
-        ]),
-      ),
-    });
-  }
-  return loadProvider<TtsProvider>(spec, 'tts');
-}
-
-interface AgentBundle {
-  readonly agent: AgentProvider | null;
-  /** dsh 专用：进程句柄要留着，退出时 stop() */
-  readonly dsh: DshSession | null;
-}
-
-/** `--agent dsh|echo|none|<path>` */
-export async function buildAgent(
-  spec: string,
-  dsh: { workDir: string; useSdk: boolean; provider: string; model: string; log: (line: string) => void },
-  announceStore: AnnounceStore | null,
-): Promise<AgentBundle> {
-  if (spec === 'none' || spec === '') {
-    return { agent: null, dsh: null };
-  }
-  if (spec === 'echo') {
-    return { agent: echoAgent(), dsh: null };
-  }
-  if (spec === 'dsh') {
-    const session = new DshSession({
-      workDir: dsh.workDir,
-      program: process.env['DSH_BIN'],
-      mode: dsh.useSdk ? 'sdk' : 'headless',
-      patch: process.env['DSH_PATCH'],
-      provider: dsh.provider,
-      model: dsh.model,
-      log: (l: string) => { console.log(`  [session] ${l}`); },
-    });
-
-    /**
-     * 流式文本：只在**真的超过门槛**时才出声。
-     *
-     * 现在只打日志 —— 把"插件 → 侧通道 → 门槛"这条链先验证到位，再接 TTS。
-     * 这条日志本身就是仪表：`释放前 N 字` 出现说明这一轮是长回答，没出现说明
-     * 整段不到 20 token（走原来的整段路径）。
-     */
-    session.onLive = (event) => {
-      if (event.type === 'start') {
-        const chars = [...event.text].length;
-        console.log(
-          `  流式    释放前 ${chars} 字：${JSON.stringify(event.text.slice(0, 40))}`,
-        );
-      } else if (event.type === 'end') {
-        console.log(
-          `  流式    ${event.streaming ? '流式' : '整段'}交付 ${event.tokens} token`,
-        );
-      }
-    };
-
-    return { agent: new VoiceAgent(session, dsh.log, announceStore), dsh: session };
-  }
-  return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
-}
-
-/**
- * 证书从文件读，路径只走环境变量 —— 部署细节不进源码。
- *
- * **配置错误抛异常，不退出进程**：插件宿主（`dsh-voice-web`）跑在 dsh 进程里，
- * `process.exit` 会把整个宿主带走。CLI 在 `main()` 里接住再转 {@link fail}，
- * 退出码与提示一字不变。
- */
-export function loadTls(): { key: Buffer; cert: Buffer } | undefined {
-  const keyPath = process.env['MIAI_TLS_KEY'] ?? '';
-  const certPath = process.env['MIAI_TLS_CERT'] ?? '';
-  if (!keyPath || !certPath) {
-    // 只给一半是配错了，不是「没配」—— 静默降级成明文会让人以为已经加密了
-    if (keyPath || certPath) {
-      const given = keyPath ? 'MIAI_TLS_KEY' : 'MIAI_TLS_CERT';
-      const absent = keyPath ? 'MIAI_TLS_CERT' : 'MIAI_TLS_KEY';
-      throw new Error(`只给了 ${given}，缺 ${absent}：TLS 要么两个都给，要么都不给`);
-    }
-    return undefined;
-  }
-  try {
-    const cert = readFileSync(certPath);
-    // 到期检查：过期的证书服务端照常启动、照常监听，只是每一次握手都失败 ——
-    // 客户端只看到「连不上」，日志里一个字都没有。所以在这里喊出来。
-    for (const line of expiryWarning(cert) ?? []) {
-      console.warn(`  ${line}`);
-    }
-    return { key: readFileSync(keyPath), cert };
-  } catch (error) {
-    throw new Error(`TLS 证书读不到：${(error as Error).message}`);
-  }
-}
+export {
+  assemblePipelinePlan,
+  assembleStreamingAgent,
+  buildAgent,
+  buildStt,
+  buildTts,
+  createAuditSlot,
+  isMainModule,
+  loadAuthenticator,
+  loadDotEnv,
+  loadStaticAsrCorpus,
+  loadTls,
+  resolveAsrLanguage,
+  shouldCreateFrontedAgent,
+};
+export type { AssembledStreamingPipeline };
+export { formatCurrentDateContext } from './runtime/asr-context.ts';
+export type { AuditSink, AuditSlot } from './runtime/audit-slot.ts';
+export type {
+  AssembleStreamingAgentDeps,
+  FrontedPlan,
+} from './runtime/pipeline-assembly.ts';
 
 /** 启动期配置错误：说清楚是哪一项、该怎么改，然后退出。 */
 function fail(message: string): never {
   console.error(`\n启动失败：${message}\n`);
   process.exit(2);
-}
-
-/**
- * 设备鉴权：`MIAI_TOKENS` 指向一个文件，每行 `token` 或 `token:deviceId`。
- *
- * - 不配就**不鉴权**（只可能用于本机地址 —— 由 `bind-policy.ts` 把关）
- * - 配了就必须首帧 `Hello`，且 token 要过强度校验（见 `tokens.ts`）
- * - 文件变了自动重读，**吊销不必重启进程**
- * - 写了 `token:deviceId` 就是真绑定：`Hello.deviceId` 对不上同样拒绝
- *
- * 与 {@link loadTls} 一样：配置错误**抛异常**，由调用方决定是退出还是收下
- * （插件宿主不能退出）。
- */
-export function loadAuthenticator(log: (line: string) => void): ((hello: { deviceId?: string; token?: string }) => boolean) | undefined {
-  const path = process.env['MIAI_TOKENS'] ?? '';
-  if (!path.trim()) return undefined;
-
-  const resolved = tokenFilePath(path);
-  // 启动时就报出弱/错 token，别等到设备连上来才发现「配了等于没配」
-  const { entries, bad } = readTokenFile(resolved);
-  for (const item of bad) {
-    throw new Error(
-      `${resolved} 第 ${item.line} 行不合格：${describeTokenProblem(item.raw, item.problem)}\n`
-      + '（要重新发一个：node src/pair.ts new --device <id>）',
-    );
-  }
-  if (entries.length === 0) {
-    throw new Error(`${resolved} 里没有任何可用的 token`);
-  }
-
-  const gate = new TokenGate(resolved, log);
-  console.log(`鉴权      ${entries.length} 个设备 token（来自 ${resolved}，改动会自动重读）`);
-  return (hello) => typeof hello.token === 'string' && gate.match(hello.token, hello.deviceId) !== null;
 }
 
 // ------------------------------------------------------------------ 入口
@@ -438,46 +202,6 @@ const DEFAULT_PET_TICK_MS = 3_000;
 const DEFAULT_PET_MIC_OPEN_TIMEOUT_MS = 1_500;
 
 /**
- * 读 `cloud/.env`（KEY=VALUE，忽略 # 注释与空行）。
- *
- * 不引依赖：格式就这么点。**已存在的环境变量优先**，所以命令行临时覆盖仍然有效。
- */
-export function loadDotEnv(): number {
-  const path = join(process.cwd(), '.env');
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch {
-    return 0;
-  }
-  let count = 0;
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) {
-      continue;
-    }
-    const eq = line.indexOf('=');
-    if (eq <= 0) {
-      continue;
-    }
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"'))
-      || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (process.env[key] === undefined) {
-      process.env[key] = value;
-      count += 1;
-    }
-  }
-  if (count > 0) {
-    console.log(`凭据    ${path}（${count} 项）`);
-  }
-  return count;
-}
-
-/**
  * `MIAI_LOG_TS=1`：给每一行日志加一个进程启动以来的毫秒时间戳。
  *
  * 只在排查时开 —— 平时日志的格式有人 grep，加前缀会连累所有既有脚本。
@@ -495,78 +219,6 @@ function installLogClock(): void {
   };
 }
 
-/** 审计出口的形状：`agent.*` / `tts.*` 事件往哪儿写。 */
-export type AuditSink = (name: string, data: Record<string, unknown>) => void;
-
-/**
- * 审计出口的**槽位**：进程里所有共用件（`FrontedAgent`、TTS provider）都往这里写，
- * 而真正的接收方（档案）是**每连接一份**。
- */
-export interface AuditSlot {
-  /** 当前挂着的那个（`null` = 没人接）。排障/单测用，不参与装配。 */
-  peek(): AuditSink | null;
-  /**
-   * 挂上 / 摘掉。
-   *
-   * 传 `expected` 时是**所有权守卫**：只有「槽里现在挂的正是我当初挂的那个」才摘，
-   * 否则什么也不做 —— 旧连接断开时不能把后来那条连接的档案摘掉。
-   * 不传 `expected`（`undefined` / `null`）保持老语义：直接覆盖。
-   */
-  set(sink: AuditSink | null, expected?: AuditSink | null): void;
-  /** 转发一条事件；没有持有者、或持有者抛错，都只当没发生。 */
-  emit(name: string, data: Record<string, unknown>): void;
-  /** 挂上并返回**只摘自己那一份**的卸载函数。 */
-  register(sink: AuditSink): () => void;
-}
-
-/**
- * 造一个审计槽位。
- *
- * 为什么要有所有权守卫：`FrontedAgent` 和 TTS provider 是**进程级共用**的，它们的
- * 回调只能写「当前这条连接」的档案。多设备并发（或快速重连）时，旧连接的生命周期
- * 收拾得比新连接晚，它那句 `setAudit(null)` 会把新连接的档案出口一起摘掉 ——
- * 之后所有 `agent.*` / `tts.*` 事件静默丢失，日志里一个字都没有。
- *
- * 现在 `voice-session` 传不传令牌由它自己决定：不传（1 参调用）就仍是
- * 「最后挂上的赢、`null` 直接清」；传了（2 参）就走所有权守卫。装配层两参都转发，
- * 所以那一侧改签名时这里不用再动。
- */
-export function createAuditSlot(): AuditSlot {
-  let current: AuditSink | null = null;
-
-  const set = (sink: AuditSink | null, expected?: AuditSink | null): void => {
-    if (sink === null && expected != null) {
-      // 只摘自己挂上去的那一个：别人后来居上时保持原样
-      if (current === expected) {
-        current = null;
-      }
-      return;
-    }
-    current = sink;
-  };
-
-  return {
-    peek: () => current,
-    set,
-    emit: (name, data) => {
-      const sink = current;
-      if (sink === null) {
-        return;
-      }
-      // 审计抛错不能把一轮通话带下水（档案可能刚好在关）
-      try {
-        sink(name, data);
-      } catch {
-        // 忽略
-      }
-    },
-    register: (sink) => {
-      set(sink);
-      return () => { set(null, sink); };
-    },
-  };
-}
-
 /**
  * 审计出口的**当前持有者**：哪条连接在写档案。
  *
@@ -576,309 +228,18 @@ export function createAuditSlot(): AuditSlot {
  */
 const auditSlot = createAuditSlot();
 
-/** `FrontedAgent` 的装配结论，见 {@link shouldCreateFrontedAgent}。 */
-export interface FrontedPlan {
-  /** 要不要造这个装饰器。`false` 时 agent 保持原样（纯 `VoiceAgent`）。 */
-  readonly create: boolean;
-  /** 传给 `FrontedAgent` 的 `apiKey`：`''` = 级联文本模型关，只留 omni + dsh。 */
-  readonly cascadeKey: string;
-  /** 为什么是这个结论（`cascade` / `omni-only` / `off` / `no-key`），只用于日志与单测。 */
-  readonly why: 'cascade' | 'omni-only' | 'off' | 'no-key';
+// 热路径字面量（envNum / env['FAST_LANE_*']）只留在 assembleStreamingAgent，
+// time-knobs 记第一次出现的文件。旧装配走这几个函数，避免抢持有者。
+function readLegacyNumber(name: string, fallback: number): number {
+  return envNumber(name, fallback);
 }
 
-/**
- * 造不造 `FrontedAgent` —— 纯判据，装配层照它执行。
- *
- * 这里错一次的代价是**静默**的：`FrontedAgent` 同时拿着级联文本快车道和 omni 音频
- * 车道的挂载点（`attachAudioLane` / `willServeAudio` / `noteServedTurn`）。以前它只在
- * 「有 `FAST_LANE_API_KEY`」时才造，于是删掉 qwen-flash 的 key 就顺手把 omni 也删了：
- * `VoiceAgent` 没有那些可选方法，`trackActivity` 转发的也是 `undefined`，宿主一路
- * 静默降级，日志里只有一句「快车道 关」。
- *
- * 所以现在的判据是**两件事任一成立**：
- * - 有 key 且没被 `FAST_LANE=0` 关掉 → 级联照旧；
- * - omni 车道会启用（`omniWillEnable`）→ 也必须造，但 `apiKey: ''`
- *   （`routeTurn()` 见 `cascade: false` 就直接跳过级联，只留 `live` + `dsh`）。
- *
- * **别把 `fastOff` 当成「omni 也关」**：那个开关只管文本快车道。
- */
-export function shouldCreateFrontedAgent(input: {
-  readonly fastOff: boolean;
-  readonly fastKey: string;
-  readonly omniEnabled: boolean;
-}): FrontedPlan {
-  if (!input.fastOff && input.fastKey !== '') {
-    return { create: true, cascadeKey: input.fastKey, why: 'cascade' };
-  }
-  if (input.omniEnabled) {
-    return { create: true, cascadeKey: '', why: 'omni-only' };
-  }
-  return { create: false, cascadeKey: '', why: input.fastOff ? 'off' : 'no-key' };
+function readLegacyOn(name: string): boolean {
+  return process.env[name] !== '0';
 }
 
-/**
- * 启动期管道计划。纯函数：只看传入的 `env`，不读 `process.env`。
- *
- * `main()` 在 `--agent dsh` 的流式装配上调用它；非法值、live 缺 key、
- * live 的 STT 不是 `qwen-realtime` 都从这里抛出去，由调用方打印后退出。
- */
-export function assemblePipelinePlan(
-  env: Record<string, string | undefined>,
-  opts?: { readonly sttName?: string; readonly strict?: boolean },
-): PipelinePlan {
-  return resolveVoicePipelineFromEnv(env, opts);
-}
-
-/**
- * 热路径引擎的 `respond()` 不经过 `trackActivity` 包过的 `reply()`
- * （`toEngine()` 拿的是装饰器自己的 `this`）。
- *
- * 不在这里记账的话，空闲时钟停在进程启动那一刻：用户一直在说话，
- * 保活仍会在 180 分钟后往 dsh 打一枪。
- */
-function watchEngineActivity(
-  engine: FastVoiceEngine,
-  state: { inflight: number; last: number },
-): FastVoiceEngine {
-  const respond: FastVoiceEngine['respond'] = (turn, signal) => {
-    state.inflight += 1;
-    let gen: AsyncIterable<EngineEvent>;
-    try {
-      gen = engine.respond(turn, signal);
-    } catch (error) {
-      state.inflight -= 1;
-      state.last = Date.now();
-      throw error;
-    }
-    return (async function* () {
-      try {
-        yield* gen;
-      } finally {
-        state.inflight -= 1;
-        state.last = Date.now();
-      }
-    })();
-  };
-  return new Proxy(engine, {
-    get(target, prop) {
-      if (prop === 'respond') return respond;
-      if (prop === 'constructor') return Reflect.get(target, prop, target);
-      const value = Reflect.get(target, prop, target);
-      return typeof value === 'function' ? value.bind(target) : value;
-    },
-  });
-}
-
-/**
- * 纯 live 的离线兜底。
- *
- * `VoiceAgent` 自己会在播报出口为空时写入 `announceStore`。`LiveOrchestrator`
- * 构造时把那条出口换成了任务总线，断线后再 `setTaskReporter(null)` 结论就丢了。
- * 这里在「还没有连接」和「连接把出口摘成 null」两种情况下都写回同一份队列。
- */
-function armLiveOfflineAnnounce(
-  orch: LiveOrchestrator,
-  store: AnnounceStore | null,
-  log: (line: string) => void,
-): LiveOrchestrator {
-  const persist = (speech: string, emotion?: string): void => {
-    const pending = store?.push(speech, emotion) ?? 0;
-    log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
-  };
-  const fallbackAnnouncer = (speech: string, emotion?: string): void => {
-    persist(speech, emotion);
-  };
-  const fallbackReport = (report: BackgroundTaskReport): void => {
-    persist(report.verbatim ?? report.summary, report.emotion);
-  };
-  orch.setAnnouncer(fallbackAnnouncer);
-  orch.setTaskReporter(fallbackReport);
-  const setAnnouncer = (cb: ((speech: string, emotion?: string) => void) | null): void => {
-    orch.setAnnouncer(cb ?? fallbackAnnouncer);
-  };
-  const setTaskReporter = (cb: ((report: BackgroundTaskReport) => void) | null): void => {
-    orch.setTaskReporter(cb ?? fallbackReport);
-  };
-  return new Proxy(orch, {
-    get(target, prop) {
-      if (prop === 'setAnnouncer') return setAnnouncer;
-      if (prop === 'setTaskReporter') return setTaskReporter;
-      if (prop === 'constructor') return Reflect.get(target, prop, target);
-      const value = Reflect.get(target, prop, target);
-      return typeof value === 'function' ? value.bind(target) : value;
-    },
-  }) as LiveOrchestrator;
-}
-
-function envNum(env: Record<string, string | undefined>, name: string, fallback: number): number {
-  const raw = env[name];
-  if (raw === undefined || raw === '') return fallback;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function cancelModeOf(env: Record<string, string | undefined>): 'rpc' | 'interrupt' | 'off' {
-  const mode = env['FAST_LANE_CANCEL'];
-  return mode === 'sigint' ? 'interrupt' : mode === 'off' ? 'off' : 'rpc';
-}
-
-/**
- * 级联要逐条记忆，直播编排要一整段注记。调用方统一传
- * `relevant().join('\n')`，这里再拆开。空串是「没有」，不能变成 `['']`。
- */
-function memoryLines(memory: (text: string) => string): (text: string) => readonly string[] {
-  return (text) => {
-    const block = memory(text);
-    if (block.trim() === '') return [];
-    return block.split('\n');
-  };
-}
-
-function streamingOmniShadow(
-  plan: PipelinePlan,
-  env: Record<string, string | undefined>,
-  log: (line: string) => void, ctx: OmniStaticInput = {},
-): NonNullable<VoiceSessionOptions['omniShadow']> | undefined {
-  const model = env['OMNI_SHADOW_MODEL'];
-  const modelOpt = model === undefined ? {} : { model };
-  const apiKey = resolveOmniApiKey(env);
-  if (plan.mode === 'live') {
-    const requested = (env['OMNI_ANSWER'] ?? '').trim().toLowerCase();
-    if (requested !== '' && requested !== 'off' && requested !== 'full' && requested !== 'clip') {
-      throw new Error(`OMNI_ANSWER=${requested} 不合法（off|full；clip 已并入 full）`);
-    }
-    if (requested === 'clip') {
-      log('管道      OMNI_ANSWER=clip 已取消，纯 live 按 full 出声');
-    }
-    const omniShadow = { apiKey, serve: 'full' as const, ...modelOpt, ...omniStaticContext(ctx) };
-    log(
-      `影子    omni 前台开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
-      + `**会出声** serve=${omniShadow.serve}）\n`,
-    );
-    return omniShadow;
-  }
-  if (plan.useOmniProbeOnly) {
-    const omniShadow = { apiKey, serve: 'off' as const, ...modelOpt, ...omniStaticContext(ctx) };
-    log(
-      `影子    omni 只读探针（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`,
-    );
-    return omniShadow;
-  }
-  return undefined;
-}
-
-/** {@link assembleStreamingAgent} 的显式依赖。不读 `process.env`。 */
-export interface AssembleStreamingAgentDeps {
-  readonly plan: PipelinePlan;
-  readonly env: Record<string, string | undefined>;
-  readonly dshAgent: AgentProvider;
-  readonly tts: TtsProvider;
-  readonly activity: ActivityState;
-  readonly memory: (text: string) => string;
-  readonly taskStatus: () => string;
-  readonly audit: (name: string, data: Record<string, unknown>) => void;
-  readonly speculate: boolean;
-  readonly announceStore?: AnnounceStore | null;
-  readonly log?: (line: string) => void; readonly memorySummary?: () => string; readonly clockContext?: () => string; readonly asrCorpusText?: string; readonly asrLanguage?: string;
-}
-
-/** `VOICE_PIPELINE=live | cascade` 装配完、可以直接交给 `runVoiceServer` 的那一套。 */
-export interface AssembledStreamingPipeline {
-  readonly mode: VoicePipelineMode;
-  readonly agent: AgentProvider;
-  /** 已经用 `trackActivity` 的同一份 `activity` 包过 `respond()`。 */
-  readonly engine?: FastVoiceEngine;
-  readonly omniShadow?: VoiceSessionOptions['omniShadow'];
-  readonly speakAnnounce?: VoiceSessionOptions['speakAnnounce'];
-  readonly cancelAnnounce?: VoiceSessionOptions['cancelAnnounce'];
-  readonly onFallbackAnnounceSpoken?: VoiceSessionOptions['onFallbackAnnounceSpoken'];
-  readonly dispose: () => void;
-}
-
-/**
- * `--agent dsh` 的流式热路径。`live` 与 `cascade` 只装其中一条。
- *
- * 不读 `process.env`：密钥、档位、快车道旋钮都只看 `env`。
- * `main()` 在 TTS 就绪后调用，装配结果与原先写在 `main()` 里的那一段相同。
- */
-export function assembleStreamingAgent(input: AssembleStreamingAgentDeps): AssembledStreamingPipeline {
-  const {
-    plan, env, dshAgent, tts, activity, memory, taskStatus, audit, speculate,
-  } = input;
-  const announceStore = input.announceStore ?? null;
-  const log = input.log ?? ((line: string) => { console.log(line); });
-
-  if (plan.mode === 'live') {
-    // pure-live-assembly：只要直播编排。文本级联不装。
-    // 非法 OMNI_ANSWER 在造编排器之前抛出，免得退出时留下一条没人 dispose 的总线。
-    const omniShadow = streamingOmniShadow(plan, env, log, { memorySummary: input.memorySummary, clockContext: input.clockContext, asrCorpusText: input.asrCorpusText, asrLanguage: input.asrLanguage });
-    const orch = new LiveOrchestrator({
-      inner: dshAgent,
-      tts,
-      // 编排器要的是一整段注记；记忆文件返回的是几条，调用方已经拼好。
-      memory,
-      log,
-    });
-    const surfaced = armLiveOfflineAnnounce(orch, announceStore, log);
-    const agent = trackActivity(surfaced, activity);
-    const engine = watchEngineActivity(orch.toEngine(), activity);
-    return {
-      mode: plan.mode,
-      agent,
-      engine,
-      ...(omniShadow === undefined ? {} : { omniShadow }),
-      speakAnnounce: (item, playAudio) => orch.speakBackgroundReport(item, playAudio),
-      cancelAnnounce: () => { orch.cancelBackgroundSpeech(); },
-      onFallbackAnnounceSpoken: (item, interrupted) => {
-        orch.noteFallbackAnnounceSpoken(item, interrupted);
-      },
-      dispose: () => { orch.dispose(); },
-    };
-  }
-
-  // pure-cascade-assembly：只要级联，或关掉快车道后的直连 dsh。不接 omni 发声。
-  const fastModel = env['FAST_LANE_MODEL'] ?? 'qwen-flash';
-  const baseUrl = env['FAST_LANE_BASE_URL'];
-  const fastBaseUrl = baseUrl === undefined ? {} : { baseUrl };
-  const delegateEnabled = (env['FAST_LANE_DELEGATE'] ?? '0') !== '0';
-  let agent: AgentProvider;
-  let engine: FastVoiceEngine | undefined;
-  if (plan.useCascadeFastLane) {
-    const cascadeAgent = new CascadeAgent({
-      inner: dshAgent,
-      apiKey: plan.cascadeKey,
-      model: fastModel,
-      ...fastBaseUrl,
-      timeoutMs: envNum(env, 'FAST_LANE_TIMEOUT_MS', 1_200),
-      speculate,
-      cancelMode: cancelModeOf(env),
-      maxChars: envNum(env, 'FAST_LANE_MAX_CHARS', 14),
-      prefetch: env['FAST_LANE_PREFETCH'] !== '0',
-      partialSpeculate: env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
-      specMinChars: envNum(env, 'FAST_LANE_SPEC_MIN_CHARS', 6),
-      windowChars: envNum(env, 'FAST_LANE_WINDOW_CHARS', 800),
-      keepTurns: envNum(env, 'FAST_LANE_KEEP_TURNS', 0),
-      hedge: envNum(env, 'FAST_LANE_HEDGE', 2),
-      delegateEnabled,
-      taskStatus,
-      memory: memoryLines(memory),
-      log,
-      audit,
-    });
-    agent = trackActivity(cascadeAgent, activity);
-    engine = watchEngineActivity(cascadeAgent.toEngine(tts), activity);
-  } else {
-    agent = trackActivity(dshAgent, activity);
-    engine = undefined;
-  }
-  const omniShadow = streamingOmniShadow(plan, env, log, { memorySummary: input.memorySummary, clockContext: input.clockContext, asrCorpusText: input.asrCorpusText, asrLanguage: input.asrLanguage });
-  return {
-    mode: plan.mode,
-    agent,
-    ...(engine === undefined ? {} : { engine }),
-    ...(omniShadow === undefined ? {} : { omniShadow }),
-    dispose: () => {},
-  };
+function readLegacyOptIn(name: string): boolean {
+  return (process.env[name] ?? '0') !== '0';
 }
 
 async function main(): Promise<void> {
@@ -1057,7 +418,7 @@ async function main(): Promise<void> {
      *
      * 保留 `!== '0'` 那个写法会让「什么都没设」变成打开 —— 而线上一直是关的。
      */
-    const delegateEnabled = (process.env['FAST_LANE_DELEGATE'] ?? '0') !== '0';
+    const delegateEnabled = readLegacyOptIn('FAST_LANE_DELEGATE');
     const fastModel = process.env['FAST_LANE_MODEL'] ?? 'qwen-flash';
     const cancelMode = ((): 'rpc' | 'interrupt' | 'off' => {
       const mode = process.env['FAST_LANE_CANCEL'];
@@ -1089,7 +450,7 @@ async function main(): Promise<void> {
         + ` specMinChars=${envNumber('FAST_LANE_SPEC_MIN_CHARS', 6)}`
         + ` window=${envNumber('FAST_LANE_WINDOW_CHARS', 800)}`
         + ` maxChars=${envNumber('FAST_LANE_MAX_CHARS', 14)}`
-        + ` partialSpeculate=${process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0' ? 'on' : 'off'}`
+        + ` partialSpeculate=${readLegacyOn('FAST_LANE_PARTIAL_SPECULATE') ? 'on' : 'off'}`
         + ` delegate=${delegateEnabled ? 'on' : 'OFF（纯聊天）'}`,
       );
       // 记忆条数打出来：mock 记忆混进生产最常见的原因就是探针脚本写进了真文件
@@ -1134,7 +495,7 @@ async function main(): Promise<void> {
           apiKey: fronted.cascadeKey,
           model: fastModel,
           ...fastBaseUrl,
-          timeoutMs: envNumber('FAST_LANE_TIMEOUT_MS', 1_200),
+          timeoutMs: readLegacyNumber('FAST_LANE_TIMEOUT_MS', 1_200),
           // 投机双轨：dsh 与快模型同时发。关掉就退回串行（委派轮要白等一次判定）。
           // 前置条件：宿主必须能取消在途那一轮（启动时探测，见 `resolveSpeculate`）。
           speculate,
@@ -1142,9 +503,9 @@ async function main(): Promise<void> {
           cancelMode,
           maxChars: envNumber('FAST_LANE_MAX_CHARS', 14),
           // 判停前起跑：A/B 用，`FAST_LANE_PREFETCH=0` 关掉就退回「开轮才发请求」
-          prefetch: process.env['FAST_LANE_PREFETCH'] !== '0',
+          prefetch: readLegacyOn('FAST_LANE_PREFETCH'),
           // 中间结果投机：比定稿再往前提，但文本是猜的（定稿确认是前缀才认领）
-          partialSpeculate: process.env['FAST_LANE_PARTIAL_SPECULATE'] !== '0',
+          partialSpeculate: readLegacyOn('FAST_LANE_PARTIAL_SPECULATE'),
           // 投机的最小字数：默认 6。2026-11-18 试过降到 2，请求涨 2.5 倍、端到端 p50 没动
           // （14 场回放，见 OPS-RECORD §12.8），已退回。这里留旋钮不再改代码。
           specMinChars: envNumber('FAST_LANE_SPEC_MIN_CHARS', 6),
@@ -1339,7 +700,10 @@ async function main(): Promise<void> {
       maxSentenceSilenceMs: sentenceSilenceMs,
       ...(vocabularyId ? { vocabularyId } : {}), corpusText, language,
     });
-    const tts = await buildTts(ttsSpec === '' ? 'mimo' : ttsSpec);
+    const tts = await buildTts(
+      ttsSpec === '' ? 'mimo' : ttsSpec,
+      (name, data) => { auditSlot.emit(name, data); },
+    );
     console.log(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）\n`);
 
     /**
@@ -1603,125 +967,9 @@ async function main(): Promise<void> {
   process.exit(code);
 }
 
-/**
- * 本文件是「被当成入口跑」（`node src/main.ts`）还是只是被 import 进来？
- *
- * 为什么需要这道守卫：`tests/main-wiring.test.ts` 要 import 本文件取纯函数做单测，
- * 而顶层 `void main()` 会当场打印用法并 `process.exit(2)` —— 整个测试进程直接死。
- *
- * 判据按 **URL** 比，不按字符串：`process.argv[1]` 可能是相对路径、盘符大小写也可能
- * 与 `import.meta.url` 不一致（Windows），所以两边都 realpath 再转 URL。
- * 不能只判「`argv[1]` 存在」：`node --test` 下它是测试文件，不是本文件。
- */
-export function isMainModule(entry = process.argv[1], moduleUrl = import.meta.url): boolean {
-  if (entry === undefined || entry === '') {
-    return false;
-  }
-  let entryUrl: string;
-  try {
-    entryUrl = pathToFileURL(realpathSync(entry)).href;
-  } catch {
-    // 文件不存在（打错/已删）时退回 resolve：比较结果同样可信
-    entryUrl = pathToFileURL(resolve(entry)).href;
-  }
-  return normalizeFileUrl(entryUrl) === normalizeFileUrl(moduleUrl);
-}
-
-/** 盘符大小写、URL 里中文/空格的转义形式都可能不同，只比「像不像同一个文件」。 */
-function normalizeFileUrl(url: string): string {
-  let decoded = url;
-  try {
-    decoded = decodeURIComponent(url);
-  } catch {
-    // 非法转义：保持原样再比
-  }
-  return process.platform === 'win32' ? decoded.toLowerCase() : decoded;
-}
-
 // `node src/main.ts`（含 `npm start`）仍然原样进 `main()`：无参运行时打印用法并以
 // 退出码 2 结束，那是 `docs/CLOUD-ARCHITECTURE.md` §8 的启动自检。
-if (isMainModule()) {
+// 第二个参数必须是本文件的 URL。默认值比的是 runtime/is-main.ts，无参调用进不了 main()。
+if (isMainModule(process.argv[1], import.meta.url)) {
   void main();
-}
-
-/**
- * 静态热词、识别语言、日期。`main()` 和 `bench/eval/server.ts` 共用。
- *
- * 放在文件末尾：插到 `envNumber(...)` 前面会改行号，`docs/TIME-KNOBS.md` 会对不上。
- */
-interface OmniStaticInput {
-  readonly memorySummary?: () => string;
-  readonly clockContext?: () => string;
-  readonly asrCorpusText?: string;
-  readonly asrLanguage?: string;
-}
-
-/**
- * ASR 语言。默认中文。
- *
- * `auto` / `off` / 空串（含只含空白）表示不写 `language` 字段，让服务端自己判。
- * 其它非空值 trim 后原样返回。
- */
-export function resolveAsrLanguage(
-  env: Record<string, string | undefined> = process.env,
-): string | undefined {
-  const raw = env['QWEN_ASR_LANGUAGE'];
-  if (raw === undefined) return 'zh';
-  const trimmed = raw.trim();
-  if (trimmed === '' || trimmed === 'auto' || trimmed === 'off') return undefined;
-  return trimmed;
-}
-
-/**
- * 仓根 `docs/hotwords.txt` 与记忆热词收成一条静态 corpus。
- *
- * `QWEN_ASR_CORPUS=0` 关掉。文件读不到就当没有热词，不抛。
- */
-export function loadStaticAsrCorpus(
-  memoryHints = '',
-  env: Record<string, string | undefined> = process.env,
-): string {
-  if (env['QWEN_ASR_CORPUS'] === '0') return '';
-  let hotwordsText = '';
-  try {
-    hotwordsText = readFileSync(new URL('../docs/hotwords.txt', import.meta.url), 'utf8');
-  } catch {
-    hotwordsText = '';
-  }
-  return mergeCorpusText([hotwordsText, memoryHints], 800);
-}
-
-/**
- * 建连时写进提示词的日期。只有年月日和星期，没有钟点：
- * 长连接不会因为「现在几点」过几小时就过期。
- *
- * `Intl.DateTimeFormat#format` 会把「日」和「星期」粘在一起，这里按字段重拼，
- * 中间留一个空格。
- */
-export function formatCurrentDateContext(now: Date = new Date()): string {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-    weekday: 'long',
-  }).formatToParts(now);
-  const value = (type: Intl.DateTimeFormatPartTypes): string =>
-    parts.find((part) => part.type === type)?.value ?? '';
-  return `当前日期：${value('year')}年${value('month')}月${value('day')}日 ${value('weekday')}（北京时间）`;
-}
-
-/** 影子上的静态上下文。记忆摘要留成函数，每条新连接再读一次。 */
-function omniStaticContext(ctx: OmniStaticInput): {
-  readonly memoryContext?: () => string;
-  readonly clockContext: () => string;
-  readonly asrCorpusText?: string;
-  readonly asrLanguage?: string;
-} {
-  return {
-    ...(ctx.memorySummary === undefined ? {} : { memoryContext: ctx.memorySummary }),
-    clockContext: ctx.clockContext ?? (() => formatCurrentDateContext()),
-    ...(ctx.asrCorpusText === undefined ? {} : { asrCorpusText: ctx.asrCorpusText }),
-    ...(ctx.asrLanguage === undefined ? {} : { asrLanguage: ctx.asrLanguage }),
-  };
 }

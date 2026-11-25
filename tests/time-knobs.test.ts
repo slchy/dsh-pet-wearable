@@ -182,7 +182,13 @@ test('关键热路径参数必须出现在总表里', () => {
   }
 });
 
-test('流式热路径开关指向 assembleStreamingAgent，而不是旧分支', () => {
+test('流式热路径开关指向 assembleStreamingAgent，而不是旧分支', { timeout: 30_000 }, () => {
+  // 持有者按扫描器当场扫到的源码算。提交的 docs/TIME-KNOBS.md 要等
+  // Wave 3 整表重生成，这一条不拿过期行号当结论。
+  const generated = generate().replace(/\r\n/g, '\n');
+  const assembly = readFileSync(join(root, 'src/runtime/pipeline-assembly.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const fnLine = assembly.split('\n').findIndex((line) => line.includes('function assembleStreamingAgent(')) + 1;
+  assert.ok(fnLine > 0, 'assembleStreamingAgent 应在 src/runtime/pipeline-assembly.ts');
   const streaming = [
     'FAST_LANE_TIMEOUT_MS',
     'FAST_LANE_DELEGATE',
@@ -190,13 +196,15 @@ test('流式热路径开关指向 assembleStreamingAgent，而不是旧分支', 
     'FAST_LANE_PARTIAL_SPECULATE',
   ];
   for (const name of streaming) {
-    const holder = cell(tableRow(name), 4).replace(/`/g, '');
-    const match = holder.match(/^src\/main\.ts:(\d+)$/);
-    assert.ok(match !== null, `${name} 应指向 src/main.ts：${holder}`);
+    const row = generated.split('\n').find((line) => line.startsWith(`| \`${name}\``));
+    assert.ok(row !== undefined, `生成表里应该有 ${name}`);
+    const holder = cell(row, 4).replace(/`/g, '');
+    const match = holder.match(/^src\/runtime\/pipeline-assembly\.ts:(\d+)$/);
+    assert.ok(match !== null, `${name} 应指向 src/runtime/pipeline-assembly.ts：${holder}`);
     const line = Number(match[1]);
     assert.ok(
-      line < 900,
-      `${name} 应落在 assembleStreamingAgent（行号 < 900），实际 ${line}`,
+      line >= fnLine,
+      `${name} 应落在 assembleStreamingAgent（src/runtime/pipeline-assembly.ts:${fnLine} 起），实际 ${line}`,
     );
   }
 });

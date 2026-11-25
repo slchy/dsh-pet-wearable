@@ -22,7 +22,7 @@ import {
   type Sample,
   type TurnLatency,
 } from '../../src/latency-report.ts';
-import { isMainModule } from '../../src/main.ts';
+import { isMainModule } from '../../src/runtime/is-main.ts';
 import type {
   BgReportRecord,
   CaseRunTrace,
@@ -920,7 +920,26 @@ export function renderMarkdown(r: EvalSummaryReport): string {
   return `${lines.join('\n')}\n`;
 }
 
-function renderCompare(base: EvalSummaryReport, cand: EvalSummaryReport): string {
+/**
+ * `--compare` 吃两种 JSON：平铺的 {@link EvalSummaryReport}，
+ * 或归档包 `{ baselineId, sharedServerRun }`（`bench/eval/baseline/*.json`）。
+ * `sharedServerRun` 得是非空对象才解开，否则原样返回。
+ */
+export function asSummaryReport(raw: unknown): EvalSummaryReport {
+  if (typeof raw !== 'object' || raw === null || !('sharedServerRun' in raw)) {
+    return raw as EvalSummaryReport;
+  }
+  const shared = (raw as { sharedServerRun?: unknown }).sharedServerRun;
+  if (typeof shared !== 'object' || shared === null || Array.isArray(shared)) {
+    return raw as EvalSummaryReport;
+  }
+  if (Object.keys(shared).length === 0) {
+    return raw as EvalSummaryReport;
+  }
+  return shared as EvalSummaryReport;
+}
+
+export function renderCompare(base: EvalSummaryReport, cand: EvalSummaryReport): string {
   const delta = (a: number | null | undefined, b: number | null | undefined, unit = ''): string => {
     if (typeof a !== 'number' || typeof b !== 'number' || !Number.isFinite(a) || !Number.isFinite(b)) return '—';
     const d = b - a;
@@ -956,8 +975,8 @@ function main(): void {
       console.error('用法: node bench/eval/score.ts --compare <base.json> <cand.json>');
       process.exit(2);
     }
-    const base = JSON.parse(readFileSync(resolve(aPath), 'utf8')) as EvalSummaryReport;
-    const cand = JSON.parse(readFileSync(resolve(bPath), 'utf8')) as EvalSummaryReport;
+    const base = asSummaryReport(JSON.parse(readFileSync(resolve(aPath), 'utf8')));
+    const cand = asSummaryReport(JSON.parse(readFileSync(resolve(bPath), 'utf8')));
     console.log(renderCompare(base, cand));
     return;
   }

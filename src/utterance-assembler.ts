@@ -20,7 +20,8 @@
  * {@link UtteranceAssemblerOptions.maxUnsureExtensions} 次，其余文本判据合计
  * 最多 {@link UtteranceAssemblerOptions.maxExtensions} 次，然后强制收下，
  * 避免模型不确定时永远不定稿。语义明确 MORE、且 unsure 已把等待预算吃光、
- * 拍数还没越过上限时，再给一次（仍受 `maxOpenSilenceMs` 约束）。
+ * 拍数还没越过上限时，再给一次。这一次的静音天花板在 `more` 已经落定时
+ * 抬到序列预算，否则仍是 `maxOpenSilenceMs`。
  *
  * <h2>与静候窗重叠</h2>
  *
@@ -36,9 +37,14 @@
  *
  * 本模块**不做 I/O**：判停器、日志、时钟全部注入。
  */
+import { AudioSnapshotBuffer } from './assembler/audio-snapshot.ts';
+import { SemanticGate, looksUnfinished, stripTail } from './assembler/semantic-gate.ts';
+import type { SemanticBudgetContext } from './assembler/semantic-gate.ts';
 import type { AudioFrame } from './engine-contract.ts';
-import { pcm16DurationMs, pcm16PeakDbfs, pcm16TrimTrailingSilence } from './pcm.ts';
+import { pcm16PeakDbfs } from './pcm.ts';
 import { SilenceTriggers } from './silence-triggers.ts';
+
+export { looksUnfinished };
 
 export interface UtteranceAssemblerOptions {
   /** 句子结束后先静候这么久再判定 */
@@ -60,7 +66,8 @@ export interface UtteranceAssemblerOptions {
   readonly semanticEndpoint?: (text: string) => Promise<'end' | 'more' | null>;
   /**
    * 等语义判停回话的上限（ms）。等不到就按「说完了」走。
-   * 缺省 {@link DEFAULT_SEMANTIC_BUDGET_MS}；生产运行时由 `SEMANTIC_END_TAG_BUDGET_MS` 传入覆写。
+   * 缺省 300 ms（`semantic-gate.ts` 的 `DEFAULT_SEMANTIC_BUDGET_MS`）；
+   * 生产运行时由 `SEMANTIC_END_TAG_BUDGET_MS` 传入覆写。
    */
   readonly semanticBudgetMs?: number;
   /** 一轮最多延长几次（**总预算**，四种原因共用） */
@@ -283,7 +290,10 @@ export interface UtteranceAssemblerOptions {
    *
    * 为什么要它：`waitBudget` 系列只封住「收下」那条判定，静音闸门和文本判据各自
    * 还有自己的额度，实测能绕过去 —— 真机一场 29 轮里有 15 轮 ② 超 1200 ms，
-   * 最大 2264 ms。这条是**唯一一条不许任何分支绕过的上限**：静音到顶就放行。
+   * 最大 2264 ms。这条是**不许分支绕过的上限**：静音到顶就放行。
+   * 已经同步落定的语义 `more` 把天花板抬到 `waitBudgetSequenceMs`
+   * （仍是硬顶；延长过一次就回到本值）。没落定、`'end'`、或这一拍已经不该再延长时，
+   * 仍然是本值，顶部不等待在途语义。
    *
    * 取 650 的依据（真机 54 轮，见 `docs/EOT-SUPPLEMENT.md` §8）：开轮静音
    * 500–1200 ms 那 7 轮**一次都没有**被用户接着说，而 <300 ms 的 6 轮**全部**被接着说。
@@ -365,19 +375,6 @@ const DEFAULT_SHORT_FRAGMENT_WAIT_MS = 400;
 const DEFAULT_SHORT_FRAGMENT_WINDOW_MS = 1_200;
 
 /**
- * 普通静音上限下，语义 `more` 的单拍下限（ms）。
- * `max(extendMs, 本值)` 之后还要被 `cap - quietNow` 和 `fragmentCap` 夹住。
- * 没配 `maxOpenSilenceMs` 时不用这道下限。
- */
-const SEMANTIC_MORE_MIN_WAIT_MS = 350;
-
-/**
- * 启用了更大的 `waitBudgetSequenceMs` 时，语义 `more` 的单拍等待（ms）。
- * `max(extendMs, 本值)` 之后只受 `cap - quietNow` 夹住。
- */
-const SEMANTIC_MORE_SEQUENCE_WAIT_MS = 550;
-
-/**
  * `speaking_more` 断流看门狗的最短等待（ms）。
  * 帧还在来时会重装；彻底停帧后靠它退出，避免卡死。
  */
@@ -389,73 +386,8 @@ const SPEAKING_WATCHDOG_MIN_MS = 350;
  */
 const SPEAKING_WATCHDOG_MARGIN_MS = 100;
 
-/**
- * 等语义判停回话的模块兜底（ms）。等不到按「说完了」放行。
- * 生产运行时由 `SEMANTIC_END_TAG_BUDGET_MS` 传入覆写。
- */
-const DEFAULT_SEMANTIC_BUDGET_MS = 300;
-
-/**
- * 结尾「必须还有下文」的记号。纯机械，不做语义推断
- * （和 `backchannel.ts`、`shouldWaitForMore` 同一条原则）。
- *
- * 只收「单独出现在句尾就不成立」的记号：
- * - 数字 / 中文数字：`#W866`、`第`
- * - 字母：`井号W`（订单号、型号被拦腰截断）
- * - 连词与引子：`和` `就是` `因为` `的话`…
- *
- * **宁漏不误**：误判的代价是这一轮多给一份序列预算（见
- * {@link UtteranceAssemblerOptions.waitBudgetSequenceMs}），漏判只是维持现状。
- */
-const UNFINISHED_TAIL =
-  /(?:[0-9０-９]|[零一二三四五六七八九十百千万亿两]|[A-Za-z#＃]|井号|第|和|跟|与|及|还有|就是|因为|所以|但是|然后|如果|的话|或者|还是)$/u;
-
-/** 尾部标点 —— ASR 每个 `SentenceEnd` 都会补一个，作为句界记号而不是内容 */
-const TRAILING_PUNCT = /[\s。．.，,、!！?？~～…\-—:：;；"'“”‘’]+$/u;
-
 /** 这句话里有中日韩汉字吗 —— 用来选判停阈值（见 `thresholdFor`） */
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
-
-/**
- * 声学判据到了这个置信度，**完整句**就不等语义判停了。
- *
- * 语义判停的意义在「声学拿不准」（p 落在 0.3–0.80 那条带）。p 已经 0.83–0.98
- * 时再等 256–324 ms 纯属白搭 —— 真机 `20261123-051448` 与 `-053719` 两场
- * 语义一次没拦住 MORE，而 p=0.834 那轮白等了 273 ms。
- *
- * `looksUnfinished` 的半句不走这条捷径：eval-v1 S4「实在不甘心的话。」p=0.977、
- * 「如果明天下午不下雨的话。」p=0.873，语义都回了 MORE，跳过等待就把半句开了轮。
- * 那种情况仍等已经在飞的那趟，上限是 `semanticBudgetMs`。
- */
-const SEMANTIC_SKIP_P = 0.80;
-
-/**
- * 语义判停两个缓存各留多少条。
- *
- * 它们是「最近几句」的窗口，不是历史账本：中间结果会连续改写，几小时前的判定
- * 既不会被同一个前缀命中，还会把旧结论借给新句（`semanticSettled` 曾经只进不出，
- * 随会话无限长，前缀匹配甚至可能跨到上一次连接）。
- */
-const SEMANTIC_CACHE_LIMIT = 8;
-
-/**
- * 「定稿只是中间结果的收尾」允许差几个字。
- *
- * 中间结果的最后一版和定稿通常差一两个标点/收尾字（`…《基础之森` → `…《基础之森》吗？`）。
- * 超过这个长度就是另一句话了，前缀判定不再作数。
- */
-const SEMANTIC_PREFIX_SLACK_CHARS = 6;
-
-/** 丢掉尾部标点，只看最后那个字 */
-function stripTail(text: string): string {
-  return text.replace(TRAILING_PUNCT, '');
-}
-
-/** 结尾看起来「还有下文」吗 —— 见 {@link UNFINISHED_TAIL} */
-export function looksUnfinished(text: string): boolean {
-  const core = stripTail(text);
-  return core.length > 0 && UNFINISHED_TAIL.test(core);
-}
 
 /**
  * 判停组装器的显式有限状态（单点真相源）。
@@ -480,8 +412,10 @@ export type AssemblerPhase =
 export class UtteranceAssembler {
   private readonly options: UtteranceAssemblerOptions;
   private readonly now: () => number;
-  private readonly recentChunks: Buffer[] = [];
-  private recentBytes = 0;
+  /** 判停器的滚动音频窗口。`lastSnapshotBytes` 仍留在本类，用来比「再等一拍有没有新音频」。 */
+  private readonly audio: AudioSnapshotBuffer;
+  /** 语义判停。不持有开轮定时器，也不改 {@link _phase}。 */
+  private readonly semanticGate: SemanticGate;
   private pendingText = '';
   private pendingTimer: NodeJS.Timeout | null = null;
   private _phase: AssemblerPhase = 'idle';
@@ -536,24 +470,6 @@ export class UtteranceAssembler {
   /** `predictAtMs` 的定时器 */
   private predictTimer: NodeJS.Timeout | null = null;
   private extensions = 0;
-  /**
-   * 语义判停的请求缓存：文字 → 判定。
-   *
-   * 为什么按**文字**存：判定在说话期间（中间结果）和定稿时就发出去了，而真正要用的
-   * 时刻是「即将开轮」；同一段文字可能被问过一次，就该直接取。只留最近几条 ——
-   * 中间结果会连续改写，不是历史账本。
-   */
-  private readonly semanticAsks = new Map<string, Promise<'end' | 'more' | null>>();
-  /**
-   * 已经回来的判定（同步可读，见 hasPrefixMore）。
-   *
-   * 与 {@link semanticAsks} **同生共死**、同样只留最近 {@link SEMANTIC_CACHE_LIMIT} 条
-   * （见 `evictSemanticCache`）：它曾经只进不出，随会话无限长，于是几分钟前那句的
-   * 前缀判定会被借给新句。`dispose()` 会清空。
-   */
-  private readonly semanticSettled = new Map<string, 'end' | 'more' | null>();
-  /** 已经因为语义判停延长过的那段文字（同一段只延长一次） */
-  private semanticExtended = '';
   /** 上一段定稿的时刻 / 汉字数（去抖判据用，见 `isJunkAfterLongSentence`） */
   private lastSentenceAt = -1e9;
   private lastSentenceChars = 0;
@@ -598,6 +514,13 @@ export class UtteranceAssembler {
   constructor(options: UtteranceAssemblerOptions) {
     this.options = options;
     this.now = options.now ?? Date.now;
+    this.audio = new AudioSnapshotBuffer({
+      recentMaxBytes: options.recentMaxBytes,
+      sampleRate: 16_000,
+      silenceDb: options.silenceDb,
+      silenceFloorOffsetDb: options.silenceFloorOffsetDb,
+      trailingTrimMs: options.trailingTrimMs,
+    });
     // 触发器只读事实、只喊「到点了」：文本与判停状态机仍在这一层 ——
     // 拆出去的那一半不认识 `pendingText` 是怎么攒起来的，也不认识 `seq`。
     this.silence = new SilenceTriggers(options, {
@@ -610,6 +533,18 @@ export class UtteranceAssembler {
       startUpcomingPrediction: () => { this.startPrediction(this.seq + 1, true); },
       onVoiced: (atMs) => { this.handleVoiced(atMs); },
       onSilence: (atMs, silenceMs) => { this.handleSilence(atMs, silenceMs); },
+    });
+    this.semanticGate = new SemanticGate({
+      semanticEndpoint: options.semanticEndpoint,
+      semanticBudgetMs: options.semanticBudgetMs,
+      maxOpenSilenceMs: options.maxOpenSilenceMs,
+      waitBudgetSequenceMs: options.waitBudgetSequenceMs,
+      extendMs: options.extendMs,
+      fragmentWaitMs: options.shortFragmentWaitMs ?? DEFAULT_SHORT_FRAGMENT_WAIT_MS,
+      hasPredictor: options.predict !== undefined,
+      now: () => this.now(),
+      lastVoicedAtMs: () => this.silence.lastVoicedAtMs,
+      log: (line) => { this.options.log(line); },
     });
   }
 
@@ -633,9 +568,7 @@ export class UtteranceAssembler {
     if (this._phase === 'disposed') {
       return;
     }
-    this.recentChunks.push(Buffer.from(chunk));
-    this.recentBytes += chunk.length;
-    this.trimRecent();
+    this.audio.push(chunk);
     const floor = this.options.silenceDb;
     if (floor === undefined) {
       return;
@@ -658,9 +591,7 @@ export class UtteranceAssembler {
     if (this._phase === 'disposed') {
       return;
     }
-    this.recentChunks.push(Buffer.from(frame.pcm));
-    this.recentBytes += frame.pcm.length;
-    this.trimRecent();
+    this.audio.push(frame.pcm);
     this.silence.noteFrame(frame.voiced, frame.tsMs, frame.silenceMs, true);
   }
 
@@ -678,36 +609,17 @@ export class UtteranceAssembler {
    * @param chunks 这一句已知的前置音频（能量门的预卷），通常是 800 ms
    */
   resetAudio(chunks: readonly Buffer[] = []): void {
-    this.recentChunks.length = 0;
-    for (const c of chunks) {
-      this.recentChunks.push(Buffer.from(c));
-    }
-    this.recentBytes = this.recentChunks.reduce((n, c) => n + c.length, 0);
-    this.trimRecent();
-  }
-
-  private trimRecent(): void {
-    while (this.recentBytes > this.options.recentMaxBytes && this.recentChunks.length > 1) {
-      const dropped = this.recentChunks.shift();
-      this.recentBytes -= dropped?.length ?? 0;
-    }
+    this.audio.reset(chunks);
   }
 
   /**
-   * 送给判停器的音频快照：拼接 + 裁掉尾巴上多余的静音。
+   * 送给判停器的音频快照。
    *
-   * 两处判停（提前预跑、定稿现算）都必须走这里，否则同一句话会因为"从哪个入口问"
-   * 拿到两个不同的 p。
+   * 两处判停（提前预跑、定稿现算）都必须走这里，否则同一句话会因为「从哪个入口问」
+   * 拿到两个不同的 p。裁尾在 {@link AudioSnapshotBuffer.snapshot}。
    */
   private snapshot(): Buffer {
-    const pcm = Buffer.concat(this.recentChunks);
-    // 裁静音的门限要**比开门门槛低一截**：开门门槛（`silenceDb`，默认 −40）问的是
-    // 「有没有人说话」，而这台设备的语音峰值本身就在 −32…−40；拿它当静音判据会把
-    // 最后几个音节一起裁掉。−20 dB 的偏移对应噪声峰（实测 −69）与语音峰之间。
-    const floor = this.options.silenceDb === undefined
-      ? undefined
-      : this.options.silenceDb - (this.options.silenceFloorOffsetDb ?? 20);
-    return pcm16TrimTrailingSilence(pcm, floor, this.options.trailingTrimMs ?? 0);
+    return this.audio.snapshot();
   }
 
   /**
@@ -770,6 +682,7 @@ export class UtteranceAssembler {
     this.extensions = 0;
     this.waitedMs = 0;
     this.unsureExtensions = 0;
+    this.semanticGate.resetForUtterance();
     // 新的一句：上一句的判定（不管算完没算完）都不能再用来定稿。
     // **例外**是预跑（`silence-triggers.ts` 的 `maybePrefirePrediction`）：那份快照
     // 本来就是给这一句的（seq 已经对上），留着才能把「出句→开轮」那一段省掉。
@@ -798,10 +711,10 @@ export class UtteranceAssembler {
     // 没有判停器时 `evaluate` 不读这份结果。发了就是一次必丢的远程请求。
     if (
       this.options.predict !== undefined
-      && !this.hasPrefixMore(this.pendingText)
-      && !this.hasPrefixEnd(this.pendingText)
+      && !this.semanticGate.hasPrefixMore(this.pendingText)
+      && !this.semanticGate.hasPrefixEnd(this.pendingText)
     ) {
-      void this.askSemantics(this.pendingText);
+      void this.semanticGate.ask(this.pendingText);
     }
     const delay = this.armDelayMs();
     this.setPhase('armed');
@@ -923,6 +836,7 @@ export class UtteranceAssembler {
     this.extensions = 0;
     this.unsureExtensions = 0;
     this.waitedMs = 0;
+    this.semanticGate.resetForUtterance();
     this.sentenceVoicedAt = Number.NEGATIVE_INFINITY;
     const text = this.pendingText.trim();
     this.pendingText = '';
@@ -946,12 +860,10 @@ export class UtteranceAssembler {
     this.prediction = null;
     this.pendingText = '';
     this.sentenceVoicedAt = Number.NEGATIVE_INFINITY;
-    this.recentChunks.length = 0;
-    this.recentBytes = 0;
+    this.audio.clear();
     // 语义判停的两个缓存不准跟到连接之后：它们是「最近几句」的窗口，
     // 留着的判定既没有下一个消费者，也不会再被淘汰。
-    this.semanticAsks.clear();
-    this.semanticSettled.clear();
+    this.semanticGate.clear();
   }
 
   /** 唯一状态迁移入口：`disposed` 是吸收态，任何路径都不可覆盖。 */
@@ -1165,12 +1077,27 @@ export class UtteranceAssembler {
     // `thresholdFor()` 只依赖 `pendingText`，提前算就能让下面那条统一上限先执行
     const threshold = this.thresholdFor();
 
-    // **统一上限**：静音到顶就放行，任何分支都不许再加拍。
-    // 放在所有分支之前 —— 它就是那条"谁都不能绕过"的闸。
-    const openSilenceCap = this.options.maxOpenSilenceMs ?? 0;
+    // **统一上限**：静音到顶就放行。已经同步落定 `more` 且这一拍还允许延长时，
+    // 天花板抬到序列预算（`raisedCap`）；否则仍是 `maxOpenSilenceMs`。
+    // 这里不 await —— 没落定的请求按原上限收，完整句和在途语义都是 0 ms 额外延迟。
+    const openSilenceCap = this.semanticGate.raisedCap(this.pendingText, this.budgetContext());
     if (openSilenceCap > 0) {
-      const quietNow = this.now() - this.silence.lastVoicedAtMs;
+      let quietNow = this.now() - this.silence.lastVoicedAtMs;
       if (quietNow >= openSilenceCap) {
+        if (
+          this.semanticGate.shouldAwaitInFlightBeforeCap(
+            this.pendingText,
+            probability,
+            this.budgetContext(),
+            quietNow,
+          )
+        ) {
+          const allow = await this.semanticAllowsFlush(seq, epoch, probability);
+          if (this.isStaleEval(seq, epoch) || !allow) {
+            return;
+          }
+          quietNow = this.now() - this.silence.lastVoicedAtMs;
+        }
         this.options.log(
           `  判停    ${shown} → 静音 ${Math.round(quietNow)} ms ≥ 上限 ${openSilenceCap}，放行`,
         );
@@ -1307,269 +1234,52 @@ export class UtteranceAssembler {
   }
 
 
-  /** 把某段文字的判定请求发出去（同一段文字只问一次；失败一律回 `null`）。 */
-  private askSemantics(text: string): Promise<'end' | 'more' | null> {
-    const endpoint = this.options.semanticEndpoint;
-    // 无判停器时结果没人读。这里再挡一次，避免其它调用点漏判又把请求放出去。
-    if (this.options.predict === undefined || endpoint === undefined || text.trim() === '') {
-      return Promise.resolve(null);
-    }
-    const cached = this.semanticAsks.get(text) ?? this.semanticAskedNear(text);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const promise = endpoint(text).catch((): null => null).then((verdict) => {
-      this.semanticSettled.set(text, verdict);
-      this.evictSemanticCache();
-      return verdict;
-    });
-    this.semanticAsks.set(text, promise);
-    this.evictSemanticCache();
-    return promise;
-  }
-
   /**
-   * 淘汰语义判停缓存里最老的条目。
-   *
-   * 两个 Map **必须一起收**：`semanticAsks` 是请求侧、`semanticSettled` 是结果侧。
-   * 只收一边的话请求被淘汰了、判定却永远留着 —— `hasPrefixMore` / `hasPrefixEnd`
-   * 靠 `semanticSettled` 做前缀复用，于是几小时前那句的前缀判定会被借给新句
-   * （`semanticSettled` 曾经真的只进不出）。结果侧自己也压一遍上限：它的键
-   * 不一定还在请求侧（请求先被淘汰、之后才落地）。
+   * 这一拍交给语义门的预算快照。门不记账；拍数和已等毫秒仍在这里。
    */
-  private evictSemanticCache(): void {
-    while (this.semanticAsks.size > SEMANTIC_CACHE_LIMIT) {
-      const oldest = this.semanticAsks.keys().next().value;
-      if (oldest === undefined) {
-        break;
-      }
-      this.semanticAsks.delete(oldest);
-      this.semanticSettled.delete(oldest);
-    }
-    while (this.semanticSettled.size > SEMANTIC_CACHE_LIMIT) {
-      const oldest = this.semanticSettled.keys().next().value;
-      if (oldest === undefined) {
-        break;
-      }
-      this.semanticSettled.delete(oldest);
-    }
+  private budgetContext(): SemanticBudgetContext {
+    return {
+      extensions: this.extensions,
+      unsureExtensions: this.unsureExtensions,
+      maxExtensions: this.maxExtensionsNow(),
+      extendMs: this.options.extendMs,
+      waitBudget: this.waitBudget(),
+      overBudget: this.overBudget(),
+    };
   }
 
   /**
-   * 已经问过「同一句话的另一个版本」吗。
+   * 「要不要开轮」的最后一道文本闸。
    *
-   * 两个版本互为前缀、长度差不超过 {@link SEMANTIC_PREFIX_SLACK_CHARS} 就算同一句：
-   * 中间结果的收尾和定稿常常只差一个句号或一个语气词。真机 `20261123-053719`
-   * 第 4 轮先问了 `…《奇》书。`（309 ms）又问 `…《奇》书`（342 ms），
-   * 两趟结论都是 `end`，第二趟纯属白等。
-   */
-  private semanticAskedNear(text: string): Promise<'end' | 'more' | null> | undefined {
-    for (const [asked, promise] of this.semanticAsks) {
-      if (asked === text) {
-        return promise;
-      }
-      const [shorter, longer] = asked.length <= text.length ? [asked, text] : [text, asked];
-      if (longer.startsWith(shorter) && longer.length - shorter.length <= SEMANTIC_PREFIX_SLACK_CHARS) {
-        return promise;
-      }
-    }
-    return undefined;
-  }
-
-  /**
-   * 明确的语义 MORE 还能不能占这一拍。
+   * 语义门只返回判别结果。延长时由这里加拍数、改相位，并挂带 seq/epoch 的定时器。
    *
-   * 调用方已经确认判定是 `'more'`（不是 `'end'` / `null` / `'timeout'`），
-   * 而且这段文字还没因语义延长过。静音天花板由调用方先挡掉。
-   *
-   * - `extensions > maxExtensions`：不许。已经越过拍数上限。
-   * - `extensions < maxExtensions` 且预算还没用完：可以（原行为）。
-   * - 否则（拍数刚用满，或 `overBudget()`）：只有 unsure 自己的等待已经盖住
-   *   **当前**预算，并且 `extensions <= maxExtensions`，才放行这一次。
-   *   当前预算是 {@link waitBudget}：普通句是 `waitBudgetMs`，序列句是
-   *   `waitBudgetSequenceMs`。静音闸门 / 短碎片把预算吃光的，不豁免。
-   *   `maxExtensions: 0` 时 unsure 一拍都不会发生，因此仍然立刻放行。
-   */
-  private semanticMoreAllowed(): boolean {
-    const limit = this.maxExtensionsNow();
-    if (this.extensions > limit) {
-      return false;
-    }
-    if (this.extensions < limit && !this.overBudget()) {
-      return true;
-    }
-    return this.extensions <= limit && this.unsureAteBudget();
-  }
-
-  /**
-   * unsure 分支累计的等待是否已经盖住当前预算。
-   *
-   * unsure 每拍加的就是 `extendMs`（见 `evaluate`）。这里不看 `waitedMs`：
-   * 静音闸门和短碎片也往里加，那些不算「预算被 unsure 吃掉」。
-   */
-  private unsureAteBudget(): boolean {
-    const budget = this.waitBudget();
-    if (budget <= 0 || this.unsureExtensions <= 0) {
-      return false;
-    }
-    return this.unsureExtensions * this.options.extendMs >= budget;
-  }
-
-  /**
-   * 静音上限：普通/完整句严格受 `maxOpenSilenceMs` 约束（0 额外延迟）；
-   * 仅当语义判停**明确确认** `'more'` 且宿主显式配置了更大的序列预算
-   * (`waitBudgetSequenceMs > maxOpenSilenceMs`) 时，采用序列预算作为天花板，
-   * 避免 `commit(150) + decode(230) + semantic(300) ≈ 680 ms` 把 `more` 压成死代码。
-   */
-  private silenceCapFor(semanticMore: boolean): number {
-    const base = this.options.maxOpenSilenceMs ?? 0;
-    if (base <= 0) {
-      return 0;
-    }
-    if (semanticMore) {
-      const sequenceBudget = this.options.waitBudgetSequenceMs ?? 0;
-      if (sequenceBudget > base) {
-        return sequenceBudget;
-      }
-    }
-    return base;
-  }
-
-  /**
-   * 语义 MORE 这一拍等多少。
-   *
-   * - 没给 `maxOpenSilenceMs`：`min(extendMs, shortFragmentWaitMs ?? DEFAULT_SHORT_FRAGMENT_WAIT_MS)`；
-   * - 给了 `maxOpenSilenceMs` 但未配更大的 `waitBudgetSequenceMs`：
-   *   `min(fragmentCap, max(1, min(max(extendMs, SEMANTIC_MORE_MIN_WAIT_MS), cap - quietNow)))`；
-   * - 显式配了更大的 `waitBudgetSequenceMs`（如 1200 > 650）：取
-   *   `max(extendMs, SEMANTIC_MORE_SEQUENCE_WAIT_MS)`，仍严格受 `cap - quietNow` 夹住，
-   *   足以接住 700–900 ms 的句中思考停顿，且对完整句零额外延迟。
-   *   调用方保证 `quietNow < cap`。
-   */
-  private semanticMoreWait(openSilenceCap: number, quietNow: number): number {
-    const fragmentCap = this.options.shortFragmentWaitMs ?? DEFAULT_SHORT_FRAGMENT_WAIT_MS;
-    const baseCap = this.options.maxOpenSilenceMs ?? 0;
-    const sequenceBudget = this.options.waitBudgetSequenceMs ?? 0;
-    if (openSilenceCap > 0) {
-      const room = openSilenceCap - quietNow;
-      if (baseCap > 0 && sequenceBudget > baseCap) {
-        // 更大的 waitBudgetSequenceMs：语义 more 单拍等待，受 cap - quietNow 夹住。
-        const want = Math.max(this.options.extendMs, SEMANTIC_MORE_SEQUENCE_WAIT_MS);
-        return Math.max(1, Math.min(want, room));
-      }
-      // 普通静音上限下的语义 more 单拍下限，受 cap - quietNow 和 fragmentCap 夹住。
-      const want = Math.max(this.options.extendMs, SEMANTIC_MORE_MIN_WAIT_MS);
-      return Math.min(fragmentCap, Math.max(1, Math.min(want, room)));
-    }
-    return Math.min(this.options.extendMs, fragmentCap);
-  }
-
-  /**
-   * 「要不要开轮」的最后一道文本闸：语义判停说还有下文时再等一拍。
-   *
-   * 硬边界：
-   * - **只延长一次**（同一段文字）。多次延长等于把判停交给另一层，收益全是延迟。
-   * - 拍数越过 `maxExtensions` 就放行。拍数刚用满或 `overBudget()` 时，只有
-   *   「unsure 吃光当前预算且 `extensions <= maxExtensions`」才再给这一次
-   *   （见 {@link semanticMoreAllowed}）。`end` / `null` / `timeout` 没有豁免。
-   * - **静音天花板谁都不许绕过**：`maxOpenSilenceMs > 0` 且已静音到顶，立刻放行。
-   *   `evaluate` 开头那道闸量的是进来之前；这里再量一次，是因为等语义回话的
-   *   那几百毫秒里静音还在涨。
-   * - 等判停本身有上限（`semanticBudgetMs`）；等不到按「说完了」放行 —— 判停这层
-   *   出问题绝不能把用户的话吞掉。
-   * - p ≥ {@link SEMANTIC_SKIP_P} 的完整句不等还没回来的语义（0 ms）。
-   *   `looksUnfinished` 的半句要等已经在飞的那趟。
-   *
-   * @returns 是否放行（`true` = 可以 `flush()`）
+   * @returns 是否放行（true = 可以 flush）
    */
   private async semanticAllowsFlush(seq: number, epoch: number, probability: number): Promise<boolean> {
-    if (this.options.semanticEndpoint === undefined) {
-      return true;
-    }
-    const text = this.pendingText;
-    if (text.trim() === '') {
-      return true;
-    }
-    // 说话期间/定稿时已经问过了就直接取。**前缀判定要先看**：定稿常常只是中间结果的
-    // 延长，那份「还有下文」已经够用了 —— 再为延长后的文字问一趟，等回来时开轮早就
-    // 该发生了（实测 p50 250–310 ms）。
-    const settled = this.semanticSettled.get(text);
-    let verdict: 'end' | 'more' | null | 'timeout';
-    if (settled !== undefined) {
-      verdict = settled;
-    } else if (this.hasPrefixMore(text)) {
-      verdict = 'more';
-    } else if (this.hasPrefixEnd(text)) {
-      // 定稿只是中间结果的收尾（多一两个标点）：前面那趟已经说「说完了」，别再问
-      verdict = 'end';
-    } else if (probability >= SEMANTIC_SKIP_P && !looksUnfinished(text)) {
-      // 声学判据已经很有把握，**不再等**语义：真机 `20261123-051448` 里 p 到
-      // 0.88–0.98 的几轮还各等了 256–324 ms，而全场语义一次没拦住 MORE —— 纯成本。
-      // 只挡住「等」；说话期间已经发出去的那趟请求照旧（它与 ASR 并行，不要钱），
-      // 所以上面那两条「已经回来的判定」仍然优先。
-      // 半句（`looksUnfinished`：的话 / 因为 / 如果 …）不走这里，改等已经在飞的
-      // 那趟，上限仍是 `semanticBudgetMs`。完整句维持 0 ms 放行。
-      verdict = 'end';
-    } else {
-      verdict = await this.awaitSemantics(text);
-    }
-    if (this.isStaleEval(seq, epoch)) {
-      // 等待期间来了新句（`seq` 已变）、用户重新开口（`speaking_more`）或代次过期：
-      // 必须返回 `false` 放弃本次提交，绝不能落进 `flushOrWait` 把新缓冲句提前冲掉。
+    const decision = await this.semanticGate.allowsFlush(
+      this.pendingText,
+      probability,
+      this.budgetContext(),
+      () => this.isStaleEval(seq, epoch),
+    );
+    if (decision.action === 'stale' || this.isStaleEval(seq, epoch)) {
       return false;
     }
-    if (verdict !== 'more') {
-      if (verdict === 'timeout') {
-        const budget = this.options.semanticBudgetMs ?? DEFAULT_SEMANTIC_BUDGET_MS;
-        this.options.log(`  判停    语义判停 ${budget} ms 没回话，按「说完了」放行`);
-      }
-      return true;
-    }
-    if (this.semanticExtended === text) {
-      return true;
-    }
-    // 静音天花板：仅对明确 `more` 启用 `silenceCapFor(true)`；等语义的那一程不在
-    // `evaluate` 开头那道闸的量程里，所以这里用此刻的静音再判一次。
-    const openSilenceCap = this.silenceCapFor(true);
-    const quietNow = openSilenceCap > 0 ? this.now() - this.silence.lastVoicedAtMs : 0;
-    if (openSilenceCap > 0 && quietNow >= openSilenceCap) {
+    if (decision.action === 'extend') {
+      this.extensions += 1;
+      this.waitedMs += decision.waitMs;
       this.options.log(
-        `  判停    语义=还有下文，但静音 ${Math.round(quietNow)} ms ≥ 上限 ${openSilenceCap}，放行`,
+        `  判停    语义=还有下文（${JSON.stringify(decision.text.slice(0, 24))}），再等 ${decision.waitMs} ms`,
       );
-      return true;
+      this.reportJudge({
+        p: probability, waitMs: decision.waitMs, action: 'extend', why: 'meaning',
+      });
+      this.cancelTimer();
+      this.setPhase('extending');
+      this.pendingTimer = setTimeout(() => { void this.evaluate(seq, epoch); }, decision.waitMs);
+      return false;
     }
-    if (!this.semanticMoreAllowed()) {
-      this.options.log('  判停    语义=还有下文，但拍数/预算已经用完，放行');
-      return true;
-    }
-    const wait = this.semanticMoreWait(openSilenceCap, quietNow);
-    this.semanticExtended = text;
-    this.extensions += 1;
-    this.waitedMs += wait;
-    this.options.log(
-      `  判停    语义=还有下文（${JSON.stringify(text.slice(0, 24))}），再等 ${wait} ms`,
-    );
-    this.reportJudge({ p: probability, waitMs: wait, action: 'extend', why: 'meaning' });
-    this.cancelTimer();
-    this.setPhase('extending');
-    this.pendingTimer = setTimeout(() => { void this.evaluate(seq, epoch); }, wait);
-    return false;
-  }
-
-  /** 取这段文字的判定；没问过就现问，最多等 `semanticBudgetMs`。 */
-  private async awaitSemantics(text: string): Promise<'end' | 'more' | null | 'timeout'> {
-    const ask = this.semanticAsks.get(text) ?? this.askSemantics(text);
-    const budget = this.options.semanticBudgetMs ?? DEFAULT_SEMANTIC_BUDGET_MS;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const timedOut = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), budget);
-    });
-    const verdict = await Promise.race([ask, timedOut]).finally(() => {
-      if (timer !== null) {
-        clearTimeout(timer);
-      }
-    });
-    return verdict;
+    return true;
   }
 
   /**
@@ -1625,39 +1335,6 @@ export class UtteranceAssembler {
     this.flush();
   }
 
-  /** 有没有哪份**前缀**判定说了「还有下文」（定稿往往只是中间结果的延长）。 */
-  private hasPrefixMore(text: string): boolean {
-    for (const [asked, verdict] of this.semanticSettled) {
-      if (verdict !== 'more' || asked === text || !text.startsWith(asked)) {
-        continue;
-      }
-      if (text.length - asked.length <= SEMANTIC_PREFIX_SLACK_CHARS) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * 这条定稿的**前缀**已经被判成「说完了」了吗。
-   *
-   * 仍然需要：判停并段时，先定稿的那半句已经问过一趟，延长版不该再问第二趟
-   * （真机 `20261123-051448` 第 6/8/9 轮各发了两趟）。只复用「延长 ≤ 6 字」的前缀。
-   *
-   * ⚠️ 中间结果那一侧**已于 2026-11-23 取消**：`053719` 第 4 轮一句话发了 9 趟语义
-   * 请求，没有一趟改变结论。现在语义判停只在**定稿**（`addSentence`）发一次。
-   */
-  private hasPrefixEnd(text: string): boolean {
-    for (const [asked, verdict] of this.semanticSettled) {
-      if (verdict !== 'end' || asked === text || !text.startsWith(asked)) {
-        continue;
-      }
-      if (text.length - asked.length <= SEMANTIC_PREFIX_SLACK_CHARS) {
-        return true;
-      }
-    }
-    return false;
-  }
   /** 判停决定落档（见 {@link UtteranceAssemblerOptions.onJudge}）。没有出口就算了 */
   /**
    * 这条定稿是不是「上一段长句的第二次识别」。
@@ -1779,7 +1456,7 @@ export class UtteranceAssembler {
 
   /** 便于日志：最近音频的时长 */
   get recentDurationMs(): number {
-    return pcm16DurationMs(this.recentBytes, 16_000);
+    return this.audio.durationMs;
   }
 
   /** 便于测试：当前时间戳 */
