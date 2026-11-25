@@ -1,10 +1,10 @@
 /**
  * 浏览器侧采集：麦克风 → 16 kHz 单声道 PCM16 小块。
  *
- * 采样率由 worklet 里做「累加-抽点」降采样（integrate-and-dump）：
- * 每 `inputRate / 16000` 个输入样本取一次均值。48 kHz → 16 kHz 正好三点平均，
- * 这本身就带一点低通，比直接抽第一个样本干净得多，也比写个多相滤波短。
- * 44.1 kHz 这类非整数比会出现步长在 2 与 3 之间抖动，语音听感上无所谓。
+ * 采样率由 worklet 里做「低通抗混叠 + 分数相位线性插值」重采样：
+ * 15 阶 Hamming 窗 sinc 低通滤掉奈奎斯特以上高频，再用分数步长插值输出，
+ * 同时兼容 48 kHz（3:1）与 44.1 kHz（2.756:1），避免简单抽点在 44.1 kHz 下
+ * 2/3 步长抖动与混叠损伤中文清辅音识别；16 kHz 输入直接透传。
  *
  * **必须和播放共用一个 `AudioContext`**：浏览器的回声消除拿同一 context 里
  * 正在播放的信号当参考，采集单独开一个 context 就等于没有参考，外放时自己
@@ -22,33 +22,87 @@ class VoiceCapturer extends AudioWorkletProcessor {
     this.chunk = Math.max(1, Math.round(targetRate * (o.chunkMs || 20) / 1000));
     this.out = new Int16Array(this.chunk);
     this.n = 0;
-    this.acc = 0;
-    this.count = 0;
-    this.phase = 0;
+    this.passthrough = Math.abs(this.ratio - 1) < 1e-6;
+    this.useFilter = this.ratio > 1.001;
+    this.tapCount = 15;
+    this.taps = new Float32Array(this.tapCount);
+    this.hist = new Float32Array(this.tapCount);
+    this.histIdx = 0;
+    if (this.useFilter) {
+      const half = (this.tapCount - 1) / 2;
+      const fc = 0.45 / this.ratio;
+      let sum = 0;
+      for (let k = 0; k < this.tapCount; k += 1) {
+        const m = k - half;
+        const sinc = m === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * m) / (Math.PI * m);
+        const win = 0.54 - 0.46 * Math.cos((2 * Math.PI * k) / (this.tapCount - 1));
+        this.taps[k] = sinc * win;
+        sum += this.taps[k];
+      }
+      if (sum !== 0) {
+        for (let k = 0; k < this.tapCount; k += 1) {
+          this.taps[k] /= sum;
+        }
+      }
+    }
+    this.pos = 0;
+    this.prevY = 0;
+    this.currY = 0;
+    this.started = false;
     this.alive = true;
     this.port.onmessage = (event) => {
       if (event.data === 'stop') { this.alive = false; }
     };
   }
+  pushSample(v) {
+    this.out[this.n] = v < -1 ? -32768 : v > 1 ? 32767 : Math.round(v * 32767);
+    this.n += 1;
+    if (this.n >= this.out.length) {
+      this.port.postMessage(this.out.buffer, [this.out.buffer]);
+      this.out = new Int16Array(this.chunk);
+      this.n = 0;
+    }
+  }
   process(inputs) {
     const input = inputs[0];
     const channel = input && input[0];
     if (channel) {
-      for (let i = 0; i < channel.length; i += 1) {
-        this.acc += channel[i];
-        this.count += 1;
-        this.phase += 1;
-        if (this.phase >= this.ratio) {
-          this.phase -= this.ratio;
-          const mean = this.acc / this.count;
-          this.acc = 0;
-          this.count = 0;
-          this.out[this.n] = mean < -1 ? -32768 : mean > 1 ? 32767 : (mean * 32767) | 0;
-          this.n += 1;
-          if (this.n >= this.out.length) {
-            this.port.postMessage(this.out.buffer, [this.out.buffer]);
-            this.out = new Int16Array(this.chunk);
-            this.n = 0;
+      if (this.passthrough) {
+        for (let i = 0; i < channel.length; i += 1) {
+          this.pushSample(channel[i]);
+        }
+      } else {
+        const taps = this.taps;
+        const hist = this.hist;
+        const nTaps = this.tapCount;
+        for (let i = 0; i < channel.length; i += 1) {
+          let y = channel[i];
+          if (this.useFilter) {
+            hist[this.histIdx] = y;
+            this.histIdx += 1;
+            if (this.histIdx >= nTaps) this.histIdx = 0;
+            let acc = 0;
+            let idx = this.histIdx;
+            for (let k = 0; k < nTaps; k += 1) {
+              acc += taps[k] * hist[idx];
+              idx += 1;
+              if (idx >= nTaps) idx = 0;
+            }
+            y = acc;
+          }
+          if (!this.started) {
+            this.prevY = y;
+            this.currY = y;
+            this.started = true;
+          } else {
+            this.prevY = this.currY;
+            this.currY = y;
+            this.pos -= 1;
+          }
+          while (this.pos <= 0) {
+            const alpha = 1 + this.pos;
+            this.pushSample(this.prevY + (this.currY - this.prevY) * alpha);
+            this.pos += this.ratio;
           }
         }
       }

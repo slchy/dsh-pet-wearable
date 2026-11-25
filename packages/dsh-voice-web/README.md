@@ -22,9 +22,37 @@
 
 包名已被 `0.0.0-stage` 占住（那个空占位没有 `main`，`import` 会失败）；本仓库的版本尚未发布。
 
+## dsh web / Desktop 浮动语音桌宠挂件（Gemini 娘）
+
+`mode` 默认 `auto`。profile 里有 `webServer`（`dsh web`、Desktop）时，插件挂到宿主的 `/dsh-voice/*` 与 `/dsh-voice/ws`，不另开 `:8767`。启动时若 `webServer` 还没出现，会再等大约 1.5 秒；仍没有就退回独立桥，`demo/` 的打开方式不变。沿用 `:8767` 与 `demo/` 时，把 `mode` 设为 `standalone`。`host` 则一直等到 `webServer` 再挂载。
+
+一条命令把本机这份源码装进 `web` profile（路径换成仓库里 `packages/dsh-voice-web` 的绝对路径）：
+
+```bash
+dsh plugin --profile web add link:<abs-path-to-packages/dsh-voice-web>
+```
+
+挂件有两条注入通道，各写各的、各自去重：
+
+- Desktop 壳不经过 `tapIndex`。`apply()` 一进来（还没跑 `ctx.effect` / `ctx.inject`）就听 `webserver/index-inject`，往表里追加一段内联引导，由它自己插入 `<script src="/dsh-voice/widget.js">`。脚本 404 时引导把标记清掉，不把桌面壳的启动打失败。
+- 网页 index 走 `tapIndex`，在 `</body>` 前插同一支脚本。
+
+`/dsh-voice/ws` 与页面同源。二进制帧原样进出语音栈（上下行音频）；文本帧只带界面事件（相位、字幕、情绪），不写进 TCP。`agent: dsh` 且宿主有 `sessionController` 时用 `InProcessDshAgent`，会话钉在一条上：`sessionId` 非空就用配置里的 id，并盖过 `~/.dsh/.dsh-voice-pet.json`；留空则沿用那个文件里上次选中的 id。`agent: dsh-subprocess` 始终拉起原来的 `dsh` 子进程。没有 `sessionController` 时，`dsh` 也退回子进程。
+
+挂件画 10 个表情，说话时按底轴 RMS 摇摆，按压有回弹，松手吸附到边缘，点击区域按不透明像素的凸包算。
+
+| 配置 | 含义 |
+|---|---|
+| `mode` | `auto`（默认）/ `host` / `standalone` |
+| `sessionId` | 固定的 dsh 会话。空字符串表示用 `~/.dsh/.dsh-voice-pet.json` |
+| `DSHV_TRUSTED_HOSTS` | 宿主连接栅栏不可用时，额外允许的 Host，逗号分隔 |
+| `DSHV_ADMIN_HOSTS` | 非回环写请求额外允许的 Host，逗号分隔 |
+
+代码、配置与文档是 MIT。`assets/pet/**` 的表情图不在 MIT 许可内，也不授予再许可，只供本插件运行时使用。界限和清单在 [`PROVENANCE.md`](./PROVENANCE.md)。
+
 ## 语音栈从哪来
 
-`packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/` 和 `demo/`。
+`packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/`、`demo/`、`assets/`、`cordis.patch.yml` 和 `PROVENANCE.md`。
 
 为什么不是软连接：实测 npm 11.16 的 packlist **直接跳过 symlink** —— `files: ["src"]`、显式列 `src/voice`、`src/voice/**` 三种写法打出来的 tarball 里都没有链接目标，本地能跑、发出去是空包。
 

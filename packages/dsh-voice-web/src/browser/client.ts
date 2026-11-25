@@ -17,6 +17,22 @@ import {
 } from './frames.ts';
 import { createPlayback, type PlaybackHandle } from './playback.ts';
 
+/** 服务端 WS 文本帧里的相位，和桥上的 JSON 字段对齐。 */
+export type PetUiPhase = 'idle' | 'listening' | 'thinking' | 'speaking';
+
+/**
+ * 服务端走 WS **文本帧**下发的界面事件。二进制音频帧不走这里。
+ * `path` 标这条字是哪条链路写的；没有就省略。
+ */
+export type PetUiEvent =
+  | { readonly type: 'phase'; readonly phase: PetUiPhase }
+  | { readonly type: 'asr'; readonly text: string; readonly final: boolean }
+  | { readonly type: 'asr.replace'; readonly text: string; readonly previous?: string }
+  | { readonly type: 'reply.delta'; readonly delta: string; readonly path?: 'omni' | 'fast' | 'dsh' }
+  | { readonly type: 'reply.final'; readonly text: string; readonly emotion: string; readonly path?: 'omni' | 'fast' | 'dsh' }
+  | { readonly type: 'delegated'; readonly query: string; readonly reason?: string }
+  | { readonly type: 'announce'; readonly text: string; readonly emotion: string };
+
 export type VoiceClientEvent =
   | { readonly type: 'open' }
   | { readonly type: 'ready' }
@@ -24,6 +40,8 @@ export type VoiceClientEvent =
   | { readonly type: 'call'; readonly json: unknown }
   /** 下行有没有声音在放：页面靠它显示「它在说话」 */
   | { readonly type: 'speaking'; readonly active: boolean }
+  /** 服务端文本帧：相位、转写、回复、委派、播报 */
+  | { readonly type: 'ui'; readonly event: PetUiEvent }
   | { readonly type: 'error'; readonly message: string }
   | { readonly type: 'close'; readonly code: number; readonly reason: string };
 
@@ -67,6 +85,11 @@ export interface VoiceClient {
    * 测出来的回波电平会偏高，没有意义。
    */
   readonly context: AudioContext | null;
+  /**
+   * 扬声器输出电平，归一化 RMS，范围 `[0, 1]`。
+   * 还没建播放、或播放报静音时为 `0`。
+   */
+  getOutputLevel(): number;
 }
 
 /**
@@ -90,6 +113,21 @@ function capabilities(): Record<string, unknown> {
 /** 下行原语是不是指定的那个 `op`。非对象、非字符串一律不算。 */
 function isOp(json: unknown, op: string): boolean {
   return typeof json === 'object' && json !== null && (json as { op?: unknown }).op === op;
+}
+
+/** 文本帧的 `type` 是不是界面事件。其它 JSON 丢掉，不当成二进制帧去解。 */
+function isPetUiEvent(value: unknown): value is PetUiEvent {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const type = (value as { type?: unknown }).type;
+  return type === 'phase'
+    || type === 'asr'
+    || type === 'asr.replace'
+    || type === 'reply.delta'
+    || type === 'reply.final'
+    || type === 'delegated'
+    || type === 'announce';
 }
 
 export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
@@ -208,6 +246,10 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
       return context;
     },
 
+    getOutputLevel(): number {
+      return playback?.getLevel() ?? 0;
+    },
+
     async start(): Promise<void> {
       if (phase === 'closed') {
         throw new Error('客户端已关闭，重新创建一个实例');
@@ -319,12 +361,28 @@ export function createVoiceClient(options: VoiceClientOptions): VoiceClient {
         })));
       };
 
-      ws.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+      ws.onmessage = (event: MessageEvent<ArrayBuffer | string>) => {
         if (phase === 'closed' || socket !== ws) {
           return;
         }
-        for (const frame of decoder.push(new Uint8Array(event.data))) {
-          handleFrame(frame.type, frame.payload);
+        // 文本帧是界面事件，不进二进制分帧器。解析失败或 type 不认识就丢掉。
+        if (typeof event.data === 'string') {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          if (isPetUiEvent(parsed)) {
+            emit({ type: 'ui', event: parsed as PetUiEvent });
+            return;
+          }
+          return;
+        }
+        if (event.data instanceof ArrayBuffer) {
+          for (const frame of decoder.push(new Uint8Array(event.data))) {
+            handleFrame(frame.type, frame.payload);
+          }
         }
       };
 

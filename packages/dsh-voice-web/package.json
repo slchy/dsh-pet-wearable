@@ -36,20 +36,31 @@
     "./browser": {
       "types": "./lib/browser-types/client.d.ts",
       "default": "./lib/browser.mjs"
-    }
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "main": "./lib/driver.js",
   "types": "./lib/driver.d.ts",
   "files": [
     "lib",
-    "demo"
+    "demo",
+    "assets",
+    "cordis.patch.yml",
+    "PROVENANCE.md"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "sync:voice": "node scripts/sync-voice.mjs",
     "build:node": "tsc -p tsconfig.build.json",
     "build:browser": "esbuild src/browser/client.ts --bundle --format=esm --outfile=lib/browser.mjs",
+    "build:widget": "esbuild src/browser/pet-widget.ts --bundle --format=iife --outfile=lib/widget.js",
     "build:browser-types": "tsc -p tsconfig.browser-types.json",
-    "build": "npm run sync:voice && npm run build:node && npm run build:browser && npm run build:browser-types && npm run demo:build",
+    "build": "npm run sync:voice && npm run build:node && npm run build:browser && npm run build:widget && npm run build:browser-types && npm run demo:build",
     "typecheck": "npm run sync:voice && tsc --noEmit && tsc --noEmit -p tsconfig.browser.json",
     "test": "npm run sync:voice && node --test tests/*.test.ts",
     "demo:build": "esbuild demo/main.ts --bundle --format=esm --outfile=demo/main.js",

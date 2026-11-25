@@ -1,0 +1,17 @@
+# ============================================================================
+# dsh-voice-web —— DSH Web / Desktop 语音桌宠挂件 bundle patch
+# ============================================================================
+# 安装方式：
+#   dsh plugin --profile web add dsh-voice-web
+# 或本地开发链接安装：
+#   dsh plugin --profile web add link:<本目录绝对路径>
+#
+# 不写 config 时用插件 schema 的默认：mode=auto，sessionId 为空。
+#   mode: auto | host | standalone
+#   sessionId: 非空则固定 InProcessDshAgent 的会话，并盖过 ~/.dsh/.dsh-voice-pet.json
+# 信任域不进这份 patch，走环境变量 DSHV_TRUSTED_HOSTS / DSHV_ADMIN_HOSTS。
+# ============================================================================
+
+- insert:
+    - id: dsh-voice-web
+      name: dsh-voice-web

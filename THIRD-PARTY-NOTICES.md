@@ -57,6 +57,15 @@ Apache-2.0 §4(a) 还要求**给接收方一份许可证副本** —— 就是 �
 
 只用 `bench/eot/` 的评测链，**不参与线上**。改那段前端前先对照上游。
 
+## 3.2 `dsh-whale-widget`（`packages/dsh-voice-web` 桌宠挂件机制借鉴）
+
+| | |
+|---|---|
+| 涉及模块 | `packages/dsh-voice-web/src/host-security.ts`、`src/host-mount.ts`、`src/browser/pet-geometry.ts`、`src/browser/pet-widget.ts` |
+| 上游 | <https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget>（`dsh-whale-widget@0.3.16`） |
+| 许可证 | **MIT** · `Copyright (c) 2026 MeteorNOX`（正文见 §4.3） |
+| 借鉴范围 | 仅参考其 MIT 代码层中的 DSH 宿主双通道注入（`webserver/index-inject` + `tapIndex`）、Fail-Closed 信任栅栏（`connection.requestRejection` + 回环写保护）、按压果冻回弹参数、四边吸附与相对锚点越界自愈、以及不透明区域凸包 `clip-path` 透明穿透设计；**未复制**其 `assets/` 下任何非 MIT 图片或音频资源。 |
+
 ## 4. 许可证正文
 
 ### 4.1 BSD 2-Clause License（Daily）
@@ -293,4 +302,30 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+````
+
+### 4.3 MIT License（`dsh-whale-widget` / MeteorNOX）
+
+````text
+MIT License
+
+Copyright (c) 2026 MeteorNOX
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ````
