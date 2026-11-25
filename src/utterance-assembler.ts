@@ -58,7 +58,10 @@ export interface UtteranceAssemblerOptions {
    * 判定在 `addSentence` 时就发出去，与静候窗重叠，所以正常情况下**不额外加延迟**。
    */
   readonly semanticEndpoint?: (text: string) => Promise<'end' | 'more' | null>;
-  /** 等语义判停回话的上限（ms）。等不到就按「说完了」走。默认 300 */
+  /**
+   * 等语义判停回话的上限（ms）。等不到就按「说完了」走。
+   * 缺省 {@link DEFAULT_SEMANTIC_BUDGET_MS}；生产运行时由 `SEMANTIC_END_TAG_BUDGET_MS` 传入覆写。
+   */
   readonly semanticBudgetMs?: number;
   /** 一轮最多延长几次（**总预算**，四种原因共用） */
   readonly maxExtensions: number;
@@ -76,7 +79,12 @@ export interface UtteranceAssemblerOptions {
    * 缺省与 `maxExtensions` 相同（= 不改变旧行为）。
    */
   readonly maxUnsureExtensions?: number;
-  /** 没有判停器时的固定合并窗口（旧行为） */
+  /**
+   * 没有判停器、且没配 {@link openQuietMs} 时的固定合并窗口（旧行为）。
+   *
+   * 手动端点配了开轮静音门槛时不再用这扇窗：静音够了马上放行，不够只补差额，
+   * 并且受 {@link maxOpenSilenceMs} 封顶。
+   */
   readonly fallbackWindowMs: number;
   /** 概率门限 */
   readonly threshold: number;
@@ -128,14 +136,17 @@ export interface UtteranceAssemblerOptions {
    * 见 {@link UtteranceAssembler} 里 `shouldWaitForMore` 的说明。
    */
   readonly shortFragmentChars?: number;
-  /** 上一轮收下之后多久内出现的短碎片算「同一句话被切开」。默认 1200 ms */
+  /**
+   * 上一轮收下之后多久内出现的短碎片算「同一句话被切开」。
+   * 缺省 {@link DEFAULT_SHORT_FRAGMENT_WINDOW_MS}。
+   */
   readonly shortFragmentWindowMs?: number;
   /**
-   * 碎片最多再等多久。默认 400 ms。
+   * 碎片最多再等多久。缺省 {@link DEFAULT_SHORT_FRAGMENT_WAIT_MS}。
    *
    * 不能直接用 {@link extendMs}：生产上那是 700 ms，而「碎片」
    * 多半只是用户正常的一句短回答（「好。」「行。」），每句多等 700 ms
-   * 是把判停的收益赔进去。ASR 断句间隔通常远小于 400 ms，够用了。
+   * 是把判停的收益赔进去。ASR 断句间隔通常远小于这一拍，够用了。
    */
   readonly shortFragmentWaitMs?: number;
   /**
@@ -218,9 +229,10 @@ export interface UtteranceAssemblerOptions {
    */
   readonly awaitDecode?: () => Promise<void> | null;
   /**
-   * 等解码的上限（ms，默认 240）。超了就照常开轮 —— 等 ASR 这一层绝不能把话吞掉。
+   * 等解码的上限（ms）。超了就照常开轮 —— 等 ASR 这一层绝不能把话吞掉。
+   * 缺省 {@link DEFAULT_DECODE_WAIT_MS}，这段等待直接计入首声。
    *
-   * 240 的依据：`commit → 定稿` 实测中位 261 ms，而封段已经比判停早 50–150 ms，
+   * 取值依据：`commit → 定稿` 实测中位 261 ms，而封段已经比判停早 50–150 ms，
    * 正常轮次只需要等几十毫秒。
    */
   readonly decodeWaitMs?: number;
@@ -236,6 +248,7 @@ export interface UtteranceAssemblerOptions {
    * **不花时间**，只在「用户确实又开口了」时才拦住 —— 那本来也不该开轮。
    *
    * 不设 = 关闭（NLS 那种服务端判句的 provider 用不上：它吐句子时静音早已够）。
+   * 没有判停器时同样认这道门槛，不再盲等 {@link fallbackWindowMs}。
    */
   readonly openQuietMs?: number;
   /**
@@ -335,6 +348,52 @@ export interface JudgeFact {
 
 /** 判定一次的结果，便于日志与测试断言 */
 export type EndpointDecision = 'accept' | 'extend' | 'predictor-unavailable';
+
+/**
+ * 开轮前等在途 ASR 解码收尾的硬上限（ms）。
+ * 直接计入首声；超了按当前文本开轮，不能把话吞掉。
+ */
+const DEFAULT_DECODE_WAIT_MS = 240;
+
+/**
+ * 短碎片再等一拍的上限（ms）。
+ * 生产上的 `extendMs` 更长；碎片多半只是「好。」「行。」这种短回答，不能按那一拍来等。
+ */
+const DEFAULT_SHORT_FRAGMENT_WAIT_MS = 400;
+
+/** 上一轮收下之后，多久以内出现的短碎片仍算同一句话被切开（ms）。 */
+const DEFAULT_SHORT_FRAGMENT_WINDOW_MS = 1_200;
+
+/**
+ * 普通静音上限下，语义 `more` 的单拍下限（ms）。
+ * `max(extendMs, 本值)` 之后还要被 `cap - quietNow` 和 `fragmentCap` 夹住。
+ * 没配 `maxOpenSilenceMs` 时不用这道下限。
+ */
+const SEMANTIC_MORE_MIN_WAIT_MS = 350;
+
+/**
+ * 启用了更大的 `waitBudgetSequenceMs` 时，语义 `more` 的单拍等待（ms）。
+ * `max(extendMs, 本值)` 之后只受 `cap - quietNow` 夹住。
+ */
+const SEMANTIC_MORE_SEQUENCE_WAIT_MS = 550;
+
+/**
+ * `speaking_more` 断流看门狗的最短等待（ms）。
+ * 帧还在来时会重装；彻底停帧后靠它退出，避免卡死。
+ */
+const SPEAKING_WATCHDOG_MIN_MS = 350;
+
+/**
+ * 看门狗相对 `rearmSilenceMs()` 与 `extendMs` 多等的余量（ms）。
+ * 必须晚于静音收口，否则断流兜底会抢在静音门槛之前开火。
+ */
+const SPEAKING_WATCHDOG_MARGIN_MS = 100;
+
+/**
+ * 等语义判停回话的模块兜底（ms）。等不到按「说完了」放行。
+ * 生产运行时由 `SEMANTIC_END_TAG_BUDGET_MS` 传入覆写。
+ */
+const DEFAULT_SEMANTIC_BUDGET_MS = 300;
 
 /**
  * 结尾「必须还有下文」的记号。纯机械，不做语义推断
@@ -736,15 +795,52 @@ export class UtteranceAssembler {
     // - MORE：延长后的文字问回来时，开轮早该发生了；
     // - END：定稿不过是那个前缀的收尾（多一两个标点/收尾字），再问一趟是纯成本
     //   （真机 `20261123-051448` 第 6/8/9 轮各对同一句话发了两趟）。
-    if (!this.hasPrefixMore(this.pendingText) && !this.hasPrefixEnd(this.pendingText)) {
+    // 没有判停器时 `evaluate` 不读这份结果。发了就是一次必丢的远程请求。
+    if (
+      this.options.predict !== undefined
+      && !this.hasPrefixMore(this.pendingText)
+      && !this.hasPrefixEnd(this.pendingText)
+    ) {
       void this.askSemantics(this.pendingText);
     }
-    const delay = this.options.predict
-      ? this.options.quietMs
-      : this.options.fallbackWindowMs;
+    const delay = this.armDelayMs();
     this.setPhase('armed');
     this.schedulePrediction(seq, delay);
     this.pendingTimer = setTimeout(() => { void this.evaluate(seq, epoch); }, delay);
+  }
+
+  /**
+   * 这一句定稿后，第一拍等多久。
+   *
+   * 有判停器：仍是 `quietMs`（判停往返藏在这扇窗里）。
+   * 没有判停器、也没配开轮门槛：仍是 `fallbackWindowMs`（服务端 VAD / NLS）。
+   * 没有判停器、但配了开轮门槛：看**此刻已经静音了多久**。够了就 `0`（下一拍放行，
+   * 不再盲等 600 ms）；不够只补差额，并且不超过 `maxOpenSilenceMs`。
+   * 无音频帧时 `lastVoicedAtMs` 是 −∞，静音差分为 +∞，同样立刻放行。
+   *
+   * 计划好的等待记进 `waitedMs`。假时钟不往前走时，`evaluate` 靠这个数发现
+   * 「再等也不会更静」，到上限就停，不会空转。
+   */
+  private armDelayMs(): number {
+    if (this.options.predict !== undefined) {
+      return this.options.quietMs;
+    }
+    const openQuiet = this.options.openQuietMs ?? 0;
+    if (openQuiet <= 0) {
+      return this.options.fallbackWindowMs;
+    }
+    const quietNow = this.now() - this.silence.lastVoicedAtMs;
+    const cap = this.options.maxOpenSilenceMs ?? 0;
+    let delay: number;
+    if (quietNow >= openQuiet || (cap > 0 && quietNow >= cap)) {
+      delay = 0;
+    } else {
+      const needed = Math.ceil(openQuiet - quietNow);
+      const capLeft = cap > 0 ? Math.max(0, Math.ceil(cap - quietNow)) : needed;
+      delay = Math.max(1, Math.min(needed, capLeft));
+    }
+    this.waitedMs = delay;
+    return delay;
   }
 
   /**
@@ -933,7 +1029,11 @@ export class UtteranceAssembler {
   /** `speaking_more` 断流兜底定时器：持续说话期间每 20 ms 刷新，彻底停帧时保证活性。 */
   private armSpeakingWatchdog(seq: number): void {
     this.cancelSpeakingWatchdog();
-    const waitMs = Math.max(this.rearmSilenceMs() + 100, this.options.extendMs + 100, 350);
+    const waitMs = Math.max(
+      this.rearmSilenceMs() + SPEAKING_WATCHDOG_MARGIN_MS,
+      this.options.extendMs + SPEAKING_WATCHDOG_MARGIN_MS,
+      SPEAKING_WATCHDOG_MIN_MS,
+    );
     this.speakingWatchdog = setTimeout(() => {
       this.speakingWatchdog = null;
       if (this._phase === 'speaking_more' && seq === this.seq) {
@@ -979,6 +1079,46 @@ export class UtteranceAssembler {
 
     const predict = this.options.predict;
     if (!predict) {
+      // 没配开轮门槛：`addSentence` 已经等过 `fallbackWindowMs`，到点直接收。
+      // 配了门槛：按真实静音补差额。用户中途又开口会进 `speaking_more`，
+      // 停嘴后 `rearmFromSpeakingMore` 再进这里，把剩下的门槛补上；
+      // 后半句若先到，`addSentence` 会把两句并进同一轮。两边都受静音上限封顶。
+      const openQuiet = this.options.openQuietMs ?? 0;
+      if (openQuiet > 0) {
+        const quietNow = this.now() - this.silence.lastVoicedAtMs;
+        const openSilenceCap = this.options.maxOpenSilenceMs ?? 0;
+        const maxWaitBudget = openSilenceCap > 0
+          ? openSilenceCap
+          : Math.max(openQuiet, this.options.fallbackWindowMs);
+        if (openSilenceCap > 0 && quietNow >= openSilenceCap) {
+          this.options.log(
+            `  判停    无判停器，静音 ${Math.round(quietNow)} ms ≥ 上限 ${openSilenceCap}，放行`,
+          );
+          await this.flushOrWait(seq, epoch);
+          if (this.isStaleEval(seq, epoch)) {
+            return;
+          }
+          return;
+        }
+        if (quietNow < openQuiet && this.waitedMs < maxWaitBudget) {
+          const remaining = Math.ceil(openQuiet - quietNow);
+          const capRemaining = openSilenceCap > 0
+            ? Math.max(0, Math.ceil(openSilenceCap - quietNow))
+            : remaining;
+          const budgetRemaining = Math.max(0, Math.ceil(maxWaitBudget - this.waitedMs));
+          const wait = Math.min(remaining, capRemaining, budgetRemaining);
+          if (wait > 0) {
+            this.waitedMs += wait;
+            this.options.log(
+              `  判停    无判停器，静音才 ${Math.round(quietNow)} ms（门槛 ${openQuiet}），`
+                + `再等 ${wait} ms`,
+            );
+            this.setPhase('extending');
+            this.pendingTimer = setTimeout(() => { void this.evaluate(seq, epoch); }, wait);
+            return;
+          }
+        }
+      }
       await this.flushOrWait(seq, epoch);
       if (this.isStaleEval(seq, epoch)) {
         return;
@@ -1124,7 +1264,7 @@ export class UtteranceAssembler {
         && this.shouldWaitForMore(this.pendingText)
       ) {
         this.extensions += 1;
-        const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? 400);
+        const wait = Math.min(this.options.extendMs, this.options.shortFragmentWaitMs ?? DEFAULT_SHORT_FRAGMENT_WAIT_MS);
         this.waitedMs += wait;
         this.options.log(
           `  判停    ${shown} → 太短且紧跟前一轮，再等 ${wait} ms`,
@@ -1170,7 +1310,8 @@ export class UtteranceAssembler {
   /** 把某段文字的判定请求发出去（同一段文字只问一次；失败一律回 `null`）。 */
   private askSemantics(text: string): Promise<'end' | 'more' | null> {
     const endpoint = this.options.semanticEndpoint;
-    if (endpoint === undefined || text.trim() === '') {
+    // 无判停器时结果没人读。这里再挡一次，避免其它调用点漏判又把请求放出去。
+    if (this.options.predict === undefined || endpoint === undefined || text.trim() === '') {
       return Promise.resolve(null);
     }
     const cached = this.semanticAsks.get(text) ?? this.semanticAskedNear(text);
@@ -1297,25 +1438,27 @@ export class UtteranceAssembler {
   /**
    * 语义 MORE 这一拍等多少。
    *
-   * - 没给 `maxOpenSilenceMs`：`min(extendMs, shortFragmentWaitMs ?? 400)`；
+   * - 没给 `maxOpenSilenceMs`：`min(extendMs, shortFragmentWaitMs ?? DEFAULT_SHORT_FRAGMENT_WAIT_MS)`；
    * - 给了 `maxOpenSilenceMs` 但未配更大的 `waitBudgetSequenceMs`：
-   *   `min(shortFragmentWaitMs ?? 400, max(1, min(max(extendMs, 350), cap - quietNow)))`；
-   * - 显式配了更大的 `waitBudgetSequenceMs`（如 1200 > 650）：允许单拍等最多 550 ms
-   *   （仍严格受 `cap - quietNow` 夹住），足以接住 700–900 ms 的句中思考停顿，
-   *   且对完整句零额外延迟。调用方保证 `quietNow < cap`。
+   *   `min(fragmentCap, max(1, min(max(extendMs, SEMANTIC_MORE_MIN_WAIT_MS), cap - quietNow)))`；
+   * - 显式配了更大的 `waitBudgetSequenceMs`（如 1200 > 650）：取
+   *   `max(extendMs, SEMANTIC_MORE_SEQUENCE_WAIT_MS)`，仍严格受 `cap - quietNow` 夹住，
+   *   足以接住 700–900 ms 的句中思考停顿，且对完整句零额外延迟。
+   *   调用方保证 `quietNow < cap`。
    */
   private semanticMoreWait(openSilenceCap: number, quietNow: number): number {
-    const fragmentCap = this.options.shortFragmentWaitMs ?? 400;
+    const fragmentCap = this.options.shortFragmentWaitMs ?? DEFAULT_SHORT_FRAGMENT_WAIT_MS;
     const baseCap = this.options.maxOpenSilenceMs ?? 0;
     const sequenceBudget = this.options.waitBudgetSequenceMs ?? 0;
     if (openSilenceCap > 0) {
       const room = openSilenceCap - quietNow;
       if (baseCap > 0 && sequenceBudget > baseCap) {
-        const want = Math.max(this.options.extendMs, 550);
+        // 更大的 waitBudgetSequenceMs：语义 more 单拍等待，受 cap - quietNow 夹住。
+        const want = Math.max(this.options.extendMs, SEMANTIC_MORE_SEQUENCE_WAIT_MS);
         return Math.max(1, Math.min(want, room));
       }
-      // 350：见上面的说明。不要抽成 `*_MS` 常量 —— 扫描器会把它登记成新旋钮。
-      const want = Math.max(this.options.extendMs, 350);
+      // 普通静音上限下的语义 more 单拍下限，受 cap - quietNow 和 fragmentCap 夹住。
+      const want = Math.max(this.options.extendMs, SEMANTIC_MORE_MIN_WAIT_MS);
       return Math.min(fragmentCap, Math.max(1, Math.min(want, room)));
     }
     return Math.min(this.options.extendMs, fragmentCap);
@@ -1377,7 +1520,7 @@ export class UtteranceAssembler {
     }
     if (verdict !== 'more') {
       if (verdict === 'timeout') {
-        const budget = this.options.semanticBudgetMs ?? 300;
+        const budget = this.options.semanticBudgetMs ?? DEFAULT_SEMANTIC_BUDGET_MS;
         this.options.log(`  判停    语义判停 ${budget} ms 没回话，按「说完了」放行`);
       }
       return true;
@@ -1416,7 +1559,7 @@ export class UtteranceAssembler {
   /** 取这段文字的判定；没问过就现问，最多等 `semanticBudgetMs`。 */
   private async awaitSemantics(text: string): Promise<'end' | 'more' | null | 'timeout'> {
     const ask = this.semanticAsks.get(text) ?? this.askSemantics(text);
-    const budget = this.options.semanticBudgetMs ?? 300;
+    const budget = this.options.semanticBudgetMs ?? DEFAULT_SEMANTIC_BUDGET_MS;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timedOut = new Promise<'timeout'>((resolve) => {
       timer = setTimeout(() => resolve('timeout'), budget);
@@ -1439,7 +1582,7 @@ export class UtteranceAssembler {
     if (waiting === null) {
       return false;
     }
-    const budget = this.options.decodeWaitMs ?? 240;
+    const budget = this.options.decodeWaitMs ?? DEFAULT_DECODE_WAIT_MS;
     const startedAt = this.now();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timedOut = new Promise<boolean>((resolve) => {
@@ -1616,7 +1759,7 @@ export class UtteranceAssembler {
     const limit = this.options.shortFragmentChars ?? 3;
     if (core.length === 0 || core.length > limit) return false;
 
-    const window = this.options.shortFragmentWindowMs ?? 1_200;
+    const window = this.options.shortFragmentWindowMs ?? DEFAULT_SHORT_FRAGMENT_WINDOW_MS;
     return this.now() - this.lastUtteranceAt <= window;
   }
 

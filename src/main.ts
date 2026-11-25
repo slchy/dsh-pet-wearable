@@ -113,7 +113,7 @@ export async function buildStt(
         ...(process.env['QWEN_ASR_URL'] ? { url: process.env['QWEN_ASR_URL'] } : {}),
         ...(process.env['QWEN_ASR_MODEL'] ? { model: process.env['QWEN_ASR_MODEL'] } : {}),
         turnDetection,
-        vadSilenceMs: envNumber('QWEN_ASR_VAD_SILENCE_MS', 200), ...(corpusText ? { corpusText } : {}), ...(language ? { language } : {}),
+        ...(corpusText ? { corpusText } : {}), ...(language ? { language } : {}),
       },
       (line) => { console.log(`  [asr] ${line}`); },
     );
@@ -431,6 +431,11 @@ async function runListen(port: number, pipe: Pipeline): Promise<number> {
  * `docs/ALIYUN-ASR-PROBED.md` §5.1。
  */
 const DEFAULT_SENTENCE_SILENCE_MS = 200;
+
+/** 宠物环心跳。不进 `.env`，源码是唯一默认值。 */
+const DEFAULT_PET_TICK_MS = 3_000;
+/** 开麦到首帧上行音频的截止。小米实测 0.62 s，给到 1.5 s。 */
+const DEFAULT_PET_MIC_OPEN_TIMEOUT_MS = 1_500;
 
 /**
  * 读 `cloud/.env`（KEY=VALUE，忽略 # 注释与空行）。
@@ -882,9 +887,8 @@ async function main(): Promise<void> {
   // 必须在这里（`loadDotEnv` 之后、任何 fetch 之前）：`fetch` 默认 4 秒就关连接，
   // 而真机两轮间隔 4–16 秒 —— 等于每轮重做一次 TCP+TLS，实测多花 130–190 ms。
   // 见 `http-agent.ts` 的实测账。
-  const keepAliveMs = envNumber('MIAI_HTTP_KEEPALIVE_MS', DEFAULT_KEEPALIVE_MS);
-  installHttpAgent(keepAliveMs);
-  console.log(`HTTP     连接保活 ${keepAliveMs} ms（默认 4 秒会让每轮重新握手）\n`);
+  installHttpAgent(DEFAULT_KEEPALIVE_MS);
+  console.log(`HTTP     连接保活 ${DEFAULT_KEEPALIVE_MS} ms（默认 4 秒会让每轮重新握手）\n`);
   const argv = process.argv.slice(2);
 
   const opt = (flag: string, def: string): string => {
@@ -1292,16 +1296,29 @@ async function main(): Promise<void> {
     const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
       && turnJudgePython !== '' && turnJudgeScript !== '';
     const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
-    const semanticEnabled = envString('SEMANTIC_END_TAG') !== '0' && semanticKey !== '';
+    // Pure Live 默认关语义判停，只有显式 SEMANTIC_END_TAG=1 才开。
+    // Cascade / 非 live 仍默认开，SEMANTIC_END_TAG=0 退回纯声学判停。
+    const semanticEnabled = (
+      pipelinePlan?.mode === 'live'
+        ? envString('SEMANTIC_END_TAG') === '1'
+        : envString('SEMANTIC_END_TAG') !== '0'
+    ) && semanticKey !== '';
     // 增益、门限、判停、端点、超时：CLI / 插件 / 评测沙盒同一份（`voice-config.ts`）。
-    const voice = buildVoiceRuntimeConfig({
-      env: process.env,
-      sttSpec: resolvedStt,
-      turnJudgeEnabled,
-      turnJudgePython,
-      turnJudgeScript,
-      semanticEnabled,
-    });
+    // 时序不变量不过（validateVoiceTiming）就在这里退出，别把坏组合带进会话。
+    let voice: ReturnType<typeof buildVoiceRuntimeConfig>;
+    try {
+      voice = buildVoiceRuntimeConfig({
+        env: process.env,
+        sttSpec: resolvedStt,
+        ...(pipelinePlan === null ? {} : { pipelineMode: pipelinePlan.mode }),
+        turnJudgeEnabled,
+        turnJudgePython,
+        turnJudgeScript,
+        semanticEnabled,
+      });
+    } catch (error) {
+      fail((error as Error).message);
+    }
     // 只有阿里云实现关心 region/appkey；换成别的实现时别把无关信息印出来
     const endpointBanner = voice.manualEndpoint
       ? `端点由我们控（commit=${voice.gate.commitMs} ms / VOICE_COMMIT_MS，ASR 封段 ${voice.gate.sttCommitMs} ms / VOICE_STT_COMMIT_MS）`
@@ -1400,7 +1417,8 @@ async function main(): Promise<void> {
      * 语义判停（END 标签）：声学判停判不了「这句话说完了没有」，这一层只补这个洞。
      *
      * 和快车道共用一套凭据/端点（同一个 `qwen-flash`）—— 判停要的是快，不是聪明。
-     * `SEMANTIC_END_TAG=0` 关掉，退回纯声学判停。
+     * Cascade / 非 live 默认开，`SEMANTIC_END_TAG=0` 退回纯声学判停。
+     * Pure Live 默认关，只有 `SEMANTIC_END_TAG=1` 才开。
      */
     const semantic = semanticEnabled
       ? semanticEndpoint({
@@ -1457,7 +1475,7 @@ async function main(): Promise<void> {
     console.log(
       proactiveOn
         ? '宠物环   开（主动开口）：心跳每 '
-          + `${envNumber('PET_TICK_MS', 3_000)} ms，离场 ${envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs)} ms 后重戴会打招呼\n`
+          + `${DEFAULT_PET_TICK_MS} ms，离场 ${DEFAULT_PET_TIMING.greetAfterAwayMs} ms 后重戴会打招呼\n`
         : '宠物环   关（PET_PROACTIVE≠1）：只跑对话环，不会主动开口\n',
     );
 
@@ -1550,13 +1568,13 @@ async function main(): Promise<void> {
       proactive: proactiveOn
         ? {
           params: {
-            greetAfterAwayMs: envNumber('PET_GREET_AWAY_MS', DEFAULT_PET_TIMING.greetAfterAwayMs),
-            chatterAfterIdleMs: envNumber('PET_CHATTER_IDLE_MS', DEFAULT_PET_TIMING.chatterAfterIdleMs),
+            greetAfterAwayMs: DEFAULT_PET_TIMING.greetAfterAwayMs,
+            chatterAfterIdleMs: DEFAULT_PET_TIMING.chatterAfterIdleMs,
             // 开麦到首帧上行音频的截止。小米实测 0.62 s，给到 1.5 s
-            micOpenTimeoutMs: envNumber('PET_MIC_OPEN_TIMEOUT_MS', 1500),
+            micOpenTimeoutMs: DEFAULT_PET_MIC_OPEN_TIMEOUT_MS,
           },
-          listenMs: envNumber('PET_LISTEN_MS', DEFAULT_PET_PARAMS.listenMs),
-          tickMs: envNumber('PET_TICK_MS', 3_000),
+          listenMs: DEFAULT_PET_PARAMS.listenMs,
+          tickMs: DEFAULT_PET_TICK_MS,
         }
         : null,
     });

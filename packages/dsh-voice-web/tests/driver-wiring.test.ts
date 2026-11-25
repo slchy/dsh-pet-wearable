@@ -16,19 +16,23 @@ import {
   reduceStackPhase,
   resolveArchiveDir,
   resolveHostVoiceBackendView,
+  shouldEnableSemanticEndpoint,
   shouldUsePureLiveAudio,
   type HostPhase,
   type StackPhase,
 } from '../src/driver.ts';
+import { buildVoiceRuntimeConfig } from '../src/voice/voice-config.ts';
 
 test('driver.ts 调用同一份配置，不再自抄默认值', () => {
   const driver = readFileSync(new URL('../src/driver.ts', import.meta.url), 'utf8');
 
   assert.match(driver, /buildVoiceRuntimeConfig\(/u);
-  assert.match(driver, /micGain:\s*1/u);
-  assert.match(driver, /controlPort:\s*0/u);
+  assert.match(driver, /profile:\s*'browser'/u);
+  assert.match(driver, /pipelineMode:\s*plan\.mode/u);
+  assert.match(driver, /shouldEnableSemanticEndpoint\(/u);
   assert.match(driver, /isLoopbackHost\(config\.host\)/u);
-  assert.match(driver, /installHttpAgent\(/u);
+  assert.match(driver, /installHttpAgent\(DEFAULT_KEEPALIVE_MS\)/u);
+  assert.equal(/MIAI_HTTP_KEEPALIVE_MS/u.test(driver), false);
   assert.match(driver, /expiryWarning\(cert\)/u);
   assert.match(driver, /loadStaticAsrCorpus\(memoryFile\.hotwordHints\(\)/u);
   assert.match(driver, /resolveAsrLanguage\(process\.env\)/u);
@@ -37,6 +41,58 @@ test('driver.ts 调用同一份配置，不再自抄默认值', () => {
   assert.equal(/config\.host !== '127\.0\.0\.1'/u.test(driver), false);
   assert.equal(/SEMANTIC_END_TAG_BUDGET_MS',\s*300/u.test(driver), false);
   assert.equal(/30_000/u.test(driver), false);
+});
+
+test('语义判停：Pure Live 默认关，Cascade 与直连非 dsh 默认开', () => {
+  assert.equal(shouldEnableSemanticEndpoint({
+    pipelineMode: 'live',
+    envFlag: undefined,
+    hasApiKey: true,
+  }), false);
+  assert.equal(shouldEnableSemanticEndpoint({
+    pipelineMode: 'live',
+    envFlag: '1',
+    hasApiKey: true,
+  }), true);
+  assert.equal(shouldEnableSemanticEndpoint({
+    pipelineMode: 'live',
+    envFlag: '1',
+    hasApiKey: false,
+  }), false);
+  assert.equal(shouldEnableSemanticEndpoint({
+    pipelineMode: 'cascade',
+    envFlag: undefined,
+    hasApiKey: true,
+  }), true);
+  assert.equal(shouldEnableSemanticEndpoint({
+    pipelineMode: 'cascade',
+    envFlag: '0',
+    hasApiKey: true,
+  }), false);
+  assert.equal(shouldEnableSemanticEndpoint({
+    pipelineMode: null,
+    envFlag: undefined,
+    hasApiKey: true,
+  }), true);
+});
+
+test('浏览器档案经 buildVoiceRuntimeConfig 给出电平、封段与 Pure Live 投机窗', () => {
+  const runtime = buildVoiceRuntimeConfig({
+    env: {},
+    profile: 'browser',
+    pipelineMode: 'live',
+    sttSpec: 'qwen-realtime',
+    turnJudgeEnabled: false,
+    turnJudgePython: '',
+    turnJudgeScript: '',
+    semanticEnabled: false,
+  });
+  assert.equal(runtime.micGain, 1);
+  assert.equal(runtime.peakDbfs, -34);
+  assert.equal(runtime.controlPort, 0);
+  assert.equal(runtime.gate.sttCommitMs, 320);
+  assert.equal(runtime.gate.speculateMs, 0);
+  assert.equal(runtime.gate.maxOpenSilenceMs, 650);
 });
 
 test('档案目录默认落到 ~/.voice-agent/archives，显式空字符串仍关闭', () => {

@@ -71,6 +71,7 @@ import { TurnRunner } from './turn-runner.ts';
 import { safeEmitUi, type PetUiEvent, type PetUiPhase } from './ui-events.ts';
 import { UplinkPipeline } from './uplink-pipeline.ts';
 import { UtteranceAssembler } from './utterance-assembler.ts';
+import { DEFAULT_TRAILING_TRIM_MS } from './voice-config.ts';
 import type { SemanticEndpoint } from './semantic-endpoint.ts';
 
 /** 上行采样率：mSBC 解码后固定 16 kHz */
@@ -258,16 +259,6 @@ export function mergePowerReading(
  */
 const ASSEMBLER_RECENT_SECONDS = 8;
 
-/**
- * 送给判停器的快照，尾部最多留多少毫秒静音。
- *
- * 官方约定是「音频顶到输入向量的末尾、零补在开头」。尾巴留静音等于把语音从窗口
- * 末尾推开，p 会被拉低（同一句留 0 ms 时 0.95、留 800 ms 时 0.04）。留多少在
- * **噪声里**：两场真机 21 轮的离线扫描 0–20 ms 略好于 100 ms（18/21 vs 15/21），
- * 但真机回放复现不出来 —— 所以取小值只是方向正确，不是可测量的收益。
- */
-const ASSEMBLER_TRAILING_TRIM_MS = 20;
-
 export interface VoiceSessionOptions {
   /** 监听端口 */
   readonly port: number;
@@ -432,6 +423,11 @@ export interface VoiceSessionOptions {
     readonly openQuietMs?: number;
     /** 判停概率高时的短门槛（见 {@link openQuietMs}） */
     readonly openQuietShortMs?: number;
+    /**
+     * 开轮静音的统一上限（ms）。没有判停侧车时，手动端点仍把这一份交给组装器，
+     * 见 `UtteranceAssemblerOptions.maxOpenSilenceMs`。`0` 表示不设上限。
+     */
+    readonly maxOpenSilenceMs?: number;
   };
   /** 播完后额外等待的余量 */
   readonly playbackTailMs: number;
@@ -1014,6 +1010,7 @@ export class VoiceConnection {
     );
     this.turnJudge = detector.client;
     this.ownsTurnJudge = detector.owned;
+    const maxOpenSilenceMs = turnJudgeOptions?.maxOpenSilenceMs ?? options.gate.maxOpenSilenceMs;
 
     this.assembler = new UtteranceAssembler({
       quietMs: turnJudgeOptions?.quietMs ?? 0,
@@ -1033,9 +1030,7 @@ export class VoiceConnection {
       ...(turnJudgeOptions?.waitBudgetSequenceMs === undefined
         ? {}
         : { waitBudgetSequenceMs: turnJudgeOptions.waitBudgetSequenceMs }),
-      ...(turnJudgeOptions?.maxOpenSilenceMs === undefined
-        ? {}
-        : { maxOpenSilenceMs: turnJudgeOptions.maxOpenSilenceMs }),
+      ...(maxOpenSilenceMs === undefined ? {} : { maxOpenSilenceMs }),
       ...(options.semantic === undefined
         ? {}
         : {
@@ -1047,7 +1042,7 @@ export class VoiceConnection {
       recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
       // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是
       // 「要不要再等一拍」的依据 —— 不裁就是「每多等一拍，判据更差」。
-      trailingTrimMs: turnJudgeOptions?.trailingTrimMs ?? ASSEMBLER_TRAILING_TRIM_MS,
+      trailingTrimMs: turnJudgeOptions?.trailingTrimMs ?? DEFAULT_TRAILING_TRIM_MS,
       // 判停的每次决定都落档：`② 定稿→开轮` 在档案里一直是黑盒，1 ms 和 2400 ms
       // 都可以是这个数，不看 p 分不清「判停不敢收」和「排队」。
       onJudge: (fact) => { this.archive?.event(EVENTS.judge, { ...fact }); },

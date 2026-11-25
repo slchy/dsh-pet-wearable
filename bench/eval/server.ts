@@ -170,7 +170,6 @@ async function buildEvalStt(
         ...(process.env['QWEN_ASR_URL'] ? { url: process.env['QWEN_ASR_URL'] } : {}),
         ...(process.env['QWEN_ASR_MODEL'] ? { model: process.env['QWEN_ASR_MODEL'] } : {}),
         turnDetection,
-        vadSilenceMs: envNumber('QWEN_ASR_VAD_SILENCE_MS', 200),
         corpusText,
         language,
       },
@@ -270,7 +269,7 @@ async function main(): Promise<void> {
   const corpusText = loadStaticAsrCorpus(memoryFile.hotwordHints(), env);
   const language = resolveAsrLanguage(env);
 
-  installHttpAgent(envNumber('MIAI_HTTP_KEEPALIVE_MS', DEFAULT_KEEPALIVE_MS));
+  installHttpAgent(DEFAULT_KEEPALIVE_MS);
 
   const auditSlot = createAuditSlot();
   const log = (line: string): void => { console.log(line); };
@@ -420,12 +419,15 @@ async function main(): Promise<void> {
 
   const semanticKey = (env['FAST_LANE_API_KEY'] ?? env['DEEPSEEK_API_KEY'] ?? '').trim();
   const semanticEnabled = !noSemantic
-    && envString('SEMANTIC_END_TAG') !== '0'
+    && (plan.mode === 'live'
+      ? envString('SEMANTIC_END_TAG') === '1'
+      : envString('SEMANTIC_END_TAG') !== '0')
     && semanticKey !== '';
   // 与 CLI 同一套默认值。沙盒只显式加长空闲、放大档案、缩短拍照等待。
   const voice = buildVoiceRuntimeConfig({
     env,
     sttSpec,
+    pipelineMode: plan.mode,
     turnJudgeEnabled,
     turnJudgePython,
     turnJudgeScript,

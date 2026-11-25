@@ -100,7 +100,7 @@ const DEFAULT_INSTRUCTIONS =
   OMNI_SHORT_INSTRUCTIONS;
 
 /** `seal()` 之后、下一次有声之前，最多留多少音频（防软起音被吞） */
-const DEFAULT_RING_MILLISECONDS = 150;
+const DEFAULT_RING_MS = 150;
 
 /** 回注进 omni 上下文的文本上限（字）。委派轮的答案动辄几百字，整段塞进去只是烧 token */
 const MAX_INJECT_CHARS = 200;
@@ -705,7 +705,7 @@ export class OmniShadow {
     this.opts = options;
     this.log = options.log ?? (() => {});
     this.now = options.now ?? (() => performance.now());
-    this.ringMaxBytes = Math.round(BYTES_PER_MILLISECOND * (options.ringMs ?? DEFAULT_RING_MILLISECONDS));
+    this.ringMaxBytes = Math.round(BYTES_PER_MILLISECOND * (options.ringMs ?? DEFAULT_RING_MS));
   }
 
   get currentState(): OmniShadowState {

@@ -220,6 +220,24 @@ export function formatArchiveBanner(archiveDir: string): string {
 }
 
 /**
+ * Pure Live 默认关语义判停：没写 `SEMANTIC_END_TAG` 时只有显式 `1` 才开。
+ * Cascade 与直连非 dsh（`pipelineMode === null`）沿用旧默认，只有 `0` 才关。
+ * 没有 key 一律关。
+ */
+export function shouldEnableSemanticEndpoint(input: {
+  readonly pipelineMode: 'live' | 'cascade' | null
+  readonly envFlag: string | undefined
+  readonly hasApiKey: boolean
+}): boolean {
+  if (!input.hasApiKey) return false
+  const flag = input.envFlag?.trim()
+  if (input.pipelineMode === 'live') {
+    return flag === '1'
+  }
+  return flag !== '0'
+}
+
+/**
  * ALIYUN_* 走环境变量，与 CLI 同一套凭据来源 —— 不在插件配置里重复一遍，
  * 免得同一份密钥有两个地方要改。
  */
@@ -917,9 +935,8 @@ async function bootVoiceStack(
     if (homeLoaded > 0) {
       report(`凭据    ${join(dshHomeDir(), '.env')}（${homeLoaded} 项）`)
     }
-    const keepAliveMs = envNumber('MIAI_HTTP_KEEPALIVE_MS', DEFAULT_KEEPALIVE_MS)
-    installHttpAgent(keepAliveMs)
-    report(`HTTP     连接保活 ${keepAliveMs} ms（默认 4 秒会让每轮重新握手）`)
+    installHttpAgent(DEFAULT_KEEPALIVE_MS)
+    report(`HTTP     连接保活 ${DEFAULT_KEEPALIVE_MS} ms（默认 4 秒会让每轮重新握手）`)
     const archiveDir = resolveArchiveDir(process.env['MIAI_ARCHIVE_DIR'], homedir())
     report(formatArchiveBanner(archiveDir))
 
@@ -1111,28 +1128,28 @@ async function bootVoiceStack(
     const agent = streaming?.agent ?? baseAgent
 
     // 门限、判停、端点、超时与 CLI 同一份（`voice-config.ts`）。
-    // 浏览器只盖两处：上行增益 1×（getUserMedia 已开 AGC），控制口 0（没有固定偏移）。
+    // 浏览器档案 micGain: 1 / peakDbfs: -34 / sttCommitMs: 320 / controlPort: 0
+    // 已收进 `src/voice-config.ts` 的 `DEVICE_TIMING_PROFILES.browser`。
+    // 显式 `.env` 仍自动覆盖档案默认。
     const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? ''
     const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? ''
     const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
       && turnJudgePython !== '' && turnJudgeScript !== ''
     const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim()
-    const semanticEnabled = envString('SEMANTIC_END_TAG') !== '0' && semanticKey !== ''
+    const semanticEnabled = shouldEnableSemanticEndpoint({
+      pipelineMode: plan?.mode ?? null,
+      envFlag: envString('SEMANTIC_END_TAG'),
+      hasApiKey: semanticKey !== '',
+    })
     const runtime = buildVoiceRuntimeConfig({
       env: process.env,
+      profile: 'browser',
+      ...(plan === null ? {} : { pipelineMode: plan.mode }),
       sttSpec: effectiveStt,
       turnJudgeEnabled,
       turnJudgePython,
       turnJudgeScript,
       semanticEnabled,
-      // 浏览器 `micGain: 1` 比眼镜 4× 低；-30 dBFS + 150 ms 容易词中切碎，-38 又会把键盘/呼吸声
-      // 送进解码器。仅在未显式配置环境变量时给折中值 -34 dBFS / 320 ms。
-      overrides: {
-        micGain: 1,
-        controlPort: 0,
-        ...(process.env['VOICE_PEAK_DBFS'] === undefined ? { peakDbfs: -34 } : {}),
-        ...(process.env['VOICE_STT_COMMIT_MS'] === undefined ? { sttCommitMs: 320 } : {}),
-      },
     })
     const semantic = semanticEnabled
       ? semanticEndpoint({

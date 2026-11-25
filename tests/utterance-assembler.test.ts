@@ -2582,3 +2582,136 @@ test('SileroVad.reset() 无参清零复用已 init 的 state，不退回未就�
   assert.equal(internal.state, state, '无参 reset 必须留着原来的 Tensor');
   assert.equal(state.data[0], 0, 'state.data 要清零复用');
 });
+
+// --------------------------------------- 无判停器（Pure Live 手动端点）
+//
+// 没配 TURN_JUDGE 时 `predict === undefined`。这条路径以前两处都是空转：
+// 每句都发一次没人读的语义请求，并且不管静音够不够都盲等 fallbackWindowMs。
+
+test('无判停器时不空发 semanticEndpoint', { timeout: 2_000 }, async () => {
+  let semanticCalls = 0;
+  const { assembler, utterances } = makeAssembler({
+    predict: undefined,
+    fallbackWindowMs: 0,
+    semanticEndpoint: () => {
+      semanticCalls += 1;
+      return new Promise(() => {});
+    },
+  });
+  try {
+    assembler.addSentence('你好。');
+    await delay(40);
+    assert.equal(semanticCalls, 0, '没有判停器时结果没人读，不能发远程请求');
+    assert.deepEqual(utterances.map((u) => u.text), ['你好。']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('无判停器 + openQuietMs：静音早已够时不盲等 fallbackWindowMs', { timeout: 2_000 }, async () => {
+  let clock = 1_000;
+  const { assembler, utterances } = makeAssembler({
+    predict: undefined,
+    fallbackWindowMs: 600,
+    openQuietMs: 300,
+    maxOpenSilenceMs: 650,
+    silenceDb: -40,
+    now: () => clock,
+  });
+  try {
+    for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+    for (let i = 0; i < 20; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 400 ≥ 300
+    const t0 = Date.now();
+    assembler.addSentence('你好。');
+    await delay(80);
+    assert.equal(utterances.length, 1, '静音已经超过 openQuietMs，不该再盲等 600 ms');
+    assert.equal(utterances[0]?.text, '你好。');
+    const elapsed = (utterances[0]?.at ?? t0) - t0;
+    assert.ok(elapsed < 80, `应在几十毫秒内出句，实际 ${elapsed} ms`);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('无判停器 + openQuietMs：静音不够时守门并合并换气续句', { timeout: 2_000 }, async () => {
+  let clock = 1_000;
+  const { assembler, utterances } = makeAssembler({
+    predict: undefined,
+    fallbackWindowMs: 600,
+    openQuietMs: 120,
+    maxOpenSilenceMs: 400,
+    silenceDb: -40,
+    now: () => clock,
+  });
+  try {
+    for (let i = 0; i < 6; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+    for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 40 < 120
+    assembler.addSentence('对吗？');
+    await delay(30);
+    assert.equal(utterances.length, 0, '静音才 40 ms，不到开轮门槛，不能放行');
+
+    // 换气后续上后半句。连续两帧才算重新开口，定时器随之作废。
+    for (let i = 0; i < 3; i += 1) { clock += 20; assembler.addAudio(voiced()); }
+    for (let i = 0; i < 2; i += 1) { clock += 20; assembler.addAudio(silent(20)); }
+    assembler.addSentence('那句。');
+    await delay(30);
+    assert.equal(utterances.length, 0, '后半句刚到，静音仍不够');
+
+    for (let i = 0; i < 5; i += 1) { clock += 20; assembler.addAudio(silent(20)); } // 40 + 100 ≥ 120
+    await delay(200);
+    assert.deepEqual(utterances.map((u) => u.text), ['对吗？那句。']);
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('无判停器 + openQuietMs：假时钟不推进时受 maxOpenSilenceMs 封顶', { timeout: 2_000 }, async () => {
+  // 时钟冻住之后静音不会再涨。若只看 openQuietMs（300）又忘了把已排上的等待
+  // 记进预算，evaluate 会一拍接一拍地空转。上限 80 必须把这条路掐断。
+  const clock = 5_000;
+  const logs: string[] = [];
+  const { assembler, utterances } = makeAssembler({
+    predict: undefined,
+    fallbackWindowMs: 600,
+    openQuietMs: 300,
+    maxOpenSilenceMs: 80,
+    silenceDb: -40,
+    now: () => clock,
+    log: (line) => { logs.push(line); },
+  });
+  try {
+    // 两帧才把 lastVoicedAt 从 −∞ 推上来。只喂一帧的话静音差分是 +∞，会走「早已够」而不是上限。
+    assembler.addAudio(voiced());
+    assembler.addAudio(voiced());
+    const t0 = Date.now();
+    assembler.addSentence('你好。');
+    await delay(250);
+    assert.equal(utterances.length, 1, '假时钟不走也必须放行，不能死循环');
+    assert.equal(utterances[0]?.text, '你好。');
+    const elapsed = (utterances[0]?.at ?? t0) - t0;
+    assert.ok(elapsed < 250, `应在 maxOpenSilenceMs=80 的量级结束，实际 ${elapsed} ms`);
+    assert.equal(
+      logs.filter((line) => line.includes('再等')).length,
+      0,
+      `预算在第一拍就顶满上限，不该再续：${JSON.stringify(logs)}`,
+    );
+  } finally {
+    assembler.dispose();
+  }
+});
+
+test('无判停器且未设 openQuietMs：保留 fallbackWindowMs', { timeout: 2_000 }, async () => {
+  const { assembler, utterances } = makeAssembler({
+    predict: undefined,
+    fallbackWindowMs: 120,
+  });
+  try {
+    assembler.addSentence('你好。');
+    await delay(40);
+    assert.equal(utterances.length, 0, '40 ms 还没到 fallbackWindowMs，不该提前出句');
+    await delay(140);
+    assert.deepEqual(utterances.map((u) => u.text), ['你好。']);
+  } finally {
+    assembler.dispose();
+  }
+});
