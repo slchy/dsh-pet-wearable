@@ -33,10 +33,10 @@ test('maskApiKey 严格脱敏，永不回显完整明文密钥', () => {
   assert.equal(maskApiKey('abcd'), '****');
   assert.equal(maskApiKey('sk-123456'), 'sk****56');
 
-  const secret = 'sk-proj-secretMiddleToken9876';
+  const secret = 'sk-proj-secret-middle-token-9876';
   const masked = maskApiKey(secret);
   assert.equal(masked, 'sk-pro****9876');
-  assert.equal(masked?.includes('secretMiddleToken'), false);
+  assert.equal(masked?.includes('secret-middle-token'), false);
 });
 
 test('Base URL 推导：任意 HTTP/WSS 端点互转，零厂商下拉依赖', () => {
