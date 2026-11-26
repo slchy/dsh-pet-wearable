@@ -1387,9 +1387,14 @@ test('后台汇报途中断线、stop 或 response 超时：生成器结束，�
   assert.ok(timed);
   const started = Date.now();
   const chunks: Buffer[] = [];
-  for await (const chunk of timed!.chunks) {
-    chunks.push(chunk);
-  }
+  const timedDrain = (async () => {
+    for await (const chunk of timed!.chunks) {
+      chunks.push(chunk);
+    }
+  })();
+  // responseTimer 本身 unref；Node 22 下裸等 async iterator 会让事件循环提前结束，
+  // 借 finishSoon 的保活超时兜底并把超时回归转成明确断言。
+  assert.equal(await finishSoon(timedDrain, 1000), 'done', 'response 超时要把读端叫醒');
   assert.equal(chunks.length, 0);
   assert.ok(Date.now() - started < 1000, 'response 超时要把读端叫醒');
   assert.equal(shadow.currentState, 'broken');

@@ -1,10 +1,11 @@
 /**
  * 声学判停（Smart Turn v3.2）的纯 TS 特征与进程内推理。
  *
- * 三层断言，缺一层就会静默坏掉：
+ * 四层断言，缺一层就会静默坏掉：
  * - **FFT**：400 = 2^4×5^2，混合基实现必须与朴素 DFT 同值，否则 log-mel 全错；
  * - **窗口**：8 秒尾对齐、开头补零，喂反了 p 会落在 0.2–0.5 之间晃；
- * - **数值**：真模型 + 1 s 预热正弦的输出必须与 Python 金标准一致（< 1e-4）。
+ * - **特征金标准**：预热正弦的 log-mel 张量严格对齐 Python Whisper 提取器（< 1e-5，跨 CPU 无关）；
+ * - **真模型端到端**：INT8 ONNX 推理落在高置信区间（兼容 AVX2/AVX-512 VNNI 量化累加差异）且同机可复现。
  *
  * 模型文件不在 git 里（`models/*.onnx`）。缺失时真模型那组 `t.skip`，
  * 其余用例在无模型 CI 上照样跑 —— 纯逻辑部分零原生依赖。
@@ -139,6 +140,48 @@ test('computeWhisperLogMelFeatures：doNormalize=false 与 true 结果不同', (
   assert.ok(diff > 1e-3, '归一化开关没有生效');
 });
 
+function warmupSinePcm(): Buffer {
+  const warmup = Buffer.alloc(WHISPER_SAMPLE_RATE * 2);
+  for (let i = 0; i < WHISPER_SAMPLE_RATE; i += 1) {
+    warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2);
+  }
+  return warmup;
+}
+
+test('computeWhisperLogMelFeatures：1 s 预热正弦张量对齐 Python 金标准（< 1e-5，跨 CPU 无关）', () => {
+  const features = computeWhisperLogMelFeatures(pcm16ToLast8Seconds(warmupSinePcm()), {
+    doNormalize: true,
+  });
+  let sum = 0;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < features.length; i += 1) {
+    const v = features[i]!;
+    sum += v;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const mean = sum / features.length;
+  assert.ok(Math.abs(mean - -0.095565254) < 1e-5, `mean=${mean}`);
+  assert.ok(Math.abs(min - -0.12583596) < 1e-5, `min=${min}`);
+  assert.ok(Math.abs(max - 1.8741641) < 1e-5, `max=${max}`);
+  const goldenSpots: ReadonlyArray<readonly [number, number, number]> = [
+    [0, 0, -0.12583596],
+    [0, 700, 1.3252102],
+    [0, 750, -0.04792843],
+    [10, 750, 1.7520860],
+    [40, 750, -0.08023851],
+    [79, 799, -0.03635429],
+  ];
+  for (const [mel, frame, expected] of goldenSpots) {
+    const actual = features[mel * WHISPER_N_FRAMES + frame]!;
+    assert.ok(
+      Math.abs(actual - expected) < 1e-5,
+      `log-mel[${mel}, ${frame}]=${actual}，金标准 ${expected}`,
+    );
+  }
+});
+
 // ---------------------------------------------------------------- 模型定位 / 启动加载
 
 test('resolveTurnJudgeModelPath：TURN_JUDGE_MODEL 优先，兼容 SMART_TURN_MODEL', () => {
@@ -209,7 +252,7 @@ test('TurnJudge：stop() 幂等，之后 predict 返回 −1', async () => {
 
 // ---------------------------------------------------------------- 真模型金标准
 
-test('Smart Turn v3.2 真模型：预热正弦输出对齐 Python 金标准（< 1e-4）', { timeout: 120_000 }, async (t) => {
+test('Smart Turn v3.2 真模型：预热正弦端到端推理高置信且同机可复现', { timeout: 120_000 }, async (t) => {
   const modelPath = resolveTurnJudgeModelPath({});
   if (modelPath === null || !existsSync(modelPath)) {
     t.skip('models/smart-turn-v3.2-cpu.onnx 不存在');
@@ -218,18 +261,18 @@ test('Smart Turn v3.2 真模型：预热正弦输出对齐 Python 金标准（< 
 
   const judge = new TurnJudge({ modelPath });
   try {
-    const warmup = Buffer.alloc(WHISPER_SAMPLE_RATE * 2);
-    for (let i = 0; i < WHISPER_SAMPLE_RATE; i += 1) {
-      warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2);
-    }
+    const warmup = warmupSinePcm();
     const startedAt = Date.now();
     const probability = await judge.predict(warmup);
     const elapsedMs = Date.now() - startedAt;
     assert.ok(probability >= 0, `真模型推理失败（p=${probability}）`);
+    // smart-turn-v3.2-cpu.onnx 为 INT8 量化模型：ONNX Runtime CPU MLAS 在
+    // AVX2（16-bit vpmaddubsw 饱和累加，实测 ~0.9403）与 AVX-512 VNNI（32-bit
+    // vpdpbusd，实测 ~0.9786）之间存在 ~0.04 的正常硬件差；而特征/窗口排错会掉到 0.2–0.6。
+    // 纯浮点 log-mel 张量精度由上面的跨 CPU 金标准单测按 < 1e-5 锁死。
     assert.ok(
-      Math.abs(probability - 0.978554368019104) < 1e-4,
-      `预热正弦 p=${probability}，Python 金标准 0.978554368019104，`
-      + `误差 ${Math.abs(probability - 0.978554368019104)}（本次 ${elapsedMs} ms）`,
+      probability > 0.85 && probability < 1,
+      `预热正弦 p=${probability}，预期落在 (0.85, 1)（本次 ${elapsedMs} ms）`,
     );
     // 第二次推理是稳态路径（第一次含模型加载 + 预热）
     const second = await judge.predict(warmup);
@@ -253,7 +296,7 @@ test('loadSharedTurnJudge：真模型就绪日志包含模型路径与 p', async
     const ready = lines.find((line) => line.includes('已就绪'));
     assert.ok(ready !== undefined, lines.join(' / '));
     assert.match(ready, /Smart Turn v3\.2 进程内 ONNX/u);
-    assert.match(ready, /p=0\.9/u);
+    assert.match(ready, /p=0\.[89]\d{2}/u);
   } finally {
     judge?.stop();
   }

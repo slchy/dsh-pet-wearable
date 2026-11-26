@@ -895,6 +895,25 @@ test('hangup 后 .failed / .error 消耗 discardLeft，下一句定稿不被吞'
   await run('error');
 });
 
+/** 用保活超时包住等待：看门狗定时器本身 unref，Node 22 下纯等它会让事件循环提前退出。 */
+function waitWithin<T>(work: Promise<T>, ms = 1000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`等待超时（>${ms} ms）`));
+    }, ms);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 test('awaitingDecode 超时看门狗解锁新 commit 并唤醒 whenDecoded', async () => {
   const h = await ready({ decodeTimeoutMs: 30 });
   try {
@@ -905,7 +924,7 @@ test('awaitingDecode 超时看门狗解锁新 commit 并唤醒 whenDecoded', asy
     assert.ok(pending);
     let woke = false;
     const wait = pending.then(() => { woke = true; });
-    await wait;
+    await waitWithin(wait);
     assert.equal(woke, true);
     assert.equal(h.asr.decoding(), false);
     h.asr.feed(Buffer.alloc(640), true);
@@ -939,7 +958,7 @@ test('解码超时按结束流程冲刷暂存并补发延后的 commit', async (
     assert.equal(commits(), 1, '解码期只能延后');
     const pending = h.asr.whenDecoded();
     assert.ok(pending);
-    await pending;
+    await waitWithin(pending);
     assert.equal(appends(), before + 1, '超时也要把窗口里的语音补推上去');
     assert.equal(commits(), 2, '延后的 commit 要补发');
     assert.equal(h.asr.decoding(), true, '补发的那一发重新进入等待');

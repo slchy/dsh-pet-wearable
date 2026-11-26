@@ -105,10 +105,12 @@ function pipelineOf(options: {
   });
 }
 
-test('SileroVadModel 共享会话，双流隔离，静音低、元音高', { timeout: 60_000 }, async () => {
+test('SileroVadModel 共享会话，双流隔离，静音低、元音高', { timeout: 60_000 }, async (t) => {
   const modelPath = resolveVadModelPath({});
-  assert.ok(modelPath, '仓库里应能定位 models/silero_vad.onnx');
-  assert.equal(existsSync(modelPath), true);
+  if (modelPath === null || !existsSync(modelPath)) {
+    t.skip('models/silero_vad.onnx 不存在');
+    return;
+  }
   const model = await SileroVadModel.load(modelPath);
   try {
     assert.match(model.modelPath, /silero_vad\.onnx$/u);
