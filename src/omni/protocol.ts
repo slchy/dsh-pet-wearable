@@ -3,8 +3,25 @@
  * 这里没有连接，也没有在途回复。
  */
 import { OMNI_SHORT_INSTRUCTIONS } from '../persona.ts';
+import {
+  buildRealtimeHeaders,
+  buildRealtimeResponseCreate,
+  buildRealtimeWsUrl,
+  realtimeLiveDefaults,
+  resolveRealtimeDialect,
+  type RealtimeDialect,
+} from '../realtime-dialect.ts';
 
 import type { RealtimeResponseDoneEvent } from './types.ts';
+
+export {
+  buildRealtimeHeaders,
+  buildRealtimeResponseCreate,
+  buildRealtimeWsUrl,
+  realtimeLiveDefaults,
+  resolveRealtimeDialect,
+  type RealtimeDialect,
+};
 
 /** 上行格式：与 `UplinkPipeline` 一致（16 kHz / 单声道 / s16le） */
 export const UPSTREAM_RATE = 16_000;
@@ -212,6 +229,12 @@ export interface SessionUpdateInput {
   readonly asrLanguage?: string;
   readonly asrCorpusText?: string;
   readonly serve: boolean;
+  /** 协议方言；缺省 `'dashscope'`，保证旧报文逐字一致。 */
+  readonly dialect?: RealtimeDialect;
+  /** 输出音色（如 OpenAI `alloy`/`verse`/`marin` 或 DashScope 自定义音色）；空白不传。 */
+  readonly voice?: string;
+  /** 覆盖内置输入音频转写模型名；空白用当前方言默认。 */
+  readonly asrModel?: string;
 }
 
 /**
@@ -219,10 +242,77 @@ export interface SessionUpdateInput {
  * 重置掉，所以动态事实刷新也发这一份，不能只补 instructions。
  */
 export function buildSessionUpdate(input: SessionUpdateInput): Record<string, unknown> {
+  const dialect = input.dialect ?? 'dashscope';
+  const defaults = realtimeLiveDefaults(dialect);
   const lang = input.asrLanguage;
   const corpus = input.asrCorpusText;
+  const voice = input.voice?.trim() ?? '';
+  const asrModel = input.asrModel?.trim() || defaults.asrModel;
+
+  if (dialect === 'openai-beta') {
+    const transcription: Record<string, unknown> = {
+      model: asrModel,
+    };
+    if (lang) {
+      transcription['language'] = lang;
+    }
+    if (corpus) {
+      transcription['prompt'] = corpus;
+    }
+    const session: Record<string, unknown> = {
+      modalities: ['text', 'audio'],
+      instructions: input.instructions,
+      ...(voice !== '' ? { voice } : {}),
+      input_audio_format: 'pcm16',
+      output_audio_format: 'pcm16',
+      turn_detection: null,
+      input_audio_transcription: transcription,
+    };
+    if (input.serve) {
+      session['tools'] = [DELEGATE_TOOL];
+      session['tool_choice'] = 'auto';
+    }
+    return { type: 'session.update', session };
+  }
+
+  if (dialect === 'openai-ga') {
+    const transcription: Record<string, unknown> = {
+      model: asrModel,
+    };
+    if (lang) {
+      transcription['language'] = lang;
+    }
+    if (corpus) {
+      transcription['prompt'] = corpus;
+    }
+    const outputAudio: Record<string, unknown> = {
+      format: { type: 'audio/pcm', rate: DOWNSTREAM_RATE },
+    };
+    if (voice !== '') {
+      outputAudio['voice'] = voice;
+    }
+    const session: Record<string, unknown> = {
+      type: 'realtime',
+      output_modalities: ['audio'],
+      instructions: input.instructions,
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: defaults.inputRate },
+          transcription,
+          turn_detection: null,
+        },
+        output: outputAudio,
+      },
+    };
+    if (input.serve) {
+      session['tools'] = [DELEGATE_TOOL];
+      session['tool_choice'] = 'auto';
+    }
+    return { type: 'session.update', session };
+  }
+
   const transcription: Record<string, unknown> = {
-    model: 'qwen3-asr-flash-realtime',
+    model: asrModel,
   };
   if (lang) {
     transcription['language'] = lang;
@@ -236,6 +326,7 @@ export function buildSessionUpdate(input: SessionUpdateInput): Record<string, un
     // 「如果决定调用工具，直接调用，不要先说任何过渡语」之后，闲聊会 3/3
     // 被判成工具调用（零音频）。决定权在工具描述，不在提示词。
     instructions: input.instructions,
+    ...(voice !== '' ? { voice } : {}),
     turn_detection: null,
     audio: {
       input: {

@@ -35,6 +35,7 @@ import { DEFAULT_PET_PARAMS } from './pet/brain/registry.ts';
 import { DEFAULT_PET_TIMING } from './pet/pet-timing.ts';
 import type { PipelinePlan } from './pipeline-mode.ts';
 import { silentTts, type AgentProvider, type TtsProvider } from './providers.ts';
+import { realtimeLiveDefaults, resolveRealtimeDialect } from './realtime-dialect.ts';
 import { loadStaticAsrCorpus, resolveAsrLanguage } from './runtime/asr-context.ts';
 import { createAuditSlot } from './runtime/audit-slot.ts';
 import { loadAuthenticator, loadDotEnv, loadTls } from './runtime/env-bootstrap.ts';
@@ -54,7 +55,8 @@ import { envNumber, envString, sleep } from './util.ts';
 import {
   buildVoiceRuntimeConfig,
   DEFAULT_IMAGE_QUESTION,
-  resolveOmniApiKey,
+  isManualEndpointStt,
+  resolveLiveApiKey,
 } from './voice-config.ts';
 import { runVoiceServer } from './voice-session.ts';
 
@@ -304,10 +306,11 @@ async function main(): Promise<void> {
    */
   const asrBackend = opt('--asr', 'mimo');
   const resolvedStt = sttSpec === '' ? (asrBackend === 'aliyun' ? 'aliyun' : '') : sttSpec;
+  const sttIsPluginPath = /^[./]/.test(resolvedStt) || /^[A-Za-z]:[\\/]/.test(resolvedStt);
   const omniWanted = envString('OMNI_SHADOW') === '1';
-  const omniKey = resolveOmniApiKey(process.env);
+  const omniKey = resolveLiveApiKey(process.env);
   /** 非流式旧装配：omni 车道真的会挂上（三件事同时成立）才造 `FrontedAgent`。 */
-  const omniWillEnable = omniWanted && omniKey !== '' && resolvedStt === 'qwen-realtime';
+  const omniWillEnable = omniWanted && omniKey !== '' && isManualEndpointStt(resolvedStt);
 
   let pipelinePlan: PipelinePlan | null = null;
   /**
@@ -326,13 +329,17 @@ async function main(): Promise<void> {
 
   // `--listen 0` 仍然点名了这条装配。非法 `VOICE_PIPELINE` 必须在用法横幅之前失败，
   // 否则 `node src/main.ts --agent dsh --stt qwen-realtime --listen 0` 只会打印用法。
+  // 自定义插件路径的 `supportsManualEndpoint` 需加载模块后才能确定，留到 `buildStt` 后复检。
   const enteringVoicePipeline = agentSpec === 'dsh'
     && resolvedStt !== ''
     && (listen > 0 || argv.includes('--listen') || argv.includes('--stt'));
   if (enteringVoicePipeline) {
     let resolvedPlan: PipelinePlan;
     try {
-      resolvedPlan = assemblePipelinePlan(process.env, { sttName: resolvedStt, strict: true });
+      resolvedPlan = assemblePipelinePlan(process.env, {
+        ...(sttIsPluginPath ? {} : { sttName: resolvedStt }),
+        strict: true,
+      });
     } catch (error) {
       fail((error as Error).message);
     }
@@ -349,7 +356,7 @@ async function main(): Promise<void> {
     console.error('用法: node src/main.ts --replay <file.sbc> | --listen <port> | --ask-image <file>');
     console.error('  --host <addr>   监听地址（默认 127.0.0.1）。非本机地址必须同时配');
     console.error('                  MIAI_TOKENS 与 MIAI_TLS_KEY/MIAI_TLS_CERT，否则拒绝启动');
-    console.error('  可替换件: --stt aliyun|qwen-realtime|noop|canned|<path>  --tts cosyvoice|omni|mimo|silent|<path>');
+    console.error('  可替换件: --stt aliyun|qwen-realtime|openai-realtime|noop|canned|<path>  --tts cosyvoice|openai|omni|mimo|silent|<path>');
     console.error('            --agent dsh|echo|none|<path>（裸 --agent 等价 dsh）');
     console.error(`  设备:     --device ${DEVICE_MODELS.join('|')}（v1 手机的型号提示；不给 = v1 基线）`);
     console.error('  其他:     [--work-dir <dir>] [--ffmpeg <path>] [--gap-ms 20]');
@@ -678,6 +685,27 @@ async function main(): Promise<void> {
         ? envString('SEMANTIC_END_TAG') === '1'
         : envString('SEMANTIC_END_TAG') !== '0'
     ) && semanticKey !== '';
+    const stt = await buildStt(resolvedStt, {
+      akId,
+      akSecret,
+      appkey,
+      region,
+      maxSentenceSilenceMs: sentenceSilenceMs,
+      ...(vocabularyId ? { vocabularyId } : {}), corpusText, language,
+    });
+    if (sttIsPluginPath && pendingStreaming !== null) {
+      try {
+        const rechecked = assemblePipelinePlan(process.env, {
+          sttName: resolvedStt,
+          sttSupportsManualEndpoint: stt.supportsManualEndpoint,
+          strict: true,
+        });
+        pipelinePlan = rechecked;
+        pendingStreaming = { ...pendingStreaming, plan: rechecked };
+      } catch (error) {
+        fail((error as Error).message);
+      }
+    }
     // 增益、门限、判停、端点、超时：CLI / 插件 / 评测沙盒同一份（`voice-config.ts`）。
     // 时序不变量不过（validateVoiceTiming）就在这里退出，别把坏组合带进会话。
     let voice: ReturnType<typeof buildVoiceRuntimeConfig>;
@@ -685,6 +713,9 @@ async function main(): Promise<void> {
       voice = buildVoiceRuntimeConfig({
         env: process.env,
         sttSpec: resolvedStt,
+        ...(stt.supportsManualEndpoint === undefined
+          ? {}
+          : { sttSupportsManualEndpoint: stt.supportsManualEndpoint }),
         ...(pipelinePlan === null ? {} : { pipelineMode: pipelinePlan.mode }),
         turnJudgeEnabled,
         ...(turnJudgeClient === null ? {} : { turnJudgeModelPath: turnJudgeClient.modelPath }),
@@ -702,17 +733,13 @@ async function main(): Promise<void> {
         + (vocabularyId ? `  vocab=${vocabularyId}` : '  vocab=(未配置)')
       : resolvedStt === 'qwen-realtime'
         ? `model=${process.env['QWEN_ASR_MODEL'] ?? 'qwen3-asr-flash-realtime'}  ${endpointBanner}`
-        : '(外部/内置实现，无需凭据)';
+        : resolvedStt === 'openai-realtime'
+          ? `model=${process.env['OPENAI_ASR_MODEL'] ?? 'gpt-4o-mini-transcribe'}  ${endpointBanner}`
+          : stt.supportsManualEndpoint
+            ? `插件手动端点  ${endpointBanner}`
+            : '(外部/内置实现，无需凭据)';
     console.log(`STT      ${resolvedStt}  ${sttBanner}\n`);
 
-    const stt = await buildStt(resolvedStt, {
-      akId,
-      akSecret,
-      appkey,
-      region,
-      maxSentenceSilenceMs: sentenceSilenceMs,
-      ...(vocabularyId ? { vocabularyId } : {}), corpusText, language,
-    });
     const tts = await buildTts(
       ttsSpec === '' ? 'mimo' : ttsSpec,
       (name, data) => { auditSlot.emit(name, data); },
@@ -743,38 +770,50 @@ async function main(): Promise<void> {
       disposeStreaming = assembled.dispose;
     }
     let omniShadow = streaming?.omniShadow;
+    const manualSttCapable = isManualEndpointStt(resolvedStt, stt.supportsManualEndpoint);
     if (streaming !== null && streaming.mode === 'cascade' && omniShadow === undefined && omniWanted) {
-      const pipelineOmniKey = resolveOmniApiKey(process.env);
+      const pipelineOmniKey = resolveLiveApiKey(process.env);
       const why = pipelineOmniKey === ''
-        ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
-        : resolvedStt !== 'qwen-realtime'
-          ? `STT=${resolvedStt}（需要 qwen-realtime）`
+        ? 'LIVE_API_KEY / OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
+        : !manualSttCapable
+          ? `STT=${resolvedStt}（需要支持手动封段的 STT，如 qwen-realtime / openai-realtime）`
           : 'OMNI_ANSWER 不是 off（只读探针要求 off，cascade 不接管发声）';
       console.log(`影子    OMNI_SHADOW=1 但没启用只读探针：${why}\n`);
     } else if (streaming === null) {
-      const omniModel = envString('OMNI_SHADOW_MODEL');
-      const modelOpt = omniModel === undefined ? {} : { model: omniModel };
+      const liveUrl = envString('LIVE_URL') ?? envString('OMNI_URL');
+      const liveDialect = resolveRealtimeDialect(envString('LIVE_DIALECT') ?? envString('OMNI_DIALECT'), liveUrl);
+      const liveDefaults = realtimeLiveDefaults(liveDialect);
+      const omniModel = envString('LIVE_MODEL') ?? envString('OMNI_SHADOW_MODEL');
+      const liveVoice = envString('LIVE_VOICE') ?? envString('OMNI_VOICE');
+      const liveAsrModel = envString('LIVE_ASR_MODEL') ?? envString('OMNI_ASR_MODEL');
       const omniAnswer = envString('OMNI_ANSWER') ?? 'off';
       if (!['off', 'full'].includes(omniAnswer)) {
         console.error(`OMNI_ANSWER=${omniAnswer} 不合法（off|full）`);
         process.exit(2);
       }
-      omniShadow = omniWillEnable
+      const fallbackLiveEnabled = omniWanted && omniKey !== '' && manualSttCapable;
+      omniShadow = fallbackLiveEnabled
         ? {
           apiKey: omniKey,
           serve: omniAnswer as 'off' | 'full',
-          ...modelOpt,
+          ...(liveUrl ? { url: liveUrl } : {}),
+          ...(liveDialect === 'dashscope' ? {} : { dialect: liveDialect }),
+          ...(omniModel ? { model: omniModel } : {}),
+          ...(liveVoice ? { voice: liveVoice } : {}),
+          ...(liveAsrModel ? { asrModel: liveAsrModel } : {}),
         }
         : undefined;
       if (omniWanted && omniShadow === undefined) {
         console.log(
           '影子    OMNI_SHADOW=1 但没启用：'
-          + (omniKey === '' ? 'OMNI_API_KEY / DASHSCOPE_API_KEY 为空' : `STT=${resolvedStt}（需要 qwen-realtime）`)
+          + (omniKey === ''
+            ? 'LIVE_API_KEY / OMNI_API_KEY / DASHSCOPE_API_KEY 为空'
+            : `STT=${resolvedStt}（需要支持手动封段的 STT，如 qwen-realtime / openai-realtime）`)
           + '\n',
         );
       } else if (omniShadow !== undefined) {
         console.log(
-          `影子    omni 旁路开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
+          `影子    live 旁路开（${liveDialect} / ${omniShadow.model ?? liveDefaults.model}，`
           + (omniShadow.serve === 'off' ? '只量不发声' : `**会出声** serve=${omniShadow.serve}`)
           + '）\n',
         );

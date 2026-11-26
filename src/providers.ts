@@ -197,6 +197,22 @@ export interface FastLaneAudioLane {
  */
 export type InjectKind = 'spoken' | 'unspoken';
 
+/**
+ * Realtime 音频直出车道的**上行 + 认领完整端口**（供连接层 `VoiceConnection` 驱动）。
+ *
+ * 把 `connection.ts` 从具体实现类 `OmniShadow` 解耦出来：任何兼容的实时语音车道
+ * （DashScope / OpenAI Realtime / 自建测试桩）实现这一接口即可接入。
+ */
+export interface RealtimeUplinkLane extends FastLaneAudioLane {
+  readonly currentState: string;
+  readonly localPort?: number;
+  start(): void;
+  stop(): void;
+  restart(preroll: readonly Buffer[]): void;
+  feed(pcm: Buffer, voiced?: boolean): void;
+  seal(seq: number, silenceMs: number): void;
+}
+
 /** Agent 回复。只保留编排层真正需要的字段。 */
 export interface AgentReplyView {
   /** 原始文本（日志/调试用） */
@@ -590,6 +606,13 @@ export interface SttHandlers {
 /** STT provider：每次连接 `open()` 一个新会话。 */
 export interface SttProvider {
   readonly name: string;
+  /**
+   * 可选能力声明：是否支持客户端手动封段（`commit()`）。
+   * 缺省为 `false`（服务端 VAD 判句，如 `aliyun-asr`）；
+   * `qwen-realtime`、`openai-realtime` 或自定义手动封段插件可声明为 `true`，
+   * 让配置层与 `VOICE_PIPELINE=live` 按能力判据放行，而不是硬编码厂商名。
+   */
+  readonly supportsManualEndpoint?: boolean;
   /** 期望的输入采样率，固定 16 kHz（mSBC 解码后的速率）。 */
   open(handlers: SttHandlers): SttSession;
 }

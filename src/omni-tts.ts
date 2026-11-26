@@ -31,10 +31,16 @@
 import WebSocket from 'ws';
 
 import type { TtsProvider } from './providers.ts';
-import type { DashScopeRealtimeEvent as ServerEvent } from './realtime-events.ts';
+import {
+  buildRealtimeHeaders,
+  buildRealtimeResponseCreate,
+  buildRealtimeWsUrl,
+  realtimeLiveDefaults,
+  resolveRealtimeDialect,
+  type RealtimeDialect,
+} from './realtime-dialect.ts';
+import type { RealtimeServerEvent as ServerEvent } from './realtime-events.ts';
 
-const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
-const DEFAULT_MODEL = 'qwen3.8-omni-flash-realtime';
 /** omni 的输出采样率（`session.update` 的 `audio.output.format` 里声明的） */
 export const OMNI_TTS_SAMPLE_RATE = 24_000;
 
@@ -54,9 +60,16 @@ export interface OmniTtsOptions {
   readonly apiKey: string;
   readonly model?: string;
   readonly url?: string;
+  readonly dialect?: RealtimeDialect;
+  readonly voice?: string;
+  readonly extraHeaders?: Readonly<Record<string, string>>;
   readonly log?: (line: string) => void;
   /** 测试注入 */
-  readonly socketFactory?: (url: string, apiKey: string) => RealtimeLike;
+  readonly socketFactory?: (
+    url: string,
+    apiKey: string,
+    headers?: Readonly<Record<string, string>>,
+  ) => RealtimeLike;
   readonly connectTimeoutMs?: number;
   readonly responseTimeoutMs?: number;
 }
@@ -73,6 +86,9 @@ const CLOSED = 3;
 
 export function omniTts(options: OmniTtsOptions): TtsProvider {
   const log = options.log ?? (() => {});
+  const dialect = options.dialect ?? resolveRealtimeDialect(undefined, options.url);
+  const defaults = realtimeLiveDefaults(dialect);
+  const voice = options.voice?.trim() ?? '';
   let ws: RealtimeLike | null = null;
   let ready = false;
   let connecting: Promise<void> | null = null;
@@ -189,13 +205,16 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
     }
     connecting = (async () => {
       const myGen = ++wsGen;
+      const headers = buildRealtimeHeaders(options.apiKey, dialect, options.extraHeaders);
       const factory = options.socketFactory
-        ?? ((url, apiKey) => new WebSocket(url, {
-          headers: { Authorization: `Bearer ${apiKey}` },
+        ?? ((url, apiKey, reqHeaders) => new WebSocket(url, {
+          headers: reqHeaders ?? { Authorization: `Bearer ${apiKey}` },
           maxPayload: 16 << 20,
         }) as unknown as RealtimeLike);
-      const url = `${options.url ?? DEFAULT_URL}?model=${encodeURIComponent(options.model ?? DEFAULT_MODEL)}`;
-      const socket = factory(url, options.apiKey);
+      const url = buildRealtimeWsUrl(options.url ?? defaults.url, {
+        model: options.model ?? defaults.model,
+      });
+      const socket = factory(url, options.apiKey, headers);
       ws = socket;
       ready = false;
       queue = [];
@@ -259,28 +278,62 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
         abandoned = false;
         releaseIdle();
       });
-      send({
-        type: 'session.update',
-        session: {
-          modalities: ['text', 'audio'],
-          instructions: READER_INSTRUCTIONS,
-          // 朗读不需要服务端判停；保持与聊天那条一致的「手动」语义
-          turn_detection: null,
-          audio: {
-            input: {
-              format: {
-                type: 'pcm',
-                sample_rate: 16_000,
-                sample_format: 's16le',
-                channels: 1,
-                packing: 'interleaved',
-                channel_layout: 'mono',
+      if (dialect === 'openai-ga') {
+        send({
+          type: 'session.update',
+          session: {
+            type: 'realtime',
+            output_modalities: ['audio'],
+            instructions: READER_INSTRUCTIONS,
+            audio: {
+              input: {
+                format: { type: 'audio/pcm', rate: 24_000 },
+                turn_detection: null,
+              },
+              output: {
+                format: { type: 'audio/pcm', rate: OMNI_TTS_SAMPLE_RATE },
+                ...(voice !== '' ? { voice } : {}),
               },
             },
-            output: { format: { type: 'pcm', sample_rate: OMNI_TTS_SAMPLE_RATE } },
           },
-        },
-      });
+        });
+      } else if (dialect === 'openai-beta') {
+        send({
+          type: 'session.update',
+          session: {
+            modalities: ['text', 'audio'],
+            instructions: READER_INSTRUCTIONS,
+            ...(voice !== '' ? { voice } : {}),
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            turn_detection: null,
+          },
+        });
+      } else {
+        send({
+          type: 'session.update',
+          session: {
+            modalities: ['text', 'audio'],
+            instructions: READER_INSTRUCTIONS,
+            ...(voice !== '' ? { voice } : {}),
+            // 朗读不需要服务端判停；保持与聊天那条一致的「手动」语义
+            turn_detection: null,
+            audio: {
+              input: {
+                format: {
+                  type: 'pcm',
+                  sample_rate: 16_000,
+                  sample_format: 's16le',
+                  channels: 1,
+                  packing: 'interleaved',
+                  channel_layout: 'mono',
+                },
+              },
+              output: { format: { type: 'pcm', sample_rate: OMNI_TTS_SAMPLE_RATE } },
+            },
+          },
+        });
+      }
       const deadline = Date.now() + (options.connectTimeoutMs ?? 15_000);
       while (!ready) {
         if (stale()) {
@@ -335,7 +388,7 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
       type: 'conversation.item.create',
       item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: readPrompt(text) }] },
     });
-    send({ type: 'response.create' });
+    send(buildRealtimeResponseCreate(dialect, false));
     inflight = true;
     const mine = (responseGen += 1);
 
@@ -354,7 +407,11 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
         if (ev === null) {
           continue;
         }
-        if (ev.type === 'conversation.item.created' && ev.item?.role === 'user' && typeof ev.item.id === 'string') {
+        if (
+          (ev.type === 'conversation.item.created' || ev.type === 'conversation.item.added')
+          && ev.item?.role === 'user'
+          && typeof ev.item.id === 'string'
+        ) {
           userItemId = ev.item.id;
           continue;
         }
@@ -362,7 +419,7 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
           assistantId = ev.item.id;
           continue;
         }
-        if (ev.type === 'response.audio.delta') {
+        if (ev.type === 'response.audio.delta' || ev.type === 'response.output_audio.delta') {
           if ((ev.delta ?? '') !== '') {
             yield Buffer.from(ev.delta as string, 'base64');
           }

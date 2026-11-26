@@ -18,6 +18,7 @@ import {
   type SttSession,
 } from '../../src/providers.ts';
 import {
+  openaiRealtimeStt,
   qwenRealtimeStt,
   type RealtimeSocket,
 } from '../../src/qwen-realtime-asr.ts';
@@ -109,6 +110,19 @@ function qwenCase(): { provider: SttProvider; socket: FakeSocket } {
   return { provider, socket };
 }
 
+function openaiCase(dialect: 'openai-ga' | 'openai-beta' = 'openai-ga'): {
+  provider: SttProvider;
+  socket: FakeSocket;
+} {
+  const socket = new FakeSocket();
+  const provider = openaiRealtimeStt({
+    apiKey: 'sk-test',
+    dialect,
+    socketFactory: () => asSocket(socket),
+  });
+  return { provider, socket };
+}
+
 function aliyunCase(): SttProvider {
   return aliyunStt({
     akId: '',
@@ -124,6 +138,8 @@ const FACTORIES: ReadonlyArray<{ name: string; make: () => SttProvider }> = [
   { name: 'noopStt', make: () => noopStt() },
   { name: 'cannedStt', make: () => cannedStt('你好。', 640) },
   { name: 'qwenRealtimeStt', make: () => qwenCase().provider },
+  { name: 'openaiRealtimeStt(ga)', make: () => openaiCase('openai-ga').provider },
+  { name: 'openaiRealtimeStt(beta)', make: () => openaiCase('openai-beta').provider },
   { name: 'aliyunStt', make: aliyunCase },
 ];
 

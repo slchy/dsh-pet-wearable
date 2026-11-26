@@ -47,10 +47,15 @@ import {
 } from './voice/runtime/pipeline-assembly.ts'
 import { buildAgent, buildStt, buildTts } from './voice/runtime/providers-factory.ts'
 import { loadSharedTurnJudge } from './voice/runtime/turn-judge-bootstrap.ts'
+import { isOpenAiDialect, resolveRealtimeDialect } from './voice/realtime-dialect.ts'
 import { semanticEndpoint } from './voice/semantic-endpoint.ts'
 import type { DshSession } from './voice/session.ts'
 import { envNumber, envString } from './voice/util.ts'
-import { buildVoiceRuntimeConfig } from './voice/voice-config.ts'
+import {
+  buildVoiceRuntimeConfig,
+  isManualEndpointStt,
+  resolveLiveApiKey,
+} from './voice/voice-config.ts'
 import { runVoiceServer } from './voice/voice-session.ts'
 
 /**
@@ -185,17 +190,18 @@ export async function bootVoiceStack(
       ? loadStaticAsrCorpus(memoryFile.hotwordHints(), process.env)
       : ''
     const language = resolveAsrLanguage(process.env)
-    // Pure Live（VOICE_PIPELINE=live 或 OMNI_ANSWER=full|clip）才把默认 STT 换成
-    // qwen-realtime，并把外部 TTS 换成静音占位。echo/none 没有这条管道；
-    // 服务端 VAD 时客户端不封段，改 silent 会直接变哑巴。
+    // Pure Live（VOICE_PIPELINE=live 或 OMNI_ANSWER=full|clip）才把默认非手动 STT 换成
+    // 手动端点 realtime STT（按方言选 qwen-realtime 或 openai-realtime），并把外部 TTS 换成静音占位。
+    // echo/none 没有这条管道；服务端 VAD 时客户端不封段，改 silent 会直接变哑巴。
     const inferredPlan = assemblePipelinePlan(process.env, { sttName: 'qwen-realtime', strict: false })
     const wantsLive = inferredPlan.mode === 'live'
-    const hasOmniKey = (process.env['OMNI_API_KEY'] ?? process.env['DASHSCOPE_API_KEY'] ?? '').trim() !== ''
+    const hasOmniKey = resolveLiveApiKey(process.env) !== ''
     const dshBacked = isDshBackedAgent(config.agent)
+    const turnDetection = process.env['ASR_TURN_DETECTION'] ?? process.env['QWEN_ASR_TURN_DETECTION']
     const liveVadConflict = pureLiveVadConflict({
       dshBacked,
       voicePipeline: process.env['VOICE_PIPELINE'],
-      turnDetection: process.env['QWEN_ASR_TURN_DETECTION'],
+      turnDetection,
     })
     if (liveVadConflict !== null) {
       report(liveVadConflict)
@@ -206,9 +212,16 @@ export async function bootVoiceStack(
       dshBacked,
       wantsLive,
       hasOmniKey,
-      turnDetection: process.env['QWEN_ASR_TURN_DETECTION'],
+      turnDetection,
     })
-    const effectiveStt = usePureLiveAudio ? 'qwen-realtime' : config.stt
+    const liveUrl = process.env['LIVE_URL'] ?? process.env['OMNI_URL']
+    const liveDialect = resolveRealtimeDialect(process.env['LIVE_DIALECT'] ?? process.env['OMNI_DIALECT'], liveUrl)
+    const defaultLiveStt = isOpenAiDialect(liveDialect) && (process.env['DASHSCOPE_API_KEY'] ?? '').trim() === ''
+      ? 'openai-realtime'
+      : 'qwen-realtime'
+    const effectiveStt = usePureLiveAudio
+      ? (isManualEndpointStt(config.stt) ? config.stt : defaultLiveStt)
+      : config.stt
     const effectiveTts = usePureLiveAudio ? 'silent' : config.tts
     const stt = await buildStt(effectiveStt, { ...sttCreds(), corpusText, language })
     const tts = await buildTts(effectiveTts, audit)
@@ -268,7 +281,13 @@ export async function bootVoiceStack(
      * `dsh-subprocess` 与进程内 dsh 都算 dsh（`dshBacked` 在选 STT/TTS 时已经算过）。
      */
     const plan = dshBacked
-      ? assemblePipelinePlan(process.env, { sttName: effectiveStt, strict: true })
+      ? assemblePipelinePlan(process.env, {
+        sttName: effectiveStt,
+        ...(stt.supportsManualEndpoint === undefined
+          ? {}
+          : { sttSupportsManualEndpoint: stt.supportsManualEndpoint }),
+        strict: true,
+      })
       : null
 
     if (plan !== null) {
@@ -373,6 +392,9 @@ export async function bootVoiceStack(
       profile: 'browser',
       ...(plan === null ? {} : { pipelineMode: plan.mode }),
       sttSpec: effectiveStt,
+      ...(stt.supportsManualEndpoint === undefined
+        ? {}
+        : { sttSupportsManualEndpoint: stt.supportsManualEndpoint }),
       turnJudgeEnabled,
       ...(turnJudgeClient === null ? {} : { turnJudgeModelPath: turnJudgeClient.modelPath }),
       semanticEnabled,

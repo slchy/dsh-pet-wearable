@@ -66,7 +66,11 @@ test('boot-voice-stack.ts 调用同一份配置，并直连 voice/runtime', () =
   assert.match(boot, /resolveArchiveDir\(process\.env\['MIAI_ARCHIVE_DIR'\], homedir\(\)\)/u);
   assert.match(boot, /formatArchiveBanner\(archiveDir\)/u);
   assert.match(boot, /state\.backend = \{ status: 'stopped' \}/u);
-  assert.match(boot, /const effectiveStt = usePureLiveAudio \? 'qwen-realtime' : config\.stt/u);
+  assert.match(boot, /resolveLiveApiKey\(process\.env\)/u);
+  assert.match(
+    boot,
+    /const effectiveStt = usePureLiveAudio\s*\?\s*\(isManualEndpointStt\(config\.stt\) \? config\.stt : defaultLiveStt\)\s*:\s*config\.stt/u,
+  );
   assert.match(boot, /const effectiveTts = usePureLiveAudio \? 'silent' : config\.tts/u);
   assert.match(
     boot,
@@ -163,6 +167,18 @@ test('语义判停：Pure Live 默认关，Cascade 与直连非 dsh 默认开', 
     envFlag: undefined,
     hasApiKey: true,
   }), true);
+  const openAiRuntime = buildVoiceRuntimeConfig({
+    env: {},
+    profile: 'browser',
+    pipelineMode: 'live',
+    sttSpec: 'openai-realtime',
+    turnJudgeEnabled: false,
+    semanticEnabled: false,
+  });
+  assert.equal(openAiRuntime.manualEndpoint, true);
+  assert.equal(openAiRuntime.gate.commitMs, 20);
+  assert.equal(openAiRuntime.gate.sttCommitMs, 320);
+  assert.equal(openAiRuntime.gate.speculateMs, 0);
 });
 
 test('浏览器档案经 buildVoiceRuntimeConfig 给出电平、封段与 Pure Live 投机窗', () => {

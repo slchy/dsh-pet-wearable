@@ -4,8 +4,9 @@
  */
 import type { DelegateReason, InjectKind } from '../providers.ts';
 import type { RealtimeSocket, RealtimeSocketFactory } from '../qwen-realtime-asr.ts';
+import type { RealtimeDialect } from '../realtime-dialect.ts';
 
-export type { DelegateReason, InjectKind, RealtimeSocket, RealtimeSocketFactory };
+export type { DelegateReason, InjectKind, RealtimeDialect, RealtimeSocket, RealtimeSocketFactory };
 
 export type OmniShadowState = 'idle' | 'connecting' | 'ready' | 'busy' | 'broken';
 
@@ -13,6 +14,14 @@ export interface OmniShadowOptions {
   readonly apiKey: string;
   readonly model?: string;
   readonly url?: string;
+  /** Realtime 协议方言（`dashscope` | `openai-beta` | `openai-ga`）；缺省按 URL 推断，默认 `dashscope`。 */
+  readonly dialect?: RealtimeDialect;
+  /** 输出音色；空白不传。 */
+  readonly voice?: string;
+  /** 输入音频转写模型名；缺省按方言默认。 */
+  readonly asrModel?: string;
+  /** 附加握手请求头。 */
+  readonly extraHeaders?: Readonly<Record<string, string>>;
   readonly instructions?: string;
   /**
    * `MEMORY.md` 里挑出来的事实。建连时追加一次；空白当没传；超过 600 字截断。

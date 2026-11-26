@@ -258,7 +258,7 @@ CAP: dict[str, str] = {
     "TURN_JUDGE_MAX_UNSURE": "TURN_JUDGE_MAX_EXT（两条取小）",
     "VOICE_COMMIT_MS": (
         "眼镜 mSBC + 手动端点下实际门槛 = 一整个上行包（75 ms）；"
-        "浏览器 20 ms PCM 帧可按帧触发；服务端 VAD / 非 qwen-realtime 归 0"
+        "浏览器 20 ms PCM 帧可按帧触发；服务端 VAD / 非手动端点 STT 归 0"
     ),
     "FAST_LANE_TIMEOUT_MS": "FAST_LANE > 0 时固定；超时转 dsh",
     "TURN_JUDGE_SEQUENCE_BUDGET_MS": (
@@ -373,12 +373,18 @@ def fmt_number(raw: str) -> str:
     nested = re.search(r"envNumber\('[A-Z0-9_]+'\s*,\s*([0-9_]+)\)", text)
     if nested is not None:
         text = nested.group(1)
-    # 三元（`stt === 'x' ? 20 : 0`）：取非零分支，并附上条件
+    # 三元（`stt === 'x' ? 20 : 0` 或 `manualEndpoint ? 20 : 0`）：取非零分支，并附上条件
     ternary = re.fullmatch(r"\w+\s*===\s*'([^']+)'\s*\?\s*([0-9_]+)\s*:\s*([0-9_]+)", text)
     if ternary is not None:
         hot, cold = ternary.group(2), ternary.group(3)
         pick = hot if int(hot.replace("_", "")) != 0 else cold
         return f"{int(pick.replace('_', ''))}（仅 {ternary.group(1)}）"
+    bool_ternary = re.fullmatch(r"(\w+)\s*\?\s*([0-9_]+)\s*:\s*([0-9_]+)", text)
+    if bool_ternary is not None:
+        hot, cold = bool_ternary.group(2), bool_ternary.group(3)
+        pick = hot if int(hot.replace("_", "")) != 0 else cold
+        label = "手动端点" if bool_ternary.group(1) == "manualEndpoint" else bool_ternary.group(1)
+        return f"{int(pick.replace('_', ''))}（仅 {label}）"
     try:
         # 只处理纯数字和「数字 * 数字」两种形态
         if re.fullmatch(r"[0-9_]+", text):

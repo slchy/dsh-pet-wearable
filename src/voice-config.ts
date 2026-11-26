@@ -118,6 +118,11 @@ export interface VoiceRuntimeInput {
    */
   readonly pipelineMode?: 'live' | 'cascade';
   readonly sttSpec: string;
+  /**
+   * STT provider 实例自报的手动封段能力（`stt.supportsManualEndpoint`）。
+   * 传入时按能力判据决定是否手动封段；省略时按内置名称（`qwen-realtime` / `openai-realtime`）推断。
+   */
+  readonly sttSupportsManualEndpoint?: boolean;
   readonly turnJudgeEnabled: boolean;
   /** 声学判停（Smart Turn v3.2）模型路径；缺省由 `resolveTurnJudgeModelPath` 找。 */
   readonly turnJudgeModelPath?: string;
@@ -191,11 +196,45 @@ export interface VoiceRuntimeConfig {
 }
 
 /**
- * omni 车道的 key。`OMNI_API_KEY` 优先，没有再落到 DashScope 那把。
- * 只含空白当成没配。
+ * 判别当前 STT 是否支持客户端手动封段（`commit()`）。
+ *
+ * 优先认 provider 实例自报的能力位；未传入时仅识别内置的手动封段实现
+ * （`qwen-realtime` 与 `openai-realtime`），其余视为服务端自己判句。
  */
+export function isManualEndpointStt(
+  sttSpec: string,
+  supportsManualEndpoint?: boolean,
+): boolean {
+  if (supportsManualEndpoint !== undefined) {
+    return supportsManualEndpoint;
+  }
+  return sttSpec === 'qwen-realtime' || sttSpec === 'openai-realtime';
+}
+
+/**
+ * Live 实时语音车道的 API key。
+ *
+ * 优先级：`LIVE_API_KEY` > `OMNI_API_KEY` > 按方言回落
+ * （OpenAI 方言/URL 回落 `OPENAI_API_KEY`，其余回落 `DASHSCOPE_API_KEY`）。
+ * 显式设为空白不会静默落到后备 key；只含空白当成没配。
+ */
+export function resolveLiveApiKey(env: VoiceEnv): string {
+  const rawDialect = (env['LIVE_DIALECT'] ?? env['OMNI_DIALECT'] ?? '').trim().toLowerCase();
+  const rawUrl = (env['LIVE_URL'] ?? env['OMNI_URL'] ?? '').trim().toLowerCase();
+  const openAi = rawDialect === 'openai'
+    || rawDialect === 'openai-ga'
+    || rawDialect === 'openai-beta'
+    || rawDialect === 'openai-v1'
+    || rawDialect === 'beta'
+    || rawDialect === 'ga'
+    || (rawDialect === '' && rawUrl.includes('openai.com'));
+  const fallback = openAi ? env['OPENAI_API_KEY'] : env['DASHSCOPE_API_KEY'];
+  return (env['LIVE_API_KEY'] ?? env['OMNI_API_KEY'] ?? fallback ?? '').trim();
+}
+
+/** 向后兼容别名：等同 {@link resolveLiveApiKey}。 */
 export function resolveOmniApiKey(env: VoiceEnv): string {
-  return (env['OMNI_API_KEY'] ?? env['DASHSCOPE_API_KEY'] ?? '').trim();
+  return resolveLiveApiKey(env);
 }
 
 /**
@@ -411,8 +450,9 @@ export function buildVoiceRuntimeConfig(input: VoiceRuntimeInput): VoiceRuntimeC
   const peakDbfs = overrides.peakDbfs ?? envNumber('VOICE_PEAK_DBFS', profile.peakDbfs);
 
   // 服务端 VAD 拿走了封段权。客户端再 commit 会和它抢同一句话。
-  const manualEndpoint = sttSpec === 'qwen-realtime' && env['QWEN_ASR_TURN_DETECTION'] !== 'vad';
-  const commitConfigured = envNumber('VOICE_COMMIT_MS', sttSpec === 'qwen-realtime' ? 20 : 0);
+  const turnDetection = (env['ASR_TURN_DETECTION'] ?? env['QWEN_ASR_TURN_DETECTION'] ?? '').trim().toLowerCase();
+  const manualEndpoint = isManualEndpointStt(sttSpec, input.sttSupportsManualEndpoint) && turnDetection !== 'vad';
+  const commitConfigured = envNumber('VOICE_COMMIT_MS', manualEndpoint ? 20 : 0);
   const sttCommitConfigured = overrides.sttCommitMs ?? envNumber('VOICE_STT_COMMIT_MS', profile.sttCommitMs);
   const openQuietMs = envNumber('VOICE_OPEN_QUIET_MS', 300);
   // 短门槛是长门槛的 2/3。300 → 200，并且天然 openQuietShortMs <= openQuietMs。

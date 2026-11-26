@@ -14,7 +14,8 @@ import {
 } from '../pipeline-mode.ts';
 import { CascadeAgent, LiveOrchestrator } from '../pipelines/index.ts';
 import type { AgentProvider, BackgroundTaskReport, TtsProvider } from '../providers.ts';
-import { resolveOmniApiKey } from '../voice-config.ts';
+import { realtimeLiveDefaults, resolveRealtimeDialect } from '../realtime-dialect.ts';
+import { resolveLiveApiKey } from '../voice-config.ts';
 import type { VoiceSessionOptions } from '../voice-session.ts';
 import { formatCurrentDateContext } from './asr-context.ts';
 
@@ -66,7 +67,11 @@ export function shouldCreateFrontedAgent(input: {
  */
 export function assemblePipelinePlan(
   env: Record<string, string | undefined>,
-  opts?: { readonly sttName?: string; readonly strict?: boolean },
+  opts?: {
+    readonly sttName?: string;
+    readonly sttSupportsManualEndpoint?: boolean;
+    readonly strict?: boolean;
+  },
 ): PipelinePlan {
   return resolveVoicePipelineFromEnv(env, opts);
 }
@@ -204,9 +209,20 @@ function streamingOmniShadow(
   log: (line: string) => void,
   ctx: OmniStaticInput = {},
 ): NonNullable<VoiceSessionOptions['omniShadow']> | undefined {
-  const model = env['OMNI_SHADOW_MODEL'];
-  const modelOpt = model === undefined ? {} : { model };
-  const apiKey = resolveOmniApiKey(env);
+  const url = (env['LIVE_URL'] ?? env['OMNI_URL'])?.trim();
+  const dialect = resolveRealtimeDialect(env['LIVE_DIALECT'] ?? env['OMNI_DIALECT'], url);
+  const defaults = realtimeLiveDefaults(dialect);
+  const model = (env['LIVE_MODEL'] ?? env['OMNI_SHADOW_MODEL'])?.trim();
+  const voice = (env['LIVE_VOICE'] ?? env['OMNI_VOICE'])?.trim();
+  const asrModel = (env['LIVE_ASR_MODEL'] ?? env['OMNI_ASR_MODEL'])?.trim();
+  const extraOpts = {
+    ...(url ? { url } : {}),
+    ...(dialect === 'dashscope' ? {} : { dialect }),
+    ...(model ? { model } : {}),
+    ...(voice ? { voice } : {}),
+    ...(asrModel ? { asrModel } : {}),
+  };
+  const apiKey = resolveLiveApiKey(env);
   if (plan.mode === 'live') {
     const requested = (env['OMNI_ANSWER'] ?? '').trim().toLowerCase();
     if (requested !== '' && requested !== 'off' && requested !== 'full' && requested !== 'clip') {
@@ -215,17 +231,17 @@ function streamingOmniShadow(
     if (requested === 'clip') {
       log('管道      OMNI_ANSWER=clip 已取消，纯 live 按 full 出声');
     }
-    const omniShadow = { apiKey, serve: 'full' as const, ...modelOpt, ...omniStaticContext(ctx) };
+    const omniShadow = { apiKey, serve: 'full' as const, ...extraOpts, ...omniStaticContext(ctx) };
     log(
-      `影子    omni 前台开（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，`
+      `影子    live 前台开（${dialect} / ${omniShadow.model ?? defaults.model}，`
       + `**会出声** serve=${omniShadow.serve}）\n`,
     );
     return omniShadow;
   }
   if (plan.useOmniProbeOnly) {
-    const omniShadow = { apiKey, serve: 'off' as const, ...modelOpt, ...omniStaticContext(ctx) };
+    const omniShadow = { apiKey, serve: 'off' as const, ...extraOpts, ...omniStaticContext(ctx) };
     log(
-      `影子    omni 只读探针（${omniShadow.model ?? 'qwen3.8-omni-flash-realtime'}，只量不发声）\n`,
+      `影子    live 只读探针（${dialect} / ${omniShadow.model ?? defaults.model}，只量不发声）\n`,
     );
     return omniShadow;
   }

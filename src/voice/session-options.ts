@@ -6,15 +6,18 @@
 import type { AnnounceItem } from '../app/dialog.ts';
 import type { AnnounceStore } from '../announce-store.ts';
 import type { FastVoiceEngine } from '../engine-contract.ts';
+import type { OmniShadowOptions } from '../omni-shadow.ts';
 import type { VoicePipelineMode } from '../pipeline-mode.ts';
 import type { PetParams } from '../pet/brain/registry.ts';
 import type {
   AgentAudioAnswer,
   AgentProvider,
+  RealtimeUplinkLane,
   SttProvider,
   TtsProvider,
 } from '../providers.ts';
 import type { RealtimeSocketFactory } from '../qwen-realtime-asr.ts';
+import type { RealtimeDialect } from '../realtime-dialect.ts';
 import type { SemanticEndpoint } from '../semantic-endpoint.ts';
 import type { ToolControl } from '../tool-control.ts';
 import type { HelloInfo } from '../transport.ts';
@@ -102,10 +105,21 @@ export interface VoiceSessionOptions {
   readonly omniShadow?: {
     readonly apiKey: string;
     readonly model?: string;
+    readonly url?: string;
+    /** 协议方言（`dashscope` | `openai-beta` | `openai-ga`）；缺省按 URL 推断，默认 `dashscope` */
+    readonly dialect?: RealtimeDialect;
+    /** 输出音色；空白不传 */
+    readonly voice?: string;
+    /** 输入音频转写模型名；缺省按方言默认 */
+    readonly asrModel?: string;
+    /** 附加握手请求头 */
+    readonly extraHeaders?: Readonly<Record<string, string>>;
     /** 认领模式：`off`（只量）/ `full`（真答）。缺省 `off` */
     readonly serve?: 'off' | 'full';
     /** 测试注入 realtime 套接字；生产不传，行为与以前一致 */
     readonly socketFactory?: RealtimeSocketFactory;
+    /** 可选覆盖车道工厂（缺省为 `new OmniShadow(opts)`），方便替换任意兼容 `RealtimeUplinkLane` 的实现 */
+    readonly createLane?: (opts: OmniShadowOptions) => RealtimeUplinkLane;
     /**
      * 长期记忆摘要。字符串原样用；函数在**这条连接**构造影子时调用一次，
      * 取当时的 MEMORY.md。空白不传。
@@ -117,6 +131,17 @@ export interface VoiceSessionOptions {
     readonly asrCorpusText?: string;
     /** ASR 语言。空白不传。 */
     readonly asrLanguage?: string;
+  };
+  /**
+   * 厂商中立的实时语音车道端口工厂（优先级高于 `omniShadow`）。
+   * 任何实现 {@link RealtimeUplinkLane} 的协议适配器均可借此接入连接层，无需改动 `VoiceConnection`。
+   */
+  readonly realtimeLane?: {
+    readonly serve?: 'off' | 'full';
+    readonly create: (hooks: {
+      readonly emit: (data: Record<string, unknown>) => void;
+      readonly log: (line: string) => void;
+    }) => RealtimeUplinkLane;
   };
   /** 显式管道模式（'live' | 'cascade'）。未设时兼容旧推断。 */
   readonly pipelineMode?: VoicePipelineMode;

@@ -553,12 +553,47 @@ test('src/main.ts 复用 buildVoiceRuntimeConfig 单源配置，不再自带默�
   const main = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
 
   assert.match(main, /buildVoiceRuntimeConfig\(/u);
-  assert.match(main, /resolveOmniApiKey\(process\.env\)/u);
+  assert.match(main, /resolveLiveApiKey\(process\.env\)/u);
   assert.match(main, /DEFAULT_IMAGE_QUESTION/u);
   assert.match(main, /DEFAULT_PET_PARAMS\.listenMs/u);
   assert.equal(/DEFAULT_PROACTIVE/u.test(main), false);
   assert.equal(main.includes('这张图里有什么'), false);
   assert.equal(/env\['OMNI_API_KEY'\] \?\? env\['DASHSCOPE_API_KEY'\]/u.test(main), false);
+});
+
+test('openai-realtime 与自定义 supportsManualEndpoint 插件同样启用手动端点', () => {
+  const openAi = buildVoiceRuntimeConfig({
+    ...base,
+    sttSpec: 'openai-realtime',
+  });
+  assert.equal(openAi.manualEndpoint, true);
+  assert.equal(openAi.gate.commitMs, 20);
+  assert.equal(openAi.gate.sttCommitMs, 150);
+
+  const openAiVad = buildVoiceRuntimeConfig({
+    ...base,
+    sttSpec: 'openai-realtime',
+    env: { ASR_TURN_DETECTION: 'vad' },
+  });
+  assert.equal(openAiVad.manualEndpoint, false);
+  assert.equal(openAiVad.gate.commitMs, 0);
+  assert.equal(openAiVad.gate.sttCommitMs, 0);
+
+  const pluginManual = buildVoiceRuntimeConfig({
+    ...base,
+    sttSpec: './custom-asr.mjs',
+    sttSupportsManualEndpoint: true,
+  });
+  assert.equal(pluginManual.manualEndpoint, true);
+  assert.equal(pluginManual.gate.commitMs, 20);
+
+  const disabledCapability = buildVoiceRuntimeConfig({
+    ...base,
+    sttSpec: 'qwen-realtime',
+    sttSupportsManualEndpoint: false,
+  });
+  assert.equal(disabledCapability.manualEndpoint, false);
+  assert.equal(disabledCapability.gate.commitMs, 0);
 });
 
 test('src/main.ts 先 loadSharedTurnJudge 再 buildVoiceRuntimeConfig，且不再读 Python 路径', () => {

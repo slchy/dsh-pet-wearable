@@ -8,6 +8,8 @@
  * `OMNI_SHADOW` / `OMNI_ANSWER` 推断；显式开关优先。
  */
 
+import { isManualEndpointStt, resolveLiveApiKey } from './voice-config.ts';
+
 /** 语音主管道形态：启动期显式二选一，会话内严格互斥，绝不混跑。 */
 export type VoicePipelineMode = 'live' | 'cascade';
 
@@ -22,10 +24,12 @@ export interface ResolvePipelineInput {
   readonly fastOff?: boolean;
   /** 文本级联快车道 API key（已 trim） */
   readonly fastKey?: string;
-  /** 音频直出模型 API key（`OMNI_API_KEY ?? DASHSCOPE_API_KEY`，已 trim） */
+  /** 音频直出模型 API key（`LIVE_API_KEY ?? OMNI_API_KEY ?? ...`，已 trim） */
   readonly omniKey?: string;
-  /** 当前选择的 STT provider 名称（如 `'qwen-realtime'` / `'aliyun'` / `'canned'`） */
+  /** 当前选择的 STT provider 名称（如 `'qwen-realtime'` / `'openai-realtime'` / `'aliyun'` / `'canned'`） */
   readonly sttName?: string;
+  /** STT provider 自报是否支持客户端手动封段；传入时优先按能力判断而非按名字判断 */
+  readonly sttSupportsManualEndpoint?: boolean;
   /** 是否跳过外部 key/STT 强校验（仅 offline/echo 测试场景需要时传 false；默认 true） */
   readonly strict?: boolean;
 }
@@ -53,10 +57,20 @@ function answerMode(omniAnswer: string | undefined): string {
   return (omniAnswer ?? 'off').trim().toLowerCase();
 }
 
+function allowManualEndpointStt(
+  sttName: string | undefined,
+  sttSupportsManualEndpoint: boolean | undefined,
+): boolean {
+  if (sttSupportsManualEndpoint !== undefined) {
+    return sttSupportsManualEndpoint;
+  }
+  return sttName === undefined || isManualEndpointStt(sttName);
+}
+
 /**
  * 把启动参数收成一份互斥的管道计划。
  *
- * `strict !== false`（默认）时，`live` 缺 key 或 STT 不是 `qwen-realtime` 直接抛错，
+ * `strict !== false`（默认）时，`live` 缺 key 或 STT 不支持客户端手动封段直接抛错，
  * 避免装成「开了 live、其实没声音」的静默降级。
  */
 export function resolveVoicePipeline(input: ResolvePipelineInput): PipelinePlan {
@@ -79,10 +93,12 @@ export function resolveVoicePipeline(input: ResolvePipelineInput): PipelinePlan 
   if (mode === 'live') {
     if (input.strict !== false) {
       if ((input.omniKey ?? '').trim() === '') {
-        throw new Error('VOICE_PIPELINE=live 需要 OMNI_API_KEY 或 DASHSCOPE_API_KEY');
+        throw new Error('VOICE_PIPELINE=live 需要 OMNI_API_KEY 或 DASHSCOPE_API_KEY（或 LIVE_API_KEY / OpenAI 方言下的 OPENAI_API_KEY）');
       }
-      if (input.sttName !== undefined && input.sttName !== 'qwen-realtime') {
-        throw new Error(`VOICE_PIPELINE=live 需要 --stt qwen-realtime（当前是 ${input.sttName}）`);
+      if (!allowManualEndpointStt(input.sttName, input.sttSupportsManualEndpoint)) {
+        throw new Error(
+          `VOICE_PIPELINE=live 需要支持手动封段的 STT（--stt qwen-realtime / openai-realtime，当前是 ${input.sttName ?? 'unknown'}）`,
+        );
       }
     }
     if ((input.fastKey ?? '').trim() !== '' && input.fastOff !== true) {
@@ -103,7 +119,7 @@ export function resolveVoicePipeline(input: ResolvePipelineInput): PipelinePlan 
   const useOmniProbeOnly = input.omniShadow === true
     && answer === 'off'
     && (input.omniKey ?? '').trim() !== ''
-    && (input.sttName === undefined || input.sttName === 'qwen-realtime');
+    && allowManualEndpointStt(input.sttName, input.sttSupportsManualEndpoint);
   if (explicit && input.omniShadow === true && answer !== 'off') {
     notes.push(CASCADE_IGNORE_ANSWER_NOTE);
   }
@@ -128,14 +144,18 @@ export function resolveVoicePipeline(input: ResolvePipelineInput): PipelinePlan 
  * - `OMNI_ANSWER` → 旧档位（`off` / `clip` / `full`）
  * - `FAST_LANE=0` → 关掉文本快车道
  * - `FAST_LANE_API_KEY ?? DEEPSEEK_API_KEY` → 级联 key
- * - `OMNI_API_KEY ?? DASHSCOPE_API_KEY` → 音频直出 key
+ * - `LIVE_API_KEY ?? OMNI_API_KEY ?? DASHSCOPE_API_KEY / OPENAI_API_KEY` → 音频直出 key
  */
 export function resolveVoicePipelineFromEnv(
   env: Record<string, string | undefined>,
-  opts?: { readonly sttName?: string; readonly strict?: boolean },
+  opts?: {
+    readonly sttName?: string;
+    readonly sttSupportsManualEndpoint?: boolean;
+    readonly strict?: boolean;
+  },
 ): PipelinePlan {
   const fastKey = (env['FAST_LANE_API_KEY'] ?? env['DEEPSEEK_API_KEY'] ?? '').trim();
-  const omniKey = (env['OMNI_API_KEY'] ?? env['DASHSCOPE_API_KEY'] ?? '').trim();
+  const omniKey = resolveLiveApiKey(env);
   return resolveVoicePipeline({
     explicit: env['VOICE_PIPELINE'],
     omniShadow: env['OMNI_SHADOW'] === '1',
@@ -144,6 +164,9 @@ export function resolveVoicePipelineFromEnv(
     fastKey,
     omniKey,
     ...(opts?.sttName === undefined ? {} : { sttName: opts.sttName }),
+    ...(opts?.sttSupportsManualEndpoint === undefined
+      ? {}
+      : { sttSupportsManualEndpoint: opts.sttSupportsManualEndpoint }),
     ...(opts?.strict === undefined ? {} : { strict: opts.strict }),
   });
 }

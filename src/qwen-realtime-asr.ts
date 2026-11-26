@@ -25,14 +25,21 @@
  */
 import WebSocket from 'ws';
 
+import { resamplePcm16Mono } from './pcm-resample.ts';
 import type { SttProvider } from './providers.ts';
-import type { DashScopeRealtimeEvent as ServerEvent } from './realtime-events.ts';
+import {
+  buildRealtimeHeaders,
+  buildRealtimeWsUrl,
+  realtimeAsrDefaults,
+  resolveRealtimeDialect,
+  type RealtimeDialect,
+} from './realtime-dialect.ts';
+import type { RealtimeServerEvent as ServerEvent } from './realtime-events.ts';
 
 const OPEN = 1;
 const CLOSING = 2;
 const CLOSED = 3;
-const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
-const DEFAULT_MODEL = 'qwen3-asr-flash-realtime';
+const DEFAULT_MODEL = realtimeAsrDefaults('dashscope').model;
 /**
  * `commit` 之后等 `.completed` / `.failed` 的上限。
  * 服务端漏回定稿时，看门狗到点就解除 `awaitingDecode`，避免整条会话卡死。
@@ -52,12 +59,27 @@ export interface RealtimeSocket {
   on(event: string, cb: (...args: never[]) => void): void;
 }
 
-export type RealtimeSocketFactory = (url: string, apiKey: string) => RealtimeSocket;
+export type RealtimeSocketFactory = (
+  url: string,
+  apiKey: string,
+  headers?: Readonly<Record<string, string>>,
+) => RealtimeSocket;
 
 export interface QwenRealtimeAsrOptions {
   apiKey: string;
   url?: string;
   model?: string;
+  /**
+   * 协议方言。缺省时按 `url` 自动嗅探，回退 `dashscope`（保持旧行为逐字不变）。
+   * - `dashscope`：16 kHz 上行、`session.update`、`corpus.text`
+   * - `openai-beta`：24 kHz 上行、`OpenAI-Beta: realtime=v1`、`transcription_session.update`、`prompt`
+   * - `openai-ga`：24 kHz 上行、`session.update`（`type: 'transcription'`）、`prompt`
+   */
+  readonly dialect?: RealtimeDialect;
+  /** 附加到 WebSocket 握手的自定义请求头（例如代理鉴权头或版本头）。 */
+  readonly extraHeaders?: Readonly<Record<string, string>>;
+  /** 发送给远端 WS 的 PCM16 采样率（缺省按方言：dashscope 16 kHz / OpenAI 24 kHz）。 */
+  readonly inputSampleRate?: number;
   /**
    * 静态热词，写入 `input_audio_transcription.corpus.text`。
    *
@@ -118,6 +140,8 @@ export class QwenRealtimeAsrError extends Error {}
 export class QwenRealtimeAsr {
   private readonly opts: QwenRealtimeAsrOptions;
   private readonly log: (line: string) => void;
+  private readonly dialect: RealtimeDialect;
+  private readonly inputSampleRate: number;
   private ws: RealtimeSocket | null = null;
   /**
    * 连接相位。`isReady` 只认 `live`，不再用 ready / connecting / dropping 三处布尔。
@@ -234,10 +258,14 @@ export class QwenRealtimeAsr {
   private discardLeft = 0;
   /** 还没就绪就到了 commit：等 `session.updated` 补发一次 */
   private commitWhenReady = false;
+  /** OpenAI `.delta` 增量是片段（DashScope `.text` 的 `stash` 是累积），本地拼接后统一抛给 `onPartial`。 */
+  private partialBuffer = '';
 
   constructor(opts: QwenRealtimeAsrOptions) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
+    this.dialect = opts.dialect ?? resolveRealtimeDialect(undefined, opts.url);
+    this.inputSampleRate = opts.inputSampleRate ?? realtimeAsrDefaults(this.dialect).inputRate;
   }
 
   /**
@@ -268,13 +296,18 @@ export class QwenRealtimeAsr {
     const myGen = ++this.wsGen;
     try {
       // 不清 backlog：`drop()` 留下的未发送音频要在这条新连接上补发。
+      const defaults = realtimeAsrDefaults(this.dialect);
+      const headers = buildRealtimeHeaders(this.opts.apiKey, this.dialect, this.opts.extraHeaders);
       const factory: RealtimeSocketFactory = this.opts.socketFactory
-        ?? ((url, apiKey) => new WebSocket(url, {
-          headers: { Authorization: `Bearer ${apiKey}` },
+        ?? ((url, apiKey, reqHeaders) => new WebSocket(url, {
+          headers: reqHeaders ?? { Authorization: `Bearer ${apiKey}` },
           maxPayload: 16 << 20,
         }) as unknown as RealtimeSocket);
-      const url = `${this.opts.url ?? DEFAULT_URL}?model=${encodeURIComponent(this.opts.model ?? DEFAULT_MODEL)}`;
-      const ws = factory(url, this.opts.apiKey);
+      const baseUrl = this.opts.url ?? defaults.url;
+      const url = this.dialect === 'dashscope'
+        ? buildRealtimeWsUrl(baseUrl, { model: this.opts.model ?? defaults.model })
+        : buildRealtimeWsUrl(baseUrl, { intent: 'transcription' });
+      const ws = factory(url, this.opts.apiKey, headers);
       if (myGen !== this.wsGen || this.linkIs('closed')) {
         try { ws.close(); } catch { /* 已断 */ }
         return;
@@ -387,6 +420,7 @@ export class QwenRealtimeAsr {
     this.heldBytes = 0;
     this.ringDuringDecode = [];
     this.ringBytes = 0;
+    this.partialBuffer = '';
     this.resolveDecode();
   }
 
@@ -401,7 +435,50 @@ export class QwenRealtimeAsr {
     const vad = this.opts.turnDetection === 'vad';
     const corpus = this.opts.corpusText?.trim() ?? '';
     const lang = this.opts.language?.trim() ?? '';
-    // 两个都空就别加键。多写一个空的 input_audio_transcription 也会让旧报文对不上。
+    const turnDetection = vad
+      ? { type: 'server_vad', silence_duration_ms: this.opts.vadSilenceMs ?? 200 }
+      : null;
+
+    if (this.dialect === 'openai-beta') {
+      const model = this.opts.model ?? realtimeAsrDefaults('openai-beta').model;
+      this.sendRaw({
+        type: 'transcription_session.update',
+        session: {
+          input_audio_format: 'pcm16',
+          input_audio_transcription: {
+            model,
+            ...(lang !== '' ? { language: lang } : {}),
+            ...(corpus !== '' ? { prompt: corpus } : {}),
+          },
+          turn_detection: turnDetection,
+        },
+      });
+      return;
+    }
+
+    if (this.dialect === 'openai-ga') {
+      const model = this.opts.model ?? realtimeAsrDefaults('openai-ga').model;
+      this.sendRaw({
+        type: 'session.update',
+        session: {
+          type: 'transcription',
+          audio: {
+            input: {
+              format: { type: 'audio/pcm', rate: this.inputSampleRate },
+              transcription: {
+                model,
+                ...(lang !== '' ? { language: lang } : {}),
+                ...(corpus !== '' ? { prompt: corpus } : {}),
+              },
+              turn_detection: turnDetection,
+            },
+          },
+        },
+      });
+      return;
+    }
+
+    // DashScope：两个都空就别加键。多写一个空的 input_audio_transcription 也会让旧报文对不上。
     const transcription = (corpus !== '' || lang !== '')
       ? {
           model: this.opts.model ?? DEFAULT_MODEL,
@@ -414,9 +491,7 @@ export class QwenRealtimeAsr {
       session: {
         modalities: ['text'],
         input_audio_format: 'pcm',
-        turn_detection: vad
-          ? { type: 'server_vad', silence_duration_ms: this.opts.vadSilenceMs ?? 200 }
-          : null,
+        turn_detection: turnDetection,
         ...(transcription ? { input_audio_transcription: transcription } : {}),
       },
     });
@@ -490,11 +565,19 @@ export class QwenRealtimeAsr {
     }
     // 软起音那几帧在 ring 里：开口那一刻一起带上，别把起音切掉
     for (const part of this.ringDuringDecode.splice(0)) {
-      this.sendRaw({ type: 'input_audio_buffer.append', audio: part.toString('base64') });
+      this.appendAudio(part);
     }
     this.ringBytes = 0;
-    this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+    this.appendAudio(pcm);
     this.dirty = true;
+  }
+
+  /** 上行固定 16 kHz，仅在远端方言要求其他采样率（如 OpenAI 24 kHz）时在发送边界重采样。 */
+  private appendAudio(pcm: Buffer): void {
+    const wire = this.inputSampleRate === 16_000
+      ? pcm
+      : resamplePcm16Mono(pcm, 16_000, this.inputSampleRate);
+    this.sendRaw({ type: 'input_audio_buffer.append', audio: wire.toString('base64') });
   }
 
   /** 静音或软起音先进这个小环；开口那一刻再转正 */
@@ -535,7 +618,7 @@ export class QwenRealtimeAsr {
     const held = this.heldDuringDecode.splice(0);
     this.heldBytes = 0;
     for (const pcm of held) {
-      this.sendRaw({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+      this.appendAudio(pcm);
     }
     this.dirty = true;
     // 补推的是「说过话的那部分」，所以这时才算缓冲里有人声
@@ -655,6 +738,7 @@ export class QwenRealtimeAsr {
   private releaseInFlightDecode(reason: string): void {
     const ending = this.awaitingDecode;
     this.awaitingDecode = false;
+    this.partialBuffer = '';
     this.clearDecodeWatchdog();
     if (ending && this.discardLeft > 0) {
       this.discardLeft -= 1;
@@ -731,7 +815,7 @@ export class QwenRealtimeAsr {
       return;
     }
 
-    if (ev.type === 'session.updated') {
+    if (ev.type === 'session.updated' || ev.type === 'transcription_session.updated') {
       if (this.linkPhase !== 'handshaking' && this.linkPhase !== 'live') return;
       if (this.ws === null || this.ws.readyState !== OPEN) {
         this.log('[asr] session.updated 时连接已不可用，backlog 保留给重连');
@@ -746,6 +830,19 @@ export class QwenRealtimeAsr {
       if (this.commitWhenReady) {
         this.commitWhenReady = false;
         this.commit();
+      }
+      return;
+    }
+    if (ev.type === 'conversation.item.input_audio_transcription.delta') {
+      const piece = ev.delta;
+      if (typeof piece === 'string' && piece !== '') {
+        this.partialBuffer += piece;
+        if (this.opts.corpusText && isCorpusEcho(this.partialBuffer, this.opts.corpusText)) {
+          this.log(`[asr] 丢弃热词回声增量（${this.partialBuffer.length} 字）`);
+          return;
+        }
+        const stamp = this.awaitingDecode ? this.decodingCommitSeq : this._commitSeq + 1;
+        this.opts.onPartial?.(this.partialBuffer, stamp);
       }
       return;
     }
@@ -774,6 +871,7 @@ export class QwenRealtimeAsr {
       //    看门狗也要在补发之前清掉，否则会拆掉下一发刚 arm 的那只。
       const completedSeq = this.decodingCommitSeq;
       this.awaitingDecode = false;
+      this.partialBuffer = '';
       this.clearDecodeWatchdog();
       const t = (ev.transcript ?? '').trim();
       const index = this.seq;
@@ -876,9 +974,51 @@ export function qwenRealtimeStt(
 ): SttProvider {
   return {
     name: `qwen-realtime:${opts.model ?? DEFAULT_MODEL}`,
+    supportsManualEndpoint: opts.turnDetection !== 'vad',
     open: (handlers) => {
       const asr = new QwenRealtimeAsr({
         ...opts,
+        onSentence: handlers.onSentence,
+        onPartial: handlers.onPartial,
+        onError: handlers.onError,
+        log,
+      });
+      return {
+        feed: (pcm, voiced) => { asr.feed(pcm, voiced); },
+        hangup: () => { asr.hangup(); },
+        close: () => { asr.close(); },
+        commit: () => { asr.commit(); },
+        commitSeq: () => asr.commitSeq(),
+        discard: () => { asr.discard(); },
+        decoding: () => asr.decoding(),
+        whenDecoded: () => asr.whenDecoded(),
+      };
+    },
+  };
+}
+
+/**
+ * 把 OpenAI Realtime Transcription（GA 或 Beta）包成 {@link SttProvider}。
+ *
+ * 复用同一套因果序号 / 解码期暂存 / 静音环缓冲状态机，只在 WS 边界自动切换为
+ * `openai-ga`（默认）或 `openai-beta` 协议并将 16 kHz 上行重采样为 24 kHz PCM16。
+ */
+export function openaiRealtimeStt(
+  opts: Omit<QwenRealtimeAsrOptions, 'onSentence' | 'onPartial' | 'onError' | 'log'>,
+  log?: (line: string) => void,
+): SttProvider {
+  const dialect = opts.dialect ?? 'openai-ga';
+  const model = opts.model ?? realtimeAsrDefaults(dialect).model;
+  const turnDetection = opts.turnDetection ?? 'manual';
+  return {
+    name: `openai-realtime:${model}`,
+    supportsManualEndpoint: turnDetection !== 'vad',
+    open: (handlers) => {
+      const asr = new QwenRealtimeAsr({
+        ...opts,
+        dialect,
+        model,
+        turnDetection,
         onSentence: handlers.onSentence,
         onPartial: handlers.onPartial,
         onError: handlers.onError,

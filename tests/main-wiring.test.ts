@@ -223,8 +223,14 @@ test('assemblePipelinePlan：非法值、live 缺 key、STT 不对，都直接�
       { VOICE_PIPELINE: 'live', DASHSCOPE_API_KEY: 'sk-test' },
       { sttName: 'aliyun', strict: true },
     ),
-    /VOICE_PIPELINE=live 需要 --stt qwen-realtime（当前是 aliyun）/u,
+    /VOICE_PIPELINE=live 需要支持手动封段的 STT.*当前是 aliyun/u,
   );
+  const openAiLive = assemblePipelinePlan(
+    { VOICE_PIPELINE: 'live', LIVE_DIALECT: 'openai-ga', OPENAI_API_KEY: 'sk-openai' },
+    { sttName: 'openai-realtime', strict: true },
+  );
+  assert.equal(openAiLive.mode, 'live');
+  assert.equal(openAiLive.useOmniPlayback, true);
   // 不读 process.env：调用方没给的 key 不能从外部环境漏进来
   const isolated = assemblePipelinePlan(
     { VOICE_PIPELINE: 'cascade', FAST_LANE_API_KEY: 'sk-fast' },

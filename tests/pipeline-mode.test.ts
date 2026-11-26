@@ -93,14 +93,41 @@ test('显式 live 缺 key 时先报 key，不把 STT 错误盖过去', () => {
   );
 });
 
-test('显式 live 的 STT 必须是 qwen-realtime', () => {
+test('显式 live 的 STT 必须支持手动封段（内置 qwen-realtime / openai-realtime 或插件能力位）', () => {
   assert.throws(
     () => resolveVoicePipeline({
       explicit: 'live',
       omniKey: 'dash-test-key',
       sttName: 'aliyun',
     }),
-    /VOICE_PIPELINE=live 需要 --stt qwen-realtime（当前是 aliyun）/,
+    /VOICE_PIPELINE=live 需要支持手动封段的 STT.*当前是 aliyun/,
+  );
+
+  const openAiPlan = resolveVoicePipeline({
+    explicit: 'live',
+    omniKey: 'openai-test-key',
+    sttName: 'openai-realtime',
+  });
+  assert.equal(openAiPlan.mode, 'live');
+  assert.equal(openAiPlan.useOmniPlayback, true);
+
+  const pluginPlan = resolveVoicePipeline({
+    explicit: 'live',
+    omniKey: 'custom-key',
+    sttName: './my-manual-asr.mjs',
+    sttSupportsManualEndpoint: true,
+  });
+  assert.equal(pluginPlan.mode, 'live');
+  assert.equal(pluginPlan.useOmniPlayback, true);
+
+  assert.throws(
+    () => resolveVoicePipeline({
+      explicit: 'live',
+      omniKey: 'dash-test-key',
+      sttName: 'qwen-realtime',
+      sttSupportsManualEndpoint: false,
+    }),
+    /当前是 qwen-realtime/,
   );
 });
 
@@ -571,4 +598,36 @@ test('从环境推断 live 时缺 key 同样失败', () => {
     }),
     /OMNI_API_KEY 或 DASHSCOPE_API_KEY/,
   );
+});
+
+test('resolveVoicePipelineFromEnv：支持 LIVE_API_KEY 与 OpenAI 方言下的 OPENAI_API_KEY', () => {
+  const neutral = resolveVoicePipelineFromEnv(
+    { VOICE_PIPELINE: 'live', LIVE_API_KEY: '  live-key  ' },
+    { sttName: 'openai-realtime' },
+  );
+  assert.equal(neutral.mode, 'live');
+  assert.equal(neutral.useOmniPlayback, true);
+
+  const openAi = resolveVoicePipelineFromEnv(
+    { VOICE_PIPELINE: 'live', LIVE_DIALECT: 'openai-ga', OPENAI_API_KEY: 'sk-openai-test' },
+    { sttName: 'openai-realtime' },
+  );
+  assert.equal(openAi.mode, 'live');
+  assert.equal(openAi.useOmniPlayback, true);
+
+  // 未切 OpenAI 方言时，OPENAI_API_KEY 不会误当成 DashScope key
+  assert.throws(
+    () => resolveVoicePipelineFromEnv(
+      { VOICE_PIPELINE: 'live', OPENAI_API_KEY: 'sk-openai-test' },
+      { sttName: 'qwen-realtime' },
+    ),
+    /OMNI_API_KEY 或 DASHSCOPE_API_KEY/,
+  );
+
+  // 显式支持手动封段的自定义插件也可挂只读探针
+  const probe = resolveVoicePipelineFromEnv(
+    { OMNI_SHADOW: '1', OMNI_ANSWER: 'off', LIVE_API_KEY: 'k' },
+    { sttName: './custom-asr.mjs', sttSupportsManualEndpoint: true },
+  );
+  assert.equal(probe.useOmniProbeOnly, true);
 });

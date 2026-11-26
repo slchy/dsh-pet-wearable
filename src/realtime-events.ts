@@ -1,11 +1,11 @@
 /**
- * DashScope realtime 协议的**唯一事件类型**（纯类型，零运行代码）。
+ * Realtime WebSocket 协议的**唯一服务端事件类型**（纯类型，零运行代码）。
  *
- * 以前 `omni/types.ts`、`omni-tts.ts`、`qwen-realtime-asr.ts` 各写一份
- * 「所有字段都可选」的 `ServerEvent`：消费端 `switch (ev.type)` 之后拿到的还是
- * 同一个宽对象，字段写错不会报错，只会在线上静默变成 `undefined`。
+ * 兼容 DashScope Realtime、OpenAI Realtime Beta 与 OpenAI Realtime GA
+ * （例如 GA 将 `response.audio.delta` 改名为 `response.output_audio.delta`、
+ * `response.audio_transcript.delta` 改名为 `response.output_audio_transcript.delta`）。
  *
- * 这里收敛成**判别联合**：`type` 是字面量，每个变体只带该事件真正拥有的字段。
+ * 判别字段一律 `readonly type: '...'`，所以 `case` 分支里能真正窄化到具体字段。
  * 服务端将来新增的事件不在联合里，运行时仍然走各消费端的 `default:` 忽略掉；
  * 类型层若要在测试里伪造未知事件，显式写成 `as unknown as ServerEvent`，
  * 不许把 `type` 放宽成 `string` 把整张网拆掉。
@@ -58,21 +58,32 @@ export interface RealtimeResponseSnapshot {
 }
 
 /**
- * DashScope `/api-ws/v1/realtime` 的服务端事件。
+ * Realtime WebSocket（DashScope / OpenAI Beta / OpenAI GA）的服务端事件。
  *
  * 判别字段一律 `readonly type: '...'`，所以 `case` 分支里能真正窄化到具体字段。
  */
-export type DashScopeRealtimeEvent =
+export type RealtimeServerEvent =
   | { readonly type: 'session.updated' }
+  | { readonly type: 'transcription_session.updated' }
   | {
     readonly type: 'conversation.item.created';
     readonly item?: RealtimeItemRef;
   }
   | {
-    /** ASR 增量：实测增量在 `stash`，`text` 恒为空串 */
+    /** OpenAI Realtime GA 将 conversation.item.created 改名为 conversation.item.added */
+    readonly type: 'conversation.item.added';
+    readonly item?: RealtimeItemRef;
+  }
+  | {
+    /** DashScope ASR 增量：实测增量在 `stash`，`text` 恒为空串 */
     readonly type: 'conversation.item.input_audio_transcription.text';
     readonly text?: string;
     readonly stash?: string;
+  }
+  | {
+    /** OpenAI Realtime Transcription 流式增量 */
+    readonly type: 'conversation.item.input_audio_transcription.delta';
+    readonly delta?: string;
   }
   | {
     readonly type: 'conversation.item.input_audio_transcription.completed';
@@ -93,7 +104,17 @@ export type DashScopeRealtimeEvent =
     readonly delta?: string;
   }
   | {
+    /** OpenAI Realtime GA 文本增量 */
+    readonly type: 'response.output_text.delta';
+    readonly delta?: string;
+  }
+  | {
     readonly type: 'response.audio_transcript.delta';
+    readonly delta?: string;
+  }
+  | {
+    /** OpenAI Realtime GA 音频字幕增量 */
+    readonly type: 'response.output_audio_transcript.delta';
     readonly delta?: string;
   }
   | {
@@ -112,6 +133,11 @@ export type DashScopeRealtimeEvent =
     readonly delta?: string;
   }
   | {
+    /** OpenAI Realtime GA 音频增量 */
+    readonly type: 'response.output_audio.delta';
+    readonly delta?: string;
+  }
+  | {
     readonly type: 'response.done';
     readonly response?: RealtimeResponseSnapshot;
   }
@@ -120,14 +146,17 @@ export type DashScopeRealtimeEvent =
     readonly error?: RealtimeErrorDetail;
   };
 
+/** 向后兼容旧导入名 */
+export type DashScopeRealtimeEvent = RealtimeServerEvent;
+
 /** 只保留 `response.done` 的窄类型（`assistantItemIds` / `finish` 用） */
 export type RealtimeResponseDoneEvent = Extract<
-  DashScopeRealtimeEvent,
+  RealtimeServerEvent,
   { readonly type: 'response.done' }
 >;
 
 /** 只保留 `error` 的窄类型（`onError` 用） */
 export type RealtimeErrorEvent = Extract<
-  DashScopeRealtimeEvent,
+  RealtimeServerEvent,
   { readonly type: 'error' }
 >;

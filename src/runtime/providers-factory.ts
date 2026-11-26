@@ -14,6 +14,7 @@ import { EMOTIONS } from '../emotion.ts';
 import { EVENTS } from '../events.ts';
 import { BASE_STYLE, DEFAULT_TTS_VOICE, mimoTts } from '../mimo.ts';
 import { omniTts } from '../omni-tts.ts';
+import { openAiTts } from '../openai-tts.ts';
 import {
   cannedStt,
   echoAgent,
@@ -23,9 +24,11 @@ import {
   type SttProvider,
   type TtsProvider,
 } from '../providers.ts';
-import { qwenRealtimeStt } from '../qwen-realtime-asr.ts';
+import { openaiRealtimeStt, qwenRealtimeStt } from '../qwen-realtime-asr.ts';
+import { resolveRealtimeDialect } from '../realtime-dialect.ts';
 import { DshSession } from '../session.ts';
 import { sampleSocket } from '../socket-stats.ts';
+import { resolveLiveApiKey } from '../voice-config.ts';
 import type { AuditSink } from './audit-slot.ts';
 
 /**
@@ -69,7 +72,7 @@ function requireName(value: Record<string, unknown>, spec: string, kind: string)
   return name;
 }
 
-/** STT 插件的最小形状：`name` + `open(handlers)`。 */
+/** STT 插件的最小形状：`name` + `open(handlers)`；可选 `supportsManualEndpoint` 须为布尔值。 */
 export function validateSttProvider(value: unknown, spec: string): SttProvider {
   if (!isRecord(value)) {
     throw shapeError(spec, 'STT', `工厂必须返回对象（得到 ${value === null ? 'null' : typeof value}）`);
@@ -77,6 +80,10 @@ export function validateSttProvider(value: unknown, spec: string): SttProvider {
   requireName(value, spec, 'STT');
   if (typeof value['open'] !== 'function') {
     throw shapeError(spec, 'STT', '缺少 open() 函数');
+  }
+  const manual = value['supportsManualEndpoint'];
+  if (manual !== undefined && typeof manual !== 'boolean') {
+    throw shapeError(spec, 'STT', `supportsManualEndpoint 必须是布尔值（得到 ${typeof manual}）`);
   }
   return value as unknown as SttProvider;
 }
@@ -121,7 +128,7 @@ export function validateAgentProvider(value: unknown, spec: string): AgentProvid
   return value as unknown as AgentProvider;
 }
 
-/** `--stt aliyun|qwen-realtime|noop|canned|<path>` */
+/** `--stt aliyun|qwen-realtime|openai-realtime|noop|canned|<path>` */
 export async function buildStt(
   spec: string,
   creds: {
@@ -140,9 +147,9 @@ export async function buildStt(
       throw new Error('STT=qwen-realtime 需要 DASHSCOPE_API_KEY（和 CosyVoice 用的是同一个 key）');
     }
     // 端点由谁判：默认我们控（`turn_detection: null`，静音窗见 `VOICE_COMMIT_MS`）；
-    // `QWEN_ASR_TURN_DETECTION=vad` 交给服务端（`speech_stopped → 定稿` 139–204 ms，
-    // 比手动 commit 的 261 ms 快，但拿走了封段权，`VOICE_COMMIT_MS` 等旋钮全部失效）
-    const turnDetection = process.env['QWEN_ASR_TURN_DETECTION'] === 'vad' ? 'vad' : 'manual';
+    // `ASR_TURN_DETECTION=vad` 或 `QWEN_ASR_TURN_DETECTION=vad` 交给服务端
+    const turnRaw = (process.env['ASR_TURN_DETECTION'] ?? process.env['QWEN_ASR_TURN_DETECTION'] ?? '').trim().toLowerCase();
+    const turnDetection = turnRaw === 'vad' ? 'vad' : 'manual';
     const { corpusText, language } = creds;
     return qwenRealtimeStt(
       {
@@ -156,11 +163,44 @@ export async function buildStt(
       (line) => { console.log(`  [asr] ${line}`); },
     );
   }
+  if (spec === 'openai-realtime') {
+    const apiKey = (process.env['OPENAI_ASR_API_KEY'] ?? process.env['OPENAI_API_KEY'] ?? '').trim();
+    if (!apiKey) {
+      throw new Error('STT=openai-realtime 需要 OPENAI_ASR_API_KEY 或 OPENAI_API_KEY');
+    }
+    const url = process.env['OPENAI_ASR_URL']?.trim();
+    const dialect = resolveRealtimeDialect(process.env['OPENAI_ASR_DIALECT'] ?? 'openai-ga', url);
+    const turnRaw = (process.env['ASR_TURN_DETECTION'] ?? process.env['OPENAI_ASR_TURN_DETECTION'] ?? '').trim().toLowerCase();
+    const turnDetection = turnRaw === 'vad' ? 'vad' : 'manual';
+    const { corpusText, language } = creds;
+    return openaiRealtimeStt(
+      {
+        apiKey,
+        dialect,
+        ...(url ? { url } : {}),
+        ...(process.env['OPENAI_ASR_MODEL'] ? { model: process.env['OPENAI_ASR_MODEL'] } : {}),
+        turnDetection,
+        ...(corpusText ? { corpusText } : {}),
+        ...(language ? { language } : {}),
+      },
+      (line) => { console.log(`  [asr] ${line}`); },
+    );
+  }
   return loadProvider<SttProvider>(spec, 'stt', validateSttProvider);
 }
 
+function optionalPositiveEnvNumber(raw: string | undefined, name: string): number | undefined {
+  const trimmed = raw?.trim() ?? '';
+  if (trimmed === '') return undefined;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name}=${trimmed} 必须是正有限数`);
+  }
+  return parsed;
+}
+
 /**
- * `--tts cosyvoice|omni|mimo|silent|<path>`
+ * `--tts cosyvoice|openai|omni|mimo|silent|<path>`
  *
  * `audit` 是 `tts.*` 事件的出口。不传就是空操作：这里不碰 CLI 的进程级槽。
  * `main()` 把自己的出口传进来；插件宿主传自己 `createAuditSlot()` 的那一份。
@@ -169,6 +209,23 @@ export async function buildStt(
 export async function buildTts(spec: string, audit?: AuditSink): Promise<TtsProvider> {
   const emit: AuditSink = audit ?? (() => {});
   if (spec === 'silent') return silentTts(24_000);
+  if (spec === 'openai' || spec === 'openai-tts') {
+    const apiKey = (process.env['OPENAI_TTS_API_KEY'] ?? process.env['OPENAI_API_KEY'] ?? '').trim();
+    if (!apiKey) {
+      throw new Error('TTS=openai 需要 OPENAI_TTS_API_KEY 或 OPENAI_API_KEY');
+    }
+    const sampleRate = optionalPositiveEnvNumber(process.env['OPENAI_TTS_SAMPLE_RATE'], 'OPENAI_TTS_SAMPLE_RATE');
+    const speed = optionalPositiveEnvNumber(process.env['OPENAI_TTS_SPEED'], 'OPENAI_TTS_SPEED');
+    return openAiTts({
+      apiKey,
+      baseUrl: process.env['OPENAI_TTS_BASE_URL'] ?? process.env['OPENAI_BASE_URL'],
+      model: process.env['OPENAI_TTS_MODEL'],
+      voice: process.env['OPENAI_TTS_VOICE'],
+      instructions: process.env['OPENAI_TTS_INSTRUCTIONS'],
+      ...(sampleRate === undefined ? {} : { sampleRate }),
+      ...(speed === undefined ? {} : { speed }),
+    });
+  }
   if (spec === 'cosyvoice') {
     if (!process.env['DASHSCOPE_API_KEY']) {
       throw new Error('DASHSCOPE_API_KEY 未设置（CosyVoice 用的是 DashScope API key，不是阿里云 AK/SK）');
@@ -200,15 +257,19 @@ export async function buildTts(spec: string, audit?: AuditSink): Promise<TtsProv
     });
   }
   if (spec === 'omni') {
-    if (!process.env['DASHSCOPE_API_KEY']) {
-      throw new Error('DASHSCOPE_API_KEY 未设置（omni 朗读机用的是 DashScope API key）');
+    const apiKey = resolveLiveApiKey(process.env);
+    if (!apiKey) {
+      throw new Error('TTS=omni 需要 LIVE_API_KEY / OMNI_API_KEY / DASHSCOPE_API_KEY（OpenAI 方言下可用 OPENAI_API_KEY）');
     }
-    // 用 omni 念 dsh 的答案 —— 全链路单一音色（S5）。
-    // 代价与门槛见 `omni-tts.ts` 文件头：语速 ~4.0–4.4 字/秒（CosyVoice 5.45–5.66）、
-    // 首块 629–781 ms（CosyVoice 350–390）。
+    const url = process.env['LIVE_URL'] ?? process.env['OMNI_URL'];
+    const dialect = resolveRealtimeDialect(process.env['LIVE_DIALECT'] ?? process.env['OMNI_DIALECT'], url);
+    // 用 omni / OpenAI Realtime 念 dsh 的答案 —— 全链路单一音色（S5）。
     return omniTts({
-      apiKey: process.env['DASHSCOPE_API_KEY'],
-      model: process.env['OMNI_SHADOW_MODEL'],
+      apiKey,
+      dialect,
+      ...(url ? { url } : {}),
+      model: process.env['LIVE_MODEL'] ?? process.env['OMNI_SHADOW_MODEL'],
+      voice: process.env['LIVE_VOICE'] ?? process.env['OMNI_VOICE'],
       log: (line) => { console.log(line); },
     });
   }

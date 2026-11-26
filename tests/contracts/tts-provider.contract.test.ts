@@ -14,6 +14,7 @@ import { test } from 'node:test';
 
 import { cosyVoiceTts, COSYVOICE_SAMPLE_RATE } from '../../src/cosyvoice.ts';
 import { omniTts, type RealtimeLike } from '../../src/omni-tts.ts';
+import { openAiTts } from '../../src/openai-tts.ts';
 import { silentTts, type TtsProvider } from '../../src/providers.ts';
 
 async function collect(source: AsyncIterable<Buffer>): Promise<Buffer[]> {
@@ -126,9 +127,17 @@ function normalOmni(): { tts: TtsProvider; sockets: FakeSocket[]; current: () =>
   });
 }
 
+function fakeOpenAiTts(): TtsProvider {
+  return openAiTts({
+    apiKey: 'sk-test',
+    fetchImpl: async () => new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }),
+  });
+}
+
 const CASES: ReadonlyArray<{ name: string; make: () => TtsProvider; canSynthesize: boolean }> = [
   { name: 'silentTts', make: () => silentTts(24_000), canSynthesize: true },
   { name: 'omniTts', make: () => normalOmni().tts, canSynthesize: true },
+  { name: 'openAiTts', make: fakeOpenAiTts, canSynthesize: true },
   { name: 'cosyVoiceTts', make: () => cosyVoiceTts({ apiKey: 'k' }), canSynthesize: false },
 ];
 

@@ -35,20 +35,26 @@
  */
 import WebSocket from 'ws';
 
-import type { AgentAudioAnswer, InjectKind } from '../providers.ts';
+import { resamplePcm16Mono } from '../pcm-resample.ts';
+import type { AgentAudioAnswer, InjectKind, RealtimeUplinkLane } from '../providers.ts';
 import { ControlPlane } from './control-plane.ts';
 import {
   assistantItemIds,
   base64Bytes,
+  buildRealtimeHeaders,
+  buildRealtimeResponseCreate,
+  buildRealtimeWsUrl,
   buildSessionUpdate,
   BYTES_PER_MILLISECOND,
   clipText,
   composeInstructions,
-  DEFAULT_MODEL,
-  DEFAULT_URL,
   DOWNSTREAM_RATE,
   MAX_INJECT_CHARS,
   parseDelegateRequest,
+  realtimeLiveDefaults,
+  resolveRealtimeDialect,
+  UPSTREAM_RATE,
+  type RealtimeDialect,
 } from './protocol.ts';
 import {
   blankPending,
@@ -78,8 +84,10 @@ import type {
 } from './types.ts';
 import { UplinkLedger } from './uplink-ledger.ts';
 
-export class OmniShadow {
+export class OmniShadow implements RealtimeUplinkLane {
   private readonly opts: OmniShadowOptions;
+  private readonly dialect: RealtimeDialect;
+  private readonly inputRate: number;
   private readonly log: (line: string) => void;
   private readonly now: () => number;
   private readonly uplink: UplinkLedger;
@@ -136,6 +144,8 @@ export class OmniShadow {
 
   constructor(options: OmniShadowOptions) {
     this.opts = options;
+    this.dialect = options.dialect ?? resolveRealtimeDialect(undefined, options.url);
+    this.inputRate = realtimeLiveDefaults(this.dialect).inputRate;
     this.log = options.log ?? (() => {});
     this.now = options.now ?? (() => performance.now());
     this.uplink = new UplinkLedger(options.ringMs, (line) => {
@@ -158,6 +168,9 @@ export class OmniShadow {
           memoryContext: this.opts.memoryContext,
           dynamicContext,
         }),
+        dialect: this.dialect,
+        voice: this.opts.voice,
+        asrModel: this.opts.asrModel,
         asrLanguage: this.opts.asrLanguage,
         asrCorpusText: this.opts.asrCorpusText,
         serve: (this.opts.serve ?? 'off') !== 'off',
@@ -190,16 +203,20 @@ export class OmniShadow {
       return;
     }
     this.state = 'connecting';
+    const defaults = realtimeLiveDefaults(this.dialect);
+    const headers = buildRealtimeHeaders(this.opts.apiKey, this.dialect, this.opts.extraHeaders);
     const factory: RealtimeSocketFactory = this.opts.socketFactory
-      ?? ((url, apiKey) => new WebSocket(url, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+      ?? ((url, apiKey, reqHeaders) => new WebSocket(url, {
+        headers: reqHeaders ?? { Authorization: `Bearer ${apiKey}` },
         maxPayload: 16 << 20,
       }) as unknown as RealtimeSocket);
 
-    const url = `${this.opts.url ?? DEFAULT_URL}?model=${encodeURIComponent(this.opts.model ?? DEFAULT_MODEL)}`;
+    const url = buildRealtimeWsUrl(this.opts.url ?? defaults.url, {
+      model: this.opts.model ?? defaults.model,
+    });
     let ws: RealtimeSocket;
     try {
-      ws = factory(url, this.opts.apiKey);
+      ws = factory(url, this.opts.apiKey, headers);
     } catch (error) {
       this.break(`建连失败：${(error as Error).message}`);
       return;
@@ -280,7 +297,7 @@ export class OmniShadow {
    * `voiced` 必须由能量门给（`EnergyGateDecision.voiced`），不能自己按能量重算 ——
    * 两处门限一漂移，这里就会开始丢字或灌静音，而且从数据上分不出来。
    */
-  feed(pcm: Buffer, voiced: boolean): void {
+  feed(pcm: Buffer, voiced = true): void {
     if (this.state === 'broken' || this.state === 'idle') {
       return;
     }
@@ -645,10 +662,7 @@ export class OmniShadow {
         content: [{ type: 'input_text', text: promptText }],
       },
     });
-    this.send({
-      type: 'response.create',
-      response: { modalities: ['audio', 'text'] },
-    });
+    this.send(buildRealtimeResponseCreate(this.dialect, true));
     this.armResponseTimeout();
     const target = resp;
     return {
@@ -701,10 +715,7 @@ export class OmniShadow {
         content: [{ type: 'input_text', text: userText }],
       },
     });
-    this.send({
-      type: 'response.create',
-      response: { modalities: ['audio', 'text'] },
-    });
+    this.send(buildRealtimeResponseCreate(this.dialect, true));
     this.armResponseTimeout();
     const target = resp;
     const answer: AgentAudioAnswer & { interrupt(): void } = {
@@ -942,10 +953,7 @@ export class OmniShadow {
         content: [{ type: 'input_text', text: next.promptText }],
       },
     });
-    this.send({
-      type: 'response.create',
-      response: { modalities: ['audio', 'text'] },
-    });
+    this.send(buildRealtimeResponseCreate(this.dialect, true));
     this.armResponseTimeout();
   }
 
@@ -1022,7 +1030,7 @@ export class OmniShadow {
     this.control.flushReady();
     const sentAt = this.now();
     this.send({ type: 'input_audio_buffer.commit' });
-    this.send({ type: 'response.create' });
+    this.send(buildRealtimeResponseCreate(this.dialect, false));
     this.resp = blankPending(meta, 'user', sentAt);
     // 接上「谁顶掉了谁」：读端要靠它跟到真正那份答案（见 claim() 的 chunks）
     if (this.supersededPrev !== null) {
@@ -1109,8 +1117,16 @@ export class OmniShadow {
       this.uplink.hold(pcm);
       return;
     }
-    this.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+    this.sendAudioAppend(pcm);
     this.uplink.noteServerAppend(pcm.length);
+  }
+
+  /** 上行固定 16 kHz；OpenAI 方言要求 24 kHz，在发送边界重采样，不影响本地字节/时长账本。 */
+  private sendAudioAppend(pcm: Buffer): void {
+    const wire = this.inputRate === UPSTREAM_RATE
+      ? pcm
+      : resamplePcm16Mono(pcm, UPSTREAM_RATE, this.inputRate);
+    this.send({ type: 'input_audio_buffer.append', audio: wire.toString('base64') });
   }
 
   /**
@@ -1123,7 +1139,7 @@ export class OmniShadow {
       return;
     }
     for (const pcm of frames) {
-      this.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+      this.sendAudioAppend(pcm);
     }
     this.log(`[omni] 补推生成期暂存的 ${frames.length} 帧`);
   }
@@ -1139,7 +1155,7 @@ export class OmniShadow {
     }
     const frames = this.uplink.releaseHeldToServer();
     for (const pcm of frames) {
-      this.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+      this.sendAudioAppend(pcm);
     }
     this.log(`[omni] 补推生成期暂存的 ${frames.length} 帧`);
   }
@@ -1172,6 +1188,7 @@ export class OmniShadow {
         }
         return;
       case 'conversation.item.created':
+      case 'conversation.item.added':
         // 这一段对应的 user 项 —— 幽灵清理时连它一起删，否则会留下「用户在说话、
         // 助手没答」的半条记录
         if (this.resp !== null && ev.item?.role === 'user' && typeof ev.item.id === 'string') {
@@ -1229,7 +1246,9 @@ export class OmniShadow {
         }
         return;
       case 'response.text.delta':
+      case 'response.output_text.delta':
       case 'response.audio_transcript.delta':
+      case 'response.output_audio_transcript.delta':
         if (this.resp !== null) {
           if (this.resp.firstTextAt === null) {
             this.resp.firstTextAt = this.now();
@@ -1255,6 +1274,7 @@ export class OmniShadow {
         }
         return;
       case 'response.audio.delta':
+      case 'response.output_audio.delta':
         if (this.resp !== null) {
           if (this.resp.firstAudioAt === null) {
             this.resp.firstAudioAt = this.now();

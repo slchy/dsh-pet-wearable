@@ -26,7 +26,7 @@ import {
 import type { DialogState } from '../dialog-fsm.ts';
 import { EVENTS } from '../events.ts';
 import { UpstreamFrameType } from '../frame.ts';
-import { OmniShadow } from '../omni-shadow.ts';
+import { OmniShadow, type OmniShadowOptions } from '../omni-shadow.ts';
 import { DEFAULT_PET_PARAMS } from '../pet/brain/registry.ts';
 import { summarizePetEvent } from '../pet/brain/session.ts';
 import type { PetReply } from '../pet/brain/types.ts';
@@ -37,6 +37,7 @@ import {
 } from '../photo-inbox.ts';
 import type {
   BackgroundTaskReport,
+  RealtimeUplinkLane,
   SttSession,
 } from '../providers.ts';
 import type { ImageAttachment } from '../session.ts';
@@ -149,12 +150,12 @@ export class VoiceConnection {
   private readonly assembler: UtteranceAssembler;
   private readonly stt: SttSession;
   /**
-   * omni 影子旁路（`OMNI_SHADOW=1` 才有，默认 null = 零成本）。
+   * Realtime 音频直出车道（`OMNI_SHADOW=1` / `VOICE_PIPELINE=live` / `realtimeLane` 才有，默认 null = 零成本）。
    *
-   * 跟着**这条连接**活：服务空跑时 DashScope realtime 会空闲断链，进程启动就建连
-   * 等于白建一条注定 `broken` 的连接。
+   * 跟着**这条连接**活：服务空跑时远端 realtime 会空闲断链，进程启动就建连
+   * 等于白建一条注定 `broken` 的连接。通过 `RealtimeUplinkLane` 端口与具体协议解耦。
    */
-  private readonly omni: OmniShadow | null;
+  private readonly omni: RealtimeUplinkLane | null;
   private readonly mic: MicController;
   private readonly device: DeviceReading;
   private readonly asr: AsrFront;
@@ -370,19 +371,38 @@ export class VoiceConnection {
     // 快车道的输入/输出、TTS 的两段耗时都接进**这一条**连接的档案（见 `setAudit`）
     options.setAudit?.(this.auditSink);
 
-    // 4. 影子跟着这条连接活。空白记忆不进提示词。
-    this.omni = options.omniShadow === undefined ? null : new OmniShadow({
-      apiKey: options.omniShadow.apiKey,
-      ...(options.omniShadow.model === undefined ? {} : { model: options.omniShadow.model }),
-      ...(options.omniShadow.socketFactory === undefined
-        ? {}
-        : { socketFactory: options.omniShadow.socketFactory }),
-      serve: options.omniShadow.serve ?? 'off',
-      ...omniStaticContext(options.omniShadow),
-      // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
-      emit: (data) => { this.archive?.event(EVENTS.omniShadow, data); },
-      log: (line) => { console.log(line); },
-    });
+    // 4. Realtime 车道跟着这条连接活。支持厂商中立 `realtimeLane` 端口，或沿用 `omniShadow` 配置。
+    const laneEmit = (data: Record<string, unknown>): void => {
+      this.archive?.event(EVENTS.omniShadow, data);
+    };
+    const laneLog = (line: string): void => {
+      console.log(line);
+    };
+    if (options.realtimeLane !== undefined) {
+      this.omni = options.realtimeLane.create({ emit: laneEmit, log: laneLog });
+    } else if (options.omniShadow !== undefined) {
+      const shadow = options.omniShadow;
+      const shadowOpts: OmniShadowOptions = {
+        apiKey: shadow.apiKey,
+        ...(shadow.model === undefined ? {} : { model: shadow.model }),
+        ...(shadow.url === undefined ? {} : { url: shadow.url }),
+        ...(shadow.dialect === undefined ? {} : { dialect: shadow.dialect }),
+        ...(shadow.voice === undefined ? {} : { voice: shadow.voice }),
+        ...(shadow.asrModel === undefined ? {} : { asrModel: shadow.asrModel }),
+        ...(shadow.extraHeaders === undefined ? {} : { extraHeaders: shadow.extraHeaders }),
+        ...(shadow.socketFactory === undefined ? {} : { socketFactory: shadow.socketFactory }),
+        serve: shadow.serve ?? 'off',
+        ...omniStaticContext(shadow),
+        // 每一份 seal 一条，`seq` 与 `asr.commit` 同源
+        emit: laneEmit,
+        log: laneLog,
+      };
+      this.omni = shadow.createLane !== undefined
+        ? shadow.createLane(shadowOpts)
+        : new OmniShadow(shadowOpts);
+    } else {
+      this.omni = null;
+    }
 
     this.asr = new AsrFront({
       now: this.assemblerNow,
@@ -575,11 +595,12 @@ export class VoiceConnection {
     // 影子握手（实测 ~1.3 s）与设备握手并行，不占关键路径。
     // 挂到 agent 上才会发声：显式 `live`，或没写管道模式且 `serve !== 'off'`
     // （旧的认领推断）。`cascade` 里影子只测量，`start()` 照跑，但不挂车道。
+    const laneServe = this.options.realtimeLane?.serve ?? this.options.omniShadow?.serve;
     const omniServesPlayback = this.options.pipelineMode === 'live'
       || (
         this.options.pipelineMode === undefined
-        && this.options.omniShadow !== undefined
-        && this.options.omniShadow.serve !== 'off'
+        && this.omni !== null
+        && laneServe !== 'off'
       );
     this.omni?.start();
     // 车道照连接挂：这一条连接答完/断开时必须摘掉，否则下一条连接会认领到

@@ -84,6 +84,19 @@ test('validateSttProvider：合法对象原样返回，非对象 / 缺 name / �
   }
   assertShapeError(() => validateSttProvider({ name: '', open: () => {} }, 'spec-stt'), ['spec-stt', 'name']);
   assertShapeError(() => validateSttProvider({ name: 'x' }, 'spec-stt'), ['spec-stt', 'open']);
+  assert.doesNotThrow(() => validateSttProvider({
+    name: 'x',
+    supportsManualEndpoint: true,
+    open: () => ({ feed: () => {}, hangup: () => {}, close: () => {} }),
+  }, 'spec-stt'));
+  assertShapeError(
+    () => validateSttProvider({
+      name: 'x',
+      supportsManualEndpoint: 'yes',
+      open: () => ({ feed: () => {}, hangup: () => {}, close: () => {} }),
+    }, 'spec-stt'),
+    ['spec-stt', 'supportsManualEndpoint', '布尔'],
+  );
 });
 
 test('validateTtsProvider：sampleRate 必须正有限，可选方法存在时必须是函数', () => {
