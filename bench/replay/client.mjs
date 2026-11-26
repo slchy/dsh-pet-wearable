@@ -51,8 +51,7 @@ const port = Number(opt(argv, '--port', '63993'));
 const token = opt(argv, '--token', '');
 /**
  * 要说的那几段 PCM，逗号分隔。**一条连接连说多段**是刻意的：
- * 判停侧车（python + ONNX）跟着连接一起建，只有一条连接里的第 2 轮起才是"热"的。
- * 想量真实稳态延迟就必须这么跑，否则每次都量到冷启动。
+ * 判停模型在进程启动时预热一次、所有连接共用；多段仍建议一条连接连说，少一次重连开销。
  */
 const pcmPaths = opt(argv, '--pcm', '').split(',').filter((p) => p !== '');
 /** 向量回放：一个会话档案目录（含 `uplink.pcm` + `events.jsonl`） */

@@ -31,7 +31,7 @@ pipecat 线上（`BaseSmartTurn.analyze_end_of_turn`）取的窗口也是**按�
 |---|---|
 | `roll` | 连续上行的最近 8 s（= 现状） |
 | `scoped-front` | `[语音起点 − 500 ms, 语音末 + N]`，不足 8 s **前面**补零（= 上游） |
-| `scoped-back` | 同上但**后面**补零（= `server.py` 现在的补法） |
+| `scoped-back` | 同上但**后面**补零（历史对照：旧实现这样喂过） |
 
 - **正样本**：窗口结束在「最后一个有声样本 + N ms」
 - **负样本**：窗口结束在这一句的 30% / 50% / 70% 处（话还没说完）
@@ -51,7 +51,7 @@ import sys
 import numpy as np
 import onnxruntime as ort
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "turn_judge"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eot"))
 from whisper_features import compute_whisper_log_mel_features  # noqa: E402
 
 RATE = 16_000

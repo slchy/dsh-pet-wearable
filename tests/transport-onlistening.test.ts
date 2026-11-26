@@ -4,7 +4,7 @@
  * 这两条断言对应两个真实的失效方式，都是**静默**的：
  * - `port: 0` 时没人知道绑到哪个口 → 外面的桥接不上，表现是「页面打不开」；
  * - 没有 `stop()` 时没有任何事件会结束 `runTransport` → 宿主卸载插件后监听还开着，
- *   进程里留一条 TCP 监听（以及它背后的控制口、侧车）。表现是「插件卸了还在占端口」。
+ *   进程里留一条 TCP 监听（以及它背后的控制口、判停模型）。表现是「插件卸了还在占端口」。
  */
 import assert from 'node:assert/strict';
 import { connect, createServer } from 'node:net';

@@ -320,7 +320,9 @@ stateDiagram-v2
 ## 4 UtteranceAssembler —— 判停
 
 **持有**：`voice-session` 的 `assembler`（`src/utterance-assembler.ts`）。
-**驱动**：ASR 定稿（`addSentence`）、声学帧（`addFrame`）、预测器（`turn-judge`）、定时器。
+**驱动**：ASR 定稿（`addSentence`）、声学帧（`addFrame`）、预测器（`src/turn-judge.ts`，进程内 ONNX 声学判停）、定时器。
+预测器特征在 `src/whisper-features.ts`，模型由 `src/runtime/turn-judge-bootstrap.ts` 的
+`loadSharedTurnJudge()` 进程级加载并预热；`TURN_JUDGE_MODEL`（兼容 `SMART_TURN_MODEL`）指定路径。
 相位只有 `setPhase` 能写；`disposed` 写进去之后 `setPhase` 直接返回。
 
 | 状态 | 含义 |

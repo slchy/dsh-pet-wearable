@@ -48,10 +48,10 @@ export interface VoiceSessionOptions {
   readonly stt: SttProvider;
   /** TTS。采样率由 provider 自己声明，这里不再单独配。 */
   readonly tts: TtsProvider;
-  /** TurnJudge 判停器；缺任一项则不启用，退回固定合并窗口 */
+  /** TurnJudge 声学判停参数；不给则不启用，退回固定合并窗口 */
   readonly turnJudge?: {
-    readonly pythonPath: string;
-    readonly scriptPath: string;
+    /** 声学判停（Smart Turn v3.2）模型路径；缺省时连接层按环境变量再找一次 */
+    readonly modelPath?: string;
     readonly quietMs: number;
     readonly extendMs: number;
     readonly maxExtensions: number;
@@ -72,7 +72,7 @@ export interface VoiceSessionOptions {
   /**
    * 进程级共享的判停器客户端。
    *
-   * 给了就用它，并且**不随连接销毁** —— 侧车是 python + 8.7 MB ONNX，冷启动实测
+   * 给了就用它，并且**不随连接销毁** —— 声学判停模型是 8.7 MB ONNX，冷启动实测
    * ~300 ms，而真机每次重连（网络抖动 / 服务重启 / 重开 App）第一句都要付这一刀。
    * 常驻之后只有进程启动付一次。
    *
@@ -136,6 +136,11 @@ export interface VoiceSessionOptions {
       readonly transcript: string;
     }>,
   ) => Promise<'spoken' | 'defer' | 'fallback'>;
+  /**
+   * 出队前检查这条后台汇报是否已经不用再说（前台代播 / 已播报 / 已取消）。
+   * Pure Live 接 `LiveOrchestrator.shouldSkipBackgroundReport()`，避免双讲。
+   */
+  readonly shouldSkipAnnounce?: (item: AnnounceItem) => boolean;
   /** 插话/双击时同步掐断正在播的 Omni 后台汇报 */
   readonly cancelAnnounce?: () => void;
   /** 当某条后台汇报退回 TTS 播完后通知上层（用于静默回注 Omni 上下文） */
@@ -196,7 +201,7 @@ export interface VoiceSessionOptions {
     /** 判停概率高时的短门槛（见 {@link openQuietMs}） */
     readonly openQuietShortMs?: number;
     /**
-     * 开轮静音的统一上限（ms）。没有判停侧车时，手动端点仍把这一份交给组装器，
+     * 开轮静音的统一上限（ms）。没有声学判停器时，手动端点仍把这一份交给组装器，
      * 见 `UtteranceAssemblerOptions.maxOpenSilenceMs`。`0` 表示不设上限。
      */
     readonly maxOpenSilenceMs?: number;

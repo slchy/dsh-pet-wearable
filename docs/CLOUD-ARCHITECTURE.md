@@ -133,7 +133,7 @@ live 的空窗汇报不进 respond()：
 | `silence-triggers.ts` | 同一次静音喂四路**期限差一个数量级**的消费者：投机 100 ms / 判停预跑 200 ms / omni 车道封段 20 ms / ASR 封段 150 ms（后两路是客户端封段的默认；`QWEN_ASR_TURN_DETECTION=vad` 时为 0，见 `voice-config.ts`）。本段已确认有声不足 `minSpeechMs`（生产缺省 `DEFAULT_MIN_SPEECH_MS = 120`）时，四路提前触发都不开火 | 四者各有自己的 `firedAt`，不是一个布尔「静音了没有」；闸只比时刻（`lastVoicedAt`），不持状态 |
 | `utterance-assembler.ts` | 句子 → 一轮话语：按 TurnJudge 概率或固定窗口判停；判停请求**与静默窗重叠**提前发出 | ASR 的句号是**句子**边界，不是**轮次**边界；问号结尾不等于说完了。提前算的那份结果带两条有效性条件（还是同一句、算完之后没再收到中间结果），不成立就现算一遍 —— 拿过期结果定稿就是抢话 |
 | `barge-voicing.ts` | 声学插话闸：定稿后无新有声帧时拦住同一截缓冲的重复解码幻觉 | 同步校验时钟同源（`CLOCK_MISMATCH_MS`） |
-| `turn-judge.ts` | 常驻 Python 侧车的客户端：`[u32 len][int16 PCM]` 问、`[f64 概率]` 答 | 进程常驻、模型只加载一次；不可用时退回固定窗口 |
+| `turn-judge.ts` | 进程内声学判停：Whisper log-mel（纯 TS，`whisper-features.ts`）→ ONNX `smart-turn-v3.2-cpu.onnx`，返回「说完了」概率。三端经 `runtime/turn-judge-bootstrap.ts` 的 `loadSharedTurnJudge()` 加载 | `onnxruntime-node` 惰性动态加载；进程级一份、模型只加载一次；不可用时退回固定窗口。`TURN_JUDGE_MODEL`（兼容 `SMART_TURN_MODEL`）指定模型，不再需要 `TURN_JUDGE_PYTHON` / `TURN_JUDGE_SCRIPT` |
 | `vad.ts` · `runtime/vad-bootstrap.ts` | Silero v5 是上行热路径。`SileroVadModel` 进程内一份，每条连接 `createStream()` 得轻量 `SileroVadStream`。三端经 `loadSharedVad()` 加载：`VOICE_VAD=energy\|0\|off\|false`、找不到 `models/silero_vad.onnx`（或 `VOICE_VAD_MODEL`）、加载失败都返回 `null` 并退回能量门，不阻断启动。`onnxruntime-node` 只在真正加载时动态 `import`。旧类 `SileroVad` 仍给 `scripts/calibrate.ts` 与 `legacy-pipeline.ts` | v5 输入是 `[1,576]`（512 + 64 点上下文）、值域 `[-1,1]`、16 kHz 下每帧 32 ms。热路径的滞回阈值在 `energy-gate.ts`（`0.45/0.30`，播报期起音 `0.65`），不是标定脚本里扫过的 0.4。开门预卷分层在 `voice/connection.ts`：TurnJudge 用满 `DEFAULT_GATE_PREROLL_MS`（800 ms），ASR 与 Omni 只取尾部 `DEFAULT_ASR_PREROLL_MS`（320 ms） |
 | `wake-word.ts` · `backchannel.ts` · `hq-intent.ts` | 三条**领域规则**：唤醒词 / 纯应答噪声 / 要看细节的措辞 | 唤醒词词表（`ignorePhrases`）与「要不要自动拍细节」（`detail` 意图）都来自设备能力（见 §2.3）；v1 基线下前者空表、后者不启用，三条规则都只是"已知的机械事实"，交给模型判断反而更贵更不准 |
 
@@ -344,8 +344,9 @@ Node 事件循环（单线程）
  │    └─ ToolControl              本机 HTTP 控制口，设备重连只热切换 handlers
  ├─ 子进程
  │    ├─ ffmpeg            每连接一个：mSBC → PCM16 16 kHz
- │    ├─ turn-judge(.py)   进程级常驻：判停概率
  │    └─ dsh               会话级常驻：NDJSON over stdin/stdout
+ ├─ 进程内（服务级）
+ │    └─ turn-judge        Smart Turn v3.2 ONNX，进程级一份：判停概率
  └─ 本机 HTTP：控制口 127.0.0.1:<port>（MCP 工具进程回调）
 ```
 
@@ -664,8 +665,8 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
 
 | 层 | 手段 |
 |---|---|
-| 部署运行时（`npm test`） | `node --test tests/*.test.ts`（127 个文件，当前 1420 通过）。`tests/deploy-boundary.test.ts` 守边界：这些测试只能引用部署清单里的路径（`src`、`mcp`、`tools`、`tests`、`turn_judge`、`scripts`，以及 `package.json` / `tsconfig.json` / `README.md` / `docs/TIME-KNOBS.md`）。`bench/` 与 `packages/` 不在清单里 |
-| 全量（`npm run test:all`） | `npm test`（1420），再加 `npm run test:bench`（24：`bench/eval/*.test.ts`、`bench/replay/*.test.ts`）和 `npm run test:web`（77：`packages/dsh-voice-web/tests/*.test.ts`）。合计 1521 |
+| 部署运行时（`npm test`） | `node --test tests/*.test.ts`（128 个文件，当前 1444 通过）。`tests/deploy-boundary.test.ts` 守边界：这些测试只能引用部署清单里的路径（`src`、`mcp`、`tools`、`tests`、`scripts`，以及 `package.json` / `tsconfig.json` / `README.md` / `docs/TIME-KNOBS.md`）。`bench/` 与 `packages/` 不在清单里 |
+| 全量（`npm run test:all`） | `npm test`（1444），再加 `npm run test:bench`（24：`bench/eval/*.test.ts`、`bench/replay/*.test.ts`）和 `npm run test:web`（77：`packages/dsh-voice-web/tests/*.test.ts`）。合计 1545 |
 | 端到端（无真机） | `tools/fake-phone.ts`：假手机，可发 mSBC、收下行、按剧本触发高清照三条分支 |
 | 类型安全 | `tsc --noEmit` + **strip-only 语法检查**：Node 的类型擦除不支持参数属性这类写法，`tsc` 查不出，必须静态挑一遍 |
 | 启动自检 | 无参数跑 `node src/main.ts` 应当打印用法并以 2 退出 —— 用它当"整张依赖图能加载"的冒烟 |
@@ -685,8 +686,9 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
    改完不用重启），但只有"这台的 token 对不对"，没有角色、配额、审计。
 5. **上行不做重采样 / 转码**：`msbc` 交 `ffmpeg` 解码，`pcm16` 直接收；手机必须按
    `Hello.capabilities.audioIn` 自报的能力原样转发设备的字节。
-6. **判停依赖侧车**：想用 TurnJudge 就得有 Python 与模型文件；不想装就用固定窗口，
-   代价是判停更钝。
+6. **判停依赖模型文件**：想用 TurnJudge 就要有 `models/smart-turn-v3.2-cpu.onnx`
+   （`TURN_JUDGE_MODEL` / 旧名 `SMART_TURN_MODEL` 可指定路径），**不需要 Python**；
+   不想装就用固定窗口，代价是判停更钝。
 7. **不支持多路并发下行**：一条连接一条音频流；单活接管意味着两台手机同时连时，
    只有后连的那台在服务。
 8. **没有端到端加密之外的私有协议**：就是 TLS/TCP + 明文帧，安全边界完全靠 TLS 与 token。

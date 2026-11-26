@@ -400,6 +400,20 @@ export class LiveOrchestrator implements AgentProvider {
   }
 
   /**
+   * 后台播报队列出队前检查：若任务已经由前台代播、已播报或已取消，直接跳过不再二次发声。
+   *
+   * 现场 20261126-073558：Omni 已经读完单槽里的完整结论，回到 `listening` 后
+   * `announceQueue` 又把同一条完整重播一遍（双讲）。`delivered` 是唯一判据 ——
+   * 前台代播已经在 `turn.recorded` 里写成 `spoken`，播报结算也会写，
+   * 取消/断线写 `dropped` / `interrupted`，它们都不该再开口。
+   */
+  shouldSkipBackgroundReport(item: { readonly taskId?: string }): boolean {
+    if (item.taskId === undefined) return false;
+    const task = this.state.tasks[item.taskId];
+    return task !== undefined && task.delivered !== 'pending';
+  }
+
+  /**
    * 空窗里让 omni 把后台结论说出来。
    *
    * Pure Live 路径禁止切去外部 TTS：哪怕 `verbatim: true`（含精确数字、端口、
@@ -418,6 +432,15 @@ export class LiveOrchestrator implements AgentProvider {
     }>,
   ): Promise<'spoken' | 'defer' | 'fallback'> {
     if (this.disposed) return 'defer';
+    // 纵深防御：`DialogRuntime` 出队前也会查一次，但别的调用方（bench、宠物环）
+    // 可能直接把同一条汇报递进来。命中就 0 字节、不入队、不走 TTS。
+    const taskId = item.taskId;
+    if (taskId !== undefined && this.shouldSkipBackgroundReport(item)) {
+      this.writeLog(
+        `  播报    跳过 ${taskId}（状态已为 ${this.state.tasks[taskId]?.delivered}，不再重复播报）`,
+      );
+      return 'spoken';
+    }
     const lane = this.audioLane;
     if (
       lane === null

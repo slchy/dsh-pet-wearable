@@ -43,6 +43,7 @@ import type { ImageAttachment } from '../session.ts';
 import type { SessionCore } from '../session-core.ts';
 import type { ToolControlHandlers } from '../tool-control.ts';
 import type { Connection } from '../transport.ts';
+import { resolveTurnJudgeModelPath } from '../runtime/turn-judge-bootstrap.ts';
 import { TurnJudge } from '../turn-judge.ts';
 import type { TurnRunner } from '../turn-runner.ts';
 import { safeEmitUi, type PetUiPhase } from '../ui-events.ts';
@@ -321,6 +322,9 @@ export class VoiceConnection {
             cancelAnnounce: options.cancelAnnounce,
             onFallbackAnnounceSpoken: options.onFallbackAnnounceSpoken,
           }),
+      ...(options.shouldSkipAnnounce === undefined
+        ? {}
+        : { shouldSkipAnnounce: options.shouldSkipAnnounce }),
       ...(options.pipelineMode === 'live' ? { allowTtsFallback: false } : {}),
     });
     // 2. 浮层钩子不进 DialogRuntime。runner 建好后再挂；缺省时 emit 都是空操作。
@@ -394,8 +398,7 @@ export class VoiceConnection {
     const detector = resolveEndpointDetector(
       options,
       () => new TurnJudge({
-        python: turnJudgeOptions!.pythonPath,
-        script: turnJudgeOptions!.scriptPath,
+        modelPath: turnJudgeOptions!.modelPath ?? resolveTurnJudgeModelPath(process.env) ?? '',
         log: (line) => { console.log(`  ${line}`); },
       }),
       (line) => { console.log(line); },
@@ -788,7 +791,7 @@ export class VoiceConnection {
     // 这里的 `dispose()` 已经是个 no-op（`app.dispose()` 里调过一次），回执钩子那一步
     // 同样走 `isActiveOwner()` 守卫。
     this.dialog.dispose();
-    // 只有自己建的那份才销毁：共享侧车由进程持有，断开就 stop 等于每次重连都
+    // 只有自己建的那份才销毁：共享判停器由进程持有，断开就 stop 等于每次重连都
     // 重新加载 ONNX（实测 ~300 ms，第一句白吃）
     if (this.ownsTurnJudge) {
       this.turnJudge?.stop();

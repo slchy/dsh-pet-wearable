@@ -260,6 +260,7 @@ export interface AssembledStreamingPipeline {
   readonly omniShadow?: VoiceSessionOptions['omniShadow'];
   readonly speakAnnounce?: VoiceSessionOptions['speakAnnounce'];
   readonly cancelAnnounce?: VoiceSessionOptions['cancelAnnounce'];
+  readonly shouldSkipAnnounce?: VoiceSessionOptions['shouldSkipAnnounce'];
   readonly onFallbackAnnounceSpoken?: VoiceSessionOptions['onFallbackAnnounceSpoken'];
   readonly dispose: () => void;
 }
@@ -303,6 +304,7 @@ export function assembleStreamingAgent(input: AssembleStreamingAgentDeps): Assem
       ...(omniShadow === undefined ? {} : { omniShadow }),
       speakAnnounce: (item, playAudio) => orch.speakBackgroundReport(item, playAudio),
       cancelAnnounce: () => { orch.cancelBackgroundSpeech(); },
+      shouldSkipAnnounce: (item) => orch.shouldSkipBackgroundReport(item),
       onFallbackAnnounceSpoken: (item, interrupted) => {
         orch.noteFallbackAnnounceSpoken(item, interrupted);
       },

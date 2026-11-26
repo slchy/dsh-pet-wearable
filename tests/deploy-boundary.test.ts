@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-const ALLOWED_DIRS = new Set(['src', 'mcp', 'tools', 'tests', 'turn_judge', 'scripts']);
+const ALLOWED_DIRS = new Set(['src', 'mcp', 'tools', 'tests', 'scripts']);
 const ALLOWED_FILES = new Set([
   'package.json',
   'tsconfig.json',

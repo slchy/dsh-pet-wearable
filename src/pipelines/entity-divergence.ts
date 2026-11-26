@@ -21,7 +21,21 @@ const NA_DEMONSTRATIVE = /^那(?:些|本|个|部|种|边|里|次|回|句|位|名
 
 const ASK_INTRO = /^(?:介绍一下|讲一下|解释一下|科普一下)(.{2,14}?)[？?。！!]*$/u;
 
-const ASK_WHAT = /^(.{2,14}?)(?:是什么|是啥|讲(?:的|了)?什么|是谁|什么意思|讲啥)[？?。！!]*$/u;
+/** 口语外框：「你知道齐主是谁吗？」剥掉之后才对得上「X 是谁」。 */
+const KNOW_PREFIXES = ['你听说过', '你听过', '你知道', '你了解'] as const;
+
+const ASK_WHAT = /^(.{2,14}?)(?:是什么|是啥|讲(?:的|了)?什么|是谁|什么意思|讲啥)(?:吗|呢|呀|啊)?[？?。！!]*$/u;
+
+/**
+ * 「你知道 X 吗 / 你听说过 X 吗」这种窄句型。
+ *
+ * 只取外框里的整段主体，**不碰带疑问词或子句谓语的非专名从句**：
+ * 「你知道怎么去机场吗」「你知道水多少度沸腾吗」「你知道你叫什么名字吗」
+ * 都不是在问某个专名，抓出来派后台只会制造误报。
+ */
+const ASK_KNOW = /^(?:你)?(?:知道|听说过|听过|了解)(.{2,14}?)(?:吗|不|没|么)[？?。！!]*$/u;
+
+const NON_NAME_CLAUSE = /怎么|为什么|多少|几|在哪|什么时候|会不会|能不能|是不是|有没有|叫什么/u;
 
 const PRONOUN_START = /^(?:大家|刚才|刚刚|今天|明天|昨天|现在|外面|上面|下面|我|你|他|她|它|这|那|咱)/u;
 
@@ -144,6 +158,24 @@ function matchSubject(text: string): string | null {
   return subject;
 }
 
+/** 剥掉「你知道 / 你听说过 / 你听过 / 你了解」外框，返回剩下的问句。 */
+function stripKnowFrame(text: string): string {
+  for (const prefix of KNOW_PREFIXES) {
+    if (!text.startsWith(prefix)) continue;
+    return trimPunct(text.slice(prefix.length));
+  }
+  return text;
+}
+
+/** 「你听说过 X 吗」的整段主体。带疑问词/子句谓语的从句不是专名，直接放过。 */
+function matchKnowSubject(text: string): string | null {
+  const know = ASK_KNOW.exec(text);
+  const subject = know?.[1]?.trim();
+  if (subject === undefined || subject === '') return null;
+  if (NON_NAME_CLAUSE.test(subject)) return null;
+  return subject;
+}
+
 function containsGeneric(subject: string): boolean {
   return GENERIC_PHRASES.some((phrase) => subject.includes(phrase));
 }
@@ -172,6 +204,18 @@ function extractSubject(raw: string): string | null {
   const text = stripLead(raw);
   const direct = acceptSubject(matchSubject(text));
   if (direct !== null) return direct;
+
+  // 「你知道齐主是谁吗？」→ 先剥外框 → 「齐主是谁吗？」→ 主体「齐主」。
+  // 必须排在 ASK_KNOW 之前：否则「你知道 X 是谁吗」会被当成整段主体「X 是谁」。
+  const unframed = stripKnowFrame(text);
+  if (unframed !== text) {
+    const framedWhat = acceptSubject(matchSubject(unframed));
+    if (framedWhat !== null) return framedWhat;
+  }
+  // 「你听说过奇耻之身吗？」→ 整段主体就是专名。
+  const known = acceptSubject(matchKnowSubject(text));
+  if (known !== null) return known;
+
   if (!text.startsWith('那') || NA_DEMONSTRATIVE.test(text)) return null;
   return acceptSubject(matchSubject(trimPunct(text.slice(1))));
 }

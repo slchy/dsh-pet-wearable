@@ -53,6 +53,8 @@ test('boot-voice-stack.ts 调用同一份配置，并直连 voice/runtime', () =
   const boot = pluginSource['boot-voice-stack.ts'];
 
   assert.match(boot, /buildVoiceRuntimeConfig\(/u);
+  assert.match(boot, /loadSharedTurnJudge\(process\.env,\s*report\)/u);
+  assert.equal(/TURN_JUDGE_PYTHON|TURN_JUDGE_SCRIPT|new TurnJudge/u.test(boot), false);
   assert.match(boot, /profile:\s*'browser'/u);
   assert.match(boot, /pipelineMode:\s*plan\.mode/u);
   assert.match(boot, /shouldEnableSemanticEndpoint\(/u);
@@ -170,8 +172,6 @@ test('浏览器档案经 buildVoiceRuntimeConfig 给出电平、封段与 Pure L
     pipelineMode: 'live',
     sttSpec: 'qwen-realtime',
     turnJudgeEnabled: false,
-    turnJudgePython: '',
-    turnJudgeScript: '',
     semanticEnabled: false,
   });
   assert.equal(runtime.micGain, 1);

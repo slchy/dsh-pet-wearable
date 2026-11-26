@@ -89,7 +89,7 @@ class HarnessConfig:
     port: int = 8766
     token: Optional[str] = None
     device_id: str = "tau2-bench"
-    #: 等 `Welcome` 的上限；dsh 起来要连模型和侧车，放宽一点
+    #: 等 `Welcome` 的上限；dsh 起来要连模型和判停模型，放宽一点
     welcome_timeout_s: float = 30.0
     downlink_rate: int = DOWNLINK_RATE
     #: dsh 在 127.0.0.1 上也只给 TLS（自签），所以默认走 tls

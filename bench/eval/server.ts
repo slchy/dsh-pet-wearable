@@ -28,6 +28,7 @@ import {
 import { createAuditSlot } from '../../src/runtime/audit-slot.ts';
 import { isMainModule } from '../../src/runtime/is-main.ts';
 import { assemblePipelinePlan, assembleStreamingAgent } from '../../src/runtime/pipeline-assembly.ts';
+import { loadSharedTurnJudge } from '../../src/runtime/turn-judge-bootstrap.ts';
 import { MemoryFile } from '../../src/memory-file.ts';
 import { omniTts } from '../../src/omni-tts.ts';
 import {
@@ -44,11 +45,10 @@ import { qwenRealtimeStt } from '../../src/qwen-realtime-asr.ts';
 import { semanticEndpoint } from '../../src/semantic-endpoint.ts';
 import { DshSession } from '../../src/session.ts';
 import { sampleSocket } from '../../src/socket-stats.ts';
-import { TurnJudge } from '../../src/turn-judge.ts';
 import { envNumber, envString, sleep } from '../../src/util.ts';
 import { loadSharedVad } from '../../src/runtime/vad-bootstrap.ts';
 import { buildVoiceRuntimeConfig } from '../../src/voice-config.ts';
-import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from '../../src/voice-session.ts';
+import { runVoiceServer } from '../../src/voice-session.ts';
 import type { BgReportRecord, DshCallRecord, EvalCase, EvalManifest } from './types.ts';
 
 function arg(name: string, fallback = ''): string {
@@ -392,30 +392,12 @@ async function main(): Promise<void> {
       streaming.onFallbackAnnounceSpoken!(item, interrupted);
     };
 
-  // 判停侧车：与生产 `main.ts` 参数保持 100% 一致
-  const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
-  const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
-  const turnJudgeEnabled = !noTurnJudge
-    && envString('TURN_JUDGE') !== '0'
-    && turnJudgePython !== ''
-    && turnJudgeScript !== ''
-    && existsSync(turnJudgeScript);
-  const turnJudgeClient = turnJudgeEnabled
-    ? new TurnJudge({
-      python: turnJudgePython,
-      script: turnJudgeScript,
-      log: (line) => { log(`  ${line}`); },
-    })
-    : null;
-  if (turnJudgeClient !== null) {
-    const warmup = Buffer.alloc(UPSTREAM_SAMPLE_RATE * 2);
-    for (let i = 0; i < warmup.length / 2; i += 1) {
-      warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2);
-    }
-    const t0 = Date.now();
-    const p = await turnJudgeClient.predict(warmup);
-    log(`[eval-server] 判停侧车预热 ${Date.now() - t0} ms（p=${p.toFixed(3)}）`);
-  }
+  // 声学判停（Smart Turn v3.2）：与生产同一条进程内 ONNX 路径。
+  // `--no-turn-judge` 仍然保留，用于对照「固定合并窗口」的旧行为。
+  const turnJudgeClient = noTurnJudge
+    ? null
+    : await loadSharedTurnJudge(process.env, log);
+  const turnJudgeEnabled = turnJudgeClient !== null;
 
   const semanticKey = (env['FAST_LANE_API_KEY'] ?? env['DEEPSEEK_API_KEY'] ?? '').trim();
   const semanticEnabled = !noSemantic
@@ -429,8 +411,7 @@ async function main(): Promise<void> {
     sttSpec,
     pipelineMode: plan.mode,
     turnJudgeEnabled,
-    turnJudgePython,
-    turnJudgeScript,
+    ...(turnJudgeClient === null ? {} : { turnJudgeModelPath: turnJudgeClient.modelPath }),
     semanticEnabled,
     overrides: {
       idleTimeoutMs: 120_000,
@@ -476,6 +457,9 @@ async function main(): Promise<void> {
         cancelAnnounce: streaming.cancelAnnounce,
         onFallbackAnnounceSpoken: wrappedFallbackSpoken,
       }),
+    ...(streaming.shouldSkipAnnounce === undefined
+      ? {}
+      : { shouldSkipAnnounce: streaming.shouldSkipAnnounce }),
     ...(streaming.omniShadow === undefined ? {} : { omniShadow: streaming.omniShadow }),
     ...(voice.turnJudge === undefined ? {} : { turnJudge: voice.turnJudge }),
     ...(turnJudgeClient === null ? {} : { turnJudgeClient }),

@@ -9,9 +9,6 @@
  * 修法是机械的：短碎片 + 紧跟上一轮 = 再等一拍看有没有后续。
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import type * as ort from 'onnxruntime-node';
@@ -20,7 +17,6 @@ import { UtteranceAssembler, looksUnfinished, type UtteranceAssemblerOptions } f
 import type { AudioFrame } from '../src/engine-contract.ts';
 import { DEFAULT_PET_PARAMS } from '../src/pet/brain/registry.ts';
 import { SilenceTriggers } from '../src/silence-triggers.ts';
-import { TurnJudge } from '../src/turn-judge.ts';
 import { UplinkPipeline } from '../src/uplink-pipeline.ts';
 import { SileroVad } from '../src/vad.ts';
 import { announceListenMs } from '../src/voice-session.ts';
@@ -295,7 +291,7 @@ test('判停器抛错按「不可用」处理，照常收下这一轮', async ()
     quietMs: 30,
     predictAtMs: 0,
     predict: async () => {
-      throw new Error('侧车崩了');
+      throw new Error('判停器崩了');
     },
   });
 
@@ -649,7 +645,7 @@ test('判停每次决定都报一条：p 与「还要等多久」要落进档案
 });
 
 test('判停低分有独立预算：unsure 到上限就收下，不占文本判据的额度', async () => {
-  // 侧车的 p 是噪声（同一音频两次回放，同一句 0.549 vs 0.189），低分那条分支
+  // 声学判停的 p 是噪声（同一音频两次回放，同一句 0.549 vs 0.189），低分那条分支
   // 又完全不看文本信号 —— 所以它必须有自己的上限，否则一句话能把 2.8 s 总预算
   // 吃干净，而 grace/短片段/结尾像没说完那三条安全闸也跟着没额度可用。
   const facts: Array<{ action: string; why?: string }> = [];
@@ -2497,73 +2493,6 @@ test('announceListenMs 认 params.listenMs，其次认 PET_LISTEN_MS 那一层',
     2_500,
     'params.listenMs 优先于这一层的 listenMs',
   );
-});
-
-test('TurnJudge 按时回来的 f64 交给当前 pending', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tj-fast-'));
-  const script = join(dir, 'sidecar.cjs');
-  writeFileSync(script, `
-'use strict';
-let buf = Buffer.alloc(0);
-process.stdin.on('data', (chunk) => {
-  buf = Buffer.concat([buf, chunk]);
-  for (;;) {
-    if (buf.length < 4) return;
-    const len = buf.readUInt32LE(0);
-    if (buf.length < 4 + len) return;
-    buf = buf.subarray(4 + len);
-    const out = Buffer.alloc(8);
-    out.writeDoubleLE(0.42, 0);
-    process.stdout.write(out);
-  }
-});
-`);
-  const judge = new TurnJudge({ python: process.execPath, script });
-  try {
-    const p = await judge.predict(Buffer.alloc(320, 1));
-    assert.equal(p, 0.42);
-  } finally {
-    judge.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('TurnJudge 超时后的迟到 f64 丢弃，不串到下一发', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tj-late-'));
-  const script = join(dir, 'sidecar.cjs');
-  // 第一发故意不回。父进程 5s 超时后才发第二发；侧车这时先补迟到的 0.11，再给 0.77。
-  writeFileSync(script, `
-'use strict';
-let buf = Buffer.alloc(0);
-let n = 0;
-process.stdin.on('data', (chunk) => {
-  buf = Buffer.concat([buf, chunk]);
-  for (;;) {
-    if (buf.length < 4) return;
-    const len = buf.readUInt32LE(0);
-    if (buf.length < 4 + len) return;
-    buf = buf.subarray(4 + len);
-    n += 1;
-    if (n === 2) {
-      const late = Buffer.alloc(8);
-      late.writeDoubleLE(0.11, 0);
-      const fresh = Buffer.alloc(8);
-      fresh.writeDoubleLE(0.77, 0);
-      process.stdout.write(late);
-      process.stdout.write(fresh);
-    }
-  }
-});
-`);
-  const judge = new TurnJudge({ python: process.execPath, script });
-  try {
-    const pcm = Buffer.alloc(320, 1);
-    assert.equal(await judge.predict(pcm), -1, '5s 超时要按不可用返回');
-    assert.equal(await judge.predict(pcm), 0.77, '迟到的 0.11 必须丢掉，不能配给下一发');
-  } finally {
-    judge.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 test('SileroVad.reset() 无参清零复用已 init 的 state，不退回未就绪', async () => {

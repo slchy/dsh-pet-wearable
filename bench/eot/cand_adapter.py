@@ -16,10 +16,9 @@ import sys
 
 import numpy as np
 
-_REPO = os.environ.get("MIAI_REPO", os.path.expanduser("~/miai-cloud"))
-_TURN_JUDGE_DIR = os.path.join(_REPO, "turn_judge")
-if _TURN_JUDGE_DIR not in sys.path:
-    sys.path.insert(0, _TURN_JUDGE_DIR)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from whisper_features import compute_whisper_log_mel_features  # noqa: E402
 

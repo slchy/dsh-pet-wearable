@@ -217,6 +217,14 @@ export interface DialogOptions {
    * - `'fallback'`：要求逐字朗读或前台不可用，退回 `runner.speakCanned()`
    */
   readonly speakAnnounce?: (item: AnnounceItem) => Promise<'spoken' | 'defer' | 'fallback'>;
+  /**
+   * 可选：出队前判断这条播报是否已经不需要再说。
+   *
+   * Pure Live 把它接到 `LiveOrchestrator.shouldSkipBackgroundReport()`：前台 Omni
+   * 可能已经读过单槽里的完整结论，队列里那一条再来一遍就是双讲。命中时
+   * **不开麦、不调 speakAnnounce、不记出过声**，连队列通知都不该发。
+   */
+  readonly shouldSkipAnnounce?: (item: AnnounceItem) => boolean;
   /** 可选：插话或双击清空播报时，同步掐断正在播的自定义后台汇报（例如 Omni `cancelBackgroundSpeech()`） */
   readonly cancelAnnounce?: () => void;
   /** 可选：当某条播报走回落 TTS（`verbatim` 或 `'fallback'`）播完/被打断后通知上层（用于静默回注 Omni 历史） */
@@ -721,6 +729,18 @@ export class DialogRuntime {
       this.scheduleAnnounceRetry(ANNOUNCE_QUIET_MS - quietFor);
       return;
     }
+    // 队首可能已经被前台代播 / 已播报 / 已取消。**在通知宠物、开麦之前**清掉：
+    // 否则会先 `onAnnounce(true,false)` 让宠物让位，再开麦、再发现没话说。
+    while (
+      this.announceQueue.length > 0
+      && this.options.shouldSkipAnnounce?.(this.announceQueue[0]!) === true
+    ) {
+      this.announceQueue.shift();
+    }
+    if (this.announceQueue.length === 0) {
+      this.announcePhase = 'empty';
+      return;
+    }
     const mic = this.options.env.announceMic;
     this.announcePhase = mic === undefined ? 'speaking' : 'opening_mic';
     // 真的出声过没有 —— `onAnnounce` 的第二个参数是「刚出过声」，跳过的那条不算
@@ -735,6 +755,10 @@ export class DialogRuntime {
         const item = this.announceQueue.shift();
         if (item === undefined) {
           break;
+        }
+        // 批内前后条各自独立：前一条开麦/出声期间，这一条可能刚被前台代播。
+        if (this.options.shouldSkipAnnounce?.(item) === true) {
+          continue;
         }
         // 情绪随这条播报走：闭包捕获，`speakAnnouncement` 的签名不用动。
         // `deferred` 由 `speak` 在 `'defer'` 时置位；两条开麦分支共用后面的结算。

@@ -354,8 +354,7 @@ function sessionOptions(
     photoTimeoutMs: 1_000,
     imageQuestion: '这是什么',
     turnJudge: {
-      pythonPath: 'python',
-      scriptPath: 'turn-judge.py',
+      modelPath: 'models/smart-turn-v3.2-cpu.onnx',
       quietMs: 0,
       extendMs: 0,
       maxExtensions: 0,

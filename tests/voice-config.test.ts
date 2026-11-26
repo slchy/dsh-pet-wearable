@@ -34,8 +34,7 @@ const base = {
   env: {} as Record<string, string | undefined>,
   sttSpec: 'qwen-realtime',
   turnJudgeEnabled: true,
-  turnJudgePython: 'python',
-  turnJudgeScript: 'judge.py',
+  turnJudgeModelPath: 'models/smart-turn-v3.2-cpu.onnx',
   semanticEnabled: true,
 } satisfies VoiceRuntimeInput;
 
@@ -99,6 +98,7 @@ test('三端默认值同源：插件只改增益和控制口，沙盒只改空�
   assert.equal(cli.imageQuestion, DEFAULT_IMAGE_QUESTION);
   assert.equal(cli.controlPort, 0);
   assert.equal(cli.turnJudge?.quietMs, 0);
+  assert.equal(cli.turnJudge?.modelPath, 'models/smart-turn-v3.2-cpu.onnx');
   assert.equal(cli.turnJudge?.extendMs, 200);
   assert.equal(cli.turnJudge?.maxExtensions, 2);
   assert.equal(cli.turnJudge?.maxUnsureExtensions, 1);
@@ -559,4 +559,15 @@ test('src/main.ts 复用 buildVoiceRuntimeConfig 单源配置，不再自带默�
   assert.equal(/DEFAULT_PROACTIVE/u.test(main), false);
   assert.equal(main.includes('这张图里有什么'), false);
   assert.equal(/env\['OMNI_API_KEY'\] \?\? env\['DASHSCOPE_API_KEY'\]/u.test(main), false);
+});
+
+test('src/main.ts 先 loadSharedTurnJudge 再 buildVoiceRuntimeConfig，且不再读 Python 路径', () => {
+  const main = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+  const load = main.indexOf('await loadSharedTurnJudge(');
+  const build = main.indexOf('buildVoiceRuntimeConfig({');
+  assert.ok(load > 0, 'main.ts 没有走进程内声学判停加载器');
+  assert.ok(build > load, 'buildVoiceRuntimeConfig 必须在 loadSharedTurnJudge 之后：参数表要带实际模型路径');
+  assert.equal(main.includes('TURN_JUDGE_PYTHON'), false);
+  assert.equal(main.includes('TURN_JUDGE_SCRIPT'), false);
+  assert.equal(/from\s+['"]\.\/turn-judge\.ts['"]/u.test(main), false, 'main.ts 不该再直接 new TurnJudge');
 });

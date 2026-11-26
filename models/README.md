@@ -6,7 +6,7 @@
 | 文件 | 干什么用 | 许可证 |
 |---|---|---|
 | `silero_vad.onnx` | 可选 VAD（`--stt aliyun` 这条路不用它） | MIT |
-| `smart-turn-v3.2-cpu.onnx` | 判停模型，`turn_judge/` 侧车加载它 | BSD 2-Clause（Daily） |
+| `smart-turn-v3.2-cpu.onnx` | 声学判停模型，`src/turn-judge.ts` 通过 `onnxruntime-node` 进程内加载它 | BSD 2-Clause（Daily） |
 
 第三方声明与许可证正文见 [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)。
 
@@ -44,8 +44,9 @@ curl -L -o models/silero_vad.onnx \
 
 ## Smart Turn v3.2（判停）
 
-`smart-turn-v3.2-cpu.onnx`（8 679 182 字节）—— [turn_judge/](../turn_judge/) 那个 Python
-侧车加载它，回答「这一轮说完了吗」。
+`smart-turn-v3.2-cpu.onnx`（8 679 182 字节）—— [src/turn-judge.ts](../src/turn-judge.ts)
+进程内加载它，回答「这一轮说完了吗」。特征提取在 [src/whisper-features.ts](../src/whisper-features.ts)
+（纯 TypeScript 移植，无 Python 运行时依赖）。
 
 ### 获取
 
@@ -60,7 +61,7 @@ curl -L -o models/smart-turn-v3.2-cpu.onnx \
 - **训练数据**是另一个许可证：`pipecat-ai/smart-turn-data-v3.1-train`，**CC BY 4.0**。
   我们只用权重，不下载也不分发数据集
 - **文件名保留上游原名**（含 `smart-turn`）：这是模型的身份证。本项目自己那一层叫
-  `TurnJudge` / `turn_judge/`，两者别混
+  `TurnJudge`（`src/turn-judge.ts`），两者别混
 
 ### 校验
 
@@ -72,7 +73,7 @@ curl -L -o models/smart-turn-v3.2-cpu.onnx \
 ### 输入形状的两个陷阱
 
 1. 固定吃**8 秒**（80×800 的 Whisper log-mel，16 kHz 单声道 PCM16）。
-   `turn_judge/server.py` 补零补在**开头**（上游 `np.pad(audio, (N, 0))`），不是末尾
+   `src/whisper-features.ts` 的 `pcm16ToLast8Seconds()` 补零补在**开头**（上游 `np.pad(audio, (N, 0))`），不是末尾
 2. 喂**一整句**（从开口前 800 ms 到停嘴），不是连续滚动的 8 秒窗口。
    喂错了 p 会落在 0.2–0.5 之间晃，看着像「模型不灵」，其实是窗口错了 ——
    见 [docs/TOOLS.md](../docs/TOOLS.md) §5

@@ -4,7 +4,7 @@
 
 1. 模型文件用本仓的 **CPU 导出**（`models/smart-turn-v3.2-cpu.onnx`），不是 HF 上的 GPU 版；
    两者是同一个 v3.2，数值应接近，但**不是同一次导出**。
-2. 特征提取用 `turn_judge/whisper_features.py`（pipecat vendor 的 numpy 实现），
+2. 特征提取用 `bench/eot/whisper_features.py`（pipecat vendor 的 numpy 实现），
    等价于 `transformers.WhisperFeatureExtractor(chunk_length=8)`，跳过 torch。
 
 窗口约定与官方一致：取**最近 8 秒**、右对齐、**前面补零**（`np.pad(audio, (pad, 0))`）。
@@ -18,9 +18,9 @@ import numpy as np
 
 _REPO = os.environ.get("MIAI_REPO", os.path.expanduser("~/miai-cloud"))
 _MODEL = os.environ.get("MIAI_TURN_JUDGE_MODEL", os.path.join(_REPO, "models", "smart-turn-v3.2-cpu.onnx"))
-_TURN_JUDGE_DIR = os.path.join(_REPO, "turn_judge")
-if _TURN_JUDGE_DIR not in sys.path:
-    sys.path.insert(0, _TURN_JUDGE_DIR)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from whisper_features import compute_whisper_log_mel_features  # noqa: E402
 

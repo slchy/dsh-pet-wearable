@@ -1,111 +1,128 @@
 /**
- * TurnJudge 客户端：常驻的 Python 侧车，回答「这一轮说完了吗」。
+ * TurnJudge：进程内的**声学判停**，回答「这一轮说完了吗」。
  *
  * 模型是 pipecat 的 Smart Turn v3.2（`models/smart-turn-v3.2-cpu.onnx`）——
- * 文件名与模型名都保留上游原名，方便对账；「TurnJudge」是本项目这一层封装的名字。
+ * 文件名与模型名都保留上游原名；「TurnJudge」是本项目这一层封装的名字。
+ * 输入是 Whisper 风格 log-mel（80×800），特征提取在 `whisper-features.ts`（纯 TS）。
  *
- * 为什么不是一个纯 TS 实现：模型输入是 Whisper 风格 log-mel（80×800），
- * 要先做 400 点 rFFT（400 = 2^4×5^2，非 2 的幂）。官方那份 numpy 实现
- * 是自包含的，直接复用比在 TS 里手写混合基 FFT 可靠。
+ * 用 `onnxruntime-node` 在**本进程内**推理：不需要 Python 运行时，也没有独立子进程。
+ * `onnxruntime-node` 只在第一次 `predict()` 时动态 `import`，顶层不静态引入，
+ * 纯逻辑单测因此不需要原生依赖。
  *
- * 协议：请求 `[u32 len][int16 PCM]`，响应 `[f64 概率]`，都是小端。
- * 进程常驻，模型只加载一次。
+ * 故障安全：空 PCM、已停止、模型缺失、加载/推理异常一律返回 `-1`（调用方退回
+ * 固定合并窗口），绝不把热路径打崩。
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { existsSync } from 'node:fs';
+
+import {
+  computeWhisperLogMelFeatures,
+  pcm16ToLast8Seconds,
+  WHISPER_N_FRAMES,
+  WHISPER_N_MELS,
+} from './whisper-features.ts';
 
 export interface TurnJudgeOptions {
-  /** 带 onnxruntime 的 python，通常是项目里的 .venv */
-  python: string;
-  /** server.py 路径 */
-  script: string;
-  log?: (line: string) => void;
+  /** 模型文件路径（`smart-turn-v3.2-cpu.onnx`）。 */
+  readonly modelPath: string;
+  readonly log?: (line: string) => void;
 }
 
+type OrtModule = typeof import('onnxruntime-node');
+type OrtSession = import('onnxruntime-node').InferenceSession;
+
+/** 串行化推理：ONNX session 一次只跑一条，热路径也不该在它身上排队炸开。 */
 export class TurnJudge {
-  private readonly opts: TurnJudgeOptions;
+  readonly modelPath: string;
+
   private readonly log: (line: string) => void;
-  private proc: ChildProcessWithoutNullStreams | null = null;
-  private rbuf: Buffer = Buffer.alloc(0);
-  /** 串行化：侧车一次只处理一条请求 */
+  private ort: OrtModule | null = null;
+  private session: OrtSession | null = null;
+  private loading: Promise<OrtSession | null> | null = null;
+  private stopped = false;
   private chain: Promise<unknown> = Promise.resolve();
-  private pending: ((p: number) => void) | null = null;
-  /**
-   * 超时后侧车仍可能补来那一发的 8 字节 `f64`。
-   * 当时 `pending` 已经清掉，这个迟到包必须先丢掉，不能配给下一发。
-   */
-  private discardNext = 0;
 
   constructor(opts: TurnJudgeOptions) {
-    this.opts = opts;
+    this.modelPath = opts.modelPath;
     this.log = opts.log ?? (() => {});
   }
 
-  private ensure(): void {
-    if (this.proc) return;
-    const proc = spawn(this.opts.python, [this.opts.script], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-    this.proc = proc;
+  private async ensureSession(): Promise<OrtSession | null> {
+    if (this.stopped) return null;
+    if (this.session !== null) return this.session;
+    if (this.loading !== null) return await this.loading;
 
-    proc.stdout.on('data', (d: Buffer) => {
-      this.rbuf = this.rbuf.length === 0 ? d : Buffer.concat([this.rbuf, d]);
-      while (this.rbuf.length >= 8) {
-        const prob = this.rbuf.readDoubleLE(0);
-        this.rbuf = this.rbuf.subarray(8);
-        if (this.discardNext > 0) {
-          this.discardNext -= 1;
-          continue;
+    this.loading = (async (): Promise<OrtSession | null> => {
+      try {
+        if (this.modelPath === '' || !existsSync(this.modelPath)) {
+          this.log(`[turn-judge] 模型不存在：${this.modelPath || '(空路径)'}`);
+          return null;
         }
-        const r = this.pending;
-        this.pending = null;
-        r?.(prob);
+        const ortModule = await import('onnxruntime-node');
+        const session = await ortModule.InferenceSession.create(this.modelPath, {
+          executionMode: 'sequential',
+          interOpNumThreads: 1,
+          intraOpNumThreads: 1,
+          graphOptimizationLevel: 'all',
+        });
+        if (this.stopped) {
+          void session.release?.();
+          return null;
+        }
+        this.ort = ortModule;
+        this.session = session;
+        this.log(`[turn-judge] 声学判停模型已加载 ${this.modelPath}`);
+        return session;
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        this.log(`[turn-judge] 模型加载失败：${detail}`);
+        return null;
       }
-    });
-    proc.stderr.on('data', (d: Buffer) => {
-      const s = d.toString().trim();
-      // 侧车自己已经打了 `[turn-judge]` 前缀，这里不再加一层
-      if (s) this.log(s.slice(0, 200));
-    });
-    proc.on('exit', (code) => {
-      this.log(`[turn-judge] 侧车退出 code=${code}，下次调用会重新拉起`);
-      this.proc = null;
-      // 进程没了，迟到的那一发也不会再来。留下的 discard 计数会吞掉新进程的第一包。
-      this.discardNext = 0;
-      this.rbuf = Buffer.alloc(0);
-      const r = this.pending;
-      this.pending = null;
-      r?.(-1);
-    });
+    })();
+
+    return await this.loading;
   }
 
   /**
    * 判断这段音频之后「用户说完了吗」。
    *
-   * @param pcm 16 kHz 单声道 PCM16，建议给整轮（截最近 8 秒）
-   * @returns 概率 0..1；侧车故障时返回 -1（调用方应退回保守策略）
+   * @param pcm 16 kHz 单声道 PCM16；建议给整轮（内部截最近 8 秒、前补零）
+   * @returns 概率 0..1；不可用时返回 -1（调用方应退回固定合并窗口）
    */
   async predict(pcm: Buffer): Promise<number> {
     const run = async (): Promise<number> => {
-      if (pcm.length === 0) return -1;
-      this.ensure();
-      const proc = this.proc;
-      if (!proc) return -1;
-      const head = Buffer.allocUnsafe(4);
-      head.writeUInt32LE(pcm.length, 0);
-      const done = new Promise<number>((resolve) => {
-        this.pending = resolve;
-        setTimeout(() => {
-          if (this.pending === resolve) {
-            this.pending = null;
-            this.discardNext += 1;
-            resolve(-1);
-          }
-        }, 5000).unref?.();
-      });
-      proc.stdin.write(head);
-      proc.stdin.write(pcm);
-      return await done;
+      if (this.stopped) {
+        this.log('[turn-judge] 已停止，跳过推理');
+        return -1;
+      }
+      if (pcm.length === 0) {
+        this.log('[turn-judge] 空 PCM，跳过推理');
+        return -1;
+      }
+      const session = await this.ensureSession();
+      if (session === null || this.stopped) return -1;
+      const ortModule = this.ort;
+      if (ortModule === null) return -1;
+
+      try {
+        const features = computeWhisperLogMelFeatures(pcm16ToLast8Seconds(pcm), {
+          doNormalize: true,
+        });
+        const input = new ortModule.Tensor('float32', features, [
+          1,
+          WHISPER_N_MELS,
+          WHISPER_N_FRAMES,
+        ]);
+        const outputs = await session.run({ input_features: input });
+        const first = outputs['logits'] ?? Object.values(outputs)[0];
+        if (first === undefined) return -1;
+        const data = first.data as Float32Array | number[];
+        const value = data[0];
+        return value === undefined ? -1 : Number(value);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        this.log(`[turn-judge] 推理失败：${detail}`);
+        return -1;
+      }
     };
 
     const next = this.chain.then(run, run);
@@ -113,13 +130,13 @@ export class TurnJudge {
     return await next;
   }
 
+  /** 幂等：标记停止并释放 ONNX session（进程退出 / 插件卸载时调用）。 */
   stop(): void {
-    const p = this.proc;
-    this.proc = null;
-    try {
-      p?.kill('SIGKILL');
-    } catch {
-      // 已退出
-    }
+    if (this.stopped) return;
+    this.stopped = true;
+    const session = this.session;
+    this.session = null;
+    this.loading = null;
+    void session?.release?.();
   }
 }

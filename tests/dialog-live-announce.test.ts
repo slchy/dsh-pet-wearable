@@ -10,7 +10,7 @@ import { test } from 'node:test';
 
 import type { AnnounceItem } from '../src/app/dialog.ts';
 import { DialogRuntime } from '../src/app/dialog.ts';
-import type { DeviceCapabilities } from '../src/devices/primitives.ts';
+import type { DeviceCall, DeviceCapabilities } from '../src/devices/primitives.ts';
 import type { FastVoiceEngine } from '../src/engine-contract.ts';
 import { VirtualClock } from '../src/pet/sim/clock.ts';
 import type { AgentProvider, AgentReplyView, TtsProvider } from '../src/providers.ts';
@@ -50,6 +50,8 @@ interface RigOptions {
   readonly captureDetail?: boolean;
   /** Pure Live 下传 `false`，禁止播报退回外部 TTS。 */
   readonly allowTtsFallback?: boolean;
+  /** 出队前消重：命中返回 `true` 表示这条已经被前台代播 / 已播报 / 已取消。 */
+  readonly shouldSkipAnnounce?: (item: AnnounceItem) => boolean;
 }
 
 interface Rig {
@@ -65,6 +67,7 @@ interface Rig {
   readonly fallbacks: Array<{ readonly item: AnnounceItem; readonly interrupted: boolean }>;
   readonly replies: { n: number };
   readonly counters: { cancels: number };
+  readonly deviceCalls: DeviceCall[];
 }
 
 function rig(options: RigOptions = {}): Rig {
@@ -79,6 +82,7 @@ function rig(options: RigOptions = {}): Rig {
   const fallbacks: Array<{ readonly item: AnnounceItem; readonly interrupted: boolean }> = [];
   const replies = { n: 0 };
   const counters = { cancels: 0 };
+  const deviceCalls: DeviceCall[] = [];
 
   const tts: TtsProvider = {
     name: 'fake',
@@ -134,8 +138,14 @@ function rig(options: RigOptions = {}): Rig {
       fallbacks.push({ item, interrupted });
     },
     ...(options.allowTtsFallback === undefined ? {} : { allowTtsFallback: options.allowTtsFallback }),
+    ...(options.shouldSkipAnnounce === undefined
+      ? {}
+      : { shouldSkipAnnounce: options.shouldSkipAnnounce }),
     env: {
-      call: () => true,
+      call: (call) => {
+        deviceCalls.push(call);
+        return true;
+      },
       assemble: () => {},
       end: () => {},
       onAnnounce: (pending, spoken) => { announces.push({ pending, spoken }); },
@@ -145,7 +155,7 @@ function rig(options: RigOptions = {}): Rig {
             listenStart: true,
             micOpenTimeoutMs: 1_500,
             listenMs: 3_000,
-            call: () => {},
+            call: (call: DeviceCall) => { deviceCalls.push(call); },
             awaitMicOpen: options.awaitMicOpen ?? (async () => true),
           },
         }
@@ -156,6 +166,7 @@ function rig(options: RigOptions = {}): Rig {
 
   return {
     clock, runtime, speeches, items, synth, announces, logs, notes, asked, fallbacks, replies, counters,
+    deviceCalls,
   };
 }
 
@@ -596,5 +607,50 @@ test('Pure Live（allowTtsFallback=false）：verbatim 仍走 speakAnnounce，fa
     assert.equal(r2.fallbacks[0]?.interrupted, true);
   } finally {
     r2.runtime.dispose();
+  }
+});
+
+test('shouldSkipAnnounce 在通知宠物和开麦之前清掉队首已代播条目', async () => {
+  const r = rig({
+    mic: true,
+    shouldSkipAnnounce: (item) => item.taskId === 'done',
+  });
+  try {
+    r.runtime.enqueueAnnounce({ speech: '前台已经讲过的完整结论', taskId: 'done' });
+    await r.clock.drain();
+
+    assert.equal(r.speeches.length, 0, '不得再交给 speakAnnounce');
+    assert.equal(r.synth.length, 0, '也不得退回外部 TTS');
+    assert.equal(
+      r.deviceCalls.some((call) => call.op === 'listen.start'),
+      false,
+      '队列已空就不能再开麦',
+    );
+    assert.deepEqual(
+      r.announces,
+      [{ pending: true, spoken: false }],
+      '只保留入队时那一次「有货」通知；排空时不得再通知宠物让位',
+    );
+    assert.equal(r.runtime.idle, true);
+  } finally {
+    r.runtime.dispose();
+  }
+});
+
+test('批内中间条已被前台代播时跳过，前后两条照常播', async () => {
+  const r = rig({
+    shouldSkipAnnounce: (item) => item.taskId === 'mid',
+  });
+  try {
+    r.runtime.enqueueAnnounce({ speech: '第一条汇报', taskId: 'first' });
+    r.runtime.enqueueAnnounce({ speech: '中间这条已经讲过了', taskId: 'mid' });
+    r.runtime.enqueueAnnounce({ speech: '第三条汇报', taskId: 'last' });
+    await r.clock.drain();
+
+    assert.deepEqual(r.speeches, ['第一条汇报', '第三条汇报']);
+    assert.equal(r.synth.length, 0);
+    assert.deepEqual(r.announces.at(-1), { pending: false, spoken: true });
+  } finally {
+    r.runtime.dispose();
   }
 });

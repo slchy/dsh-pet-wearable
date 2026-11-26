@@ -218,6 +218,19 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 神经门接上的标志是启动日志里的 `VAD Silero v5 神经 VAD 已就绪`（后面带加载毫秒和模型路径）。
 退回时是 `退回能量门`，显式关掉时是 `能量门（VOICE_VAD=…，神经 VAD 已关闭）`。
 
+### 声学判停（Smart Turn v3.2）模型与降级
+
+模型文件是 `models/smart-turn-v3.2-cpu.onnx`（8 679 182 字节），同样不进 git、不同步。
+`src/runtime/turn-judge-bootstrap.ts` 的 `resolveTurnJudgeModelPath()` 先读
+`TURN_JUDGE_MODEL`（兼容旧名 `SMART_TURN_MODEL`），否则按 cwd 与相对模块文件的四档路径
+找第一个存在的 `models/smart-turn-v3.2-cpu.onnx`。`loadSharedTurnJudge()` 在进程启动时
+加载一次并用 1 s 低幅正弦预热；CLI、Web 插件、评测沙盒三端共用。
+特征提取是纯 TypeScript（`src/whisper-features.ts`，400 点混合基 FFT），推理走
+`onnxruntime-node` 动态 `import` —— **不再需要 `TURN_JUDGE_PYTHON` / `TURN_JUDGE_SCRIPT`，
+也不需要 Python 运行时**。`TURN_JUDGE=0|off|false`（兼容 `SMART_TURN`）显式关闭；
+模型缺失、加载或预热失败都打一行日志并退回固定合并窗口，**不阻断启动**。
+接上的日志是 `声学判停  Smart Turn v3.2 进程内 ONNX 已就绪（… ms，p=…，模型路径）`。
+
 自签证书：
 
 ```bash

@@ -1,7 +1,7 @@
 /**
  * 判停器归属，以及把一条连接的静音 / 封段回调接到 {@link UtteranceAssembler}。
  *
- * 共享侧车不能在断开时 `stop`：冷启动要重新加载 ONNX。自己创建的那份必须停，
+ * 共享判停器不能在断开时 `stop`：冷启动要重新加载 ONNX。自己创建的那份必须停，
  * 否则进程退不掉。
  */
 import { UtteranceAssembler, type JudgeFact } from '../utterance-assembler.ts';
@@ -11,7 +11,7 @@ import { UPSTREAM_SAMPLE_RATE, type VoiceSessionOptions } from './session-option
 /**
  * 判停器的最小接口（`TurnJudge` 满足它）。
  *
- * 抽成接口只为一件事：**共享与独占的判定要能单测**，不必起 python 侧车。
+ * 抽成接口只为一件事：**共享与独占的判定要能单测**，不必起真 ONNX 模型。
  */
 export interface EndpointDetector {
   predict(pcm: Buffer): Promise<number>;
@@ -22,7 +22,7 @@ export interface EndpointDetector {
  * 决定这条连接用哪个判停器、以及要不要在断开时销毁它。
  *
  * 共享的那份由进程持有（`main.ts` 创建并预热），**连接断开时不能 stop**：
- * 侧车冷启动要重新加载 8.7 MB ONNX（实测 ~300 ms），真机每次重连第一句都要付。
+ * 声学判停模型冷启动要重新加载 8.7 MB ONNX（实测 ~300 ms），真机每次重连第一句都要付。
  * 自己创建的那份（单连接命令行 / 测试）必须 stop，否则进程退不掉。
  */
 export function resolveEndpointDetector(

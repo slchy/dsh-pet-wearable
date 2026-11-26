@@ -19,13 +19,16 @@
 **约束只有两条**：再分发时保留版权声明与免责声明；不得用 Daily 或 pipecat 的名义
 为本项目背书。没有 copyleft —— 商用、闭源、修改都可以。
 
-[turn_judge/server.py](./turn_judge/server.py) 的取窗与补零是照着上游 `inference.py`
-的**语义**写的，代码是本项目自己实现，没有复制。
+[src/turn-judge.ts](./src/turn-judge.ts) 的取窗与补零是照着上游 `inference.py`
+的**语义**写的，代码是本项目自己实现，没有复制；[src/whisper-features.ts](./src/whisper-features.ts)
+是特征提取的 TypeScript 移植。
 
-## 2. `turn_judge/whisper_features.py`（混血，两段声明都要留）
+## 2. `src/whisper-features.ts` / `bench/eot/whisper_features.py`（混血，两段声明都要留）
 
-这个文件**整份是第三方代码**，本仓未作修改（与上游逐行相同，见 [docs/TOOLS.md](./docs/TOOLS.md) §5）。
-文件头已经带完整声明：
+运行时的 [src/whisper-features.ts](./src/whisper-features.ts) 是 Python 实现的 1:1 TypeScript
+移植（含 400 点混合基 FFT、mel 滤波器组与全部预处理），供进程内声学判停使用；
+离线基准仍保留一份未修改的 Python 原件 [bench/eot/whisper_features.py](./bench/eot/whisper_features.py)
+（与上游逐行相同，见 [docs/TOOLS.md](./docs/TOOLS.md) §5）。两份文件头都带完整声明：
 
 - 主体 —— `Copyright (c) 2024-2026, Daily`，SPDX 标 `BSD 2-Clause License`（正文见 §4.1）
 - `Portions derived from Hugging Face Transformers` —— `Copyright 2022 The HuggingFace Inc. team`、

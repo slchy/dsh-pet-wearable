@@ -7,7 +7,7 @@
 
 官方那个 `eot_harness.smart_turn_adapter:SmartTurnAudioAdapter` 在加载时 `import torch`
 （为了 CUDA 库加载顺序）+ `transformers` 的 `WhisperFeatureExtractor`，装起来接近 1 GB。
-本仓库已经有等价的 numpy 实现（`turn_judge/whisper_features.py`，源自 pipecat vendor），
+本仓库已经有等价的 numpy 实现（`bench/eot/whisper_features.py`，源自 pipecat vendor），
 所以这里的适配器只用 **numpy + onnxruntime**。
 
 与官方适配器的差异（引用数字时要写进去）：
@@ -15,7 +15,7 @@
 | | 官方 | 本适配器 |
 |---|---|---|
 | 模型文件 | `pipecat-ai/smart-turn-v3` 的 **GPU** 导出 | 本仓 `models/smart-turn-v3.2-cpu.onnx`（**CPU** 导出） |
-| 特征 | `transformers.WhisperFeatureExtractor(chunk_length=8)` | `turn_judge/whisper_features.py`（等价实现） |
+| 特征 | `transformers.WhisperFeatureExtractor(chunk_length=8)` | `bench/eot/whisper_features.py`（等价实现） |
 | 窗口 | 最近 8 s、右对齐、**前面补零** | 同 |
 
 ## 跑法

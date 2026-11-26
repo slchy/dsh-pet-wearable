@@ -1955,3 +1955,113 @@ test('播报完成后单槽改为已口头告知，全程不堆积旁注也不�
   assert.equal(lane.injects.length, 0);
   assert.deepEqual(voice.texts, []);
 });
+
+const COVERED_REPORT = '北之战是漫画《大剑》的最终战役，克蕾雅与米里雅率领七剑对抗觉醒者与深渊者，组织真相也随之揭开。';
+
+test('前台 Omni 已读单槽讲完结论后，shouldSkipBackgroundReport 为真且不再二次发声', async () => {
+  const dsh = fakeDsh({ text: COVERED_REPORT, speech: COVERED_REPORT });
+  dsh.hold();
+  const voice = scriptedTts();
+  let phase = 0;
+  const lane = ssotLane({
+    answer: () => {
+      phase += 1;
+      if (phase === 1) {
+        return answerWithIds([PCM], '我查查。', {
+          delegate: { reason: 'delegate', text: '北之战' },
+          callId: 'call-battle',
+        });
+      }
+      return audioAnswer([PCM], COVERED_REPORT);
+    },
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+
+  await collect(host.toEngine().respond(
+    turnOf('搜一下北之战', { no: 1 }),
+    new AbortController().signal,
+  ));
+  dsh.release();
+  await settle();
+
+  const report = must(reports[0], '后台结论');
+  assert.match(lastSnapshot(lane), /尚未播报给哥/);
+  assert.equal(host.shouldSkipBackgroundReport({ taskId: report.taskId }), false);
+  assert.equal(host.shouldSkipBackgroundReport({ taskId: 'missing' }), false);
+  assert.equal(host.shouldSkipBackgroundReport({}), false);
+
+  // 用户问「搜好没？」，Omni 直接读单槽把完整结论讲出来。
+  const events = await collect(host.toEngine().respond(
+    turnOf('搜好没？', { no: 2 }),
+    new AbortController().signal,
+  ));
+  assert.equal(doneOf(events).speech, COVERED_REPORT);
+  assert.match(lastSnapshot(lane), /已口头告知哥/);
+  assert.doesNotMatch(lastSnapshot(lane), /尚未播报给哥/);
+  assert.equal(host.shouldSkipBackgroundReport({ taskId: report.taskId }), true);
+
+  const speaksBefore = lane.speaks.length;
+  let played = 0;
+  const outcome = await host.speakBackgroundReport(
+    { speech: report.summary, taskId: report.taskId, query: report.query },
+    async () => {
+      played += 1;
+      return { spokenBytes: 0, interrupted: false, transcript: '' };
+    },
+  );
+  assert.equal(outcome, 'spoken', '已代播的条目按已说出口返回，不能再排回队首');
+  assert.equal(played, 0, '0 字节：playAudio 一次都不调');
+  assert.equal(lane.speaks.length, speaksBefore, '不再向 Omni 排队第二条播报');
+  assert.deepEqual(voice.texts, [], '全程不得调用外部 TTS');
+});
+
+test('前台只答敷衍话时，后台任务仍会正常播报', async () => {
+  const dsh = fakeDsh({ text: COVERED_REPORT, speech: COVERED_REPORT });
+  dsh.hold();
+  const voice = scriptedTts();
+  let phase = 0;
+  const lane = ssotLane({
+    answer: () => {
+      phase += 1;
+      if (phase === 1) {
+        return answerWithIds([PCM], '我查查。', {
+          delegate: { reason: 'delegate', text: '北之战' },
+          callId: 'call-battle-2',
+        });
+      }
+      return audioAnswer([PCM], '还在查，等下。');
+    },
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+
+  await collect(host.toEngine().respond(
+    turnOf('搜一下北之战', { no: 1 }),
+    new AbortController().signal,
+  ));
+  dsh.release();
+  await settle();
+  const report = must(reports[0], '后台结论');
+
+  await collect(host.toEngine().respond(
+    turnOf('搜好没？', { no: 2 }),
+    new AbortController().signal,
+  ));
+  assert.match(lastSnapshot(lane), /尚未播报给哥/);
+  assert.equal(host.shouldSkipBackgroundReport({ taskId: report.taskId }), false);
+
+  const outcome = await host.speakBackgroundReport(
+    { speech: report.summary, taskId: report.taskId, query: report.query },
+    async () => ({ spokenBytes: 80, interrupted: false, transcript: report.summary }),
+  );
+  assert.equal(outcome, 'spoken');
+  assert.equal(lane.speaks.length, 1, '没被前台讲过，空窗要正常播报');
+  assert.match(lastSnapshot(lane), /已口头告知哥/);
+});

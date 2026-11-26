@@ -62,6 +62,51 @@ test('诚实说没听清或在反问，不算听岔', () => {
   assert.equal(detectSubjectHallucination('奇耻之身是什么？', '不知道。'), null);
 });
 
+test('「你知道 X 是谁吗」剥掉外框和语气词后取到 X', () => {
+  const found = hit(
+    '你知道齐主是谁吗？',
+    '知道啊，就是那本《基督山伯爵》。讲的是爱德蒙·唐泰斯被陷害入狱后复仇的故事。',
+  );
+  assert.equal(found.subject, '齐主');
+  assert.equal(found.replySubject, '《基督山伯爵》');
+});
+
+test('「你知道 X 吗 / 你听说过 X 吗」整段主体是专名', () => {
+  const found = hit(
+    '你知道奇耻之身吗？',
+    '《技术哲学》是莱姆探讨科技与人类关系的随笔集。',
+  );
+  assert.equal(found.subject, '奇耻之身');
+  assert.equal(found.replySubject, '《技术哲学》');
+
+  const heard = hit(
+    '你听说过其主之声吗？',
+    '《技术哲学》是莱姆探讨科技与人类关系的随笔集。',
+  );
+  assert.equal(heard.subject, '其主之声');
+  assert.equal(heard.replySubject, '《技术哲学》');
+});
+
+test('外框里带字面重叠或不是专名从句时不误报', () => {
+  const cases: ReadonlyArray<readonly [string, string]> = [
+    [
+      '你知道大贱这部动画吗？',
+      '知道，《大剑》是部挺有辨识度的动画。它讲的是半人半妖的战士。',
+    ],
+    [
+      '你知道波兰作家莱姆吗？',
+      '波兰作家莱姆是科幻文学巨匠，代表作有《索拉里斯星》。',
+    ],
+    ['你看过星球大战没？', '看过啊，从1977年第一部就开始追了。'],
+    ['你知道怎么去机场吗？', '坐地铁或者打车都可以过去。'],
+    ['你知道水多少度沸腾吗？', '标准大气压下是一百度。'],
+    ['你知道你叫什么名字吗？', '我叫米馍呀。'],
+  ];
+  for (const [asr, reply] of cases) {
+    assert.equal(detectSubjectHallucination(asr, reply), null, asr);
+  }
+});
+
 test('闲聊、常识、代词问句即使答复像在编书，也不报听岔', () => {
   const phrases = [
     '你叫什么名字来着？',

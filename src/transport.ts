@@ -364,7 +364,7 @@ export interface TransportOptions {
    * - `port: 0` 时没人知道绑到了哪个口，外面的桥接不上去；
    * - `singleConnection: false` 时**没有任何事件会结束本函数** —— 没有这个 `stop()`，
    *   宿主卸载插件时监听关不掉，进程里会一直留着一条 TCP 监听（以及它背后的
-   *   控制口、侧车等一切）。这是泄漏，不是便利问题。
+   *   控制口、判停模型等一切）。这是泄漏，不是便利问题。
    *
    * CLI 不用它：单设备模式靠连接结束收尾，进程退出即释放。
    */
@@ -396,7 +396,7 @@ export async function runTransport(options: TransportOptions): Promise<number> {
     let finished = false;
     /**
      * 已建立的连接。`server.close()` 只是停止收新连接，活着的还得自己断 ——
-     * 否则 `stop()` 之后监听虽然关了，连接和它们的业务对象（ASR/TTS/侧车）
+     * 否则 `stop()` 之后监听虽然关了，连接和它们的业务对象（ASR/TTS/判停模型）
      * 仍挂在进程里。
      */
     const sockets = new Set<Socket>();

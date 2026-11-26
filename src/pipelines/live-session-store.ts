@@ -163,6 +163,9 @@ const MAX_CORRECTIONS = 3;
 const DEFAULT_SNAPSHOT_CHARS = 800;
 const DEFAULT_DIALOG_TURNS = 4;
 
+/** 去重口径：只留中文、字母、数字，空白与标点都不参与 2-gram。 */
+const COMPACT_DROP = /[^\p{L}\p{N}]+/gu;
+
 const SNAPSHOT_TITLE = '【当前后台任务与已核实事实（唯一真相源：未标注 completed 的一律视为尚未执行，禁止声称已办成）】';
 const DIALOG_TITLE = '【最近前台对话（仅供理解代词与指代，不要重复回答）】';
 
@@ -249,6 +252,49 @@ export function listUnspokenReports(state: LiveSessionState): readonly LiveTaskR
     out.push(task);
   }
   return out;
+}
+
+/**
+ * 前台这一轮是不是已经把某条后台结论讲给用户了。
+ *
+ * 现场：用户问「搜好没？」时后台刚好完成，`live-session-store` 把完整结论写进
+ * Omni 单槽，`connection.ts` 也把同一条推入播报队列。Omni 读单槽讲了 25.6 s，
+ * 回 `listening` 后队列不知道前台已经讲过，又重播 29.76 s。
+ *
+ * 判据用**去空白/标点后的 2-gram 重叠**，不是字符集合：集合会把「大贱/大剑」
+ * 这种只差一个字的句子判成覆盖；2-gram 要求连续两个字都出现。短回执（「好的」
+ * 「还在查，等下。」）先被 8 字门槛挡住，进度敷衍再被低重叠挡住。
+ *
+ * 长报告被 Omni 浓缩复述时命中率会掉到 30% 以下，所以还有第二条宽松路径：
+ * 至少命中 6 个 2-gram，并且占**短侧**（复述或总结哪边更短）四分之一以上。
+ */
+export function foregroundCoveredReport(assistantSpoken: string, summary: string): boolean {
+  const spokenCompact = compactOverlapText(assistantSpoken);
+  const summaryCompact = compactOverlapText(summary);
+  if (codePointLength(spokenCompact) < 8 || summaryCompact === '') return false;
+  const summaryBigrams = bigramsOf(summaryCompact);
+  if (summaryBigrams.size === 0) return false;
+  const spokenBigrams = bigramsOf(spokenCompact);
+  let hits = 0;
+  for (const gram of summaryBigrams) {
+    if (spokenBigrams.has(gram)) hits += 1;
+  }
+  if (hits < 3) return false;
+  if (hits / summaryBigrams.size >= 0.30) return true;
+  return hits >= 6 && hits / Math.min(summaryBigrams.size, spokenBigrams.size) >= 0.25;
+}
+
+function compactOverlapText(text: string): string {
+  return text.replace(COMPACT_DROP, '');
+}
+
+function bigramsOf(compact: string): ReadonlySet<string> {
+  const chars = [...compact];
+  const grams = new Set<string>();
+  for (let i = 0; i + 1 < chars.length; i += 1) {
+    grams.add(`${chars[i]}${chars[i + 1]}`);
+  }
+  return grams;
 }
 
 function applyEvent(state: LiveSessionState, event: LiveSessionEvent): Reduced | null {
@@ -369,18 +415,52 @@ function applyRecorded(
   const index = findTurn(state.turns, state.epoch, event.turnNo);
   const current = index >= 0 ? state.turns[index] : undefined;
   const lastAnsweredLane = turn.assistantSpoken.trim() !== '' ? turn.lane : state.lastAnsweredLane;
-  if (current !== undefined && sameTurn(current, turn) && lastAnsweredLane === state.lastAnsweredLane) {
+  const seq = state.seq + 1;
+  // 前台已经把结论讲出来时，后台任务不必再进空窗播报队列（否则就是双讲）。
+  // 这一步必须在「没变就早退」之前算：turn 本身可能和上次完全相同，
+  // 变的只有任务投递状态和随之刷新的单槽快照。
+  const tasks = markForegroundCoveredTasks(state, turn, seq);
+  const turnChanged = current === undefined || !sameTurn(current, turn);
+  if (!turnChanged && tasks === state.tasks && lastAnsweredLane === state.lastAnsweredLane) {
     return null;
   }
   return {
     state: {
       ...state,
-      seq: state.seq + 1,
-      turns: placeTurn(state.turns, turn),
+      seq,
+      turns: turnChanged ? placeTurn(state.turns, turn) : state.turns,
+      tasks,
       lastAnsweredLane,
     },
     effects: [],
   };
+}
+
+/**
+ * 前台代播消重。只认当前代际、非静默、已跑完、还没播过的任务。
+ * 返回同一份 `tasks` 表示没有变化（调用方据此保持早退语义）。
+ */
+function markForegroundCoveredTasks(
+  state: LiveSessionState,
+  turn: LiveTurnRecord,
+  seq: number,
+): Readonly<Record<string, LiveTaskRecord>> {
+  if (turn.lane !== 'live' || turn.truncated || turn.assistantSpoken.trim() === '') {
+    return state.tasks;
+  }
+  let tasks: Record<string, LiveTaskRecord> | null = null;
+  for (const taskId of state.taskOrder) {
+    const task = state.tasks[taskId];
+    if (task === undefined || task.epoch !== state.epoch || isSilentTask(task)) continue;
+    if (task.state !== 'completed' && task.state !== 'failed') continue;
+    if (task.delivered !== 'pending') continue;
+    const summary = task.summary?.trim();
+    if (summary === undefined || summary === '') continue;
+    if (!foregroundCoveredReport(turn.assistantSpoken, summary)) continue;
+    if (tasks === null) tasks = { ...state.tasks };
+    tasks[taskId] = { ...task, delivered: 'spoken', updatedSeq: seq };
+  }
+  return tasks ?? state.tasks;
 }
 
 /** 只改票据完全相同的最后一条。对不上就原样返回，连序号都不动。 */

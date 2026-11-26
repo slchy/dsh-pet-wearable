@@ -23,7 +23,7 @@
 算出来的数字通常还错（§13 第 1 条就是活例）。
 
 **③ 新探针一律放 `bench/`。** 部署边界以 `tests/deploy-boundary.test.ts` 为准：
-根测试只能引用 `src`、`mcp`、`tools`、`tests`、`turn_judge`、`scripts`，以及
+根测试只能引用 `src`、`mcp`、`tools`、`tests`、`scripts`，以及
 `package.json`、`tsconfig.json`、`README.md`、`docs/TIME-KNOBS.md`。
 `bench/` 与 `packages/` 不在清单里。往 `scripts/` 里塞一次性探针，等于把它推上生产服务器。
 部署脚本本身不在本公开仓。
@@ -63,7 +63,7 @@
 | 改了一行代码，端到端快了没有 | `bench/replay/run.py`（同一份真机音频） | 同口径前后对比。比对器单测是 `bench/replay/baseline.test.ts`，进 `npm run test:bench`，不进 `npm test` |
 | **live 管道离线 55 轮准不准、护栏有没有破** | `bench/eval/`：`node bench/eval/score.ts --compare <基线> <候选>` | S1–S4 与首字延迟。快照 `bench/eval/baseline/20261124-live-v1-wave-ab.json`。单测 `npm run test:bench`；连同 `npm test` 与 web 用 `npm run test:all` |
 | 不接眼镜、全自动跑几条话术 | `bench/e2e/run.py`（手机当喇叭+话筒） | 说完→首音 / 通过与否 |
-| 判停侧车为什么不敢收 | **档案里的 `judge.decide`**（线上就有，最省事）；要离线复算才用 `bench/latency/probe-turnjudge-silence.py` | 每次决定的 `p` + 等待；② 的成因 |
+| 声学判停为什么不敢收 | **档案里的 `judge.decide`**（线上就有，最省事）；要离线复算才用 `bench/latency/probe-turnjudge-silence.py` | 每次决定的 `p` + 等待；② 的成因 |
 | 换个判停阈值/延长次数会怎样 | `bench/latency/probe-turnjudge-silence.py --curve START:END:STEP` | p 随尾部静音怎么变 |
 | CosyVoice 首包多少 / 要几个字才开跑 | `bench/latency/probe-cosyvoice-firstbatch.mts` | 首批字数 × 首块时间 |
 | 快车道会不会答错本该交给 `dsh` 的 | `bench/fast_lane/run.ts` | 误拦截率（>0 退出码 1） |
@@ -177,7 +177,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/tau2/lat_summary.py` | 合并 `/tmp/tau2-lat-*.json` 出 p50/p90/p95，折真机体感 |
 | `bench/tau2/reply_breakdown.py` | ③ 拆成模型侧 `dsh_ms` 与 TTS 握手 `tts_first_ms` |
 | `bench/tau2/open_latency.py` | 按答复长度分桶看「τ² 任务是不是让模型开口更晚」 |
-| `bench/latency/probe-single-turn.mjs` | 起生产形态服务端跑一整轮，读档案 —— 本地没有判停侧车，②只作参考 |
+| `bench/latency/probe-single-turn.mjs` | 起生产形态服务端跑一整轮，读档案 —— 本地没有 Smart Turn 模型时②只作参考 |
 | `bench/latency/analyze-real-archive.mjs` | 真机档案速览（含「等关门」列）。**只用于看 ②，段口径以 `latency-report.ts` 为准** |
 
 `bench/latency/` 下其余四个是 TTS 专项探针（见 §6），两个 `probe-turnjudge-*` 见 §5。
@@ -288,7 +288,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 **跨 ASR 默认拒跑**，必须显式 `--allow-cross-asr`（跨 ASR 时 ① 与逐轮对比都无效）。
 详见 `bench/replay/README.md`。
 
-## 5. 判停（TurnJudge 侧车）
+## 5. 判停（TurnJudge 进程内声学判停）
 
 | 脚本 | 作用 |
 |---|---|
@@ -304,11 +304,12 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | 偏差 | 事实 |
 |---|---|
 | 窗口 | 我们是**连续 8 s 滚动**（短句子里七秒可能是上一轮）；官方是 `speech_start − 500 ms` 到现在的**这一句**。同一句滚动 p=0.26、按句裁 p=0.95 |
-| 补零 | `server.py` 补在**末尾**，官方 `np.pad(audio, (padding, 0))` 补在**开头**（语音永远顶到窗口末尾） |
+| 补零 | 早期实现补在**末尾**，官方 `np.pad(audio, (padding, 0))` 补在**开头**（语音永远顶到窗口末尾） |
 | 尾巴 | 尾巴上的静音会把 p 一路拉低（停嘴处 0.95、+300 ms 0.35、+800 ms 0.04），而 p 正是「要不要再等一拍」的依据 —— 每等一拍判据更差 |
 
 模型、特征提取、ORT 都验过是对的：模型文件与 pipecat 内置的
-`smart-turn-v3.2-cpu.onnx` **git blob 相同**；`turn_judge/whisper_features.py` 与上游逐行相同，
+`smart-turn-v3.2-cpu.onnx` **git blob 相同**；`bench/eot/whisper_features.py` 与上游逐行相同，
+`src/whisper-features.ts` 是它的 1:1 TypeScript 移植，
 输出与 `transformers.WhisperFeatureExtractor(chunk_length=8, do_normalize=True)`
 **bit-identical**（maxdiff 0.0）；换 ORT 1.19 与 1.31 结果一致。中文准确率本来就低
 （官方 benchmark 85.8%，其余语种 90–97%），所以 p 只当**参考信号**，别做硬判据。
@@ -529,7 +530,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 - 快车道那 6 句里 4 句判停当场收下（②= 5/6/53/75），2 句等到门关（②= 950/2115）
 - `dsh` 那 6 句里 4 句等到门关（②= 1466/1474/1889/1900），2 句当场收（②= 1/75）
-- 逐轮对得上：`② ≈ 等关门`。`②` 是**判停侧车敢不敢收**，和走哪条无关
+- 逐轮对得上：`② ≈ 等关门`。`②` 是**声学判停敢不敢收**，和走哪条无关
 
 真正由路径决定的是 ③：`dsh` 的 ③ 再拆是模型首字 **888** + TTS **~300**；
 快车道是 qwen-flash 首字 **~300** + TTS **~260**。
@@ -544,7 +545,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
    而 ③ 只占端到端的三成多。`p50 1253` 对 baseline（`bench/replay` 8 场 21 轮）
    的 `1408` 是 −155 ms，和噪声一个量级；而 `p90 2490` 对 `1652` 反而更差，
    因为这次的 5 个样本里有一次 `② = 2115`。**n=5 不支撑任何显著性结论。**
-3. **② 大不等于排队，也不等于走慢车道**：它就是判停侧车不敢收，一直等到能量门
+3. **② 大不等于排队，也不等于走慢车道**：它就是声学判停不敢收，一直等到能量门
    走满 2 s 静音才被迫开轮（判停 p 值只有 0.025–0.356；而「还在吗？」p=0.94，
    ②只有 6 ms）。用 `analyze-real-archive.mjs` 的「等关门」列一看就知道。
    **要压端到端先压 ②**，换模型省下的 200 ms 会被它的方差（5–2115）淹掉。
@@ -634,7 +635,7 @@ qwen 现场回的是 200–660，`dsh` 是 885–1342 —— **三段有重叠**
 |---|---|
 | **回执的时长 / 首块** | 回执的**文本**已有（`receipt` 事件带 `text` + `chars`），但**时长和首块**仍只有 console 的 `回执 … 0.65 s（首块 330ms）` 那一行 |
 | TTS 这条流走的是流式还是整段回退 | 看 console 的 `流式 分支=…` / `流式 ✗ 合成失败…` |
-| 判停 `predict` 那一趟往返的耗时 | 看 console 的 `判停 侧车预热 … ms`（只有预热有数） |
+| 判停 `predict` 那一趟往返的耗时 | 看 console 的 `声学判停  Smart Turn v3.2 进程内 ONNX 已就绪（… ms…）`（只有预热有数） |
 | 作业 / 子代理的状态转移 | **不要往档案里抄** —— dsh 的 session log 已经写全，用 `dsh-timeline.ts` 去取 |
 
 前三条要补的话，各自是一个 `onEvent` 调用；**先问值不值**（新增字段 = 档案变长 + 一套要维护的读法）。

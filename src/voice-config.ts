@@ -119,8 +119,8 @@ export interface VoiceRuntimeInput {
   readonly pipelineMode?: 'live' | 'cascade';
   readonly sttSpec: string;
   readonly turnJudgeEnabled: boolean;
-  readonly turnJudgePython: string;
-  readonly turnJudgeScript: string;
+  /** 声学判停（Smart Turn v3.2）模型路径；缺省由 `resolveTurnJudgeModelPath` 找。 */
+  readonly turnJudgeModelPath?: string;
   readonly semanticEnabled: boolean;
   readonly overrides?: VoiceRuntimeOverrides;
 }
@@ -146,15 +146,15 @@ export interface VoiceGateConfig {
   readonly openQuietMs?: number;
   readonly openQuietShortMs?: number;
   /**
-   * 开轮静音的统一上限。手动端点时总会带上，即使没开判停侧车。
+   * 开轮静音的统一上限。手动端点时总会带上，即使没开声学判停。
    * `0` 表示不设上限。非手动端点不传。
    */
   readonly maxOpenSilenceMs?: number;
 }
 
 export interface VoiceTurnJudgeConfig {
-  readonly pythonPath: string;
-  readonly scriptPath: string;
+  /** 声学判停（Smart Turn v3.2）模型路径；缺省时连接层按环境变量再找一次。 */
+  readonly modelPath?: string;
   readonly quietMs: number;
   readonly extendMs: number;
   readonly maxExtensions: number;
@@ -171,7 +171,7 @@ export interface VoiceRuntimeConfig {
   readonly micGain: number;
   readonly peakDbfs: number;
   readonly gate: VoiceGateConfig;
-  /** `turnJudgeEnabled` 为假时不给参数表，调用方也就不必建侧车 */
+  /** `turnJudgeEnabled` 为假时不给参数表，调用方也就不必建判停器 */
   readonly turnJudge: VoiceTurnJudgeConfig | undefined;
   readonly semanticBudgetMs: number;
   readonly semanticTimeoutMs: number;
@@ -319,7 +319,7 @@ export function validateVoiceTiming(config: VoiceRuntimeConfig): void {
       );
     }
     // 语义判停返回 `more` 且序列预算大于开轮静音上限时，`silenceCapFor(true)` 会把
-    // 静音天花板抬到 `waitBudgetSequenceMs`。没开侧车时这项是 0，不抬天花板。
+    // 静音天花板抬到 `waitBudgetSequenceMs`。没开声学判停时这项是 0，不抬天花板。
     // 0 表示不设序列上限。
     const sequenceBudgetMs = config.turnJudge?.waitBudgetSequenceMs ?? 0;
     const ceiling = Math.max(
@@ -417,7 +417,7 @@ export function buildVoiceRuntimeConfig(input: VoiceRuntimeInput): VoiceRuntimeC
   const openQuietMs = envNumber('VOICE_OPEN_QUIET_MS', 300);
   // 短门槛是长门槛的 2/3。300 → 200，并且天然 openQuietShortMs <= openQuietMs。
   const openQuietShortMs = Math.round((openQuietMs * 2) / 3);
-  // 只读一次：gate 与 turnJudge 共用，手动端点在没开侧车时也能拿到同一把尺子。
+  // 只读一次：gate 与 turnJudge 共用，手动端点在没开声学判停时也能拿到同一把尺子。
   const maxOpenSilenceMs = envNumber('TURN_JUDGE_MAX_OPEN_SILENCE_MS', 650);
   // Pure Live 没有级联中间结果，投机每帧空转。级联和缺省才用默认窗。
   const speculateMs = input.pipelineMode === 'live' ? 0 : DEFAULT_SPECULATE_MS;
@@ -440,8 +440,7 @@ export function buildVoiceRuntimeConfig(input: VoiceRuntimeInput): VoiceRuntimeC
 
   const turnJudge = input.turnJudgeEnabled
     ? {
-      pythonPath: input.turnJudgePython,
-      scriptPath: input.turnJudgeScript,
+      ...(input.turnJudgeModelPath === undefined ? {} : { modelPath: input.turnJudgeModelPath }),
       // 有了静音预跑判停，定稿到达时概率已经算好，这段静候是白等。
       quietMs: 0,
       // 真机上「再等」全部等到放行、没有人接着说。400 ms 没换到新信息。

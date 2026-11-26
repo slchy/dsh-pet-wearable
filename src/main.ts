@@ -46,17 +46,17 @@ import {
   type AssembledStreamingPipeline,
 } from './runtime/pipeline-assembly.ts';
 import { buildAgent, buildStt, buildTts } from './runtime/providers-factory.ts';
+import { loadSharedTurnJudge } from './runtime/turn-judge-bootstrap.ts';
 import { loadSharedVad } from './runtime/vad-bootstrap.ts';
 import { semanticEndpoint } from './semantic-endpoint.ts';
 import type { DshSession } from './session.ts';
-import { TurnJudge } from './turn-judge.ts';
 import { envNumber, envString, sleep } from './util.ts';
 import {
   buildVoiceRuntimeConfig,
   DEFAULT_IMAGE_QUESTION,
   resolveOmniApiKey,
 } from './voice-config.ts';
-import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice-session.ts';
+import { runVoiceServer } from './voice-session.ts';
 
 export {
   assemblePipelinePlan,
@@ -654,10 +654,22 @@ async function main(): Promise<void> {
     );
     // 热词表 ID 留空就不下发该字段（传不存在的 ID 会被服务端静默忽略，不报错）
     const vocabularyId = opt('--vocab-id', process.env['ALIYUN_VOCAB_ID'] ?? '');
-    const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? '';
-    const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? '';
-    const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
-      && turnJudgePython !== '' && turnJudgeScript !== '';
+    /**
+     * 声学判停（Smart Turn v3.2）：**进程级一份，跨连接常驻**。
+     *
+     * 模型是 8.7 MB ONNX，冷启动实测 ~300 ms —— 真机每次重连（网络抖动 / 服务重启 /
+     * 重开 App）第一句都要付这一刀，而它刚好落在「用户说完 → 开一轮」里。常驻之后
+     * 只有进程启动付一次。`loadSharedTurnJudge` 内部用 1 s 低幅正弦预热一次推理。
+     *
+     * 必须在 {@link buildVoiceRuntimeConfig} 之前加载：参数表要带上实际模型路径，
+     * 而配置要在这一步决定 `turnJudge` 是否存在（模型缺失 / `TURN_JUDGE=0` 时退回
+     * 固定合并窗口）。
+     */
+    const turnJudgeClient = await loadSharedTurnJudge(process.env, (line) => { console.log(line); });
+    const turnJudgeEnabled = turnJudgeClient !== null;
+    if (turnJudgeClient !== null) {
+      process.on('exit', () => { turnJudgeClient.stop(); });
+    }
     const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim();
     // Pure Live 默认关语义判停，只有显式 SEMANTIC_END_TAG=1 才开。
     // Cascade / 非 live 仍默认开，SEMANTIC_END_TAG=0 退回纯声学判停。
@@ -675,8 +687,7 @@ async function main(): Promise<void> {
         sttSpec: resolvedStt,
         ...(pipelinePlan === null ? {} : { pipelineMode: pipelinePlan.mode }),
         turnJudgeEnabled,
-        turnJudgePython,
-        turnJudgeScript,
+        ...(turnJudgeClient === null ? {} : { turnJudgeModelPath: turnJudgeClient.modelPath }),
         semanticEnabled,
       });
     } catch (error) {
@@ -771,16 +782,7 @@ async function main(): Promise<void> {
     }
 
     /**
-     * 判停器侧车：**进程级一份，跨连接常驻**。
-     *
-     * 以前每条连接建一个、断开就 `stop()`。侧车是 python + 8.7 MB ONNX，冷启动
-     * 实测 ~300 ms —— 真机每次重连（网络抖动 / 服务重启 / 重开 App）第一句都要
-     * 付这一刀，而它刚好落在「用户说完 → 开一轮」里。常驻之后只有进程启动付一次。
-     *
-     * 预热：先用 1 s 静音跑一次推理把模型加载进来，别让第一次真说话的那轮承担。
-     */
-    /**
-     * 语义判停（END 标签）：声学判停判不了「这句话说完了没有」，这一层只补这个洞。
+     * 语义判停（END 标签，文本）：声学判停判不了「这句话说完了没有」，这一层只补这个洞。
      *
      * 和快车道共用一套凭据/端点（同一个 `qwen-flash`）—— 判停要的是快，不是聪明。
      * Cascade / 非 live 默认开，`SEMANTIC_END_TAG=0` 退回纯声学判停。
@@ -801,27 +803,6 @@ async function main(): Promise<void> {
       : null;
     if (semantic !== null) {
       console.log('语义判停  开（END 标签，与静候窗重叠，超时按「说完了」）  SEMANTIC_END_TAG=0 关闭');
-    }
-    const turnJudgeClient = turnJudgeEnabled
-      ? new TurnJudge({
-        python: turnJudgePython,
-        script: turnJudgeScript,
-        log: (line) => { console.log(`  ${line}`); },
-      })
-      : null;
-    if (turnJudgeClient !== null) {
-      // 低幅正弦而不是全零：全零在 log-mel 里是 −∞ dB，不该拿它当"正常输入"试模型
-      const warmup = Buffer.alloc(UPSTREAM_SAMPLE_RATE * 2);
-      for (let i = 0; i < warmup.length / 2; i += 1) {
-        warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2);
-      }
-      const startedAt = Date.now();
-      const p = await turnJudgeClient.predict(warmup);
-      console.log(
-        `判停    侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}）`
-        + '，之后所有连接共用这一份\n',
-      );
-      process.on('exit', () => { turnJudgeClient.stop(); });
     }
 
     // 增益先算好并打出来：调音时最想知道「现在到底是几倍、门限在哪」。
@@ -885,6 +866,9 @@ async function main(): Promise<void> {
           cancelAnnounce: streaming.cancelAnnounce,
           onFallbackAnnounceSpoken: streaming.onFallbackAnnounceSpoken,
         }),
+      ...(streaming?.shouldSkipAnnounce === undefined
+        ? {}
+        : { shouldSkipAnnounce: streaming.shouldSkipAnnounce }),
       // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
       ...(omniShadow === undefined ? {} : { omniShadow }),
       ...(voice.turnJudge === undefined ? {} : { turnJudge: voice.turnJudge }),

@@ -92,6 +92,12 @@ src/browser/pet-geometry.ts pet-prefs.ts pet-session.ts
 文件不在 git 里（仓根 `.gitignore` 的 `models/*.onnx`）。找不到或加载失败就退回能量门，插件照常起来。
 接上的日志是 `VAD Silero v5 神经 VAD 已就绪`。最短人声 120 ms 与 ASR 预卷 320 ms 由仓根 `voice-config.ts` 的常量 `DEFAULT_MIN_SPEECH_MS` / `DEFAULT_ASR_PREROLL_MS` 控制。
 
+声学判停（TurnJudge）同理：`boot-voice-stack.ts` 调同步过来的
+`voice/runtime/turn-judge-bootstrap.ts` 的 `loadSharedTurnJudge()`，模型
+`models/smart-turn-v3.2-cpu.onnx`（`TURN_JUDGE_MODEL`，兼容旧名 `SMART_TURN_MODEL`），
+进程内 ONNX 推理，**不需要 Python**。找不到模型时退回固定合并窗口，插件照常起来；
+接上的日志是 `声学判停  Smart Turn v3.2 进程内 ONNX 已就绪`。
+
 `npm test` 当前 **77** 项，都在 `tests/*.test.ts`（桥、帧、宿主挂载与安全、进程内 agent、桌宠几何 / 拖拽 / 表情 / 姿态）。
 语音栈行为的测试在仓根 `src/` 同步之前的那一份上跑，不在这 77 项里。
 

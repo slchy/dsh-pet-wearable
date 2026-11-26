@@ -221,7 +221,7 @@ done
 1. **去掉一个等待相位** —— 例如流式合成：原来是「等整段 → 再合成」两个串行相位，
    改成「首个 token 就开始合成」，省下的是 `dsh_ms - TTFT` 这一段**结构性**时间（实测
    −216 ms），不是靠挤压某个 API 的响应。
-2. **减少一次往返** —— 例如判停侧车常驻、连接复用。
+2. **减少一次往返** —— 例如判停从子进程搬进本进程（已落地）、连接复用。
 
 不值得做：把某个参数调 20 ms、把批次从 10 字降到 8 字、追某一档的 p90。
 **那些都在噪声里，测不出来，也没人会感觉到。**
@@ -254,7 +254,7 @@ done
 
 ## 部署边界与测试归属
 
-根目录 `tests/*.test.ts` **只能引用部署清单里的路径**。清单与 `scripts/deploy_cloud.py` 的 `ITEMS` 对齐：`src/`、`mcp/`、`tools/`、`tests/`、`turn_judge/`、`scripts/`，以及 `package.json`、`tsconfig.json`、`README.md`、`docs/TIME-KNOBS.md`。`tests/deploy-boundary.test.ts` 静态检查越界引用。`bench/` 与 `packages/` 不在清单里，写进根测试后服务器自检会模块找不到。
+根目录 `tests/*.test.ts` **只能引用部署清单里的路径**。清单与 `scripts/deploy_cloud.py` 的 `ITEMS` 对齐：`src/`、`mcp/`、`tools/`、`tests/`、`scripts/`，以及 `package.json`、`tsconfig.json`、`README.md`、`docs/TIME-KNOBS.md`。`tests/deploy-boundary.test.ts` 静态检查越界引用。`bench/` 与 `packages/` 不在清单里，写进根测试后服务器自检会模块找不到。
 
 测试按归属拆开：
 

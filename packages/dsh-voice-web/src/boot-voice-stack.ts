@@ -46,12 +46,12 @@ import {
   type AssembledStreamingPipeline,
 } from './voice/runtime/pipeline-assembly.ts'
 import { buildAgent, buildStt, buildTts } from './voice/runtime/providers-factory.ts'
+import { loadSharedTurnJudge } from './voice/runtime/turn-judge-bootstrap.ts'
 import { semanticEndpoint } from './voice/semantic-endpoint.ts'
 import type { DshSession } from './voice/session.ts'
-import { TurnJudge } from './voice/turn-judge.ts'
 import { envNumber, envString } from './voice/util.ts'
 import { buildVoiceRuntimeConfig } from './voice/voice-config.ts'
-import { runVoiceServer, UPSTREAM_SAMPLE_RATE } from './voice/voice-session.ts'
+import { runVoiceServer } from './voice/voice-session.ts'
 
 /**
  * ALIYUN_* 走环境变量，与 CLI 同一套凭据来源 —— 不在插件配置里重复一遍，
@@ -115,7 +115,7 @@ export async function bootVoiceStack(
   const voice: { stop: (() => void) | null } = { stop: null }
   let dshSession: DshSession | null = null
   let inProcessAgent: InProcessDshAgent | null = null
-  let turnJudge: TurnJudge | null = null
+  let turnJudge: Awaited<ReturnType<typeof loadSharedTurnJudge>> = null
   let streaming: AssembledStreamingPipeline | null = null
   let stopKeepalive: () => void = () => {}
   let released = false
@@ -357,10 +357,11 @@ export async function bootVoiceStack(
     // 浏览器档案 micGain: 1 / peakDbfs: -34 / sttCommitMs: 320 / controlPort: 0
     // 已收进 `src/voice-config.ts` 的 `DEVICE_TIMING_PROFILES.browser`。
     // 显式 `.env` 仍自动覆盖档案默认。
-    const turnJudgePython = envString('TURN_JUDGE_PYTHON') ?? ''
-    const turnJudgeScript = envString('TURN_JUDGE_SCRIPT') ?? ''
-    const turnJudgeEnabled = envString('TURN_JUDGE') !== '0'
-      && turnJudgePython !== '' && turnJudgeScript !== ''
+    //
+    // 声学判停（Smart Turn v3.2）进程内一份、跨连接常驻；必须在
+    // `buildVoiceRuntimeConfig` 之前加载 —— 参数表要带上实际模型路径。
+    const turnJudgeClient = await loadSharedTurnJudge(process.env, report)
+    const turnJudgeEnabled = turnJudgeClient !== null
     const semanticKey = (process.env['FAST_LANE_API_KEY'] ?? process.env['DEEPSEEK_API_KEY'] ?? '').trim()
     const semanticEnabled = shouldEnableSemanticEndpoint({
       pipelineMode: plan?.mode ?? null,
@@ -373,8 +374,7 @@ export async function bootVoiceStack(
       ...(plan === null ? {} : { pipelineMode: plan.mode }),
       sttSpec: effectiveStt,
       turnJudgeEnabled,
-      turnJudgePython,
-      turnJudgeScript,
+      ...(turnJudgeClient === null ? {} : { turnJudgeModelPath: turnJudgeClient.modelPath }),
       semanticEnabled,
     })
     const semantic = semanticEnabled
@@ -391,19 +391,6 @@ export async function bootVoiceStack(
       })
       : null
 
-    const turnJudgeClient = turnJudgeEnabled
-      ? new TurnJudge({ python: turnJudgePython, script: turnJudgeScript, log: report })
-      : null
-    if (turnJudgeClient !== null) {
-      // 低幅正弦而不是全零：全零在 log-mel 里是 −∞ dB，不该拿它当"正常输入"试模型
-      const warmup = Buffer.alloc(UPSTREAM_SAMPLE_RATE * 2)
-      for (let i = 0; i < warmup.length / 2; i += 1) {
-        warmup.writeInt16LE(Math.round(Math.sin(i / 7) * 300), i * 2)
-      }
-      const startedAt = Date.now()
-      const p = await turnJudgeClient.predict(warmup)
-      report(`判停    侧车预热 ${Date.now() - startedAt} ms（p=${p.toFixed(3)}），之后所有连接共用这一份`)
-    }
     turnJudge = turnJudgeClient
 
     sharedVad = await loadSharedVad(process.env, report)
@@ -430,6 +417,9 @@ export async function bootVoiceStack(
             cancelAnnounce: streaming.cancelAnnounce,
             onFallbackAnnounceSpoken: streaming.onFallbackAnnounceSpoken,
           }),
+        ...(streaming?.shouldSkipAnnounce === undefined
+          ? {}
+          : { shouldSkipAnnounce: streaming.shouldSkipAnnounce }),
         // omni 影子旁路：默认不传 = 这条连接不会去连 DashScope，零成本
         ...(streaming?.omniShadow === undefined ? {} : { omniShadow: streaming.omniShadow }),
         ...(turnJudgeClient === null || runtime.turnJudge === undefined

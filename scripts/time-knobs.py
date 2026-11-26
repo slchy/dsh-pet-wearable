@@ -196,7 +196,7 @@ SHADED_BY: dict[str, str] = {
     ),
     "VAD_FRAME_MS": "无（神经 VAD 的帧长，时间戳按它倒推，不加额外等待）",
     "DEFAULT_GATE_HOLD_MS": "无（决定 gate.close 何时落，① 的起点；必须大于封段与开轮静音天花板）",
-    "DEFAULT_TRAILING_TRIM_MS": "判停侧车输入预处理（不额外等）",
+    "DEFAULT_TRAILING_TRIM_MS": "声学判停输入预处理（不额外等）",
     "TURN_JUDGE_SEQUENCE_BUDGET_MS": "模型段（只对数字/字母/「然后」这类句尾生效）",
     "VOICE_COMMIT_MS": "无 —— 它就是封段的那一刻，实际门槛被上行包长盖住",
     "VOICE_STT_COMMIT_MS": "无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠）",

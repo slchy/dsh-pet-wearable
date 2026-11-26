@@ -76,7 +76,7 @@ export interface UtteranceAssemblerOptions {
    * 其中**「判停说没说完」**这一类最多延长几次（ms 由 `extendMs` 定）。
    *
    * 为什么要单列一个上限：`p < threshold` 那条分支**不参考任何文本信号**
-   * （用户在不在出字、结尾像不像没说完），只按 p 再等一拍。而侧车给的 p
+   * （用户在不在出字、结尾像不像没说完），只按 p 再等一拍。而声学判停给的 p
    * 是噪声 —— 同一段音频两次回放，同一句从 `0.549` 变成 `0.189`，
    * 后者连等 5 拍 2.4 s。真机实测 4 次延长（1600 ms）才收下是常态。
    *
@@ -794,7 +794,7 @@ export class UtteranceAssembler {
     }
     const pcm = this.snapshot();
     const startedAt = this.now();
-    // 侧车可能抛（也可能同步抛）；两种都吞成「不可用」，否则这份提前发起的
+    // 判停模型可能抛（也可能同步抛）；两种都吞成「不可用」，否则这份提前发起的
     // promise 没人接，会变成 unhandledRejection
     const probability = Promise.resolve().then(() => predict(pcm)).catch(() => -1);
     this.prediction = { seq, startedAt, pre: upcoming, probability, bytes: pcm.length };
@@ -1185,7 +1185,7 @@ export class UtteranceAssembler {
       || this.extensions >= this.maxExtensionsNow()
       // QoS：总预算用完了就收下，不管还剩多少分支额度
       || this.overBudget()
-      // 「判停说没说完」有自己的上限：侧车给的 p 是噪声，不能让它把总预算
+      // 「判停说没说完」有自己的上限：声学判停给的 p 是噪声，不能让它把总预算
       // （2.8 s）吃干净，也不能让它拖累静音闸门和短碎片的额度
       || this.unsureExtensions >= this.maxUnsureNow()
     ) {

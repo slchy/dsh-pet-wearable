@@ -150,7 +150,7 @@ export class Pipeline {
   private processing = false;
   private silenceFrames = 0;
   private hasSpoken = false;
-  /** 本轮静音是否已发起过语义预判（重新出现语音就重置） */
+  /** 本轮静音是否已发起过句尾预判（重新出现语音就重置） */
   private prefetching = false;
   /** 预判还在飞行中。长阈值到时不能自己判停，否则预判结果白做。 */
   private prefetchPending = false;
@@ -312,7 +312,7 @@ export class Pipeline {
       if (this.confirmSilence >= CONFIRM_SILENCE_FRAMES) {
         const p = this.pendingTrigger;
         this.pendingTrigger = null;
-        this.trigger('语义判停', p.text, p.pcm);
+        this.trigger('句尾判停', p.text, p.pcm);
         return;
       }
     }
@@ -325,7 +325,7 @@ export class Pipeline {
       return;
     }
 
-    // 短阈值：发起一次语义预判（已有 pending 就不用再猜）
+    // 短阈值：发起一次句尾预判（已有 pending 就不用再猜）
     if (this.silenceFrames >= SHORT_SILENCE_FRAMES && !this.prefetching && !this.pendingTrigger) {
       this.prefetching = true;
       void this.prefetch();
@@ -333,7 +333,7 @@ export class Pipeline {
   }
 
   /**
-   * 语义预判：静音刚满 1 秒时先识别一次，看这句是不是说完了。
+   * 句尾预判：静音刚满 1 秒时先识别一次，看这句是不是说完了。
    *
    * 异步执行，不堵塞 VAD。返回时如果用户又开口了（silenceFrames 被清零），
    * 这次预判直接作废——音频已经变了，结论不再成立。
@@ -422,7 +422,7 @@ export class Pipeline {
         text = r.text;
         console.log(`  ASR     ${((Date.now() - t0) / 1000).toFixed(2)} s  chunks=${r.chunks}`);
       } else {
-        // 语义预判已经识别过同一段音频，不再重复调用
+        // 句尾预判已经识别过同一段音频，不再重复调用
         console.log(`  ASR     跳过（预判已识别）`);
       }
       console.log(`  文本    ${JSON.stringify(text)}`);

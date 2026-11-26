@@ -24,6 +24,7 @@ import type { RealtimeSocket } from '../src/qwen-realtime-asr.ts';
 import type {
   AgentProvider,
   AgentReplyView,
+  BackgroundTaskReport,
   TtsProvider,
 } from '../src/providers.ts';
 import type { DownlinkSink } from '../src/transport.ts';
@@ -191,6 +192,7 @@ interface LiveRig {
   readonly logs: string[];
   readonly outcomes: Array<{ readonly speech: string; readonly outcome: 'spoken' | 'defer' | 'fallback' }>;
   readonly fallbacks: Array<{ readonly speech: string; readonly interrupted: boolean }>;
+  readonly reports: BackgroundTaskReport[];
   readonly stops: { canned: number; announce: number };
   readonly reconciled: Array<{ readonly truncated: boolean }>;
   seq: number;
@@ -206,6 +208,7 @@ function openLive(): LiveRig {
   const logs: string[] = [];
   const outcomes: Array<{ readonly speech: string; readonly outcome: 'spoken' | 'defer' | 'fallback' }> = [];
   const fallbacks: Array<{ readonly speech: string; readonly interrupted: boolean }> = [];
+  const reports: BackgroundTaskReport[] = [];
   const stops = { canned: 0, announce: 0 };
   const reconciled: Array<{ readonly truncated: boolean }> = [];
   const socket = new FakeSocket();
@@ -275,6 +278,8 @@ function openLive(): LiveRig {
       stops.announce += 1;
       live.cancelBackgroundSpeech();
     },
+    // 与生产装配一致：出队前先问编排器这条任务是不是已经被前台代播 / 已播报。
+    shouldSkipAnnounce: (item) => live.shouldSkipBackgroundReport(item),
     onFallbackAnnounceSpoken: (item, interrupted) => {
       fallbacks.push({ speech: item.speech, interrupted });
       live.noteFallbackAnnounceSpoken({
@@ -305,6 +310,7 @@ function openLive(): LiveRig {
     originalCanned();
   };
   live.setTaskReporter((report) => {
+    reports.push(report);
     const item: AnnounceItem = {
       speech: report.verbatim ?? report.summary,
       taskId: report.taskId,
@@ -330,6 +336,7 @@ function openLive(): LiveRig {
     logs,
     outcomes,
     fallbacks,
+    reports,
     stops,
     reconciled,
     seq: 0,
@@ -881,5 +888,52 @@ test('纯级联：快车道流式、动作轮走 dsh 并回落整段 TTS，没�
   } finally {
     runtime.dispose();
     dsh.release();
+  }
+});
+
+test('现场 20261126-073558：前台 Omni 读单槽讲完后，后台播报队列不再重播', async () => {
+  const h = openLive();
+  const summary = '北之战是漫画《大剑》的最终战役，克蕾雅与米里雅率领七剑对抗觉醒者与深渊者，组织真相也随之揭开。';
+  try {
+    h.dsh.hold();
+    h.dsh.setResult({ text: summary, speech: summary });
+    await completeUserTurn(h, '搜一下北之战', { transcript: '我查查。', tool: '北之战' });
+    assert.equal(h.runtime.core.phase, 'listening');
+    assert.equal(h.dsh.pending(), 1);
+
+    // 后台刚好完成：结论进单槽（尚未播报），同时进播报队列等空窗。
+    h.dsh.release();
+    await h.clock.drain();
+    assert.equal(h.reports.length, 1);
+    const report = h.reports[0];
+    assert.ok(report !== undefined);
+    assert.match(latestInstructions(h.socket), /尚未播报给哥/);
+    assert.equal(h.live.shouldSkipBackgroundReport({ taskId: report.taskId }), false);
+
+    // 用户问「搜好没？」：Omni 直接看单槽，把完整结论用同一副嗓子讲出来。
+    const createsBefore = h.socket.count('response.create');
+    await completeUserTurn(h, '搜好没？', { transcript: summary });
+    assert.equal(h.runtime.core.phase, 'listening');
+    assert.equal(h.live.shouldSkipBackgroundReport({ taskId: report.taskId }), true);
+    assert.match(latestInstructions(h.socket), /已口头告知哥/);
+    assert.doesNotMatch(latestInstructions(h.socket), /尚未播报给哥/);
+    assert.equal(h.socket.count('response.create'), createsBefore + 1, '只该有前台这一轮');
+
+    // 回 listening 后队列空转：不开麦、不再让 omni 念、不调外部 TTS、0 字节。
+    const outcomesBefore = h.outcomes.length;
+    const createsAfterTurn = h.socket.count('response.create');
+    await advance(h.clock, QUIET_MS + 1_600);
+    assert.equal(h.outcomes.length, outcomesBefore, '不得再尝试播报同一条结论');
+    assert.equal(h.socket.count('response.create'), createsAfterTurn, '不得为旧结论再开一张 response');
+    assert.deepEqual(h.ttsTexts, []);
+    assert.equal(
+      userItemTexts(h.socket).some((text) => text.includes('用一两句口语')),
+      false,
+      '不得再给 omni 排一条「把这条后台结论说出来」的提示',
+    );
+    assert.equal(h.runtime.core.phase, 'listening');
+    assert.equal(h.socket.sent.filter((frame) => frame.type === 'error').length, 0);
+  } finally {
+    closeLive(h);
   }
 });

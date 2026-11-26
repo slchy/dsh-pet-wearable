@@ -1,7 +1,7 @@
 /**
  * 判停器的**归属**判定：共享的那份不许在断开时销毁。
  *
- * 这条判据看着琐碎，代价却是实打实的：侧车是 python + 8.7 MB ONNX，冷启动实测
+ * 这条判据看着琐碎，代价却是实打实的：声学判停模型是 8.7 MB ONNX，冷启动实测
  * ~300 ms，而它刚好落在「用户说完 → 开一轮」里。以前每条连接建一个、断开就
  * `stop()`，于是真机每次重连（网络抖动 / 服务重启 / 重开 App）的第一句都要付
  * 这一刀 —— 端到端实测第 1 轮 309 ms、第 2 轮 150 ms，差的就是它。
@@ -24,8 +24,7 @@ function fakeDetector(): EndpointDetector & { stopped: boolean } {
 }
 
 const params = {
-  pythonPath: '/dev/null',
-  scriptPath: '/dev/null',
+  modelPath: 'models/smart-turn-v3.2-cpu.onnx',
   quietMs: 150,
   extendMs: 400,
   maxExtensions: 7,

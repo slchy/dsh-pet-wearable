@@ -338,7 +338,7 @@ response.done 到达 → assistantItemIds：role==='assistant' 或 type==='funct
 
 `finish()` 见到 `origin === 'user'`、还没人 `claim()`、没标 `deleteOnDone`、没被取消、
 `pending` 也是空的回复，**不进 orphans**。它停在 `readyResp`。
-Silero 把判停提前之后，TurnJudge 可能比 Omni 晚几十毫秒；done 一到就删，
+Silero 把判停提前之后，TurnJudge（进程内 ONNX 声学判停，`src/turn-judge.ts`）可能比 Omni 晚几十毫秒；done 一到就删，
 编排器只能退回 `answerFromText`，已经生成的音频就没了。
 `willServe()` / `claim()` 经 `liveResp()` 仍看得见这份。认领到它时槽位清空，引用留在 `claimedResp`。
 

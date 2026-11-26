@@ -39,8 +39,8 @@ import sys
 import numpy as np
 import onnxruntime as ort
 
-# 侧车用的是自带的特征提取，直接复用，别重写
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "turn_judge"))
+# 离线基准副本自带特征提取，直接复用，别重写
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eot"))
 from whisper_features import compute_whisper_log_mel_features  # noqa: E402
 
 RATE = 16_000
