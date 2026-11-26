@@ -187,7 +187,36 @@ npm run pair -- new --device pixel-9 --host 203.0.113.10 --port 8766 --tls
 | `MIAI_TOKENS` | 指向 `token` 或 `token:deviceId` 一行的文件；配了就要求首帧 `Hello` |
 | `QWEN_ASR_TURN_DETECTION` | `manual`（默认）或 `vad`。`vad` 时 `src/voice-config.ts` 把客户端 `commitMs` / `sttCommitMs` 收成 0，并且不传 `openQuietMs`，于是 `VOICE_COMMIT_MS` / `VOICE_STT_COMMIT_MS` / `VOICE_OPEN_QUIET_MS` 不再生效，避免和服务器 VAD 各切一次。服务端静音窗是 `QWEN_ASR_VAD_SILENCE_MS`（默认 `200`，下限 200） |
 | `OMNI_API_KEY` | omni 车道的 key。`resolveOmniApiKey`（`src/voice-config.ts`）优先用它，空则落到 `DASHSCOPE_API_KEY`（只含空白当没配）。CLI（`src/main.ts`）、Web 插件、评测沙盒（`bench/eval/server.ts` 经 `assemblePipelinePlan`）同一份 |
+| `VOICE_VAD` | 缺省 `auto`。`energy` / `0` / `off` / `false` 退回能量门，不加载 ONNX。其它值（含 `auto`）尝试 Silero v5。见下节 |
+| `VOICE_VAD_MODEL` | 非空则原样当模型路径（相对路径也可以，存在性由加载时再查）。空则按下面的顺序找 `models/silero_vad.onnx` |
 | `--host` | 缺省 `127.0.0.1`；上公网由部署方显式给 `0.0.0.0`（**且必须配齐 `MIAI_TLS_*` 与 `MIAI_TOKENS`**） |
+
+最短人声与分层预卷属于 `src/voice-config.ts` 的二级热路径常量（不通过环境变量覆盖），由 `buildVoiceRuntimeConfig` 直接填进 `gate`：
+
+| 常量 | 默认 | 写进 |
+|---|---:|---|
+| `DEFAULT_MIN_SPEECH_MS` | `120` | `gate.minSpeechMs`。本段有声累计不够时，封段、ASR 封段、投机、判停预跑都不开火 |
+| `DEFAULT_ASR_PREROLL_MS` | `320` | `gate.asrPrerollMs`。开门时喂给 ASR 与 Omni 的预卷尾窗 |
+| `DEFAULT_GATE_PREROLL_MS` | `800` | `gate.prerollMs`。TurnJudge 仍吃完整这一段 |
+
+### 神经 VAD（Silero v5）模型与降级
+
+模型文件是 `models/silero_vad.onnx`。`.gitignore` 忽略 `models/*.onnx`，**不进 git**。
+`deploy_cloud.py` 的同步清单不含 `models/`（`.env`、`docs`、`models`、`node_modules`、`tmp` 一律不同步，见本机 `docs/OPS-RECORD.md` §2.1）。
+新机器要自己把文件放进部署目录的 `models/`，或设置 `VOICE_VAD_MODEL`。
+
+未设置 `VOICE_VAD_MODEL` 时，`resolveVadModelPath` 按固定顺序找第一个存在的文件。
+后三档是相对**这个模块文件**的 URL，CLI 与插件同步副本因此落到不同目录：
+
+1. 进程 cwd 下的 `models/silero_vad.onnx`
+2. `../../models/silero_vad.onnx`。文件在 `src/runtime/` 时这是仓根 `models/`
+3. `../../../models/silero_vad.onnx`。文件在 `packages/dsh-voice-web/src/voice/runtime/` 时这是插件包内的 `models/`
+4. `../../../../../models/silero_vad.onnx`。同一份插件副本再往上，回到仓根 `models/`
+
+`loadSharedVad` 由 CLI（`src/main.ts`）和 Web 插件（`packages/dsh-voice-web/src/boot-voice-stack.ts`，同步后的 `voice/runtime/vad-bootstrap.ts`）共用。
+找不到文件，或 ONNX 加载失败，都打一行日志并返回 `null`，能量门接着用，**不阻断启动**。
+神经门接上的标志是启动日志里的 `VAD Silero v5 神经 VAD 已就绪`（后面带加载毫秒和模型路径）。
+退回时是 `退回能量门`，显式关掉时是 `能量门（VOICE_VAD=…，神经 VAD 已关闭）`。
 
 自签证书：
 
@@ -305,7 +334,9 @@ node scripts/said-audit.ts <会话目录>            # 逐轮「用户说了什�
 （故意不回 `function_call_output`）之后，`conversation.item.create`（`role: user`）
 紧接着 `response.create` 还能不能出声，以及下一轮还记不记得注入的事实。
 这就是 `OmniShadow.speakFromText` 的在线复现。`session.update` 的 instructions
-与工具描述和 `src/persona.ts`、`src/omni-shadow.ts` 逐字一致。口径见
+以 `src/persona.ts` 为准，工具描述以 `src/omni/protocol.ts` 的 `DELEGATE_TOOL` 为准
+（车道时序在 `src/omni/shadow.ts`；`src/omni-shadow.ts` 只重导出）。
+探针脚本自己嵌了一份副本，不 import `.ts`，不会跟着源码自动变。口径见
 [OMNI-LANE.md](./OMNI-LANE.md) §10.1 与 §12.5。
 
 ```bash

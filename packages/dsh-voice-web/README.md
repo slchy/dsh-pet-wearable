@@ -50,6 +50,32 @@ dsh plugin --profile web add link:<abs-path-to-packages/dsh-voice-web>
 
 代码、配置与文档是 MIT。`assets/pet/**` 的表情图不在 MIT 许可内，也不授予再许可，只供本插件运行时使用。界限和清单在 [`PROVENANCE.md`](./PROVENANCE.md)。
 
+## 源码地图
+
+宿主逻辑位于 `src/host-*.ts`，桌宠界面位于 `src/browser/pet-*.ts`，进程内 `dsh` 代理位于 `src/in-process-agent.ts`（`InProcessDshAgent`）。
+
+```text
+src/driver.ts              apply()：宿主相位、桌面注入，再把语音栈交给 boot
+src/driver-policy.ts       HostPhase / StackPhase / VoiceBackendState，纯转移
+src/boot-voice-stack.ts    与 CLI 同一套装配；这里调用 loadSharedVad
+src/standalone-bridge.ts   mode=standalone 的独立桥
+src/host-lifecycle.ts      发现 webServer、会话 id、mountHostPlugin
+src/host-mount.ts          /dsh-voice/* 与 index 注入
+src/host-security.ts       连接栅栏
+src/in-process-agent.ts    InProcessDshAgent
+src/bridge.ts              WS ↔ 本机 TCP
+src/browser/client.ts      VoiceClient（ClientPhase）
+src/browser/capture.ts     采集
+src/browser/playback.ts    播放
+src/browser/frames.ts      分帧
+src/browser/pet-widget.ts  挂件入口
+src/browser/pet-ui.ts      界面状态
+src/browser/pet-sprites.ts 十张表情
+src/browser/pet-talk.ts    说话时的姿态
+src/browser/pet-dom.ts pet-styles.ts pet-hit.ts pet-drag.ts
+src/browser/pet-geometry.ts pet-prefs.ts pet-session.ts
+```
+
 ## 语音栈从哪来
 
 `packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/`、`demo/`、`assets/`、`cordis.patch.yml` 和 `PROVENANCE.md`。
@@ -57,6 +83,17 @@ dsh plugin --profile web add link:<abs-path-to-packages/dsh-voice-web>
 为什么不是软连接：实测 npm 11.16 的 packlist **直接跳过 symlink** —— `files: ["src"]`、显式列 `src/voice`、`src/voice/**` 三种写法打出来的 tarball 里都没有链接目标，本地能跑、发出去是空包。
 
 为什么要复制而不是依赖 `dsh-pet-wearable`：包② 要能在没有包① 的情况下装起来，所以不能只留一个 `dependencies` 指过去。代价是两边的 `package.json` 依赖清单得手动对齐 —— **漏一个就是编译/运行期才炸**（例如 `undici`：包① 的 `http-agent.ts` 直接引它，web 侧少了它连 `lib/` 都编不出来）。
+
+神经 VAD 不在插件里另写一份查找。`boot-voice-stack.ts` 调同步过来的
+`voice/runtime/vad-bootstrap.ts`（仓根是 `src/runtime/vad-bootstrap.ts`）。
+`VOICE_VAD` 缺省 `auto`；`VOICE_VAD_MODEL` 非空就用那个路径。
+否则按 cwd，以及相对该文件的 `../../models`、`../../../models`、`../../../../../models`
+找 `silero_vad.onnx`。仓根开发时更深的那一档回到仓库 `models/`。
+文件不在 git 里（仓根 `.gitignore` 的 `models/*.onnx`）。找不到或加载失败就退回能量门，插件照常起来。
+接上的日志是 `VAD Silero v5 神经 VAD 已就绪`。最短人声 120 ms 与 ASR 预卷 320 ms 由仓根 `voice-config.ts` 的常量 `DEFAULT_MIN_SPEECH_MS` / `DEFAULT_ASR_PREROLL_MS` 控制。
+
+`npm test` 当前 **77** 项，都在 `tests/*.test.ts`（桥、帧、宿主挂载与安全、进程内 agent、桌宠几何 / 拖拽 / 表情 / 姿态）。
+语音栈行为的测试在仓根 `src/` 同步之前的那一份上跑，不在这 77 项里。
 
 ## 为什么不用 WebRTC
 
@@ -80,7 +117,7 @@ dsh plugin --profile web add link:<abs-path-to-packages/dsh-voice-web>
 npm install                # 本包是独立包（仓根没有 workspaces），依赖要在本目录装
 npm run build              # 同步语音栈 + 编译 lib/ + 打包页面
 npm run typecheck          # 不产出文件，只验类型
-npm test                   # sync:voice，再 node --test tests/*.test.ts（4 项：桥、帧对齐、driver 装配）
+npm test                   # sync:voice，再 node --test tests/*.test.ts（77 项：桥、宿主、进程内 agent、桌宠；语音栈行为以仓根 src/ 的测试为准）
 ```
 
 `prepublishOnly` 跑 `typecheck && test`。

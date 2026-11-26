@@ -73,7 +73,7 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 两份长文本迟早漂移，只留一份就没得漂。
 
 - 本地改完要 `npm run install-profile`，否则跑的是没人设的通用 agent；
-- 服务器由 `scripts/deploy_cloud.py` 自动安装；
+- 服务器安装脚本不在本公开仓（同步清单与 `tests/deploy-boundary.test.ts` 的允许路径一致）；
 - 【情绪标签】那行的八个标签必须与 `src/emotion.ts` 的 `EMOTION_LABELS` 一致，
   `tests/profile-prompt.test.ts` 会卡住不一致。
 
@@ -84,7 +84,10 @@ ssh -i $k user@host "echo $b64 | base64 -d | bash -s"
 [`src/persona.ts`](src/persona.ts) 导出（`PERSONA_NAME` / `OMNI_SHORT_INSTRUCTIONS` /
 `FAST_LANE_PERSONA_HEADER`）。`LIVE_BACKEND_TASK_DIRECTIVE` 与 `buildLiveReportPrompt`
 也住在同一份 [`src/persona.ts`](src/persona.ts) 里，跟这三个放在一起。
-**不要在 `fronted-agent.ts` / `omni-shadow.ts` 里手写字面量**。两处抄一份的下场是
+**不要在 `fronted-agent.ts` / `src/omni/shadow.ts` 里手写字面量**。Omni 短人设正文是
+`persona.ts` 的 `OMNI_SHORT_INSTRUCTIONS`；唯一工具 `DELEGATE_TOOL` 在
+[`src/omni/protocol.ts`](src/omni/protocol.ts)。[`src/omni-shadow.ts`](src/omni-shadow.ts)
+只再导出 `OmniShadow`，里面没有第二份提示词。两处抄一份的下场是
 「只改了一边，用户听出换了个人」—— 而代码不会报错。
 
 `tests/profile-prompt.test.ts` 守着同源：名字、定位、身份措辞要能被同一个来源解释，
@@ -264,3 +267,36 @@ done
 ## 三端运行配置唯一真相源
 
 CLI（`src/main.ts`）、Web 插件（`packages/dsh-voice-web/src/driver.ts`）、评测服务（`bench/eval/server.ts`）共用 `src/voice-config.ts`。运行时默认值只从 `buildVoiceRuntimeConfig`、`resolveOmniApiKey`、`DEFAULT_IMAGE_QUESTION` 取；三端差异只走 `overrides`。入口里再抄一套默认，改一处就会漂。
+
+## 上行人声：Silero v5 在热路径上，能量门是退路
+
+生产与 Web 插件都经 [`src/runtime/vad-bootstrap.ts`](src/runtime/vad-bootstrap.ts) 的 `loadSharedVad()` 加载一份共享 `SileroVadModel`（[`src/vad.ts`](src/vad.ts)）。Web 侧是 `boot-voice-stack.ts` 调用同步副本里的同一函数。每条连接 `createStream()` 拿自己的 `SileroVadStream`，LSTM 状态不跨连接共享。
+
+- `VOICE_VAD=energy|0|off|false`、找不到 `models/silero_vad.onnx`（或 `VOICE_VAD_MODEL` 指到的文件）、加载抛错：返回 `null`，继续用能量门。**不许因此拒绝启动**。`src/main.ts` 顶层不静态 `import` `onnxruntime-node`。
+- 有模型时 [`src/uplink-pipeline.ts`](src/uplink-pipeline.ts) 把放大后的 PCM 切成 `VAD_FRAME_MS = 32`（512 个采样）再推理。队列严格串行：同一个 `SpeechVadStream.process` 不能重叠。
+- 概率进 [`src/energy-gate.ts`](src/energy-gate.ts)：起音 `0.45`、维持 `0.30`，峰值还得高于 `-62 dBFS`。`speaking` 且本段还没确认人声时，起音改 `0.65`，去抖取 `max(voiceDebounceFrames, speakingDebounceFrames)`，后者缺省 4。
+- 封段门槛在 [`src/silence-triggers.ts`](src/silence-triggers.ts)：`minSpeechMs` 缺省 `DEFAULT_MIN_SPEECH_MS = 120`。不够 120 ms 的碎声不封段、不投机、不预跑。
+- 预卷分层在 [`src/voice/connection.ts`](src/voice/connection.ts)：TurnJudge 吃满 `DEFAULT_GATE_PREROLL_MS`（800 ms）；ASR 与 Omni 只补尾部 `DEFAULT_ASR_PREROLL_MS`（320 ms）。
+- [`scripts/calibrate.ts`](scripts/calibrate.ts) 仍是离线标定（旧的单会话 `SileroVad`、10 个阈值）。它的 0.4 标定观察点不要写回能量门的 `0.45/0.30`。
+
+## Pure Live 的前台事实只有 `live-session-store`
+
+[`src/pipelines/live-session-store.ts`](src/pipelines/live-session-store.ts) 的 `reduceLiveSession` 是唯一数据面：前台轮次、后台任务、已经投影给 Omni 的那一槽 `lastSnapshot`。编排器只执行它吐出的意图：
+
+- `sync_omni_snapshot` → `updateDynamicContext`。快照字符串没变就不发。控制面只留最新一份，发出去的是整份 `session.update`。
+- `send_tool_output` → `sendFunctionCallOutput`。
+- `delete_omni_items` → `deleteItems`，清掉未核实的助手项。
+
+真车道实现了 `updateDynamicContext` 时，后台结论只进这一槽。`injectAnswer` 只留给没有这个方法的旧假车道。真车道上再把同一结论旁注进下一轮，Omni 会同时看到两份事实。
+
+后台正文开头的 `[原意: …]` / `【原意：…】` 由 [`src/background-task-bus.ts`](src/background-task-bus.ts) 的 `parseCanonicalUserTag` 剥掉，写进 `canonicalUser`，再投影进快照。标签留在要朗读的正文里会被念出来。
+
+## 守卫轮：没标委派，首块音频一字节都不外放
+
+`decideLiveTurn` 给出 `live_with_bg_guard` 时（要动手，或 `isRealtimeFactRequest` 命中的实时事实），[`src/pipelines/live-orchestrator.ts`](src/pipelines/live-orchestrator.ts) 在第一块 `audio` 出去之前看 `delegateReason()`。还是空的就 `discard`，用用户原话走 `early_rule`，再排队一句短应声。这时已经交出的音频字节数必须仍是 0。整段 0 音频且仍没有 `delegate` 时，同样补原话并应一声。
+
+这几处要一起改，拆开就会漏声或漏拦：
+
+- [`src/omni/shadow.ts`](src/omni/shadow.ts) 在 `response.output_item.added` 看到 `function_call` 立刻标 `delegate`（真服务上工具比首块音频早约 150 ms）。没人认领的回复停在 `readyResp`。同句再封段只删助手项，用户音频留下，下一句才连用户项一起删。
+- 专名、动手、长期记忆的领域边界写在 [`src/omni/protocol.ts`](src/omni/protocol.ts) 的 `DELEGATE_TOOL`，不写进 `instructions`。没调工具、也没被实时事实守卫接走时，[`detectSubjectHallucination`](src/pipelines/entity-divergence.ts) 只在听写与答复专名零重叠时派后台复核；注记要求第一行写 `[原意: 纠正后的用户原话]`。
+- [`src/turn-router.ts`](src/turn-router.ts) 的 `isConditionalWeatherAside` 把「如果……的话就……」这类条件假设排除出天气守卫。假设后面又显式问天气，仍然要查。

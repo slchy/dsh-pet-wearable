@@ -6,7 +6,7 @@
 >
 > **对账基准**：`src/` 当前代码 + `npm test`（部署运行时，见 §8）全绿。
 > **注意**：这棵树早年放在 `cloud/src`、编排类叫 `aliyun-session`；现在路径是 `src/`，
-> 编排类是 `VoiceConnection`（`src/voice-session.ts`）。文中已按现行名字改写，
+> 编排类是 `VoiceConnection`（实现在 `src/voice/connection.ts`，`src/voice-session.ts` 只再导出）。文中已按现行名字改写，
 > 见到旧名按这个对应关系读。文档与代码冲突时以代码为准。
 
 ---
@@ -18,8 +18,8 @@
 │ main.ts          装配：CLI / 环境 → pipeline-mode → provider → 服务    │
 │                  VOICE_PIPELINE=live | cascade（启动期显式二选一）      │
 ├──────────────────────────────────────────────────────────────────────┤
-│ voice-session.ts 一条连接的**编排**（VoiceConnection）：把下面各层接起来，│
-│                  自身不含判定                                          │
+│ voice-session.ts 公开入口（再导出）。实现是 voice/connection.ts        │
+│                  VoiceConnection 自身不含判定                           │
 ├──────────────┬──────────────┬───────────────┬────────────────────────┤
 │ 传输与协议    │ 上行处理      │ 应用层         │ 判定 / 路由 / 执行      │
 │ transport    │ uplink-…     │ AppSession    │ kernel（纯 step）       │
@@ -32,14 +32,14 @@
 │              │              │               │   → FastVoiceEngine     │
 ├──────────────┴──────────────┴───────────────┴────────────────────────┤
 │ 主管道（会话内互斥，pipeline-mode.ts 启动期选定）：                      │
-│  live    pipelines/live-orchestrator + background-task-bus            │
-│          Omni 单前台 + 异步 dsh；空窗 speakFromText 同嗓子汇报          │
+│  live    live-orchestrator + live-session-store + task-bus            │
+│          Omni 单前台；事实单槽 updateDynamicContext；空窗同嗓汇报       │
 │  cascade pipelines/cascade-agent                                      │
 │          FastLlmClient + PrefetchSlot + dsh 投机 + CosyVoice 流式      │
 │          （routeTurn 的 live 恒为 off，不接 Omni）                      │
 │ 引擎     engines/live-voice-engine · cascade-voice-engine             │
 │          · agent-engine-adapter（未注入引擎时收成同一条 respond()）      │
-│ 可替换   omni-shadow · dsh（session.ts）· qwen-realtime-asr / aliyun  │
+│ 可替换   omni/（门面 omni-shadow.ts）· dsh（session.ts）· ASR / TTS   │
 │          cosyvoice / omni-tts / mimo · turn-judge                     │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 旁路：archive · announce-store · photo-inbox · tool-control（服务级）  │
@@ -60,7 +60,8 @@ main.ts ──▶ pipeline-mode（纯函数：VOICE_PIPELINE=live | cascade）
                             │         └──▶ turn-runner（单泵，只消费 FastVoiceEngine.respond）
                             │                    ├──▶ 注入的引擎
                             │                    │      live：pipelines/live-orchestrator.toEngine
-                            │                    │            └── engines/live-voice-engine ──▶ omni-shadow
+                            │                    │            └── engines/live-voice-engine ──▶ omni/shadow
+                            │                    │                 （门面 omni-shadow.ts；快照来自 live-session-store）
                             │                    │            └── background-task-bus ──▶ dsh（异步，不抢前台）
                             │                    │      cascade：pipelines/cascade-agent.toEngine
                             │                    │            └── fast-llm-client + prefetch-slot
@@ -89,7 +90,7 @@ live 的空窗汇报不进 respond()：
 `kernel-runtime` 之上的薄门面，相位只读 `runtime.state.dialog`。`SessionCore`
 另从 `kernel` 取 `isPreTurnCommit` 这一个谓词，方向相同，不成环。
 
-两条主管道互不引用。`cascade-agent` 不引用 `omni-shadow`、`live-orchestrator`、
+两条主管道互不引用。`cascade-agent` 不引用 `src/omni`、`live-orchestrator`、
 `background-task-bus`；`live-orchestrator` 不引用 `fast-llm-client`、
 `prefetch-slot`、`cascade-agent`。空窗播放是 `voice-session` 把
 `TurnRunner.speakAudioAnswer` 当回调递进 `speakBackgroundReport`，管道不反向
@@ -127,13 +128,13 @@ live 的空窗汇报不进 respond()：
 
 | 文件 | 职责 | 关键点 |
 |---|---|---|
-| `uplink-pipeline.ts` | 上行解码：`msbc`（子进程 `ffmpeg`）或设备自报的 `pcm16` → 放大 → 能量门 → 有声段交 STT；另有**原始 PCM 旁路**与**电平表** | `onRawPcm` 给的是**放大前**的字节（档案要能重算增益） |
-| `energy-gate.ts` | 「这块音频要不要推给 STT」的状态机 + 预卷缓冲。`silenceMs` 是封段 / 投机 / 判停共用的那一份静音累计；预卷以 `PrerollFrame`（`pcm` + 门内标好的 `voiced`）交出，下游不再自己跑 `pcm16PeakDbfs` | 生产（`voice-session.ts`）传 `voiceDebounceFrames: 2`，与静音触发器的两帧去抖对齐：单帧尖峰不把 `silenceMs` 打回 0，也不因此重开一段。缺省仍是 1（老单测）。没声音就**不建 STT 连接**：ASR 网关对"没听到有效语音"的连接 10 s 就判空闲超时 |
-| `silence-triggers.ts` | 同一次静音喂四路**期限差一个数量级**的消费者：投机 100 ms / 判停预跑 200 ms / omni 车道封段 20 ms / ASR 封段 150 ms（后两路是客户端封段的默认；`QWEN_ASR_TURN_DETECTION=vad` 时为 0，见 `voice-config.ts`） | 四者各有自己的 `firedAt`，不是一个布尔「静音了没有」；闸只比时刻（`lastVoicedAt`），不持状态 |
+| `uplink-pipeline.ts` | 上行解码：`msbc`（子进程 `ffmpeg`）或设备自报的 `pcm16` → 放大 → 能量门 → 有声段交 STT；另有**原始 PCM 旁路**与**电平表**。注入了 `vadStream` 时，放大后的 PCM 按 `VAD_FRAME_MS = 32`（512 采样）切帧，时间戳从包尾倒推，`kickVad` 严格串行调用 `process` | `onRawPcm` 给的是**放大前**的字节（档案要能重算增益）。没有 `vadStream` 时这一包直接进能量门，不切 32 ms |
+| `energy-gate.ts` | 「这块音频要不要推给 STT」的状态机 + 预卷缓冲。`silenceMs` 是封段 / 投机 / 判停共用的那一份静音累计；预卷以 `PrerollFrame`（`pcm` + 门内标好的 `voiced`）交出，下游不再自己跑 `pcm16PeakDbfs`。传入 `speechProb` 时改用神经双阈值：起音 `0.45`、维持 `0.30`，并且峰值必须高于 `-62 dBFS`。`speaking` 且本段尚未确认人声时，起音升到 `0.65`，去抖帧数缺省 4 | 生产（`voice/connection.ts`）传 `voiceDebounceFrames: 2`，与静音触发器的两帧去抖对齐：单帧尖峰不把 `silenceMs` 打回 0，也不因此重开一段。缺省仍是 1（老单测）。没声音就**不建 STT 连接**：ASR 网关对"没听到有效语音"的连接 10 s 就判空闲超时 |
+| `silence-triggers.ts` | 同一次静音喂四路**期限差一个数量级**的消费者：投机 100 ms / 判停预跑 200 ms / omni 车道封段 20 ms / ASR 封段 150 ms（后两路是客户端封段的默认；`QWEN_ASR_TURN_DETECTION=vad` 时为 0，见 `voice-config.ts`）。本段已确认有声不足 `minSpeechMs`（生产缺省 `DEFAULT_MIN_SPEECH_MS = 120`）时，四路提前触发都不开火 | 四者各有自己的 `firedAt`，不是一个布尔「静音了没有」；闸只比时刻（`lastVoicedAt`），不持状态 |
 | `utterance-assembler.ts` | 句子 → 一轮话语：按 TurnJudge 概率或固定窗口判停；判停请求**与静默窗重叠**提前发出 | ASR 的句号是**句子**边界，不是**轮次**边界；问号结尾不等于说完了。提前算的那份结果带两条有效性条件（还是同一句、算完之后没再收到中间结果），不成立就现算一遍 —— 拿过期结果定稿就是抢话 |
 | `barge-voicing.ts` | 声学插话闸：定稿后无新有声帧时拦住同一截缓冲的重复解码幻觉 | 同步校验时钟同源（`CLOCK_MISMATCH_MS`） |
 | `turn-judge.ts` | 常驻 Python 侧车的客户端：`[u32 len][int16 PCM]` 问、`[f64 概率]` 答 | 进程常驻、模型只加载一次；不可用时退回固定窗口 |
-| `vad.ts` | silero-vad v5 封装（可选判停后端） | 输入是 `[1,576]`（512 + 64 点上下文）、值域 `[-1,1]`，阈值 0.4 |
+| `vad.ts` · `runtime/vad-bootstrap.ts` | Silero v5 是上行热路径。`SileroVadModel` 进程内一份，每条连接 `createStream()` 得轻量 `SileroVadStream`。三端经 `loadSharedVad()` 加载：`VOICE_VAD=energy\|0\|off\|false`、找不到 `models/silero_vad.onnx`（或 `VOICE_VAD_MODEL`）、加载失败都返回 `null` 并退回能量门，不阻断启动。`onnxruntime-node` 只在真正加载时动态 `import`。旧类 `SileroVad` 仍给 `scripts/calibrate.ts` 与 `legacy-pipeline.ts` | v5 输入是 `[1,576]`（512 + 64 点上下文）、值域 `[-1,1]`、16 kHz 下每帧 32 ms。热路径的滞回阈值在 `energy-gate.ts`（`0.45/0.30`，播报期起音 `0.65`），不是标定脚本里扫过的 0.4。开门预卷分层在 `voice/connection.ts`：TurnJudge 用满 `DEFAULT_GATE_PREROLL_MS`（800 ms），ASR 与 Omni 只取尾部 `DEFAULT_ASR_PREROLL_MS`（320 ms） |
 | `wake-word.ts` · `backchannel.ts` · `hq-intent.ts` | 三条**领域规则**：唤醒词 / 纯应答噪声 / 要看细节的措辞 | 唤醒词词表（`ignorePhrases`）与「要不要自动拍细节」（`detail` 意图）都来自设备能力（见 §2.3）；v1 基线下前者空表、后者不启用，三条规则都只是"已知的机械事实"，交给模型判断反而更贵更不准 |
 
 ### 2.3 设备原语（`src/devices/`）
@@ -240,16 +241,40 @@ drop            丢弃这句话（纯噪声）
 | `engines/cascade-voice-engine.ts` | 端口版级联引擎。`ask` 的增量一出来就送 `synthesizeStream`（首包与模型生成重叠）；流式失败、或一个音频块都没有但清洗后的 `speech` 非空时，退回整段 `synthesize` | 只依赖四个端口（问 / 合成 / 转发上行 / 报告放弃投机），不 import 具体 agent。与 `CascadeAgent.toEngine()` 同一份 `FastVoiceEngine` 契约。`mode` 为 `'cascade'` |
 | `engines/agent-engine-adapter.ts` | 调用方没注入引擎时，把现有 `AgentProvider` + `TtsProvider` 收成一条 `FastVoiceEngine` 事件流。`TurnRunner` 在构造函数里包这一层 | `mode` 固定 `'cascade'`（「问 agent 再出音频」的泵）；某一轮实际走了 omni 直出时，路径写在 `meta.path` 上。带图不问 `willServeAudio`、omni 轮事先不开流式 TTS、流式失败退回整段、多步增量用 `spokenFromStream` 对账、omni 转交 dsh 时垫话留住，都收在 `respond()` 里 |
 | `engines/stream-utils.ts` | 流式引擎的公共件。Live / Cascade / 适配器以前各抄一份队列、中止门和「念出去的全文」 | `EventQueue`（文本和音频同一条到达顺序）/ `createAbortGate`（已中止立刻兑现且不挂监听；调用方在 `finally` 里 `cancel()` 摘掉监听）/ `spokenFromStream`（按全部增量剥情绪标签再 `cleanForSpeech`；多步时不能只拿最后一步的 `reply.speech`） |
-| `pipelines/live-orchestrator.ts` | `VOICE_PIPELINE=live` 的唯一前台。热路径是 `toEngine()`（`mode: 'live'`）：omni 一副嗓子；`reply()` 留给保活和无音频调用方 | 工具调用、识图、早规则、静默记忆进 `BackgroundTaskBus`；dsh 自己的 `run_in_background` / 子代理经 `ingestExternalAnnouncement` 进同一条总线。空窗 `speakBackgroundReport`：`verbatim` 返回 `'fallback'`；车道缺失或没有 `speakFromText` 也是 `'fallback'`；`canSpeakBackground()` 为假或 `speakFromText` 返回 null 则 `'defer'`；开口后 0 字节且不是被打断，同样 `'fallback'`。能说则把 `buildLiveReportPrompt` 交给 `speakFromText`，音频由调用方的 `playAudio`（生产是 `TurnRunner.speakAudioAnswer`）播出。用户先开口、空窗还没到时，`flushUnspoken` 按 `'unspoken'` 回注，每个任务只注一次。omni 接不上（没车道，或 `willServe()` 为假）时才同步问 dsh，再用本层 TTS 把那句说出来。插话只停前台这一句，不取消已经答应的后台任务；显式「别查了」才 `cancelAll` |
+| `pipelines/live-orchestrator.ts` | `VOICE_PIPELINE=live` 的唯一前台。热路径是 `toEngine()`（`mode: 'live'`）：omni 一副嗓子；`reply()` 留给保活和无音频调用方。前台轮次与后台事实只经 `reduceLiveSession` 推进，副作用只执行它给出的 `send_tool_output` / `delete_omni_items` / `sync_omni_snapshot` | 工具调用、识图、早规则、静默记忆进 `BackgroundTaskBus`；dsh 自己的 `run_in_background` / 子代理经 `ingestExternalAnnouncement` 进同一条总线。`live_with_bg_guard` 在第一块音频交出前若 `delegateReason()` 仍空，`discard` 并不外放任何字节，改用用户原话走 `early_rule`。专名零重叠由 `entity-divergence.ts` 的 `detectSubjectHallucination` 派后台复核。空窗 `speakBackgroundReport`：`verbatim` 返回 `'fallback'`；车道缺失或没有 `speakFromText` 也是 `'fallback'`；`canSpeakBackground()` 为假或 `speakFromText` 返回 null 则 `'defer'`；开口后 0 字节且不是被打断，同样 `'fallback'`。能说则把 `buildLiveReportPrompt` 交给 `speakFromText`。真车道有 `updateDynamicContext` 时结论进单槽快照，不再 `injectAnswer`；只有没有这个方法的旧假车道才按 spoken / unspoken 回注一次。omni 接不上时才同步问 dsh。插话只停前台这一句，不取消已经答应的后台任务；显式「别查了」才 `cancelAll` |
+| `pipelines/live-session-store.ts` | Pure Live 数据面的唯一真相源。纯 `reduceLiveSession(state, event)`，没有 IO。快照只在这里投影；与 `lastSnapshot` 相同则不发 `sync_omni_snapshot` | 意图：`send_tool_output`、`delete_omni_items`、`sync_omni_snapshot`、`deliver_report`。空快照是空串。静默记忆不进快照。`[原意]` 纠偏后的用户原话以 `canonicalUser` 进已核实说法 |
+| `pipelines/entity-divergence.ts` | 听写在追问一个具体专名，Omni 却用对不上的实体作答 | `detectSubjectHallucination`：书名或定义句与听写核心字零重叠才返回；听清、在澄清、或不是这种问句，都是 `null` |
 | `background-task-bus.ts` | Pure Live 的后台任务总线。`dispatch` 收本轮交给 dsh 的查询，`ingestExternalAnnouncement` 收 dsh 自己跑完的播报，两条路都收成 `BackgroundTaskReport`，由唯一前台决定什么时候说 | 来源：`tool_call` / `early_rule` / `image` / `memory_silent` / `dsh_background`。工人循环一次只跑一个 `runner.execute`；循环晚一个微任务才取队列，同一同步回合里先到的 `early_rule` 和后到的 `tool_call` 合成一次调用。状态只许 `queued → running \| cancelled`、`running → completed \| failed \| cancelled`。终态之后 runner 才回来的结果丢掉。`memory_silent` 与 `silent: true` 不播报；`cancelAll` 默认也不动它们。队列上限默认 16（只数还在排队的）。同一 `turnNo` 的要播报任务去重，排队中的 `tool_call` 可以升级查询。端口、订单号、代码路径、`[VERBATIM]`、超长正文走 `verbatim`（`summary` 截到 160 个码点，全文在 `verbatim`）。`dispose` 停掉还往这条连接上送的汇报并 abort 信号，不调用 `cancelRunning`：在途 dsh 可以自己跑完，结果留给离线补播 |
 | `pipelines/cascade-agent.ts` | `VOICE_PIPELINE=cascade` 的唯一 agent。热路径是 `toEngine(tts)`：`reply()` 的文本增量直接送 `tts.synthesizeStream`，流式失败再退回整段 `synthesize`；没有 `synthesizeStream` 时用 `SentencePump` 逐句合成 | `FastLlmClient`（对冲、两段超时、`[[DELEGATE]]` 早退）+ `PrefetchSlot`（定稿前预跑与中间结果投机）+ dsh 投机（快模型与 dsh 同时起跑，快车道赢了就按 `cancelMode` 取消在途那一轮）。`routeTurn` 的 `live` 恒为 `'off'`，类上没有 `attachAudioLane` / `willServeAudio` / `speakFromText` 这一组方法。短闲聊走快模型，其余交给内层 dsh。`AbortSignal` 立刻停流并 `cancelTurn` + `dropPrefetch('barge_in')` |
 | `fronted-agent.ts` | 把级联文本和 omni 车道收在同一个 `AgentProvider` 装饰器里：`willServeAudio()` / `reply()` 都问 `routeTurn()`，认领 omni、投机双轨、记账 | 扁平主管道按启动期拆开，会话内只装其中一条：`live` 用 `LiveOrchestrator`，`cascade` 用 `CascadeAgent` |
 | `fast-llm-client.ts` | 文本快车道请求端（HTTP 对冲 / 首字与整句两段超时 / SSE 暗号 `[[DELEGATE]]` 早退） | `CascadeAgent` 的快模型客户端 |
 | `prefetch-slot.ts` | 判停前预跑与中间结果投机的单槽，以及 `acceptsSpeculation` 认领闸 | `CascadeAgent` 在定稿前与中间结果上共用这一槽 |
-| `omni-shadow.ts` | omni 音频直出车道的传输 / 段 / 车道三层实现（同文件分节）。`VOICE_PIPELINE=live` 时挂上并发声；`cascade` 且 answer 为 `off` 时可以只做测速影子（`serve: 'off'`，`start()` 照跑，不挂车道） | `willServe` / `claim` / `discard` / `injectAnswer` / `speakFromText` / `canSpeakBackground` / `cancelBackgroundSpeech`。`speakFromText` 只在服务端没有在途 response、本地也没有未提交用户音频时开口，否则返回 null。三条硬约束见 [`OMNI-LANE.md`](OMNI-LANE.md) |
+| `omni-shadow.ts` | 薄门面：`export { OmniShadow }` 与选项类型。实现全部在 `src/omni/`。外部 import 路径保持这一份 | 不要在这个文件里写第二份人设或工具描述 |
+| `omni/protocol.ts` | 跟服务端说话的纯定义：采样率、`composeInstructions`、唯一工具。没有连接，也没有在途回复 | `DELEGATE_TOOL`（`delegate_to_assistant`）按领域划边界：动手、读设备、明确下令的备忘/提醒、翻查长期记忆、专名追问与「你说错了」。普通闲聊与常见常识不调用。应声纪律在工具描述里（`LEAD_IN_CLAUSE` / `NO_PREVIEW_CLAUSE`），不在 `instructions`。正文只有 `persona.ts` 的 `OMNI_SHORT_INSTRUCTIONS` |
+| `omni/shadow.ts` | 车道协调：封段、认领、发声、事件分发。`VOICE_PIPELINE=live` 时挂上并发声；`cascade` 且 answer 为 `off` 时可以只做测速影子（`serve: 'off'`，`start()` 照跑，不挂车道） | `willServe` / `claim` / `discard` / `speakFromText` / `updateDynamicContext` / `sendFunctionCallOutput` / `deleteItems`。`response.output_item.added` 的 `function_call` 立刻把 `delegate` 标上，守卫轮才能在首块音频前看见。没人认领的回复停在 `readyResp`；同句再封段只删助手项，用户音频留下。`speakFromText` 只在服务端没有在途 response、本地也没有未提交用户音频时开口，否则返回 null。三条硬约束见 [`OMNI-LANE.md`](OMNI-LANE.md) |
+| `omni/control-plane.ts` | `ready` 之后积压控制帧的唯一顺序：orphans → deletes → toolOutputs → 单槽动态事实（整份 `session.update`）→ injects | `updateDynamicContext` 与当前值、已发送值都相同且没有脏标记时直接返回；忙时只保留最新一份 |
+| `omni/uplink-ledger.ts` | 上行音频账本（ring / held / parked / dirty）。不管连接，也不管回复相位 | `dirtyBytes = serverBufferedBytes + heldBytes`；静音期只进 ring |
+| `omni/socket.ts` | 一条 realtime WebSocket：建连、JSON 发送、解帧、协议错误计数 | 非法 JSON 丢掉。连续两次其它协议错误把连接判成 `broken` |
+| `omni/response.ts` | 一份 `PendingResponse` 上的相位、独占读端、不跨 `next` 的 solo 流 | 不碰 socket，也不碰上行账本 |
+| `omni/types.ts` | 影子旁路的共享类型，避免把同一份字段形状再抄一份 | `OmniShadowState` / `OmniShadowOptions` |
 | `interrupted-tail.ts` | 按**已播时长**切出「被打断、没说出口」的那一段，交给下一轮当上下文 | 速率是标定值（实测 4.8 字/秒），切点优先落回上一处标点；一次性，隔一轮就丢 |
 | `photo-inbox.ts` | 「请设备拍一张」变成可等待 / 可超时 / 可取消的请求（见 §4.3） | 两种使用者：工具口等人取图；设备自己按快门时没人等就转成一轮识图 |
 | `spontaneous.ts` | 判定**没人催的轮次**（后台作业结算后自己开的一轮） | 有等待者的轮次不算；只认 `running → idle` 且没有 prompt 在飞 |
+
+仓根 `src/**/*.ts` 共 **140** 个文件。上面几处上帝对象拆开之后，旧路径仍是公开入口，新逻辑在子目录：
+
+| 目录 | 文件数 | 现在各自管什么 |
+|---|---:|---|
+| `src/voice/` | 8 | `connection.ts`（`VoiceConnection`）、`server.ts`、`handshake.ts`、`session-options.ts`、`endpoint-wire.ts`、`asr-front.ts`、`device-io.ts`、`mic-phase.ts`。`voice-session.ts` 只再导出 |
+| `src/session/` | 9 | `sdk-process.ts`、`headless.ts`、`turn-router.ts`（dsh 轮次机，不是 `src/turn-router.ts`）、`live-sideband.ts`、`rollback-ledger.ts`、`superseded.ts`、`parse-events.ts`、`usage.ts`、`types.ts`。`session.ts` 的 `DshSession` 仍是门面 |
+| `src/assembler/` | 2 | `semantic-gate.ts`、`audio-snapshot.ts`。轮次合并入口仍是 `utterance-assembler.ts` |
+| `src/app/` | 4 | `session.ts`（`AppSession`）、`dialog.ts`（`DialogRuntime`）、`announce.ts`、`clock.ts` |
+| `src/runtime/` | 7 | `pipeline-assembly.ts`、`providers-factory.ts`、`vad-bootstrap.ts`、`env-bootstrap.ts`、`asr-context.ts`、`audit-slot.ts`、`is-main.ts` |
+| `src/pipelines/` | 5 | `live-orchestrator.ts`、`live-session-store.ts`、`entity-divergence.ts`、`cascade-agent.ts`、`index.ts` |
+| `src/engines/` | 5 | `live-voice-engine.ts`、`cascade-voice-engine.ts`、`agent-engine-adapter.ts`、`stream-utils.ts`、`index.ts` |
+| `src/devices/` | 5 | 见 §2.3 |
+| `src/omni/` | 7 | 见上表。`omni-shadow.ts` 只再导出 |
+| `src/pet/` | 17 | 主动开口判定与仿真（`brain/`、`pet-timing.ts`、`proactive.ts`、`sim/`），见 §2.3 末 |
 
 > **出话热路径：一条泵**
 >
@@ -261,7 +286,7 @@ drop            丢弃这句话（纯噪声）
 >
 > | 启动期 | 注入的 `FastVoiceEngine` | 出声 |
 > |---|---|---|
-> | `VOICE_PIPELINE=live` | `LiveOrchestrator.toEngine()`（`mode: 'live'`）。对话音频经 `LiveVoiceEngine` 认领 `OmniShadow` | Omni 直出。后台结论在 `DialogRuntime.flushAnnounce` 的空窗（相位 `listening`，且距上次人声 ≥ `ANNOUNCE_QUIET_MS` = 800 ms）经 `speakFromText` → `speakAudioAnswer`。`verbatim`、没有 `speakFromText`、或开口后 0 字节且未被打断，返回 `'fallback'`，改走 `speakCanned`，念完再 `injectAnswer(..., 'spoken')`。车道正忙或 `speakFromText` 返回 null 则 `'defer'`，排回队首等下一个空窗 |
+> | `VOICE_PIPELINE=live` | `LiveOrchestrator.toEngine()`（`mode: 'live'`）。对话音频经 `LiveVoiceEngine` 认领 `OmniShadow` | Omni 直出。后台结论在 `DialogRuntime.flushAnnounce` 的空窗（相位 `listening`，且距上次人声 ≥ `ANNOUNCE_QUIET_MS` = 800 ms）经 `speakFromText` → `speakAudioAnswer`。`verbatim`、没有 `speakFromText`、或开口后 0 字节且未被打断，返回 `'fallback'`，改走 `speakCanned`。真车道把结论留在 `live-session-store` 的单槽快照里，不再 `injectAnswer`；没有 `updateDynamicContext` 的旧假车道才在念完后 `injectAnswer(..., 'spoken')`。车道正忙或 `speakFromText` 返回 null 则 `'defer'`，排回队首等下一个空窗 |
 > | `VOICE_PIPELINE=cascade` | `CascadeAgent.toEngine(tts)`（内部 `CascadeTurnEngine`，`mode: 'cascade'`） | `FastLlmClient` 的增量与 CosyVoice `synthesizeStream` 重叠。流式抛错退回 `synthesize(reply.speech, reply.emotion)`。这条管道的 `routeTurn({ live: 'off' })`，不挂 Omni 发声 |
 > | 调用方没给 `engine` | `TurnRunner` 自己 `new AgentEngineAdapter({ agent, tts, ... })` | 同一条 `respond()`。模拟器与只传 `{ agent, tts }` 的装配走这里 |
 >
@@ -291,7 +316,7 @@ drop            丢弃这句话（纯噪声）
 | `archive.ts` | 一条连接一个目录：`meta.json` / `events.jsonl` / `uplink.sbc` / `uplink.pcm` / `downlink.pcm` | 事件带三路字节偏移；`writeSync` 落盘，进程被中断也不丢已收字节 |
 | `announce-store.ts` | 离线待补播队列（JSONL，上限 20） | **至少一次**：`drain()` 即取走，崩溃在播放中途会重播一句（重复比丢好） |
 | `tool-control.ts` | 本机 HTTP 控制口（`127.0.0.1`），给 MCP 工具进程回调 | **进程/服务级常驻**：一个进程只开一个控制口，设备重连只 `setHandlers` 热切换（带所有权令牌，旧连接的迟到断开摘不掉新连接）；`close()` 只在进程退出时调，且必须 `closeAllConnections()` |
-| `scripts/calibrate.ts` · `legacy-pipeline.ts` | 阈值标定脚本、旧的回放链路（silero-vad + MiMo） | `calibrate` 已从 `src/` 迁到 `scripts/`；`legacy-pipeline` 只在 `--replay` / 无 `--stt` 的旧监听分支里**按需 `await import()`** —— 生产 `--stt` 启动的依赖图里没有 `onnxruntime-node` / silero-vad |
+| `scripts/calibrate.ts` · `legacy-pipeline.ts` | 离线阈值标定，以及旧的回放链路（单会话 `SileroVad` + MiMo） | `calibrate.ts` 留在 `scripts/`，扫 10 个阈值打印逐秒概率，不参与在线判人声。热路径是 `src/vad.ts` 的共享 `SileroVadModel` + `src/runtime/vad-bootstrap.ts` 的 `loadSharedVad()`。`legacy-pipeline` 仍只在 `--replay` / 无 `--stt` 的旧监听分支里**按需 `await import()`**。`main.ts` 顶层不静态引入 `onnxruntime-node`；流式路径在模型存在时由 `loadSharedVad` 动态加载，失败或 `VOICE_VAD=energy\|0\|off\|false` 退回能量门 |
 | `latency-report.ts` | **纯函数**：`events.jsonl` → 逐轮「用户说完 → 听到第一个字」分解（①判停+ASR / ②排队 / ③agent+TTS / ④播放） | 分段口径写在文件头；`null` 表示缺仪表而**不是 0**，且逐轮记下缺哪个时刻（`missing`）——缺 `tts.first` 多半是旧档案，缺 `gate.close` 多半是主动播报 |
 
 延迟分解依赖时间线仪表：`gate.close`（停嘴）、`asr.sentence`（定稿）、`tts.first`（首块）、
@@ -639,8 +664,8 @@ node src/main.ts --replay ../tmp/voice.sbc          # 离线回放一段 mSBC
 
 | 层 | 手段 |
 |---|---|
-| 部署运行时（`npm test`） | `node --test tests/*.test.ts`。`tests/deploy-boundary.test.ts` 守边界：这些测试只能引用部署清单里的路径（`src`、`mcp`、`tools`、`tests`、`turn_judge`、`scripts`，以及 `package.json` / `tsconfig.json` / `README.md` / `docs/TIME-KNOBS.md`）。`bench/` 与 `packages/` 不在清单里 |
-| 全量（`npm run test:all`） | `npm test`，再加 `npm run test:bench`（`bench/eval/*.test.ts`、`bench/replay/*.test.ts`）和 `npm run test:web` |
+| 部署运行时（`npm test`） | `node --test tests/*.test.ts`（127 个文件，当前 1420 通过）。`tests/deploy-boundary.test.ts` 守边界：这些测试只能引用部署清单里的路径（`src`、`mcp`、`tools`、`tests`、`turn_judge`、`scripts`，以及 `package.json` / `tsconfig.json` / `README.md` / `docs/TIME-KNOBS.md`）。`bench/` 与 `packages/` 不在清单里 |
+| 全量（`npm run test:all`） | `npm test`（1420），再加 `npm run test:bench`（24：`bench/eval/*.test.ts`、`bench/replay/*.test.ts`）和 `npm run test:web`（77：`packages/dsh-voice-web/tests/*.test.ts`）。合计 1521 |
 | 端到端（无真机） | `tools/fake-phone.ts`：假手机，可发 mSBC、收下行、按剧本触发高清照三条分支 |
 | 类型安全 | `tsc --noEmit` + **strip-only 语法检查**：Node 的类型擦除不支持参数属性这类写法，`tsc` 查不出，必须静态挑一遍 |
 | 启动自检 | 无参数跑 `node src/main.ts` 应当打印用法并以 2 退出 —— 用它当"整张依赖图能加载"的冒烟 |

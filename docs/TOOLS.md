@@ -22,9 +22,11 @@
 **② 先查 §1，再动手。** 手搓一个新脚本去算已有的口径，是本仓最常见的自伤 ——
 算出来的数字通常还错（§13 第 1 条就是活例）。
 
-**③ 新探针一律放 `bench/`。** `scripts/deploy_cloud.py` 的 `ITEMS` 只同步
-`src mcp tools tests turn_judge scripts package.json tsconfig.json README.md`
-九项，`bench/` 不在里面。往 `scripts/` 里塞一次性探针，等于把它推上生产服务器。
+**③ 新探针一律放 `bench/`。** 部署边界以 `tests/deploy-boundary.test.ts` 为准：
+根测试只能引用 `src`、`mcp`、`tools`、`tests`、`turn_judge`、`scripts`，以及
+`package.json`、`tsconfig.json`、`README.md`、`docs/TIME-KNOBS.md`。
+`bench/` 与 `packages/` 不在清单里。往 `scripts/` 里塞一次性探针，等于把它推上生产服务器。
+部署脚本本身不在本公开仓。
 
 **④ 每个事实只有一个源，观测工具自动去那儿取，绝不复制。** 复制一份 = 多一份要维护，
 而且两份的时钟对不上（dsh 的日志是 epoch ms，我们的档案是相对会话开始的毫秒）。
@@ -166,7 +168,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/dsh-timeline.ts` | Miai 档案 × dsh session log 同轴对齐（**一轮内部/工具/作业的唯一源**） |
 | **`scripts/partial-timeline.py`** | partial 时序：投机到底能提前多少。给三个覆盖口径、按句长分组，`--asks` 直接对 `agent.ask` 的实际发出账 |
 | **`scripts/silence-runs.py`** | 封段统计：句内静音段长度分布 + **当前实际门槛**（「等一整包」）作为基线，再按 75/25 ms 包长模拟各门槛会误封多少次、封段能提前多少 |
-| **`python scripts/time-knobs.py --check`** | **L1 跨参数不变量**（7 条）：改一个数会不会静默让另一个模块失效。进 `npm test`（`tests/qos-invariants.test.ts`） |
+| **`python scripts/time-knobs.py --check`** | **L1 跨参数不变量**（17 条，见 `scripts/time-knobs.py` 的 `INVARIANTS`）：改一个数会不会静默让另一个模块失效。进 `npm test`（`tests/qos-invariants.test.ts`） |
 | **`python scripts/sample-size.py`** | **要多少遍回放才有显著性**：从现有回放档案量出「测试-重测噪声」，算出两侧各需几遍才能判出 Δ ms。口径见 `QOS.md` §6.4 |
 | **`npm run mutate`** | **测试有效性**：12 个定向变异体（改判据/改门槛/换分位算法），要求全杀 + 对照组存活。约 20 s。**不能与其他测试并行**（它会改写 `src/`） |
 | **`python bench/replay/run.py --baseline <json>`** | **L3 回放基线**（回放 vs 回放）：超容差 exit 1。`--baseline-save` 更新基线。判据见下方 §3.1 |
@@ -186,20 +188,35 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 
 **L1 跨参数不变量** —— `python scripts/time-knobs.py --check`（进 `npm test`）
 
-数值**从源码扫**（不是文档抄的），扫不到就报「缺参数」。6 条关系（下表 5 行，
-第 2 行覆盖两个门槛）：
+数值**从源码扫**（不是文档抄的），扫不到就报「缺参数」。当前 `INVARIANTS` 共 **17** 条
+（名字与 `scripts/time-knobs.py` 逐字相同）：
 
 | 关系 | 违反后的后果 |
 |:---|:---|
+| `DEFAULT_SPECULATE_MS` ≤ `DEFAULT_PAUSE_DETECT_MS` | 判停预跑抢在投机前面起跑，投机那 100 ms 的提前量白丢 |
+| `VOICE_STT_COMMIT_MS` ≥ `VOICE_COMMIT_MS` | ASR 封段早于 omni 车道起跑，两路时序倒挂 |
+| `DEFAULT_BROWSER_STT_COMMIT_MS` ≥ `VOICE_COMMIT_MS` | browser 档案同样倒挂 |
 | `TURN_JUDGE_WAIT_BUDGET_MS` ≥ `TURN_JUDGE_EXTEND_MS` | 预算比一拍还短，等于没有预算 |
-| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` ≥ `VOICE_OPEN_QUIET_MS`（及 `_SHORT`） | 开轮门槛永远够不着，只能撞上限 |
-| `PREWARM_TTL_MS` > `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 序列句等满预算时预热 task 已过期，付一次冷启动 |
-| `MIAI_HTTP_KEEPALIVE_MS` < 服务端空闲超时（**≥60 s，上界未测**） | 复用到已关的连接，那一次请求**直接失败** |
-| `VOICE_SPECULATE_MS` ≤ `VOICE_PAUSE_DETECT_MS` | 判停预跑抢在投机前起跑，投机那 100 ms 的提前量白丢 |
+| `TURN_JUDGE_SEQUENCE_BUDGET_MS` ≥ `TURN_JUDGE_WAIT_BUDGET_MS` | 序列预算低于普通等待预算，序列豁免失效 |
+| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` ≥ `VOICE_OPEN_QUIET_MS` | 开轮静音门槛永远够不着，只能撞上限放行 |
+| `DEFAULT_ASR_PREROLL_MS` ≤ `DEFAULT_GATE_PREROLL_MS` | ASR/Omni 预卷长过能量门滑窗，尾部没有完整预卷可裁 |
+| `DEFAULT_MIN_SPEECH_MS` < `DEFAULT_GATE_HOLD_MS` | 最短有效人声不短于能量门保持，正常一句还没攒够门就关了 |
+| `DEFAULT_GATE_HOLD_MS` > `VOICE_STT_COMMIT_MS` | 能量门在眼镜 ASR 封段到达前先关门 |
+| `DEFAULT_GATE_HOLD_MS` > `DEFAULT_BROWSER_STT_COMMIT_MS` | 能量门在浏览器 ASR 封段到达前先关门 |
+| `DEFAULT_GATE_HOLD_MS` > `VOICE_OPEN_QUIET_MS` | 能量门在开轮静音门槛到达前先关门 |
+| `DEFAULT_GATE_HOLD_MS` > `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | 能量门在开轮静音上限到达前先关门 |
+| `DEFAULT_GATE_HOLD_MS` > `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 序列预算顶过能量门保持，门会先关 |
+| `PREWARM_TTL_MS` > `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 序列句等满预算时预热 task 已过期，要付一次冷启动 |
+| `DEFAULT_KEEPALIVE_MS` < `SERVER_IDLE_TIMEOUT_MS`（下界 60 s，上界未测） | 复用到一条服务端已关的连接，那一次请求直接失败 |
+| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` ≥ `SEMANTIC_MORE_MIN_WAIT_MS` | 普通静音上限低于语义 `more` 单拍下限，下限永远触顶 |
+| `TURN_JUDGE_SEQUENCE_BUDGET_MS` ≥ `SEMANTIC_MORE_SEQUENCE_WAIT_MS` | 序列预算低于语义 `more` 序列单拍等待 |
 
-> 已存在一条**警告**（不是失败）：`MIAI_HTTP_KEEPALIVE_MS=50 s` 超过 `fetch` 实测
-> 验证过的 45 s（60 s 是 `https.Agent` 的结果，不是 `fetch` 的）。真机最大轮间隔
-> 16.7 s 从未触及，所以不拦。
+其中 `DEFAULT_MIN_SPEECH_MS = 120`、`DEFAULT_ASR_PREROLL_MS = 320` 写在 `src/voice-config.ts`；
+`VAD_FRAME_MS = 32` 写在 `src/uplink-pipeline.ts`（帧长，不进上面这 17 条比较）。
+
+> 已存在一条**警告**（不是失败）：`DEFAULT_KEEPALIVE_MS = 50 s`（`src/http-agent.ts`，
+> `main.ts` 原样传给 `installHttpAgent`）超过 `fetch` 实测验证过的 45 s
+> （60 s 是 `https.Agent` 的结果）。真机最大轮间隔 16.7 s 从未触及，所以不拦。
 
 `tests/qos-invariants.test.ts` 里带一条**元测试**：注入一个必然违反的关系，确认检查器
 会红 —— 防止它变成永远绿的摆设。
@@ -387,7 +404,7 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `scripts/probe-nls-vocab.mjs` | `customization_id` / `vocabulary_id` 真被解码时用了吗 |
 | `scripts/asr-ab.mjs` | 同一段音频 16 kHz vs 8 kHz 识别对比 |
 | `scripts/env-dump.py` | 逐窗能量包络：非语音段是不是数字静音、语音段有没有碎片 |
-| `scripts/calibrate.ts` | silero VAD 阈值标定：逐秒打印概率分布 + 10 个阈值下的判停点。**已从 `src/` 迁出**（`src/` 是 `main.ts` 的静态 import 闭包，会被同步进 web 包，标定工具不该混在里面）。同一段录音里底噪段与人声段的概率差，配 `MIAI_MIC_GAIN` / `VOICE_PEAK_DBFS` 时当余量参考 |
+| `scripts/calibrate.ts` | 离线 Silero 阈值标定：用旧的单会话 `SileroVad` 逐秒打印概率分布，并在 10 个阈值（0.9 … 0.01，含 0.4）下给出判停点。它留在 `scripts/`，不进 `main.ts` 的静态 import，也不会被 `sync-voice.mjs` 带进 web 包。同一段录音里底噪段与人声段的概率差，配 `MIAI_MIC_GAIN` / `VOICE_PEAK_DBFS` 时当余量参考。**在线热路径已接回 Silero v5**：`src/vad.ts` 的共享 `SileroVadModel` + `src/runtime/vad-bootstrap.ts` 的 `loadSharedVad()`，缺模型或 `VOICE_VAD=energy\|0\|off\|false` 退回能量门。标定脚本的 0.4 不是能量门的 `0.45/0.30` 滞回 |
 | `scripts/speed-check.py` | 字/秒（判断"音频问题 vs 模型幻觉"最硬的定量指标） |
 | `scripts/hf-compare.py` | 上行 mSBC 对下行 24 kHz 的频谱斜率 |
 | `scripts/sbc-sync-test.py` | ffmpeg 解 mSBC 是否依赖 syncword（HFP 用 0xAD 不是 0x9C） |
@@ -402,8 +419,10 @@ P90 用**线性插值**（`percentile()`），不是最近秩 —— 两者在 6
 | `bench/fast_lane/cases.json` | 用例（`chitchat` / `task`） |
 | `scripts/probe-omni-inject-speak.mjs` | **live 管道的回注契约**：dangling `tool_call`（不回 `function_call_output`）之后，`injectAndSpeak` 还能不能出声、下一轮还记不记得注入的事实。跑真服务，要 `DASHSCOPE_API_KEY` |
 
-`probe-omni-inject-speak.mjs` 的 instructions / 工具与 `src/persona.ts`、`src/omni-shadow.ts`
-**逐字一致** —— 改这两处要同步它，否则探针量的是另一套提示词。它不 import `.ts`，只依赖已装的 `ws`。
+`probe-omni-inject-speak.mjs` 的 instructions / 工具要与 `src/persona.ts` 的
+`OMNI_SHORT_INSTRUCTIONS`、以及 `src/omni/protocol.ts` 的 `DELEGATE_TOOL` **逐字一致**。
+车道行为在 `src/omni/shadow.ts`；`src/omni-shadow.ts` 只再导出 `OmniShadow`，里面没有这份工具描述。
+改人设或工具要同步探针，否则它量的是另一套提示词。它不 import `.ts`，只依赖已装的 `ws`。
 
 **注意管道**：文本快车道只在 `VOICE_PIPELINE=cascade` 下加载（`live` 里 `FastLlmClient` /
 `PrefetchSlot` 根本不建）。在 `live` 进程里跑本节的门禁，量到的是"没装快车道"的那条路。

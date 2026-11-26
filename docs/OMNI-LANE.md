@@ -75,13 +75,17 @@ omni：     封段 ────── 670 ──────▶ 首块
 ├─ 4  宿主层   voice-session.ts     挂点、连接生命周期、后台汇报交进空窗
 │              pipelines/live-orchestrator.ts
 │                                    Pure Live 唯一前台（toEngine → LiveVoiceEngine）
+│              pipelines/live-session-store.ts
+│                                    前台轮次 / 后台任务 / 单槽快照的唯一状态
+│              pipelines/entity-divergence.ts
+│                                    专名听岔（与守卫轮零重叠）
 │              background-task-bus.ts
 │                                    tool_call / early_rule / 识图 / 静默记忆 / dsh 自有后台
 │              turn-runner.ts       run() 只消费 FastVoiceEngine.respond()
 │              app/dialog.ts        播报空窗（listening + FloorArbiter + 800 ms 静音）
-├─ 3  车道层   omni-shadow.ts       willServe / claim / speakFromText / discard / injectAnswer
-├─ 2  段层     omni-shadow.ts       mute 状态机、ring、pipe 封段
-└─ 1  传输层   omni-shadow.ts       WS、握手、事件流、计时、usage
+├─ 3  车道层   omni/shadow.ts       willServe / claim / speakFromText / discard / readyResp
+├─ 2  段层     omni/uplink-ledger.ts  mute、ring、held；shadow.ts 排先后
+└─ 1  传输层   omni/socket.ts       WS、握手、事件流；计时与 usage 仍在 shadow.ts 的 finish()
 ```
 
 `cascade` 是另一次启动才装上的管道（[`pipelines/cascade-agent.ts`](../src/pipelines/cascade-agent.ts)）：
@@ -89,10 +93,23 @@ omni：     封段 ────── 670 ──────▶ 首块
 那条管道里 `routeTurn()` 的 `live` 档恒为 off，不认领 omni 音频。
 `OMNI_SHADOW=1` 且 `OMNI_ANSWER=off` 时，cascade 仍可以挂一条只读影子，只测量、不发声。
 
-2/3/1 三层在同一个文件里（[omni-shadow.ts](../src/omni-shadow.ts)），
-但它们**互不知道对方的存在**：传输层不知道有「段」，段层不知道有「车道」，
-车道层不知道有 `TurnRunner`。分开文件会更"干净"，但这条通路的时序是全耦合的，
-拆开只会让「一次改动要跳三个文件」——所以刻意留在一个文件里，靠注释分节。
+车道、段、传输曾经写在同一个 [`src/omni-shadow.ts`](../src/omni-shadow.ts) 里，靠注释分节。
+现在实现在 [`src/omni/`](../src/omni/)：时序仍由 [`shadow.ts`](../src/omni/shadow.ts) 的
+`OmniShadow` 排先后，旁边的模块互不持有对方的连接。
+
+| 模块 | 只管 |
+|:---|:---|
+| [`shadow.ts`](../src/omni/shadow.ts) | 连接态、封段、认领、`readyResp`、`discard` / `restart` |
+| [`control-plane.ts`](../src/omni/control-plane.ts) | 回到 ready 之后的控制帧：孤儿、删项、工具回执、单槽 `session.update`、旧回注 |
+| [`uplink-ledger.ts`](../src/omni/uplink-ledger.ts) | `muted`、150 ms ring、生成期暂存。不算回复相位 |
+| [`protocol.ts`](../src/omni/protocol.ts) | `session.update`、`DELEGATE_TOOL`、`assistantItemIds`、人设拼装 |
+| [`response.ts`](../src/omni/response.ts) | 一份 `PendingResponse` 的相位和读端。不碰 socket |
+| [`socket.ts`](../src/omni/socket.ts) | 一条 realtime WebSocket、JSON、协议错误计数 |
+| [`types.ts`](../src/omni/types.ts) | 上面几份共用的类型 |
+
+顶层 [`src/omni-shadow.ts`](../src/omni-shadow.ts) 只重导出 `OmniShadow`、
+`OmniShadowOptions`、`OmniShadowState`。外部 import 路径没变，签名没变。
+新代码指到 `src/omni/` 里的那一个文件，不要再把三层写成「还在 omni-shadow.ts」。
 
 [`src/engines/live-voice-engine.ts`](../src/engines/live-voice-engine.ts)
 把 `FastLaneAudioLane`（生产上是 `OmniShadow`）适配成 `FastVoiceEngine`。
@@ -108,8 +125,8 @@ omni：     封段 ────── 670 ──────▶ 首块
 
 > **硬约束：`live` 会话里，车道接得住的前台轮由 omni 答。**
 > `willServe()` 的判据是**宽**的（宁可等，也不放）。为假时
-> `LiveOrchestrator` 同步问 dsh，再用本层 TTS 把那句说出来（`fallbackDsh`，
-> `turn.end` 的 `path=dsh`）。这是整条车道接不上时的兜底，和 `cascade` 管道的
+> `LiveOrchestrator` 同步问 dsh，再排队让 omni 把那句说出来（`fallbackDsh`，
+> `turn.end` 的 `path=dsh`）。车道已经断、排不进队列时只留下文本。这是整条车道接不上时的兜底，和 `cascade` 管道的
 > 文本快车道是两次启动里的两种形态，同一次会话不会从一条换到另一条。
 >
 > 旧档案里 `agent.lane` 仍用 [`fsm-trace.ts`](../src/fsm-trace.ts) 的 `isLaneFallback()` 读：
@@ -130,9 +147,9 @@ interface FastLaneAudioLane {
   claim(): AgentAudioAnswer | null;   // 认领，一份只给一个消费者
   discard(): void;                    // 这一轮不采纳：cancel + 删半句
   interrupt?(): void;                 // 播到一半被打断：cancel 但保留
-  injectAnswer?(userText: string, said: string, kind?: InjectKind): void;  // 回注（kind = 听没听到）
+  injectAnswer?(userText: string, said: string, kind?: InjectKind): void;  // 旧回注；真车道改走单槽快照
   explain?(): Record<string, unknown>;// 只进档案，不参与决策
-  canSpeakBackground?(): boolean;     // ready、无在途回复、无排队封段、dirtyBytes === 0、serve 不是 off
+  canSpeakBackground?(): boolean;     // ready、无在途回复、无排队封段、发声队列空、dirtyBytes === 0、serve 不是 off
   speakFromText?(                  // 空窗：user 文本 + response.create，忙则返回 null
     prompt: string,
     meta?: { taskId?: string; query?: string },
@@ -140,6 +157,11 @@ interface FastLaneAudioLane {
   cancelBackgroundSpeech?(): void;    // 只掐 origin === 'announce'
 }
 ```
+
+[`LiveAudioLane`](../src/engines/live-voice-engine.ts) 在这张契约上再加 Pure Live 要用的几项：
+`canAnswerText` / `answerFromText`、`enqueueSpeech`、`sendFunctionCallOutput`、
+`updateDynamicContext`、`deleteItems`。`OmniShadow` 都实现了。没有
+`updateDynamicContext` 的测试假车道，编排器才退回下面的 `injectAnswer`。
 
 **车道层仍不含「要不要用」的判断。** `live` 前台不调用 `routeTurn()`。
 分支是纯函数 `decideLiveTurn()`（取消、识图、钟点、`live_with_bg_guard`、
@@ -164,7 +186,7 @@ delegateText?(): string | null;   // tool_call 里那句「用户要什么」，
 
 - **认领时首块通常还没到**（认领在定稿 ~220 ms，首块 600–760 ms），所以必须能等。
 - **判停延拍时认领会晚到 700–870 ms**，那时首块**已经发过来了**。
-  所以音频从 `seal()` 那一刻就开始攒，不等认领（[`omni-shadow.ts`](../src/omni-shadow.ts)
+  所以音频从 `seal()` 那一刻就开始攒，不等认领（[`shadow.ts`](../src/omni/shadow.ts)
   的 `response.audio.delta` 分支：先 push 进 `resp.audio` 再唤醒读端）。
   不缓冲的版本会吞掉句首一两个字。
 
@@ -218,8 +240,8 @@ feed(voiced)  → muted = false，先补 ring 再追加
 服务端回 `Cannot cancel response before response.created`。
 
 委派轮会踩到：`seal()` 之后立刻 `discard()`，此时 `created` 还没到。
-所以 `cancelCurrent()` 先置 `cancelPending`，等 `onMessage` 收到 `created` 再补发
-（[`OmniShadow.cancelCurrent()`](../src/omni-shadow.ts)）。这条错误也不计入协议错误计数。
+所以 `cancelCurrent()` 先把相位写成 `cancel_when_created`，等 `response.created` 再补发
+（[`OmniShadow.cancelCurrent()`](../src/omni/shadow.ts)）。这条错误也不计入协议错误计数。
 
 ### 4.4 不自动重连
 
@@ -287,21 +309,55 @@ sendSeal()   建好时按预留把 claimed 置上，并把引用记进 claimedRe
 
 ```text
 discard()          → resp.deleteOnDone = true，然后 cancelCurrent()
-response.done 到达 → 从 ev.response.output 取 role==='assistant' 的 id
+response.done 到达 → assistantItemIds：role==='assistant' 或 type==='function_call'
                    → 逐个 conversation.item.delete
+                   → 从 pendingDeletes 里去掉刚发过的 id
 ```
 
-**只删助手项**：用户那条是这一轮的内容，后面几轮还要指代它。
+**在途回复标 `deleteOnDone` 时只删助手项和 `function_call` 项**：用户那条是这一轮的内容，后面几轮还要指代它。同句再封段、以及已经完成但还停在 `readyResp` 上的那份，见 §4.9，不再一律把用户项一起删掉。
 
 标记的规则（两个入口语义不同）：
 
 | 谁调 | 标记 | 为什么 |
 |:---|:---|:---|
-| `discard()`（这一轮不采纳） | 必删 | 一个字都没播，留着只会污染下一轮 |
-| `cancelCurrent()` 且 `!claimed` | 删 | 同一句第二次封段把上一份顶掉，那份答的是半句话 |
+| `discard()`（这一轮不采纳） | 在途那份必删助手项 | 一个字都没播，留着只会污染下一轮。已完成的 `readyResp` 只降级助手项，用户音频留下 |
+| `cancelCurrent()` 且 `!claimed` | 删助手项 | 同一句第二次封段把上一份顶掉，那份答的是半句话 |
 | `interrupt()`（播到一半被打断） | **不删** | 用户已经听到了一部分；删掉连那部分也没了 |
 
-### 4.8 委派轮回注：`role` 必须是 `user`
+### 4.8 委派轮回注：`role` 必须是 `user`（协议实测；真车道已改单槽）
+
+下面四条是 `conversation.item.create` 的**协议事实**，探针日期与现场保留。
+`45495f5` 之后，带 `updateDynamicContext` 的真车道**不再**把每条后台结论堆成一次 `injectAnswer`。
+唯一状态在 [`live-session-store.ts`](../src/pipelines/live-session-store.ts)，变了就发**一整份**
+`session.update`（局部 update 会把 `turn_detection` 或 `tools` 清掉）。
+`injectAnswer` 还在 [`shadow.ts`](../src/omni/shadow.ts) 里，只留给**没有**
+`updateDynamicContext` 的兼容测试假车道：`flushUnspoken` 与
+`noteFallbackAnnounceSpoken` 看到 `laneUsesSnapshot()` 为真就直接返回。
+
+### 4.9 待认领槽、同句删项、工具回执（`bc908d1`）
+
+`finish()` 见到 `origin === 'user'`、还没人 `claim()`、没标 `deleteOnDone`、没被取消、
+`pending` 也是空的回复，**不进 orphans**。它停在 `readyResp`。
+Silero 把判停提前之后，TurnJudge 可能比 Omni 晚几十毫秒；done 一到就删，
+编排器只能退回 `answerFromText`，已经生成的音频就没了。
+`willServe()` / `claim()` 经 `liveResp()` 仍看得见这份。认领到它时槽位清空，引用留在 `claimedResp`。
+
+`demoteReadyResp(deleteUser)` 把这份降成孤儿：
+
+| 谁调用 | `deleteUser` | 删什么 |
+|:---|:---|:---|
+| `discard()`、同句再 `seal()`（中间没有 `restart`）、`finish()` 顶掉上一份 `readyResp` | `false` | **只删助手项**。同句前半段的用户音频留下，下一段还听得见 |
+| `restart()`、`speakFromText()`、`answerFromText()`、`drainSpeechQueue()` | `true` | 助手项和用户项一起删。这是新一轮开口，或显式改走文本 / 播报 |
+
+`response.output_item.added` 且 `item.type === 'function_call'` 时，当场把 `resp.delegate` 标成 `'delegate'`，并记下 `call_id`。真服务上这条比首块音频早约 **150 ms**，守卫轮才能在出声前知道已经委派。`function_call_arguments.delta` / `.done` 会再标一次；`request` 仍从 `.done` 解析。
+
+`deleteOnDone` 在 `finish()` 里按 item id 发 `conversation.item.delete`。编排器可能又对同一批 id 调了 `deleteItems`，那些 id 进 `ControlPlane.pendingDeletes`。同一 id 发两次会连着两条协议错误，车道被打成 `broken`。所以 `finish()` 删完后把 `pendingDeletes` 里已经发过的 id 拿掉。`deleteItems` 入队时也跳过空串和已经在队列里的 id（上限 32，再多丢掉最早的）。
+
+`flushReady` 的顺序固定：orphans → deletes → 工具回执 → 整份 `session.update` → 旧的 `injectAnswer` 队列。门是 `ready`、没有在途回复、socket 已开。
+
+工具回执走 `sendFunctionCallOutput`。`turn.delegated` 带了 `call_id` 时，状态机发出 `send_tool_output`：`status: 'accepted_running'`、`executed: false`，正文是「已交后台执行，尚未完成」。忙时进 `pendingToolOutputs`（上限 8），回到 ready 再发 `conversation.item.create` 的 `function_call_output`。这和 §10.1 里「探针故意不回执」不是同一条路径。
+
+### 4.8 的协议约束（历史实测，仍然成立）
 
 委派轮是 omni 先说一句**回执**（「我查查」）然后把活儿交给 dsh。omni 的服务端历史里
 只有「用户问了什么」，**不知道 dsh 答了什么**——这是「缺失」，不是「污染」。
@@ -377,8 +433,9 @@ input_audio_transcription: { model: 'qwen3-asr-flash-realtime' },  // 没它就�
 而且**拿 `in_tokens` 增量（只多 5）当判据**。token 少 ≠ 模型没读 ——
 判断一个原语要用**回答内容**，不能用计费。
 
-生产上要回注 dsh 的答案时，把内容包成一条 `user` 角色的文本项即可；
+这条角色不对称仍然成立：想用 `item.create` 塞事实，角色必须是 `user`。
 实测在**音频上下文**里同样生效（§12.5 有验证方式），代价约 30–50 token/轮。
+`45495f5` 之后生产不靠把每条结论再 `item.create` 一次，改发整份 `session.update`（§4.8、§6.2）。
 
 ---
 
@@ -432,10 +489,14 @@ onFrame(frame)      → assembler.addFrame(frame) → stt.feed(pcm, voiced)
 
 `respond()` 按这个顺序做：
 
-1. `flushUnspoken()`。空窗还没到、用户已经开口时，把还没念的结论以
-   `injectAnswer(..., 'unspoken')` 回注一次，免得下一轮 omni 被问「跑完没」时现编。
+1. `flushUnspoken()`。真车道的未播结论已经在单槽快照里，这里直接返回。
+   只有没有 `updateDynamicContext` 的旧假车道，才把还没念的结论各
+   `injectAnswer(..., 'unspoken')` 一次，免得下一轮被问「跑完没」时现编。
 2. 纯函数 `decideLiveTurn()` 定这一支，只走一条：取消 → 识图 → 钟点 →
    `live_with_bg_guard` / `live_direct` → `fallback_dsh`。
+   `live_with_bg_guard` 的判据是 `isActionRequest(text) || isRealtimeFactRequest(text)`。
+   条件假设里顺口提到下雨（「如果明天下午不下雨的话我们就去公园」）被
+   `isConditionalWeatherAside` 排除，不进守卫轮；假设后面又显式问天气的仍要查。
 3. 不是取消、也不是识图，并且 `looksMemorable`：`dispatch({ source: 'memory_silent', silent: true })`。
    成功和失败都不播报，也不挡住前台（§零 的 716–776 ms，委派垫话的
    `response.done` 约 700–960 ms，见 §10.1）。
@@ -446,27 +507,35 @@ onFrame(frame)      → assembler.addFrame(frame) → stt.feed(pcm, voiced)
   说「好，不查了。」已经在跑的 `memory_silent` 默认留着。
 - **识图**：丢掉 omni 在途音频（图是 dsh 看的，omni 没看见）。车道还能交接
   （`willServe()` 或 `canSpeakBackground()`）就把图异步派进总线（`source: 'image'`），
-  前台只说「我看看。」并带 `nonBlocking`。车道接不上才同步问 dsh，再用本层 TTS 念出来。
+  前台只说「我看看。」并带 `nonBlocking`。车道接不上才同步问 dsh，再排队让 omni 把那句说出来。Pure Live 不调用外部 TTS。
 - **钟点**（`isClockTimeRequest`）：车道还能答就立刻 `early_rule`，前台只应一声「我查查。」
   接不上才 `fallbackDsh`。这条不进 `live_with_bg_guard`，因为 Omni 会直接编时间。
 - **`live_with_bg_guard`**：要查外部或要动手，并且车道还能开口（`willServe()`，或至少
-  `answerFromText` 在场）。**进 Omni 之前不派单**。`finishLive()` 一见到 `delegate` 就立刻
-  `dispatch({ source: 'tool_call' })`，查询用 `rewrittenQuery` 再附上用户原话。
-  整段结束仍没有 `delegate`，才用原话补一笔 `early_rule`。中止，或 `dispose()`
-  已经置上 `disposed`，都不再派。工人因此不会拿着 ASR 原话先跑完，再和改写查询各答一次。
+  `answerFromText` 在场）。**进 Omni 之前不派单**。真服务上 `function_call` 比首块音频早约 150 ms，
+  `output_item.added` 已经把 `delegate` 标上。`finishLive()` 在**第一块音频之前**若守卫还开着、
+  字节数仍是 0、并且 `delegateReason()` 仍是空的：当场 `discard()`，一个字节都不外放，
+  用用户原话补 `early_rule`，再排队一句短应声（`meta.delegate: 'task'`）。
+  已经标了 `delegate` 的按 `tool_call` 派：主查询是用户原话；`rewrittenQuery` 只在和原话不一致时写进注记。
+  整段结束仍没有 `delegate`（包括 0 音频），才用原话再补一笔 `early_rule`（`supplemented` 挡住第二次）。
+  中止，或 `dispose()` 已经置上 `disposed`，都不再派。
 - **`live_direct`**：同样进 Omni，但不挂这道后台守卫。封段认领和文本直答都没有，才
-  `fallbackDsh`（账本记 `dsh`）。
+  `fallbackDsh`（账本记 `dsh`）。整段结束、没调工具、也没被守卫接走时，才跑
+  [`detectSubjectHallucination`](../src/pipelines/entity-divergence.ts)：只认「在问某个具体专名是什么」
+  这种窄句，答复又换成一个对不上的实体。命中就派 `early_rule`，注记要求 dsh 第一行写
+  `[原意: 纠正后的用户原话]`。闲聊、代词、诚实的「没听清」返回 `null`，不派、不等。
+  这一支和 `DELEGATE_TOOL` 的专名领域、以及上面的守卫轮互不重叠：守卫轮在开口前就截住，
+  听岔复核只看守卫没接走、模型也没调工具的那一句。
 
 `tool_call` 出在 `delegate` 事件上。封段认领和 `answerFromText` 都进同一条
 `finishLive()`。编排器打上 `meta.nonBlocking`，垫话播完这一轮就结束。
-omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免对着静音干等。
+omni 一个采样都没吐时，`enqueueSpeech` 让同一副嗓子补一句短应声，不另开 TTS。
 
 总线的规矩：
 
 | 规矩 | 行为 |
 |:---|:---|
 | 同一 `turnNo` | 要播报的任务去重，只执行一次。还在 `queued` 的 `early_rule` 会被后到的 `tool_call` 换成工具里的查询；已经 `running` 或 `completed` 的保持原查询，不再开第二次 |
-| 编排器时序 | `live_with_bg_guard` 不在进 Omni 之前派 `early_rule`。`tool_call` 在 `finishLive()` 当场派改写查询；整段没有 `delegate` 才补 `early_rule`。两条不会各跑一遍 |
+| 编排器时序 | `live_with_bg_guard` 不在进 Omni 之前派 `early_rule`。首块音频前没有 `delegate` 就 `discard` 并补原话；已经标了 `delegate` 才派 `tool_call`，主查询是用户原话。两条不会各跑一遍 |
 | 同一同步回合 | 若两条 `dispatch` 发生在同一次同步调用里、工人还没取队列，微任务会把它们合成一次 `execute`（先升级再跑） |
 | 工人 | 一次只跑一个 `execute`，避免单会话 dsh RPC 叠在一起 |
 | `memory_silent` | 不参与 `turnNo` 去重，不产生 `BackgroundTaskReport`。`cancelAll` 默认不停它 |
@@ -476,11 +545,17 @@ omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免�
 
 完成的 `BackgroundTaskReport` 交给 `setTaskReporter`。没人接时才退回 `setAnnouncer(summary)`。
 
-账本在编排器自己的 `ConversationLedger`：omni 答完（含垫话）记 `live`，同步兜底记 `dsh`。
-记下时 `truncated` 先按 false，内核结算经 `reconcileTurnOutcome({no, gen})` 改成真实结果。
-`lastLedgerLane()` 原样读账本上一轮：omni 记 `live`，`fallbackDsh` 记过 `dsh` 之后这里返回 `dsh`。
-还没答过、或只有 `pet`，是 `null`。垫话轮记的是垫话本身；结论稍后由
-`speakFromText` 进 omni 的服务端历史，或由逐字 TTS 用 `inject: 'spoken'` 补进去。
+账本是 [`reduceLiveSession`](../src/pipelines/live-session-store.ts) 的那一份状态，不是编排器里再抄一套 Map。
+`turn.recorded` 把 omni 答完（含垫话）记成 `live`，同步兜底记 `dsh`。
+`truncated` 先按 false，内核结算经 `turn.reconciled` 按 `{no, gen}` 改成真实结果。
+`lastLedgerLane()` 读 `lastAnsweredLane`：omni 记 `live`，`fallbackDsh` 记过 `dsh` 之后这里返回 `dsh`。
+还没答过是 `null`。快照文本只在这里投影。空快照是空串，纯闲聊不往 instructions 上贴段落。
+`memory_silent` 不进快照。文本变了才发一次 `sync_omni_snapshot` → `updateDynamicContext`。
+
+dsh 若在结论第一行写下 `[原意: …]` / `【原意：…】`（`background-task-bus.ts` 只认开头那一个标签），
+`canonicalUser` 写回对应轮次。和 ASR 原话不同时，快照里多一行「已核实说法：第 N 轮「原转写」→「原意」」，
+汇报上带 `previousUserText`。`emit_ui_asr_replace` 不再另发一条界面事件，字幕纠偏附在 `deliver_report` 上。
+听岔复核的注记也要求这个标签；原话本身准确就不要写。
 
 `needsVerbatimRead()` 决定这份结论能不能交给全双工自己说。下面任一为真，报告带上
 `verbatim`（清洗后的全文）和截到 160 个码点的 `summary`：
@@ -489,8 +564,10 @@ omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免�
 - 连续 5 位及以上数字、IPv4、代码路径、订单号形态（1–4 个大写字母接至少 4 位数字）
 - 正文超过 180 个码点
 
-普通短句（天气、闹钟）不带 `verbatim`，交给 omni 用一两句口语说。全双工会改词、漏读数字
-（§十一），所以必须逐字的内容改走 TTS。
+普通短句（天气、闹钟）不带 `verbatim`，交给 omni 用一两句口语说。
+带了 `verbatim` 的报告在 Pure Live 里仍由 omni 念，提示要求把数字念准；
+`allowTtsFallback === false`，不改走外部 TTS。§十一 那条「不用 omni 当纯 TTS」说的是
+另开一条朗读连接去念 dsh 正文，不是这条空窗汇报。
 
 **空窗里怎么说出来**（`speakBackgroundReport` + `DialogRuntime.flushAnnounce`）：
 
@@ -500,16 +577,15 @@ omni 一个采样都没吐时，用本层 TTS 补一句「我查查。」避免�
 
 | 条件 | 结果 |
 |:---|:---|
-| 报告带 `verbatim` | 不调用 `speakFromText`。`TurnRunner.speakCanned` 用 TTS 逐字念原文。念完且没被打断时，`noteFallbackAnnounceSpoken` 以 `injectAnswer(..., 'spoken')` 把原文注进 omni，不再出第二声 |
-| `canSpeakBackground()` 为假，或 `speakFromText` 返回 null | `'defer'`：条目排回队首，等下一个 800 ms 空窗。忙着发 `response.create` 会被服务端丢掉（§4.2） |
-| 可以开口 | `buildLiveReportPrompt`（[`persona.ts`](../src/persona.ts)）写成一条 user 文本。`OmniShadow.speakFromText` 连发 `conversation.item.create` + `response.create`，音频由 `TurnRunner.speakAudioAnswer` 下发。同一副嗓子，上下文自然接着。`playAudio` 确认这一条是 `spoken` 之后才 `markInjected` |
-| 开口前 0 字节，且不是被打断 | `'fallback'`：还没 `markInjected`，改走 TTS，并按 `'spoken'` 回注。提前标记会让这次回注被吞掉 |
-| TTS 被打断 | 不按 `'spoken'` 回注 |
+| 可以开口（含 `verbatim`） | Pure Live **不切外部 TTS**。`buildLiveReportPrompt`（[`persona.ts`](../src/persona.ts)）写成一条 user 文本，精确数字留在提示里让 omni 念准。优先 `enqueueSpeech`，否则 `speakFromText`。`playAudio` 确认播过或被打断之后，`announce.settled` 写进单槽，快照跟着变。不再为这一条 `injectAnswer` |
+| `canSpeakBackground()` 为假 | `'defer'`：条目排回队首，等下一个 800 ms 空窗。忙着发 `response.create` 会被服务端丢掉（§4.2） |
+| 车道已断，或既没有 `enqueueSpeech` 也没有 `speakFromText` | `'fallback'`。`pipelineMode === 'live'` 时 `allowTtsFallback` 为 false：只把文字交给界面，不调用 `speakCanned`。`onFallbackAnnounceSpoken(item, true)` 把投递记成 `interrupted` |
+| 旧假车道、没有 `updateDynamicContext`、而且没被打断 | `noteFallbackAnnounceSpoken` 才 `injectAnswer(..., 'spoken')` 一次。真车道在记完 `announce.settled` 之后返回 |
 
 `dispose()` 之后 `speakBackgroundReport` 直接 `'defer'`，在途的 `finishLive` 也不再补派。
 
 `canSpeakBackground()` 为真要同时满足：`ready`、没有在途回复、没有排队封段、
-`dirtyBytes === 0`，并且 `serve` 不是 off。`canAnswerText()` 同样只认 `ready`
+发声队列是空的、`dirtyBytes === 0`，并且 `serve` 不是 off。`canAnswerText()` 同样只认 `ready`
 （`serve` 不是 off、没有在途回复、没有排队封段），但不看 `dirtyBytes`。
 `willServe()` 更宽：状态是 `ready` 或 `busy`，`serve` 不是 off，手里有活回复，或者 `pending` 里还排着一份。
 
@@ -729,8 +805,11 @@ A2DP 是常数，**Δ 不变**，但它放大长尾的观感：级联 p90 服务
 **决定权在 `description`，不在提示词。** `instructions` 里任何关于「要不要调工具」的
 暗示都会把闲聊推向调用；而「调之前先说一句」这句**只有挂在 `description` 上才生效**
 （换到 `instructions`：实测 2/2 仍是 0 ms 音频，白写）。见
-[`omni-shadow.ts`](../src/omni-shadow.ts) 的 `DELEGATE_TOOL` 注释、
+[`protocol.ts`](../src/omni/protocol.ts) 的 `DELEGATE_TOOL` 注释、
 `LEAD_IN_CLAUSE` 的实测记录，以及 `DEFAULT_INSTRUCTIONS` 顶部的警告。
+专名边界写在同一份 `description` 里：具体书名、影名、论文、听不清的冷门专名、用户指出说错，必须调用。
+普通闲聊和「你看过星球大战没」不要调用。这和 `detectSubjectHallucination` 是两道闸：
+工具描述让模型自己委派；听岔复核只在 `live_direct` 里、模型没调工具、答复实体和 ASR 主语对不上时才派后台。
 
 ### 10.1 委派轮那一声（垫话）
 
@@ -753,15 +832,18 @@ TTS 链路合成回执，就是两句不同的嗓子接在一起，而且还多�
 `tests/omni-shadow.test.ts` 的「工具调用之后才到的音频也要播」钉住。
 
 另外两件事也顺手验了：闲聊轮不会被这段描述带偏（3/3 不调工具）；
-`tool_call` 之后我们从不回 `function_call_output`（dsh 的答案另走 `injectAnswer` 注入），
-这条 dangling call 不影响下一轮（3/3 照常回答、不重复调工具）。
+当时的探针在 `tool_call` 之后**故意不回** `function_call_output`（答案另走注入），
+这条 dangling call 不影响下一轮（3/3 照常回答、不重复调工具）。那是协议实验，不是现在的生产闭环。
 
-Pure Live 把这条 dangling call 当成生产路径：不回 `function_call_output`。
-`tool_call` 进 `BackgroundTaskBus`，前台在垫话的 `response.done`（约 700–960 ms）收轮，
-不把 dsh 的十几秒堵在这一回合里。结论稍后在空窗里用 `speakFromText` 说，协议形状与
-上面的注入相同：`conversation.item.create`（`role: 'user'`）紧接着 `response.create`。
-真连接复现是 [`scripts/probe-omni-inject-speak.mjs`](../scripts/probe-omni-inject-speak.mjs)
-（§12.5）：同一条连接上先留下 dangling `tool_call`，再测这次注入出不出声、下一轮记不记得。
+生产路径从 `45495f5` 起改成两截。`tool_call` 仍进 `BackgroundTaskBus`，前台在垫话的
+`response.done`（约 700–960 ms）收轮，不把 dsh 的十几秒堵在这一回合里。
+同一轮 `turn.delegated` 若带了 `call_id`，立刻 `sendFunctionCallOutput`：
+`accepted_running` / `executed: false`，告诉 omni 这事还没做完，禁止把「交代了」说成「做完了」。
+结论进单槽快照（全量 `session.update`），空窗再用 `enqueueSpeech` / `speakFromText` 说出来。
+多次 `injectAnswer` 旁注只留给没有 `updateDynamicContext` 的假车道。
+[`scripts/probe-omni-inject-speak.mjs`](../scripts/probe-omni-inject-speak.mjs)
+（§12.5）仍按旧实验故意不回执，用来复现 dangling call 之后注入还能不能出声。
+脚本自己嵌了一份工具描述，不 import `.ts`；现行 `DELEGATE_TOOL` 以 `src/omni/protocol.ts` 为准。
 
 ### 10.2 委派轮：垫话留下，正文等空窗，绝不掐断重说
 
@@ -777,7 +859,7 @@ Pure Live 不在同一轮后面再合成 dsh 的正文：`tool_call` 进总线�
 （`20261123-072301`）第 8/9 轮：omni 先念 2.2 s / 3.4 s，掐断之后 dsh 又从头说了
 13.52 s / 10.40 s，中间还夹 4.25 s 静音。反过来"检测到说了正文就不转交"则把答案丢了。
 
-「回执要短、别先讲答案」是**提示词纪律**，而且写在哪很关键：`omni-shadow.ts` 里两条
+「回执要短、别先讲答案」是**提示词纪律**，而且写在哪很关键：`protocol.ts` 里两条
 clause 都挂在**工具描述**上（`LEAD_IN_CLAUSE` = 八个字以内应一声、
 `NO_PREVIEW_CLAUSE` = 应声之后不要先讲答案）。放进 `instructions` 实测拿到 **0 ms 应声**，
 等于没写；把长度收得更紧（"六个字以内"）也会让应声整个消失（4/4 → 2/4）。
@@ -796,8 +878,8 @@ Pure Live 的规矩：
 | 用户干了什么 | 处理 | 为什么 |
 |:--|:--|:--|
 | **插话**（说别的事） | `interrupt()` 前台 omni。总线上已经派出去的任务继续跑 | 回执等于**承诺了答案**。`cancelTurn` 只取消同步兜底那一次 `inner.reply`，不取消总线 |
-| 用户已经在说下一句，结论还没念 | **不补播**。`flushUnspoken` 以 `injectAnswer(..., 'unspoken')` 回注一次 | 补播会打断他；不回注的话下一轮 omni 会现编 |
-| 空窗到了（`listening` + `FloorArbiter` 上 `reply` 已放开 + 静音 800 ms） | 同一副嗓子说结论；`needsVerbatimRead` 为真时走 TTS，并以 `'spoken'` 静默回注 | 见 §6.2 |
+| 用户已经在说下一句，结论还没念 | **不补播**。真车道的未播结论留在单槽里；旧假车道才 `injectAnswer(..., 'unspoken')` | 补播会打断他；快照没更新的话下一轮 omni 会现编 |
+| 空窗到了（`listening` + `FloorArbiter` 上 `reply` 已放开 + 静音 800 ms） | 同一副嗓子说结论，含 `verbatim`。真车道靠 `announce.settled` 刷新快照，不静默回注 | 见 §6.2 |
 | 用户**显式下令取消**（「算了 / 别查了 / 取消」，`turn-router.isCancelRequest()`）且确有要汇报的任务 | `cancelAll('user_cancel')`。迟到结果丢掉。前台说「好，不查了。」`memory_silent` 默认不停 | 「不要了」才是真的不要了 |
 
 > **旧装配曾经漏了一整条路**：`FrontedAgent` 里写的是 `this.inner.detachTurn?.(ticket)`，
@@ -842,16 +924,16 @@ Pure Live 的规矩：
 | 无 `created_ms` | 无（`created` 只是内部布尔） | 没用到 |
 | `~380 行`，`fronted-agent.ts` 零改动 | 850 + 4 处改动 | 记忆复用 `pending` |
 | 无「删半句」 | `discard()` 标 `deleteOnDone`，`done` 到了才删（见 §4.7） | 那会儿才有 item id |
-| 无「回注」 | `injectAnswer()`：`user` 角色 + 带原问题 + 硬截断 + 等 `ready`（见 §4.8） | 委派轮 omni 会失忆 |
+| 无「回注」 | 协议层仍是 `injectAnswer()`（§4.8 的实测）。`45495f5` 起真车道改单槽 `updateDynamicContext`；`injectAnswer` 只留给没有这个方法的假车道 | 委派轮 omni 会失忆；旁注堆多次也会把历史灌满 |
 | 委派在前台等 dsh 再合成 | `tool_call` / `early_rule` / 识图进 `BackgroundTaskBus`，空窗用 `speakFromText` | 前台轮停在垫话的约 700 ms，不堵在 dsh 上 |
 | 快车道与 omni 逐轮混选 | `VOICE_PIPELINE` 启动期二选一。`live` 的 `useCascadeFastLane` 恒为 false | 同一次会话里没有文本投机可以接住「车道挂了」 |
 | 写在 `QOS.md` 里 | 独立本文 + `QOS.md` 附录一行 | 篇幅 |
 
 ### 12.1 当前空档
 
-1. **两副嗓子**：omni 是 Tina，级联 TTS 是龙安欢。`live` 会话里前台和空窗汇报都是 omni。
-   本层 TTS 仍负责三处：零音频时的「我查查。」/「我看看。」/「好，不查了。」、
-   `needsVerbatimRead` 的逐字稿、以及车道接不上时的 `fallbackDsh`。
+1. **两副嗓子**：omni 是 Tina，级联 TTS 是龙安欢。`live` 会话里前台、短应声、空窗汇报
+   （含 `verbatim`）都走 omni。`fallbackDsh` 同步问完 dsh 之后也排队让 omni 说；
+   队列排不进去时只留文本，不调用外部 TTS。级联管道仍用自己的 TTS。
    早先全量之后曾降成「委派轮偶尔切」（dsh 链路在 S5 之前仍是 CosyVoice）。
 2. **tool_call 自委派从未在真机触发过**：两场 `delegate` 只有 1 个 `task`
    （当时是本地 `isFastCandidate` 的 14 字闸拦的；那条闸现在只作用于级联）。
@@ -859,10 +941,11 @@ Pure Live 的规矩：
    dangling `tool_call` 之后的注入出声。真机上模型会不会发出 `tool_call`，仍缺一场。
 3. **`✗ ASR: maybe no invalid audio stream`** 偶发，归属未确认（疑为既有问题，
    不是 omni —— 分属两条 WS）。
-4. **上下文双轨**：omni 的服务端历史与 `LiveOrchestrator` 的 `ConversationLedger` 各记一份。
-   对齐的口子是 `remember` / `reconcileTurnOutcome`、`speakFromText`（汇报本身进会话）、
-   以及 `injectAnswer` 的 `spoken` / `unspoken`。`CascadeAgent` 与更早的
-   `FrontedAgent.pending` 是级联那本账。这是 pipe 形态的固有代价。
+4. **上下文双轨**：omni 的服务端历史与 `LiveSessionStore` 各记一份。
+   对齐的口子是 `turn.recorded` / `turn.reconciled`、单槽快照、`sendFunctionCallOutput`，
+   以及 `enqueueSpeech` / `speakFromText`（汇报本身进会话）。
+   `injectAnswer` 的 `spoken` / `unspoken` 只还服务没有 `updateDynamicContext` 的假车道。
+   `CascadeAgent` 与更早的 `FrontedAgent.pending` 是级联那本账。这是 pipe 形态的固有代价。
 
 ### 12.2 已解决的（留作来由）
 
@@ -896,7 +979,7 @@ STT 是 `qwen-realtime`）。`OMNI_ANSWER=full` 在这条管道上既不发声�
 **`has_lane === true && lane_ok === false && lane !== 'dsh'`**
 （[`fsm-trace.ts`](../src/fsm-trace.ts) 的 `isLaneFallback()`）。这表示车道自己没接住。
 **这个数应当是 0。** Pure Live 会话看 `turn.end.path`：`omni` 是前台，`dsh` 是
-`fallbackDsh`（同步问 dsh，再用本层 TTS 念）。那一次兜底仍在同一次 `live` 启动里，
+`fallbackDsh`（同步问 dsh，再排队让 omni 说；说不了就只留文本）。那一次兜底仍在同一次 `live` 启动里，
 不会把进程换成 `VOICE_PIPELINE=cascade`，也不会装上 `FastLlmClient`。
 
 | 路径 | 现在 | 说明 |
@@ -904,10 +987,10 @@ STT 是 `qwen-realtime`）。`OMNI_ANSWER=full` 在这条管道上既不发声�
 | 逐轮 live → 文本快车道 | **结构上没有** | `live` 计划 `useCascadeFastLane=false`、`cascadeKey=''`。`LiveOrchestrator` 不引用 `FastLlmClient` / `PrefetchSlot` |
 | 排队窗口（92 ms） | **已修**（§4.6） | 曾经 2/38 |
 | `state === 'connecting'` | 未处理 | 握手 1.3 s。此时 `seal()` 直接 `skipped`，音频**从来没发出去**，事后补不回来 —— 真要修得把整句 PCM 缓冲到 `ready`。三场 90 轮里出现 0 次 |
-| `state === 'broken'` | 本会话内 `fallbackDsh` | 车道挂了以后 `willServe()` 为假，每一轮同步问 dsh 再用本层 TTS 说。`break()` 落一条 `{skipped:'broken', why}`。这是整场兜底，不是逐轮抖动，也不是换成 cascade 管道 |
+| `state === 'broken'` | 本会话内 `fallbackDsh` | 车道挂了以后 `willServe()` 为假，每一轮同步问 dsh。omni 已断，说不了，只留文本。`break()` 落一条 `{skipped:'broken', why}`。这是整场兜底，不是逐轮抖动，也不是换成 cascade 管道 |
 | 本轮已被 `interrupt()` | 不需要答 | 用户插话已经把这一轮作废了，不存在"该答没答"。已派的后台任务继续跑（§10.3） |
 | 带图，车道还能交接 | 异步 `image` 任务 + 「我看看。」 | omni 没看见图，图交给 dsh；前台只垫一句，`nonBlocking` |
-| 带图，车道接不上 | `fallbackDsh` | 同步问 dsh，再用本层 TTS 念 |
+| 带图，车道接不上 | `fallbackDsh` | 同步问 dsh，再排队让 omni 说；说不了就只留文本 |
 
 想彻底消灭 `connecting` 那一条，只有「缓冲整句 PCM，`ready` 后补发 commit+create」——
 约和 V2 重发同量级的工作。**在三场 90 轮实测 0 次之前不值得做。**
@@ -935,8 +1018,10 @@ STT 是 `qwen-realtime`）。`OMNI_ANSWER=full` 在这条管道上既不发声�
 同一条 DashScope Realtime 连接跑三轮：第 1 轮观察 `tool_call` 并且不回
 `function_call_output`；第 2 轮在 ready 之后立刻注入并要音频（`injectAndSpeak`）；
 第 3 轮追问，看转写里还在不在第 2 轮注入的事实。`session.update` 的 instructions 与
-`DELEGATE_TOOL` 和 `src/persona.ts`、`src/omni-shadow.ts` 逐字一致。没有
-`DASHSCOPE_API_KEY` 时退出码 2，不发起连接。用法见 [OPERATIONS.md](./OPERATIONS.md) 的诊断探针。
+人设正文以 `src/persona.ts` 的 `OMNI_SHORT_INSTRUCTIONS` 为准，工具以
+`src/omni/protocol.ts` 的 `DELEGATE_TOOL` 为准。探针脚本里的副本是它自己嵌的，
+不随源码自动更新。没有 `DASHSCOPE_API_KEY` 时退出码 2，不发起连接。
+用法见 [OPERATIONS.md](./OPERATIONS.md) 的诊断探针。
 
 ---
 
