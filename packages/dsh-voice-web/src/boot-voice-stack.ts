@@ -14,10 +14,10 @@ import {
   pureLiveVadConflict,
   resolveArchiveDir,
   shouldEnableSemanticEndpoint,
-  shouldUsePureLiveAudio,
   type VoiceBackendState,
   type VoiceWebConfig,
 } from './driver-policy.ts'
+import { readDotEnvFile } from './env-store.ts'
 import {
   dshHomeDir,
   loadDshHomeDotEnv,
@@ -26,6 +26,7 @@ import {
 } from './host-lifecycle.ts'
 import type { HostMountHandle } from './host-mount.ts'
 import { InProcessDshAgent } from './in-process-agent.ts'
+import { applyVoiceProfile } from './voice-config-apply.ts'
 import { AnnounceStore, DEFAULT_ANNOUNCE_MAX } from './voice/announce-store.ts'
 import { DEFAULT_KEEPALIVE_MS, installHttpAgent } from './voice/http-agent.ts'
 import {
@@ -47,15 +48,10 @@ import {
 } from './voice/runtime/pipeline-assembly.ts'
 import { buildAgent, buildStt, buildTts } from './voice/runtime/providers-factory.ts'
 import { loadSharedTurnJudge } from './voice/runtime/turn-judge-bootstrap.ts'
-import { isOpenAiDialect, resolveRealtimeDialect } from './voice/realtime-dialect.ts'
 import { semanticEndpoint } from './voice/semantic-endpoint.ts'
 import type { DshSession } from './voice/session.ts'
 import { envNumber, envString } from './voice/util.ts'
-import {
-  buildVoiceRuntimeConfig,
-  isManualEndpointStt,
-  resolveLiveApiKey,
-} from './voice/voice-config.ts'
+import { buildVoiceRuntimeConfig } from './voice/voice-config.ts'
 import { runVoiceServer } from './voice/voice-session.ts'
 
 /**
@@ -104,6 +100,7 @@ async function resolveSpeculate(
 
 export interface HostVoiceRuntime {
   backend: VoiceBackendState
+  activeSummary?: string | null
   inProcessAgent: InProcessDshAgent | null
   dshSession: DshSession | null
   hostMount: HostMountHandle | null
@@ -114,6 +111,7 @@ export async function bootVoiceStack(
   config: VoiceWebConfig,
   logger: Logger,
   state: HostVoiceRuntime,
+  envOverlay?: Readonly<Record<string, string | undefined>>,
 ): Promise<() => Promise<void>> {
   // 用对象持有 stop：赋值发生在 `onListening` 回调里，普通 `let` 会被 TS
   // 的控制流分析窄化成永远 null
@@ -130,6 +128,7 @@ export async function bootVoiceStack(
     if (released) return
     released = true
     state.backend = { status: 'stopped' }
+    state.activeSummary = null
     if (state.inProcessAgent === inProcessAgent) state.inProcessAgent = null
     if (state.dshSession === dshSession) state.dshSession = null
     const steps: Array<() => Promise<void> | void> = [
@@ -190,17 +189,19 @@ export async function bootVoiceStack(
       ? loadStaticAsrCorpus(memoryFile.hotwordHints(), process.env)
       : ''
     const language = resolveAsrLanguage(process.env)
-    // Pure Live（VOICE_PIPELINE=live 或 OMNI_ANSWER=full|clip）才把默认非手动 STT 换成
-    // 手动端点 realtime STT（按方言选 qwen-realtime 或 openai-realtime），并把外部 TTS 换成静音占位。
-    // echo/none 没有这条管道；服务端 VAD 时客户端不封段，改 silent 会直接变哑巴。
-    const inferredPlan = assemblePipelinePlan(process.env, { sttName: 'qwen-realtime', strict: false })
-    const wantsLive = inferredPlan.mode === 'live'
-    const hasOmniKey = resolveLiveApiKey(process.env) !== ''
     const dshBacked = isDshBackedAgent(config.agent)
-    const turnDetection = process.env['ASR_TURN_DETECTION'] ?? process.env['QWEN_ASR_TURN_DETECTION']
+    const homeEnv = readDotEnvFile(join(dshHomeDir(), '.env'))
+    const mergedEnv: Record<string, string | undefined> = {
+      ...process.env,
+      ...homeEnv,
+      ...(envOverlay ?? {}),
+    }
+    const selection = applyVoiceProfile(mergedEnv, config)
+    const effectiveEnv = selection.env
+    const turnDetection = effectiveEnv['ASR_TURN_DETECTION'] ?? effectiveEnv['QWEN_ASR_TURN_DETECTION']
     const liveVadConflict = pureLiveVadConflict({
       dshBacked,
-      voicePipeline: process.env['VOICE_PIPELINE'],
+      voicePipeline: effectiveEnv['VOICE_PIPELINE'],
       turnDetection,
     })
     if (liveVadConflict !== null) {
@@ -208,23 +209,10 @@ export async function bootVoiceStack(
       logger.warn(liveVadConflict)
       throw new Error(liveVadConflict)
     }
-    const usePureLiveAudio = shouldUsePureLiveAudio({
-      dshBacked,
-      wantsLive,
-      hasOmniKey,
-      turnDetection,
-    })
-    const liveUrl = process.env['LIVE_URL'] ?? process.env['OMNI_URL']
-    const liveDialect = resolveRealtimeDialect(process.env['LIVE_DIALECT'] ?? process.env['OMNI_DIALECT'], liveUrl)
-    const defaultLiveStt = isOpenAiDialect(liveDialect) && (process.env['DASHSCOPE_API_KEY'] ?? '').trim() === ''
-      ? 'openai-realtime'
-      : 'qwen-realtime'
-    const effectiveStt = usePureLiveAudio
-      ? (isManualEndpointStt(config.stt) ? config.stt : defaultLiveStt)
-      : config.stt
-    const effectiveTts = usePureLiveAudio ? 'silent' : config.tts
-    const stt = await buildStt(effectiveStt, { ...sttCreds(), corpusText, language })
-    const tts = await buildTts(effectiveTts, audit)
+    const effectiveStt = selection.effectiveStt
+    const effectiveTts = selection.effectiveTts
+    const stt = await buildStt(effectiveStt, { ...sttCreds(), corpusText, language }, effectiveEnv)
+    const tts = await buildTts(effectiveTts, audit, selection.ttsEnv)
     report(`可替换件 STT=${stt.name}  TTS=${tts.name}（${tts.sampleRate} Hz）`)
     // 与 CLI 同一个队列：任务结果离线时先存着，重连后补播
     const announceStore = AnnounceStore.open({
@@ -281,7 +269,7 @@ export async function bootVoiceStack(
      * `dsh-subprocess` 与进程内 dsh 都算 dsh（`dshBacked` 在选 STT/TTS 时已经算过）。
      */
     const plan = dshBacked
-      ? assemblePipelinePlan(process.env, {
+      ? assemblePipelinePlan(effectiveEnv, {
         sttName: effectiveStt,
         ...(stt.supportsManualEndpoint === undefined
           ? {}
@@ -327,7 +315,7 @@ export async function bootVoiceStack(
       // 少了它，语音栈照样能跑，但每句都退化成「等完整 dsh」。
       streaming = assembleStreamingAgent({
         plan,
-        env: process.env,
+        env: effectiveEnv,
         dshAgent: baseAgent,
         tts,
         activity,
@@ -388,7 +376,7 @@ export async function bootVoiceStack(
       hasApiKey: semanticKey !== '',
     })
     const runtime = buildVoiceRuntimeConfig({
-      env: process.env,
+      env: effectiveEnv,
       profile: 'browser',
       ...(plan === null ? {} : { pipelineMode: plan.mode }),
       sttSpec: effectiveStt,
@@ -496,6 +484,7 @@ export async function bootVoiceStack(
       port: voicePort,
       mode: plan === null ? 'direct' : plan.mode,
     }
+    state.activeSummary = selection.summary
     if (state.hostMount !== null) {
       logger.info(`就绪：宿主 /dsh-voice/ws → 语音栈 127.0.0.1:${voicePort}`)
     }

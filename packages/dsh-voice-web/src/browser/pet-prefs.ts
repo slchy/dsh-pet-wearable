@@ -1,8 +1,10 @@
 /**
- * 桌宠偏好：锚点、尺寸、镜像、字幕、右缘避让、耳机提示。
+ * 桌宠偏好：锚点、尺寸、镜像、字幕、右缘避让、耳机提示、动态音效。
  *
  * 滑条只到 240，存档可以到 260——已经放大过的尺寸不会因为打开面板被悄悄改小，
  * 直到用户真的去拖滑条。右缘避让没有上限，小于等于 0 收成 0。
+ * 音效两个开关只认显式布尔：旧存档缺字段时 `soundEnabled` 回 true、
+ * `retroSpark` 回 false，音量默认开着，彩蛋默认不吵人。
  */
 import { clamp, type SavedAnchorPos } from './pet-geometry.ts';
 
@@ -20,6 +22,8 @@ export interface PetPrefs {
   showBubble: boolean;
   rightGap: number;
   headphoneHintDismissed: boolean;
+  soundEnabled: boolean;
+  retroSpark: boolean;
 }
 
 interface PrefsStorage {
@@ -35,6 +39,8 @@ export function defaultPrefs(): PetPrefs {
     showBubble: true,
     rightGap: DEFAULT_RIGHT_GAP,
     headphoneHintDismissed: false,
+    soundEnabled: true,
+    retroSpark: false,
   };
 }
 
@@ -79,6 +85,8 @@ function prefsFromParsed(value: unknown): PetPrefs {
   prefs.showBubble = value['showBubble'] !== false;
   prefs.rightGap = readGap(value['rightGap']);
   prefs.headphoneHintDismissed = value['headphoneHintDismissed'] === true;
+  prefs.soundEnabled = value['soundEnabled'] !== false;
+  prefs.retroSpark = value['retroSpark'] === true;
   return prefs;
 }
 
@@ -103,6 +111,8 @@ export function serializePrefs(prefs: PetPrefs): string {
     showBubble: prefs.showBubble,
     rightGap: prefs.rightGap,
     headphoneHintDismissed: prefs.headphoneHintDismissed,
+    soundEnabled: prefs.soundEnabled,
+    retroSpark: prefs.retroSpark,
   });
 }
 

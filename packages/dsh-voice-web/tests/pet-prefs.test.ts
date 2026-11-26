@@ -41,7 +41,29 @@ test('坏 JSON、空串和非对象回到默认', () => {
   assert.equal(defaultPrefs().showBubble, true);
   assert.equal(defaultPrefs().mirrorOnLeft, false);
   assert.equal(defaultPrefs().headphoneHintDismissed, false);
+  assert.equal(defaultPrefs().soundEnabled, true);
+  assert.equal(defaultPrefs().retroSpark, false);
   assert.equal(defaultPrefs().anchor, null);
+});
+
+test('音效开关：soundEnabled 只有显式 false 才关，retroSpark 只有显式 true 才开', () => {
+  assert.equal(parsePrefs({}).soundEnabled, true);
+  assert.equal(parsePrefs({ soundEnabled: true }).soundEnabled, true);
+  assert.equal(parsePrefs({ soundEnabled: false }).soundEnabled, false);
+  assert.equal(parsePrefs({ soundEnabled: 0 }).soundEnabled, true);
+  assert.equal(parsePrefs({ soundEnabled: 'false' }).soundEnabled, true);
+  assert.equal(parsePrefs({ soundEnabled: null }).soundEnabled, true);
+
+  assert.equal(parsePrefs({}).retroSpark, false);
+  assert.equal(parsePrefs({ retroSpark: true }).retroSpark, true);
+  assert.equal(parsePrefs({ retroSpark: false }).retroSpark, false);
+  assert.equal(parsePrefs({ retroSpark: 1 }).retroSpark, false);
+  assert.equal(parsePrefs({ retroSpark: 'true' }).retroSpark, false);
+
+  const prefs = defaultPrefs();
+  prefs.soundEnabled = false;
+  prefs.retroSpark = true;
+  assert.deepEqual(parsePrefs(serializePrefs(prefs)), prefs);
 });
 
 test('锚点 v 不是 2 就丢掉，其它字段还在', () => {

@@ -110,3 +110,51 @@ test('读取 dsh 真实 projections.values.title，空白会话显示「新会�
   assert.equal(projectHostState({ boundSessionId: 'unlisted' }).boundTitle, 'unlisted');
   assert.equal(projectHostState({ boundSessionId: '' }).boundTitle, '未绑定');
 });
+
+test('projectHostState 透传 voiceConfig 脱敏快照并在缺省时安全回退 null', () => {
+  assert.equal(projectHostState({ pipelineMode: 'live' }).voiceConfig, null);
+
+  const projected = projectHostState({
+    pipelineMode: 'cascade',
+    voiceReady: true,
+    voiceConfig: {
+      mode: 'cascade',
+      defaultMode: {
+        apiKeyMasked: 'sk-das****1234',
+        hasApiKey: true,
+      },
+      live: {
+        baseUrl: 'https://relay.example.com/v1',
+        apiKeyMasked: 'sk-liv****5678',
+        hasApiKey: true,
+        model: 'gpt-realtime',
+        asrModel: 'gpt-4o-mini-transcribe',
+      },
+      cascade: {
+        sttBaseUrl: 'https://stt.example.com/v1',
+        sttApiKeyMasked: 'sk-stt****9999',
+        hasSttApiKey: true,
+        sttModel: 'whisper-large-v3',
+        ttsReuseStt: true,
+        ttsBaseUrl: '',
+        ttsApiKeyMasked: null,
+        hasTtsApiKey: false,
+        ttsModel: 'gpt-4o-mini-tts',
+        ttsVoice: 'nova',
+      },
+      active: {
+        mode: 'cascade',
+        pipeline: 'cascade',
+        detail: '级联 · whisper-large-v3 + gpt-4o-mini-tts',
+      },
+      envFileHint: '~/.dsh/.env',
+      reloading: false,
+    },
+  });
+  assert.ok(projected.voiceConfig !== null);
+  assert.equal(projected.voiceConfig.mode, 'cascade');
+  assert.equal(projected.voiceConfig.defaultMode.apiKeyMasked, 'sk-das****1234');
+  assert.equal(projected.voiceConfig.cascade.ttsReuseStt, true);
+  assert.equal(projected.voiceConfig.cascade.sttApiKeyMasked, 'sk-stt****9999');
+  assert.equal(projected.voiceConfig.active.detail, '级联 · whisper-large-v3 + gpt-4o-mini-tts');
+});

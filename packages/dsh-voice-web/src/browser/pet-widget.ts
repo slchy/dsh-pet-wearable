@@ -10,6 +10,17 @@
  * 偏好、立绘、口型、界面状态、会话投影、拖拽和命中都在旁边的 `pet-*.ts`。
  */
 import {
+  CUSTOM_MODE_TIP,
+  OPTIMIZED_DEFAULT_TIP,
+  VOICE_MODE_LABELS,
+  type AvailableModelItem,
+  type FetchModelsRequest,
+  type HostVoiceConfigSnapshot,
+  type ModelFetchSlot,
+  type VoiceConfigUpdateRequest,
+  type VoiceMode,
+} from '../voice-overrides.ts';
+import {
   createVoiceClient,
   type VoiceClient,
   type VoiceClientEvent,
@@ -26,6 +37,8 @@ import {
   GUARD_STYLE_ID,
   buildPetShell,
   createCheckIcon,
+  type ApiKeyFieldDom,
+  type ModelPickerDom,
 } from './pet-dom.ts';
 import {
   classifyRelease,
@@ -39,6 +52,7 @@ import {
   projectHostState,
   type SessionRow,
 } from './pet-session.ts';
+import { createPetSfx } from './pet-sfx.ts';
 import {
   SPRITE_LABELS,
   SPRITE_NAMES,
@@ -99,6 +113,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/** v2 的打断原语。浏览器是 v2 设备，服务端不会再补一条 `Control: stop`。 */
+function isAudioStop(json: unknown): boolean {
+  return isRecord(json) && json['op'] === 'audio.stop';
+}
+
 function voiceSocketUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.host}/dsh-voice/ws`;
@@ -123,25 +142,178 @@ export function mountVoicePetWidget(): void {
   }, { once: true });
 }
 
+interface VoiceConfigDraft {
+  mode: VoiceMode;
+  defaultApiKey: string;
+  clearDefaultApiKey: boolean;
+  liveBaseUrl: string;
+  liveApiKey: string;
+  clearLiveApiKey: boolean;
+  liveModel: string;
+  liveAsrModel: string;
+  sttBaseUrl: string;
+  sttApiKey: string;
+  clearSttApiKey: boolean;
+  sttModel: string;
+  ttsReuseStt: boolean;
+  ttsBaseUrl: string;
+  ttsApiKey: string;
+  clearTtsApiKey: boolean;
+  ttsModel: string;
+  ttsVoice: string;
+}
+
+interface SlotModelState {
+  fetching: boolean;
+  models: AvailableModelItem[];
+  filter: string;
+  status: string;
+  statusTone: 'neutral' | 'ok' | 'err';
+}
+
+function emptyDraft(): VoiceConfigDraft {
+  return {
+    mode: 'default',
+    defaultApiKey: '',
+    clearDefaultApiKey: false,
+    liveBaseUrl: '',
+    liveApiKey: '',
+    clearLiveApiKey: false,
+    liveModel: '',
+    liveAsrModel: '',
+    sttBaseUrl: '',
+    sttApiKey: '',
+    clearSttApiKey: false,
+    sttModel: '',
+    ttsReuseStt: false,
+    ttsBaseUrl: '',
+    ttsApiKey: '',
+    clearTtsApiKey: false,
+    ttsModel: '',
+    ttsVoice: '',
+  };
+}
+
+function emptySlotModelState(): SlotModelState {
+  return {
+    fetching: false,
+    models: [],
+    filter: '',
+    status: '',
+    statusTone: 'neutral',
+  };
+}
+
+function draftFromSnapshot(snap: HostVoiceConfigSnapshot): VoiceConfigDraft {
+  return {
+    mode: snap.mode,
+    defaultApiKey: '',
+    clearDefaultApiKey: false,
+    liveBaseUrl: snap.live.baseUrl,
+    liveApiKey: '',
+    clearLiveApiKey: false,
+    liveModel: snap.live.model,
+    liveAsrModel: snap.live.asrModel,
+    sttBaseUrl: snap.cascade.sttBaseUrl,
+    sttApiKey: '',
+    clearSttApiKey: false,
+    sttModel: snap.cascade.sttModel,
+    ttsReuseStt: snap.cascade.ttsReuseStt,
+    ttsBaseUrl: snap.cascade.ttsBaseUrl,
+    ttsApiKey: '',
+    clearTtsApiKey: false,
+    ttsModel: snap.cascade.ttsModel,
+    ttsVoice: snap.cascade.ttsVoice,
+  };
+}
+
+const FALLBACK_VOICE_CONFIG: HostVoiceConfigSnapshot = {
+  mode: 'default',
+  defaultMode: { apiKeyMasked: null, hasApiKey: false },
+  live: { baseUrl: '', apiKeyMasked: null, hasApiKey: false, model: '', asrModel: '' },
+  cascade: {
+    sttBaseUrl: '',
+    sttApiKeyMasked: null,
+    hasSttApiKey: false,
+    sttModel: '',
+    ttsReuseStt: false,
+    ttsBaseUrl: '',
+    ttsApiKeyMasked: null,
+    hasTtsApiKey: false,
+    ttsModel: '',
+    ttsVoice: '',
+  },
+  active: { mode: 'default', pipeline: 'live', detail: '默认优化' },
+  envFileHint: '~/.dsh/.env',
+  reloading: false,
+};
+
+function hasDraftChanges(draft: VoiceConfigDraft, snap: HostVoiceConfigSnapshot): boolean {
+  if (draft.mode !== snap.mode) return true;
+  if (draft.defaultApiKey.trim() !== '' || draft.clearDefaultApiKey) return true;
+  if (draft.liveApiKey.trim() !== '' || draft.clearLiveApiKey) return true;
+  if (draft.sttApiKey.trim() !== '' || draft.clearSttApiKey) return true;
+  if (draft.ttsApiKey.trim() !== '' || draft.clearTtsApiKey) return true;
+  if (draft.liveBaseUrl.trim() !== snap.live.baseUrl) return true;
+  if (draft.liveModel.trim() !== snap.live.model) return true;
+  if (draft.liveAsrModel.trim() !== snap.live.asrModel) return true;
+  if (draft.sttBaseUrl.trim() !== snap.cascade.sttBaseUrl) return true;
+  if (draft.sttModel.trim() !== snap.cascade.sttModel) return true;
+  if (draft.ttsReuseStt !== snap.cascade.ttsReuseStt) return true;
+  if (draft.ttsBaseUrl.trim() !== snap.cascade.ttsBaseUrl) return true;
+  if (draft.ttsModel.trim() !== snap.cascade.ttsModel) return true;
+  if (draft.ttsVoice.trim() !== snap.cascade.ttsVoice) return true;
+  return false;
+}
+
 function mountNow(): void {
   const prefs = loadPrefs();
   installHostGuard();
   const {
-    host, root, mirror, squish, talk, img, bubble, hint, hintDismiss,
+    host, shadow, root, mirror, squish, talk, img, bubble, hint, hintDismiss,
     asrLine, asrBody, replyLine, replyLane, replyBody, badge, note,
     statusBar, statusText, tools, micBtn, muteBtn, gearBtn, panel, panelClose,
-    pipelineTag, boundId, stateMessage, sessionList, createBtn, sizeInput,
-    sizeReadout, mirrorInput, bubbleInput, exprDetails, exprCurrent, chips, resetBtn,
+    pipelineTag, boundId, stateMessage, sessionList, createBtn,
+    configSection, configDetails, configSummaryValue, configTip, configTipText, modeBtns,
+    defaultPane, defaultKeyField,
+    livePane, liveBaseUrlInput, liveKeyField, liveModelPicker, liveModelInput, liveAsrModelInput,
+    cascadePane, cascadeSttBaseUrlInput, cascadeSttKeyField, cascadeSttPicker, cascadeSttModelInput,
+    cascadeTtsReuseInput, cascadeTtsEndpointBox, cascadeTtsBaseUrlInput, cascadeTtsKeyField,
+    cascadeTtsPicker, cascadeTtsModelInput, cascadeTtsVoiceInput,
+    configEnvHint, configFeedback, configResetBtn, configApplyBtn,
+    sizeInput, sizeReadout, mirrorInput, bubbleInput,
+    soundInput, retroInput, sfxTestBtn, exprDetails, exprCurrent, chips, resetBtn,
   } = buildPetShell(document, prefs);
 
   let ui: PetUiState = initialPetUiState(prefs);
   let bubbleSide: 'left' | 'right' = 'left';
   let client: VoiceClient | null = null;
+  // 提示音优先复用通话里的 AudioContext（浏览器 AEC 的参考信号），空闲时独立轻量。
+  const sfx = createPetSfx({
+    getSharedContext: () => client?.context ?? null,
+    isEnabled: () => prefs.soundEnabled,
+    isRetroSpark: () => prefs.retroSpark,
+  });
+  /** 一次通话只响一次开麦音；等语音后端 `ready` 再响，避免连上即被 4503 断开时先响一声。 */
+  let micOpenCuePlayed = false;
+  /** 服务端 stop 帧会先把 speaking 清掉，用一拍把「刚刚在说」接给打断音效。 */
+  let speakingJustEnded = false;
   let drag: DragGesture | null = null;
   let alpha: Uint8ClampedArray | null = null;
   let hitMode: 'rect' | 'alpha' = 'rect';
   let settingsOpen = false;
   let sessionBusy = false;
+  let configBusy = false;
+  let configDirty = false;
+  let hostStateLoaded = false;
+  let autoExpandedForMissingKey = false;
+  let serverVoiceConfig: HostVoiceConfigSnapshot | null = null;
+  let draftConfig: VoiceConfigDraft = emptyDraft();
+  const slotModels: Record<ModelFetchSlot, SlotModelState> = {
+    live: emptySlotModelState(),
+    stt: emptySlotModelState(),
+    tts: emptySlotModelState(),
+  };
   let boundSessionId: string | null = null;
   let talkPose: TalkPose = idleTalkPose();
   let talkRaf = 0;
@@ -335,6 +507,14 @@ function mountNow(): void {
     renderExpression();
   }
 
+  function syncSfxControls(): void {
+    soundInput.checked = prefs.soundEnabled;
+    retroInput.checked = prefs.retroSpark;
+    retroInput.disabled = !prefs.soundEnabled;
+    sfxTestBtn.disabled = !prefs.soundEnabled;
+    retroInput.closest('.setting-row')?.classList.toggle('is-disabled', !prefs.soundEnabled);
+  }
+
   function applyEffects(effects: readonly PetEffect[]): void {
     for (const effect of effects) {
       switch (effect.type) {
@@ -364,13 +544,55 @@ function mountNow(): void {
 
   function handleClientEvent(event: VoiceClientEvent): void {
     const wasSpeaking = ui.speaking;
+    const wasLive = ui.link !== 'off';
+
+    // 音效按「事件发生时」的口径判，再进状态机。stop 帧和它触发的 speaking=false
+    // 在同一批事件里，`speakingJustEnded` 让打断音还看得到刚刚的说话态。
+    if (event.type === 'call' && isAudioStop(event.json)) {
+      if (wasSpeaking || speakingJustEnded) {
+        sfx.play('barge-in');
+        speakingJustEnded = false;
+      }
+    } else if (event.type === 'control' && event.text === 'stop') {
+      if (wasSpeaking || speakingJustEnded) {
+        sfx.play('barge-in');
+        speakingJustEnded = false;
+      }
+    } else if (event.type === 'ready') {
+      if (!micOpenCuePlayed) {
+        micOpenCuePlayed = true;
+        sfx.play('mic-open');
+      }
+    } else if (event.type === 'close') {
+      if (event.code === 1000) {
+        if (wasLive) sfx.play('mic-close');
+      } else {
+        sfx.play('sleepy');
+      }
+    } else if (event.type === 'speaking') {
+      if (event.active) sfx.fadeOut('delegate', 20);
+    } else if (event.type === 'ui') {
+      if (event.event.type === 'delegated') {
+        sfx.play('delegate');
+      } else if (event.event.type === 'announce') {
+        sfx.play('proactive');
+      } else if (event.event.type === 'reply.delta' || event.event.type === 'reply.final') {
+        sfx.fadeOut('delegate', 20);
+      }
+    }
+
     const reduced = reduceClientEvent(ui, event, Date.now());
     ui = reduced.state;
+    if (wasSpeaking && !ui.speaking) {
+      speakingJustEnded = true;
+      queueMicrotask(() => { speakingJustEnded = false; });
+    }
     if (ui.speaking && !wasSpeaking) beginTalk();
     applyEffects(reduced.effects);
   }
 
   function failVoiceStart(message: string): void {
+    sfx.play('sleepy');
     ui = { ...ui, link: 'off' };
     stopTalk();
     ui = { ...ui, phase: 'idle', noteText: message };
@@ -381,6 +603,9 @@ function mountNow(): void {
 
   function startVoice(): void {
     if (ui.link === 'connecting') return;
+    // 必须在这次点击的调用栈里解锁备用 AudioContext。
+    sfx.prime();
+    micOpenCuePlayed = false;
     client?.close();
     const next = createVoiceClient({
       url: voiceSocketUrl(),
@@ -402,6 +627,7 @@ function mountNow(): void {
   }
 
   function stopVoice(): void {
+    const wasLive = ui.link !== 'off';
     client?.close();
     client = null;
     const wasSpeaking = ui.speaking;
@@ -409,11 +635,17 @@ function mountNow(): void {
     if (wasSpeaking) stopTalk();
     renderExpression();
     renderStatus();
+    if (wasLive) sfx.play('mic-close');
   }
 
   function interruptVoice(): void {
+    // `client.interrupt()` 会同步停播放并回报 speaking=false，先记账再动手。
+    const wasSpeaking = ui.speaking;
     client?.interrupt();
-    if (!ui.speaking) return;
+    if (!wasSpeaking) return;
+    sfx.play('barge-in');
+    // 手动打断已经响过，服务端随后下发的 audio.stop 不再补第二声。
+    speakingJustEnded = false;
     ui = { ...ui, noteText: '已打断' };
     scheduleNote(NOTE_MS);
   }
@@ -576,7 +808,430 @@ function mountNow(): void {
     syncSessionButtons();
   }
 
-  function renderState(payload: unknown): void {
+  function setConfigFeedback(text: string, tone: 'neutral' | 'ok' | 'err' = 'neutral'): void {
+    configFeedback.textContent = text;
+    configFeedback.hidden = text === '';
+    configFeedback.className = tone === 'ok'
+      ? 'config-feedback is-ok'
+      : tone === 'err'
+        ? 'config-feedback is-err'
+        : 'config-feedback';
+  }
+
+  function syncTextInput(input: HTMLInputElement, value: string): void {
+    if (shadow.activeElement !== input && input.value !== value) {
+      input.value = value;
+    }
+    input.disabled = configBusy;
+  }
+
+  function renderApiKeyField(
+    field: ApiKeyFieldDom,
+    opts: {
+      readonly masked: string | null;
+      readonly draftValue: string;
+      readonly pendingClear: boolean;
+      readonly emptyPlaceholder: string;
+    },
+  ): void {
+    const hasSaved = opts.masked !== null;
+    if (opts.pendingClear) {
+      field.badge.textContent = '保存后清除';
+      field.badge.className = 'key-badge is-clearing';
+      field.badge.title = '保存后会从 .env 删除此密钥';
+      field.clearBtn.hidden = false;
+      field.clearBtn.textContent = '撤销';
+    } else if (hasSaved) {
+      field.badge.textContent = opts.masked;
+      field.badge.className = 'key-badge is-set';
+      field.badge.title = `已脱敏保存于 .env：${opts.masked}`;
+      field.clearBtn.hidden = false;
+      field.clearBtn.textContent = '清除';
+    } else {
+      field.badge.textContent = '未配置';
+      field.badge.className = 'key-badge';
+      field.badge.title = '尚未写入 .env';
+      field.clearBtn.hidden = true;
+    }
+    field.clearBtn.disabled = configBusy;
+    syncTextInput(field.input, opts.draftValue);
+    field.input.placeholder = opts.pendingClear
+      ? '输入新 Key 可覆盖，留空则清除'
+      : hasSaved
+        ? `已保存 ${opts.masked}，留空保持不变`
+        : opts.emptyPlaceholder;
+  }
+
+  function pickerDomFor(slot: ModelFetchSlot): ModelPickerDom {
+    if (slot === 'live') return liveModelPicker;
+    if (slot === 'stt') return cascadeSttPicker;
+    return cascadeTtsPicker;
+  }
+
+  function renderModelPicker(slot: ModelFetchSlot): void {
+    const dom = pickerDomFor(slot);
+    const state = slotModels[slot];
+    const backendReady = serverVoiceConfig !== null;
+    dom.fetchBtn.disabled = configBusy || state.fetching || !backendReady;
+    dom.fetchBtn.textContent = state.fetching
+      ? '拉取中…'
+      : slot === 'live'
+        ? '拉取可用模型'
+        : slot === 'stt'
+          ? '拉取 STT 模型'
+          : '拉取 TTS 模型';
+    dom.status.textContent = state.status;
+    dom.status.title = state.status;
+    dom.status.className = state.statusTone === 'err'
+      ? 'model-fetch-status is-err'
+      : state.statusTone === 'ok'
+        ? 'model-fetch-status is-ok'
+        : 'model-fetch-status';
+
+    dom.tableWrap.hidden = state.models.length === 0;
+    if (state.models.length === 0) return;
+
+    dom.filterInput.hidden = state.models.length <= 6;
+    if (shadow.activeElement !== dom.filterInput && dom.filterInput.value !== state.filter) {
+      dom.filterInput.value = state.filter;
+    }
+
+    const q = state.filter.trim().toLowerCase();
+    const filtered = q === ''
+      ? state.models
+      : state.models.filter((item) => item.id.toLowerCase().includes(q)
+        || (item.ownedBy?.toLowerCase().includes(q) ?? false));
+
+    const currentPrimary = slot === 'live'
+      ? draftConfig.liveModel.trim()
+      : slot === 'stt'
+        ? draftConfig.sttModel.trim()
+        : draftConfig.ttsModel.trim();
+    const currentSecondary = slot === 'live' ? draftConfig.liveAsrModel.trim() : '';
+
+    dom.list.replaceChildren();
+    if (filtered.length === 0) {
+      const empty = element('div', 'model-empty');
+      empty.textContent = '无匹配模型，可直接手动输入';
+      dom.list.append(empty);
+      return;
+    }
+
+    for (const item of filtered) {
+      const row = element('div', 'model-row');
+      const isPrimary = currentPrimary === item.id;
+      if (isPrimary) row.classList.add('is-selected');
+
+      const mainBtn = element('button', 'model-row-main');
+      mainBtn.type = 'button';
+      mainBtn.title = item.ownedBy ? `${item.id} (${item.ownedBy})` : item.id;
+      const idSpan = element('span', 'model-row-id');
+      idSpan.textContent = item.id;
+      mainBtn.append(idSpan);
+      if (item.ownedBy !== undefined && slot !== 'live') {
+        const ownerSpan = element('span', 'model-row-owner');
+        ownerSpan.textContent = item.ownedBy;
+        mainBtn.append(ownerSpan);
+      }
+      mainBtn.addEventListener('click', () => {
+        if (slot === 'live') updateDraftConfig({ liveModel: item.id });
+        else if (slot === 'stt') updateDraftConfig({ sttModel: item.id });
+        else updateDraftConfig({ ttsModel: item.id });
+      });
+      row.append(mainBtn);
+
+      if (slot === 'live') {
+        const altBtn = element('button', 'model-row-alt');
+        altBtn.type = 'button';
+        altBtn.textContent = '转写';
+        altBtn.title = `将 ${item.id} 设为 Live 转写模型`;
+        if (currentSecondary === item.id) altBtn.classList.add('is-selected');
+        altBtn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          updateDraftConfig({ liveAsrModel: item.id });
+        });
+        row.append(altBtn);
+      }
+
+      dom.list.append(row);
+    }
+  }
+
+  function renderVoiceConfig(): void {
+    const backendReady = serverVoiceConfig !== null;
+    const snap = serverVoiceConfig ?? FALLBACK_VOICE_CONFIG;
+    configSection.hidden = false;
+
+    configSummaryValue.textContent = !backendReady
+      ? (hostStateLoaded ? '需重启后端' : '读取中…')
+      : (snap.active.detail || (snap.mode === 'default' ? '默认优化' : VOICE_MODE_LABELS[snap.mode]));
+
+    for (const [mode, btn] of modeBtns) {
+      btn.setAttribute('aria-checked', draftConfig.mode === mode ? 'true' : 'false');
+      btn.disabled = configBusy;
+    }
+
+    const isDefaultPane = draftConfig.mode === 'default';
+    configTip.className = isDefaultPane ? 'config-tip' : 'config-tip is-subtle';
+    configTipText.textContent = isDefaultPane ? OPTIMIZED_DEFAULT_TIP : CUSTOM_MODE_TIP;
+
+    defaultPane.hidden = draftConfig.mode !== 'default';
+    livePane.hidden = draftConfig.mode !== 'live';
+    cascadePane.hidden = draftConfig.mode !== 'cascade';
+
+    // 默认模式：只需 DASHSCOPE_API_KEY
+    renderApiKeyField(defaultKeyField, {
+      masked: snap.defaultMode.apiKeyMasked,
+      draftValue: draftConfig.defaultApiKey,
+      pendingClear: draftConfig.clearDefaultApiKey,
+      emptyPlaceholder: '输入 DashScope API Key（sk-...）',
+    });
+
+    // Live 模式
+    syncTextInput(liveBaseUrlInput, draftConfig.liveBaseUrl);
+    renderApiKeyField(liveKeyField, {
+      masked: snap.live.apiKeyMasked,
+      draftValue: draftConfig.liveApiKey,
+      pendingClear: draftConfig.clearLiveApiKey,
+      emptyPlaceholder: '输入 OpenAI 兼容 API Key',
+    });
+    syncTextInput(liveModelInput, draftConfig.liveModel);
+    syncTextInput(liveAsrModelInput, draftConfig.liveAsrModel);
+    renderModelPicker('live');
+
+    // 级联模式
+    syncTextInput(cascadeSttBaseUrlInput, draftConfig.sttBaseUrl);
+    renderApiKeyField(cascadeSttKeyField, {
+      masked: snap.cascade.sttApiKeyMasked,
+      draftValue: draftConfig.sttApiKey,
+      pendingClear: draftConfig.clearSttApiKey,
+      emptyPlaceholder: '输入 STT API Key',
+    });
+    syncTextInput(cascadeSttModelInput, draftConfig.sttModel);
+    renderModelPicker('stt');
+
+    cascadeTtsReuseInput.checked = draftConfig.ttsReuseStt;
+    cascadeTtsReuseInput.disabled = configBusy;
+    cascadeTtsEndpointBox.hidden = draftConfig.ttsReuseStt;
+    syncTextInput(cascadeTtsBaseUrlInput, draftConfig.ttsBaseUrl);
+    renderApiKeyField(cascadeTtsKeyField, {
+      masked: snap.cascade.ttsApiKeyMasked,
+      draftValue: draftConfig.ttsApiKey,
+      pendingClear: draftConfig.clearTtsApiKey,
+      emptyPlaceholder: '输入 TTS API Key',
+    });
+    syncTextInput(cascadeTtsModelInput, draftConfig.ttsModel);
+    syncTextInput(cascadeTtsVoiceInput, draftConfig.ttsVoice);
+    renderModelPicker('tts');
+
+    configEnvHint.textContent = `保存后写入 ${snap.envFileHint}（前端仅展示脱敏密钥）`;
+    if (hostStateLoaded && !backendReady) {
+      setConfigFeedback('当前 dsh web 仍运行旧版插件后端，请重启 dsh web 后再写入 .env 或拉取模型。', 'err');
+    }
+    configDirty = hasDraftChanges(draftConfig, snap);
+    configResetBtn.disabled = !backendReady || configBusy || (snap.mode === 'default' && !configDirty);
+    configApplyBtn.disabled = !backendReady || configBusy || !configDirty;
+    configApplyBtn.textContent = configBusy ? '正在写入并重载…' : '写入 .env 并重载';
+  }
+
+  function updateDraftConfig(patch: Partial<VoiceConfigDraft>): void {
+    draftConfig = { ...draftConfig, ...patch };
+    setConfigFeedback('');
+    renderVoiceConfig();
+    if (settingsOpen) placeFloating(panel, bubbleSide);
+  }
+
+  function buildConfigUpdatePayload(): VoiceConfigUpdateRequest {
+    const mode = draftConfig.mode;
+    const defaultKey = draftConfig.defaultApiKey.trim();
+    const liveKey = draftConfig.liveApiKey.trim();
+    const sttKey = draftConfig.sttApiKey.trim();
+    const ttsKey = draftConfig.ttsApiKey.trim();
+
+    const includeDefault = mode === 'default' || defaultKey !== '' || draftConfig.clearDefaultApiKey;
+    const includeLive = mode === 'live' || liveKey !== '' || draftConfig.clearLiveApiKey;
+    const includeCascade = mode === 'cascade'
+      || sttKey !== ''
+      || draftConfig.clearSttApiKey
+      || ttsKey !== ''
+      || draftConfig.clearTtsApiKey;
+
+    return {
+      mode,
+      ...(includeDefault
+        ? {
+          defaultMode: {
+            ...(draftConfig.clearDefaultApiKey
+              ? { clearApiKey: true }
+              : defaultKey !== ''
+                ? { apiKey: defaultKey }
+                : {}),
+          },
+        }
+        : {}),
+      ...(includeLive
+        ? {
+          live: {
+            baseUrl: draftConfig.liveBaseUrl.trim(),
+            model: draftConfig.liveModel.trim(),
+            asrModel: draftConfig.liveAsrModel.trim(),
+            ...(draftConfig.clearLiveApiKey
+              ? { clearApiKey: true }
+              : liveKey !== ''
+                ? { apiKey: liveKey }
+                : {}),
+          },
+        }
+        : {}),
+      ...(includeCascade
+        ? {
+          cascade: {
+            sttBaseUrl: draftConfig.sttBaseUrl.trim(),
+            sttModel: draftConfig.sttModel.trim(),
+            ...(draftConfig.clearSttApiKey
+              ? { clearSttApiKey: true }
+              : sttKey !== ''
+                ? { sttApiKey: sttKey }
+                : {}),
+            ttsReuseStt: draftConfig.ttsReuseStt,
+            ttsBaseUrl: draftConfig.ttsBaseUrl.trim(),
+            ttsModel: draftConfig.ttsModel.trim(),
+            ttsVoice: draftConfig.ttsVoice.trim(),
+            ...(draftConfig.clearTtsApiKey
+              ? { clearTtsApiKey: true }
+              : ttsKey !== ''
+                ? { ttsApiKey: ttsKey }
+                : {}),
+          },
+        }
+        : {}),
+    };
+  }
+
+  async function fetchSlotModels(slot: ModelFetchSlot): Promise<void> {
+    const state = slotModels[slot];
+    if (state.fetching || configBusy) return;
+    state.fetching = true;
+    state.status = '正在拉取 /models…';
+    state.statusTone = 'neutral';
+    renderModelPicker(slot);
+
+    const body: FetchModelsRequest = slot === 'live'
+      ? {
+        slot: 'live',
+        ...(draftConfig.liveBaseUrl.trim() === '' ? {} : { baseUrl: draftConfig.liveBaseUrl.trim() }),
+        ...(draftConfig.liveApiKey.trim() === '' ? {} : { apiKey: draftConfig.liveApiKey.trim() }),
+      }
+      : slot === 'stt'
+        ? {
+          slot: 'stt',
+          ...(draftConfig.sttBaseUrl.trim() === '' ? {} : { baseUrl: draftConfig.sttBaseUrl.trim() }),
+          ...(draftConfig.sttApiKey.trim() === '' ? {} : { apiKey: draftConfig.sttApiKey.trim() }),
+        }
+        : {
+          slot: 'tts',
+          reuseStt: draftConfig.ttsReuseStt,
+          ...(draftConfig.ttsReuseStt
+            ? {
+              ...(draftConfig.sttBaseUrl.trim() === '' ? {} : { sttBaseUrl: draftConfig.sttBaseUrl.trim() }),
+              ...(draftConfig.sttApiKey.trim() === '' ? {} : { sttApiKey: draftConfig.sttApiKey.trim() }),
+            }
+            : {
+              ...(draftConfig.ttsBaseUrl.trim() === '' ? {} : { baseUrl: draftConfig.ttsBaseUrl.trim() }),
+              ...(draftConfig.ttsApiKey.trim() === '' ? {} : { apiKey: draftConfig.ttsApiKey.trim() }),
+            }),
+        };
+
+    try {
+      const response = await fetch('/dsh-voice/models', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok || !isRecord(payload) || payload['ok'] !== true || !Array.isArray(payload['models'])) {
+        const errText = isRecord(payload) && typeof payload['error'] === 'string'
+          ? payload['error']
+          : `HTTP ${response.status}`;
+        throw new Error(errText);
+      }
+      const parsed: AvailableModelItem[] = [];
+      for (const entry of payload['models']) {
+        if (!isRecord(entry) || typeof entry['id'] !== 'string') continue;
+        const ownedBy = typeof entry['ownedBy'] === 'string' ? entry['ownedBy'] : undefined;
+        parsed.push(ownedBy === undefined ? { id: entry['id'] } : { id: entry['id'], ownedBy });
+      }
+      state.models = parsed;
+      state.filter = '';
+      state.status = `已拉取 ${parsed.length} 个模型`;
+      state.statusTone = 'ok';
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : '拉取失败';
+      state.status = detail;
+      state.statusTone = 'err';
+    } finally {
+      state.fetching = false;
+      renderModelPicker(slot);
+      if (settingsOpen) placeFloating(panel, bubbleSide);
+    }
+  }
+
+  async function submitVoiceConfig(
+    body: VoiceConfigUpdateRequest | { readonly reset: true },
+    successText: string,
+  ): Promise<void> {
+    if (configBusy) return;
+    configBusy = true;
+    const hadActiveCall = ui.link !== 'off';
+    if (hadActiveCall) {
+      stopVoice();
+    }
+    setConfigFeedback('正在写入 .env 并重载语音栈…', 'neutral');
+    renderVoiceConfig();
+    try {
+      const response = await fetch('/dsh-voice/config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok || (isRecord(payload) && payload['ok'] === false)) {
+        const errText = isRecord(payload) && typeof payload['error'] === 'string'
+          ? payload['error']
+          : `HTTP ${response.status}`;
+        throw new Error(errText);
+      }
+      configDirty = false;
+      if (isRecord(payload) && isRecord(payload['state'])) {
+        renderState(payload['state'], true);
+        const ready = payload['state']['voiceReady'] !== false;
+        if (ready) {
+          setConfigFeedback(successText, 'ok');
+          if (hadActiveCall) {
+            ui = { ...ui, noteText: '配置已重载，点击立绘重新开启通话' };
+            scheduleNote(NOTE_MS);
+          }
+        } else {
+          const err = typeof payload['state']['voiceError'] === 'string'
+            ? payload['state']['voiceError']
+            : '语音栈重载未就绪';
+          setConfigFeedback(`已写入 .env，但语音栈未就绪：${err}`, 'err');
+        }
+      } else {
+        await loadState();
+        setConfigFeedback(successText, 'ok');
+      }
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : '保存配置失败';
+      setConfigFeedback(`保存失败：${detail}`, 'err');
+    } finally {
+      configBusy = false;
+      renderVoiceConfig();
+      if (settingsOpen) placeFloating(panel, bubbleSide);
+    }
+  }
+
+  function renderState(payload: unknown, forceHydrateConfig = false): void {
     const view = projectHostState(payload);
     if (!view.known) {
       setStateMessage(view.statusText);
@@ -592,6 +1247,20 @@ function mountNow(): void {
       : `${view.boundTitle}（${view.boundSessionId}）`;
     setStateMessage(view.statusText);
     renderSessions(view.sessions);
+    hostStateLoaded = true;
+    serverVoiceConfig = view.voiceConfig;
+    if (view.voiceConfig !== null && (forceHydrateConfig || !configDirty)) {
+      draftConfig = draftFromSnapshot(view.voiceConfig);
+      configDirty = false;
+    }
+    if (view.voiceConfig !== null) {
+      setConfigFeedback('');
+    }
+    if (!view.voiceReady && view.voiceConfig !== null && !autoExpandedForMissingKey) {
+      autoExpandedForMissingKey = true;
+      configDetails.open = true;
+    }
+    renderVoiceConfig();
     if (settingsOpen) placeFloating(panel, bubbleSide);
   }
 
@@ -719,6 +1388,7 @@ function mountNow(): void {
   renderBubble();
   renderStatus();
   renderExpression();
+  syncSfxControls();
   preloadSprites();
   window.requestAnimationFrame(() => {
     host.style.transition = HOST_MOVE;
@@ -804,6 +1474,119 @@ function mountNow(): void {
     ui = { ...ui, showBubble: prefs.showBubble };
     renderBubble();
     savePrefs(prefs);
+  });
+  soundInput.addEventListener('change', () => {
+    prefs.soundEnabled = soundInput.checked;
+    savePrefs(prefs);
+    syncSfxControls();
+    if (prefs.soundEnabled) {
+      sfx.prime();
+      sfx.play('mic-open');
+    } else {
+      sfx.fadeOut();
+    }
+  });
+  retroInput.addEventListener('change', () => {
+    prefs.retroSpark = retroInput.checked;
+    savePrefs(prefs);
+    if (prefs.soundEnabled) {
+      sfx.prime();
+      sfx.play('mic-open');
+    }
+  });
+  sfxTestBtn.addEventListener('click', () => {
+    sfx.prime();
+    sfx.play('mic-open');
+  });
+  for (const [mode, btn] of modeBtns) {
+    btn.addEventListener('click', () => {
+      updateDraftConfig({ mode });
+    });
+  }
+  defaultKeyField.input.addEventListener('input', () => {
+    updateDraftConfig({ defaultApiKey: defaultKeyField.input.value, clearDefaultApiKey: false });
+  });
+  defaultKeyField.clearBtn.addEventListener('click', () => {
+    updateDraftConfig({ clearDefaultApiKey: !draftConfig.clearDefaultApiKey, defaultApiKey: '' });
+  });
+
+  liveBaseUrlInput.addEventListener('input', () => {
+    updateDraftConfig({ liveBaseUrl: liveBaseUrlInput.value });
+  });
+  liveKeyField.input.addEventListener('input', () => {
+    updateDraftConfig({ liveApiKey: liveKeyField.input.value, clearLiveApiKey: false });
+  });
+  liveKeyField.clearBtn.addEventListener('click', () => {
+    updateDraftConfig({ clearLiveApiKey: !draftConfig.clearLiveApiKey, liveApiKey: '' });
+  });
+  liveModelInput.addEventListener('input', () => {
+    updateDraftConfig({ liveModel: liveModelInput.value });
+  });
+  liveAsrModelInput.addEventListener('input', () => {
+    updateDraftConfig({ liveAsrModel: liveAsrModelInput.value });
+  });
+  liveModelPicker.fetchBtn.addEventListener('click', () => {
+    void fetchSlotModels('live');
+  });
+  liveModelPicker.filterInput.addEventListener('input', () => {
+    slotModels.live.filter = liveModelPicker.filterInput.value;
+    renderModelPicker('live');
+  });
+
+  cascadeSttBaseUrlInput.addEventListener('input', () => {
+    updateDraftConfig({ sttBaseUrl: cascadeSttBaseUrlInput.value });
+  });
+  cascadeSttKeyField.input.addEventListener('input', () => {
+    updateDraftConfig({ sttApiKey: cascadeSttKeyField.input.value, clearSttApiKey: false });
+  });
+  cascadeSttKeyField.clearBtn.addEventListener('click', () => {
+    updateDraftConfig({ clearSttApiKey: !draftConfig.clearSttApiKey, sttApiKey: '' });
+  });
+  cascadeSttModelInput.addEventListener('input', () => {
+    updateDraftConfig({ sttModel: cascadeSttModelInput.value });
+  });
+  cascadeSttPicker.fetchBtn.addEventListener('click', () => {
+    void fetchSlotModels('stt');
+  });
+  cascadeSttPicker.filterInput.addEventListener('input', () => {
+    slotModels.stt.filter = cascadeSttPicker.filterInput.value;
+    renderModelPicker('stt');
+  });
+
+  cascadeTtsReuseInput.addEventListener('change', () => {
+    updateDraftConfig({ ttsReuseStt: cascadeTtsReuseInput.checked });
+  });
+  cascadeTtsBaseUrlInput.addEventListener('input', () => {
+    updateDraftConfig({ ttsBaseUrl: cascadeTtsBaseUrlInput.value });
+  });
+  cascadeTtsKeyField.input.addEventListener('input', () => {
+    updateDraftConfig({ ttsApiKey: cascadeTtsKeyField.input.value, clearTtsApiKey: false });
+  });
+  cascadeTtsKeyField.clearBtn.addEventListener('click', () => {
+    updateDraftConfig({ clearTtsApiKey: !draftConfig.clearTtsApiKey, ttsApiKey: '' });
+  });
+  cascadeTtsModelInput.addEventListener('input', () => {
+    updateDraftConfig({ ttsModel: cascadeTtsModelInput.value });
+  });
+  cascadeTtsVoiceInput.addEventListener('input', () => {
+    updateDraftConfig({ ttsVoice: cascadeTtsVoiceInput.value });
+  });
+  cascadeTtsPicker.fetchBtn.addEventListener('click', () => {
+    void fetchSlotModels('tts');
+  });
+  cascadeTtsPicker.filterInput.addEventListener('input', () => {
+    slotModels.tts.filter = cascadeTtsPicker.filterInput.value;
+    renderModelPicker('tts');
+  });
+
+  configResetBtn.addEventListener('click', () => {
+    void submitVoiceConfig({ reset: true }, '已切换回默认优化方案并重载');
+  });
+  configApplyBtn.addEventListener('click', () => {
+    void submitVoiceConfig(buildConfigUpdatePayload(), '已写入 .env 并重载生效');
+  });
+  configDetails.addEventListener('toggle', () => {
+    if (settingsOpen) placeFloating(panel, bubbleSide);
   });
   for (const [name, chip] of chips) {
     chip.addEventListener('click', () => { previewSprite(name); });

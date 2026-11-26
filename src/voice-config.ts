@@ -208,7 +208,11 @@ export function isManualEndpointStt(
   if (supportsManualEndpoint !== undefined) {
     return supportsManualEndpoint;
   }
-  return sttSpec === 'qwen-realtime' || sttSpec === 'openai-realtime';
+  return sttSpec === 'qwen-realtime'
+    || sttSpec === 'openai-realtime'
+    || sttSpec === 'openai'
+    || sttSpec === 'openai-http'
+    || sttSpec === 'openai-stt';
 }
 
 /**

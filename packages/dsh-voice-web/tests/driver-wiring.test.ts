@@ -66,12 +66,9 @@ test('boot-voice-stack.ts 调用同一份配置，并直连 voice/runtime', () =
   assert.match(boot, /resolveArchiveDir\(process\.env\['MIAI_ARCHIVE_DIR'\], homedir\(\)\)/u);
   assert.match(boot, /formatArchiveBanner\(archiveDir\)/u);
   assert.match(boot, /state\.backend = \{ status: 'stopped' \}/u);
-  assert.match(boot, /resolveLiveApiKey\(process\.env\)/u);
-  assert.match(
-    boot,
-    /const effectiveStt = usePureLiveAudio\s*\?\s*\(isManualEndpointStt\(config\.stt\) \? config\.stt : defaultLiveStt\)\s*:\s*config\.stt/u,
-  );
-  assert.match(boot, /const effectiveTts = usePureLiveAudio \? 'silent' : config\.tts/u);
+  assert.match(boot, /applyVoiceProfile\(mergedEnv,\s*config\)/u);
+  assert.match(boot, /const effectiveStt = selection\.effectiveStt/u);
+  assert.match(boot, /const effectiveTts = selection\.effectiveTts/u);
   assert.match(
     boot,
     /import\s*\{[^}]*\bbuildAgent\b[^}]*\bbuildStt\b[^}]*\bbuildTts\b[^}]*\}\s*from\s*'\.\/voice\/runtime\/providers-factory\.ts'/u,

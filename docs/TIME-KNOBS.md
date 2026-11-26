@@ -16,17 +16,17 @@
 |:---|:---:|:---|:---|:---|:---|
 | `KEEPALIVE_MINUTES` | 180 | wall | `src/main.ts:424` | 无关首声（不在停嘴→出声路径上） | — |
 | `FAST_LANE_TIMEOUT_MS` | 1200 | wall | `src/runtime/pipeline-assembly.ts:346` | 模型段（它就是那一轮的上限） | FAST_LANE > 0 时固定；超时转 dsh |
-| `VOICE_COMMIT_MS` | 20（仅 手动端点） | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:455` | 无 —— 它就是封段的那一刻，实际门槛被上行包长盖住 | 眼镜 mSBC + 手动端点下实际门槛 = 一整个上行包（75 ms）；浏览器 20 ms PCM 帧可按帧触发；服务端 VAD / 非手动端点 STT 归 0 |
-| `VOICE_STT_COMMIT_MS` | 150（glasses）/ 320（browser） | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:456` | 无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠） | — |
-| `VOICE_OPEN_QUIET_MS` | 300 | wall | `src/voice-config.ts:457` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
-| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | 650 | wall | `src/voice-config.ts:461` | 无（它自己是上限） | — |
-| `TURN_JUDGE_EXTEND_MS` | 200 | wall | `src/voice-config.ts:488` | 模型段（模型 >200 ms 时几乎全遮住；模型变快后变成纯成本） | TURN_JUDGE_MAX_EXT=2 拍 / WAIT_BUDGET_MS=200（普通句一拍满即触顶，第 2 拍仅留给 <200 ms 静音闸门、语义 more 豁免或序列句）/ MAX_OPEN_SILENCE_MS |
-| `TURN_JUDGE_WAIT_BUDGET_MS` | 200 | wall | `src/voice-config.ts:505` | 同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算 | — |
-| `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 1200 | wall | `src/voice-config.ts:509` | 模型段（只对数字/字母/「然后」这类句尾生效） | 声学静音受 TURN_JUDGE_MAX_OPEN_SILENCE_MS 封顶；语义 more 豁免后受 DEFAULT_GATE_HOLD_MS（2000 ms）封顶 |
-| `SEMANTIC_END_TAG_BUDGET_MS` | 400 | wall | `src/voice-config.ts:516` | 静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行；同时作为超时上限（`semanticTimeoutMs` 与预算同一值）。Pure Live 默认关闭，`SEMANTIC_END_TAG=1` 才开 | — |
-| `MIAI_CONFIRM_TIMEOUT_MS` | DEFAULT_CONFIRM_TIMEOUT_MS | wall | `src/voice-config.ts:521` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_PHOTO_TIMEOUT_MS` | 60000 | wall | `src/voice-config.ts:532` | 无关首声（不在停嘴→出声路径上） | — |
-| `MIAI_IDLE_TIMEOUT_MS` | 45000 | wall | `src/voice-config.ts:533` | 无关首声（不在停嘴→出声路径上） | — |
+| `VOICE_COMMIT_MS` | 20（仅 手动端点） | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:459` | 无 —— 它就是封段的那一刻，实际门槛被上行包长盖住 | 眼镜 mSBC + 手动端点下实际门槛 = 一整个上行包（75 ms）；浏览器 20 ms PCM 帧可按帧触发；服务端 VAD / 非手动端点 STT 归 0 |
+| `VOICE_STT_COMMIT_MS` | 150（glasses）/ 320（browser） | wall（按上行包步进：眼镜 75 ms / 浏览器 20 ms） | `src/voice-config.ts:460` | 无（150 ms 仍早于判停的 200–300 ms 静音门槛，解码与判停那一拍重叠） | — |
+| `VOICE_OPEN_QUIET_MS` | 300 | wall | `src/voice-config.ts:461` | ASR 已出句、等静音够了才开轮（**这段是纯等待**） | — |
+| `TURN_JUDGE_MAX_OPEN_SILENCE_MS` | 650 | wall | `src/voice-config.ts:465` | 无（它自己是上限） | — |
+| `TURN_JUDGE_EXTEND_MS` | 200 | wall | `src/voice-config.ts:492` | 模型段（模型 >200 ms 时几乎全遮住；模型变快后变成纯成本） | TURN_JUDGE_MAX_EXT=2 拍 / WAIT_BUDGET_MS=200（普通句一拍满即触顶，第 2 拍仅留给 <200 ms 静音闸门、语义 more 豁免或序列句）/ MAX_OPEN_SILENCE_MS |
+| `TURN_JUDGE_WAIT_BUDGET_MS` | 200 | wall | `src/voice-config.ts:509` | 同上 —— 200 是按「模型段 ~184 ms」定的，模型变慢要重算 | — |
+| `TURN_JUDGE_SEQUENCE_BUDGET_MS` | 1200 | wall | `src/voice-config.ts:513` | 模型段（只对数字/字母/「然后」这类句尾生效） | 声学静音受 TURN_JUDGE_MAX_OPEN_SILENCE_MS 封顶；语义 more 豁免后受 DEFAULT_GATE_HOLD_MS（2000 ms）封顶 |
+| `SEMANTIC_END_TAG_BUDGET_MS` | 400 | wall | `src/voice-config.ts:520` | 静候窗（`VOICE_OPEN_QUIET_MS` 200–300 ms）—— 判停请求在定稿时已发出，等不到就按「说完了」放行；同时作为超时上限（`semanticTimeoutMs` 与预算同一值）。Pure Live 默认关闭，`SEMANTIC_END_TAG=1` 才开 | — |
+| `MIAI_CONFIRM_TIMEOUT_MS` | DEFAULT_CONFIRM_TIMEOUT_MS | wall | `src/voice-config.ts:525` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_PHOTO_TIMEOUT_MS` | 60000 | wall | `src/voice-config.ts:536` | 无关首声（不在停嘴→出声路径上） | — |
+| `MIAI_IDLE_TIMEOUT_MS` | 45000 | wall | `src/voice-config.ts:537` | 无关首声（不在停嘴→出声路径上） | — |
 
 ## 二、路径布尔开关（会改变时刻或路径）
 

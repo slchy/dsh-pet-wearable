@@ -18,14 +18,25 @@ import {
   type StackPhase,
   type VoiceWebConfig,
 } from './driver-policy.ts'
+import { readDotEnvFile, upsertDotEnvFile } from './env-store.ts'
 import {
   ASSETS_PREFIX,
   WS_UPGRADE_PATH,
   mountVoiceHost,
+  type HostPetState,
   type HostWebServer,
 } from './host-mount.ts'
 import { HostSecurityGuard, type ConnectionFence } from './host-security.ts'
 import { InProcessDshAgent, type HostSessionController } from './in-process-agent.ts'
+import { fetchAvailableModels } from './model-catalog.ts'
+import {
+  applyVoiceProfile,
+  buildEnvUpdatesFromConfigRequest,
+  buildResetToDefaultEnvUpdates,
+  buildVoiceConfigSnapshot,
+} from './voice-config-apply.ts'
+import type { VoiceConfigUpdateRequest } from './voice-overrides.ts'
+import { loadDotEnv } from './voice/runtime/env-bootstrap.ts'
 
 /** host 模式下等 `sessionController` 就绪的兜底上限；超时才退回子进程 dsh。 */
 const SESSION_CONTROLLER_WAIT_MS = 5_000
@@ -39,30 +50,22 @@ function petSessionFile(): string {
   return join(dshHomeDir(), '.dsh-voice-pet.json')
 }
 
+export function dshHomeEnvFile(): string {
+  return join(dshHomeDir(), '.env')
+}
+
+function dshHomeEnvHint(): string {
+  return process.env['DSH_HOME'] ? join(process.env['DSH_HOME'], '.env') : '~/.dsh/.env'
+}
+
 /**
  * 补读 `~/.dsh/.env`（不覆盖已有环境变量）：`dsh web` / Desktop 的 `cwd`
  * 往往不是语音仓目录，把 STT/TTS 凭据放在 `~/.dsh/.env` 即可在任意目录生效。
  */
 export function loadDshHomeDotEnv(): number {
-  const file = join(dshHomeDir(), '.env')
-  let text: string
-  try {
-    text = readFileSync(file, 'utf8')
-  } catch {
-    return 0
-  }
+  const entries = readDotEnvFile(dshHomeEnvFile())
   let count = 0
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (!line || line.startsWith('#')) continue
-    const eq = line.indexOf('=')
-    if (eq <= 0) continue
-    const key = line.slice(0, eq).trim()
-    let value = line.slice(eq + 1).trim()
-    if ((value.startsWith('"') && value.endsWith('"'))
-      || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1)
-    }
+  for (const [key, value] of Object.entries(entries)) {
     if (process.env[key] === undefined) {
       process.env[key] = value
       count += 1
@@ -75,10 +78,8 @@ export function loadPersistedSessionId(): string | null {
   try {
     const parsed: unknown = JSON.parse(readFileSync(petSessionFile(), 'utf8'))
     if (parsed === null || typeof parsed !== 'object') return null
-    const sessionId = (parsed as { sessionId?: unknown }).sessionId
-    if (typeof sessionId !== 'string') return null
-    const trimmed = sessionId.trim()
-    return trimmed === '' ? null : trimmed
+    const raw = (parsed as { sessionId?: unknown }).sessionId
+    return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : null
   } catch {
     return null
   }
@@ -88,10 +89,9 @@ function persistSessionId(sessionId: string | null): void {
   try {
     const file = petSessionFile()
     mkdirSync(dirname(file), { recursive: true })
-    const body: { sessionId: string | null } = { sessionId }
-    writeFileSync(file, JSON.stringify(body), 'utf8')
+    writeFileSync(file, JSON.stringify({ sessionId }, null, 2), 'utf8')
   } catch {
-    // 指针写失败不影响这一轮对话。
+    // 持久化失败不影响当前会话运行。
   }
 }
 
@@ -199,12 +199,27 @@ export function mountHostPlugin(
   const report = (line: string): void => { console.log(line) }
   const workDir = config.workDir === '' ? process.cwd() : config.workDir
 
+  // 同步补读一次 .env，确保桌宠 UI 首次 GET /dsh-voice/state 就能拿到准确的缺省优化方案视图。
+  loadDotEnv()
+  loadDshHomeDotEnv()
+
   const state: HostVoiceRuntime = {
     backend: { status: 'starting' },
+    activeSummary: null,
     inProcessAgent: null,
     dshSession: null,
     hostMount: null,
   }
+
+  let reloading = false
+  let unmounted = false
+  let activeBootCtx: Context = ctx
+  let reloadQueue: Promise<void> = Promise.resolve()
+
+  const readMergedVoiceEnv = (): Record<string, string | undefined> => ({
+    ...process.env,
+    ...readDotEnvFile(dshHomeEnvFile()),
+  })
 
   const ensureInProcessAgent = (): InProcessDshAgent | null => {
     if (state.inProcessAgent !== null) return state.inProcessAgent
@@ -235,6 +250,70 @@ export function mountHostPlugin(
     },
   })
 
+  const buildState = async (): Promise<HostPetState> => {
+    const view = resolveHostVoiceBackendView(state.backend)
+    const inProc = ensureInProcessAgent()
+    const mergedEnv = readMergedVoiceEnv()
+    const preview = applyVoiceProfile(mergedEnv, config)
+    const voiceConfig = buildVoiceConfigSnapshot({
+      env: mergedEnv,
+      activePipeline: view.pipelineMode,
+      activeSummary: state.activeSummary ?? preview.summary,
+      envFileHint: dshHomeEnvHint(),
+      reloading,
+    })
+    return {
+      ok: true,
+      pipelineMode: view.pipelineMode,
+      boundSessionId: inProc?.targetSessionId ?? state.dshSession?.currentSessionId ?? null,
+      sessions: inProc ? await inProc.listSessions() : [],
+      wsPath: WS_UPGRADE_PATH,
+      assetsPrefix: ASSETS_PREFIX,
+      voiceReady: view.voiceReady,
+      voiceError: view.voiceError,
+      voiceConfig,
+    }
+  }
+
+  let releaseDirectStack: (() => Promise<void>) | null = null
+  let stopManagedStack: () => Promise<void> = async () => {}
+  let restartManagedStack: () => Promise<void> = async () => {}
+
+  const applyAndReloadConfig = async (
+    req: { readonly reset: true } | { readonly reset: false; readonly value: VoiceConfigUpdateRequest },
+  ): Promise<HostPetState> => {
+    const updates = req.reset
+      ? buildResetToDefaultEnvUpdates()
+      : buildEnvUpdatesFromConfigRequest(req.value)
+    upsertDotEnvFile(dshHomeEnvFile(), updates)
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === null) {
+        delete process.env[key]
+      } else {
+        process.env[key] = value
+      }
+    }
+    const run = async (): Promise<void> => {
+      if (unmounted) return
+      reloading = true
+      try {
+        const bound = state.inProcessAgent?.targetSessionId
+        if (bound !== undefined && bound !== null && config.sessionId.trim() === '') {
+          persistSessionId(bound)
+        }
+        state.backend = { status: 'starting' }
+        state.activeSummary = null
+        await restartManagedStack()
+      } finally {
+        reloading = false
+      }
+    }
+    const chained = reloadQueue.then(run, run)
+    reloadQueue = chained
+    await chained
+    return buildState()
+  }
+
   const hostMount = mountVoiceHost({
     webServer: hostServer,
     voicePort: () => getVoicePort(state.backend),
@@ -242,20 +321,7 @@ export function mountHostPlugin(
     widgetJsPath: join(import.meta.dirname, 'widget.js'),
     assetsDir: join(import.meta.dirname, '..', 'assets', 'pet'),
     security,
-    getState: async () => {
-      const view = resolveHostVoiceBackendView(state.backend)
-      const inProc = ensureInProcessAgent()
-      return {
-        ok: true,
-        pipelineMode: view.pipelineMode,
-        boundSessionId: inProc?.targetSessionId ?? state.dshSession?.currentSessionId ?? null,
-        sessions: inProc ? await inProc.listSessions() : [],
-        wsPath: WS_UPGRADE_PATH,
-        assetsPrefix: ASSETS_PREFIX,
-        voiceReady: view.voiceReady,
-        voiceError: view.voiceError,
-      }
-    },
+    getState: buildState,
     onSelectSession: async (nextId) => {
       const inProc = ensureInProcessAgent()
       if (inProc === null) {
@@ -271,12 +337,17 @@ export function mountHostPlugin(
       persistSessionId(nextId)
       return { sessionId: nextId }
     },
+    onUpdateConfig: applyAndReloadConfig,
+    onFetchModels: (req) => fetchAvailableModels(req, readMergedVoiceEnv()),
     log: report,
   })
   state.hostMount = hostMount
   logger.info('桌宠 UI 已同步挂载到宿主 /dsh-voice/*')
 
-  ctx.effect(() => () => hostMount.close(), 'voice-web-host-ui')
+  ctx.effect(() => () => {
+    unmounted = true
+    return hostMount.close()
+  }, 'voice-web-host-ui')
 
   const bootStackWithGuard = async (bootCtx: Context): Promise<() => Promise<void>> => {
     try {
@@ -284,6 +355,7 @@ export function mountHostPlugin(
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
       state.backend = { status: 'failed', reason: detail }
+      state.activeSummary = null
       logger.warn(`语音后端未就绪（桌宠 UI 保持可用）：${detail}`)
       console.warn(`[voice-web] 语音后端未就绪（桌宠 UI 仍可用，配置 ~/.dsh/.env 后重载生效）：${detail}`)
       return async () => {}
@@ -291,7 +363,27 @@ export function mountHostPlugin(
   }
 
   if (config.agent !== 'dsh') {
-    ctx.effect(() => bootStackWithGuard(ctx), 'voice-web-host-stack')
+    restartManagedStack = async () => {
+      const prev = releaseDirectStack
+      releaseDirectStack = null
+      if (prev !== null) await prev()
+      if (unmounted) return
+      const nextRelease = await bootStackWithGuard(ctx)
+      if (unmounted) {
+        await nextRelease()
+        return
+      }
+      releaseDirectStack = nextRelease
+    }
+    ctx.effect(() => {
+      void restartManagedStack()
+      return async () => {
+        unmounted = true
+        const prev = releaseDirectStack
+        releaseDirectStack = null
+        if (prev !== null) await prev()
+      }
+    }, 'voice-web-host-stack')
     return
   }
 
@@ -301,6 +393,7 @@ export function mountHostPlugin(
   // 控制器路径与超时路径共用一个相位：只 boot 一次，release 只留一份。
   let stackPhase: StackPhase = { kind: 'waiting' }
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined
+  let inflightBoot: Promise<void> | null = null
 
   const clearFallbackTimer = (): void => {
     if (fallbackTimer !== undefined) {
@@ -315,30 +408,54 @@ export function mountHostPlugin(
     stackPhase = next.phase
     if (next.releaseNow !== null) await next.releaseNow()
   }
+  stopManagedStack = stopStack
 
-  const startBoot = (source: 'controller' | 'timeout', bootCtx: Context): void => {
+  const startBoot = (source: 'controller' | 'timeout', bootCtx: Context): Promise<void> => {
+    activeBootCtx = bootCtx
     const next = reduceStackPhase(stackPhase, { type: 'boot', source })
-    if (next.phase === stackPhase) return
+    if (next.phase === stackPhase) return inflightBoot ?? Promise.resolve()
     stackPhase = next.phase
     clearFallbackTimer()
-    void bootStackWithGuard(bootCtx).then((release) => {
+    const p = bootStackWithGuard(bootCtx).then((release) => {
       const done = reduceStackPhase(stackPhase, { type: 'booted', release })
       stackPhase = done.phase
-      if (done.releaseNow !== null) void done.releaseNow()
+      if (done.releaseNow !== null) return done.releaseNow()
+      return undefined
     }, (error: unknown) => {
       const detail = error instanceof Error ? error.message : String(error)
       logger.error(`语音栈启动失败: ${detail}`)
       const stopped = reduceStackPhase(stackPhase, { type: 'stop' })
       stackPhase = stopped.phase
-      if (stopped.releaseNow !== null) void stopped.releaseNow()
+      if (stopped.releaseNow !== null) return stopped.releaseNow()
+      return undefined
+    }).finally(() => {
+      if (inflightBoot === p) inflightBoot = null
     })
+    inflightBoot = p
+    return p
+  }
+
+  restartManagedStack = async () => {
+    if (inflightBoot !== null) {
+      await stopStack()
+      await inflightBoot
+    } else {
+      await stopStack()
+    }
+    if (unmounted) return
+    stackPhase = { kind: 'waiting' }
+    await startBoot('controller', activeBootCtx)
   }
 
   ctx.inject(['sessionController'], (scCtx) => {
+    activeBootCtx = scCtx
     if (stackPhase.kind !== 'waiting') return
-    startBoot('controller', scCtx)
+    void startBoot('controller', scCtx)
     // 效果体立刻执行；返回的才是卸载。写成立刻调用会把刚启动的栈停掉。
-    scCtx.effect(() => () => stopStack(), 'voice-web-host-stack')
+    scCtx.effect(() => () => {
+      unmounted = true
+      return stopManagedStack()
+    }, 'voice-web-host-stack')
   })
 
   ctx.effect(() => {
@@ -347,10 +464,13 @@ export function mountHostPlugin(
         fallbackTimer = undefined
         if (stackPhase.kind !== 'waiting') return
         logger.warn(`等待 sessionController 超过 ${SESSION_CONTROLLER_WAIT_MS} ms，退回子进程 dsh`)
-        startBoot('timeout', ctx)
+        void startBoot('timeout', ctx)
       }, SESSION_CONTROLLER_WAIT_MS)
       fallbackTimer.unref?.()
     }
-    return () => stopStack()
+    return () => {
+      unmounted = true
+      return stopManagedStack()
+    }
   }, 'voice-web-host-stack-fallback')
 }

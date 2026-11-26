@@ -15,12 +15,22 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 
 import type { HostSecurityGuard } from './host-security.ts';
+import type { FetchModelsOutcome } from './model-catalog.ts';
+import {
+  sanitizeFetchModelsRequest,
+  sanitizeVoiceConfigUpdate,
+  type FetchModelsRequest,
+  type HostVoiceConfigSnapshot,
+  type VoiceConfigUpdateRequest,
+} from './voice-overrides.ts';
 
 export const WIDGET_SCRIPT_PATH = '/dsh-voice/widget.js';
 export const WS_UPGRADE_PATH = '/dsh-voice/ws';
 export const ASSETS_PREFIX = '/dsh-voice/assets';
 export const STATE_PATH = '/dsh-voice/state';
 export const SESSION_PATH = '/dsh-voice/session';
+export const CONFIG_PATH = '/dsh-voice/config';
+export const MODELS_PATH = '/dsh-voice/models';
 
 export const PET_SPRITE_NAMES = [
   'calm',
@@ -109,6 +119,8 @@ export interface HostPetState {
   /** 语音后端是否已就绪；为 false 时浮窗立绘与会话选择仍可用，点击开麦会给出 voiceError 提示。 */
   readonly voiceReady?: boolean;
   readonly voiceError?: string | null;
+  /** 前端可调的语音管线 / STT / TTS 配置快照（缺省值、覆盖值与当前运行态，绝不含密钥）。 */
+  readonly voiceConfig?: HostVoiceConfigSnapshot;
 }
 
 export interface HostSessionSelection {
@@ -140,6 +152,20 @@ export interface HostMountOptions {
   readonly onSelectSession?: (
     sessionId: string | null,
   ) => Promise<HostSessionSelection> | HostSessionSelection;
+  /**
+   * `POST /dsh-voice/config`。
+   * 写入 `~/.dsh/.env` 并热重载语音栈后返回最新状态（返回体仅含脱敏后的 API Key 预览）。
+   */
+  readonly onUpdateConfig?: (
+    req: { readonly reset: true } | { readonly reset: false; readonly value: VoiceConfigUpdateRequest },
+  ) => Promise<HostPetState> | HostPetState;
+  /**
+   * `POST /dsh-voice/models`。
+   * 由宿主代发 `GET {baseUrl}/models` 拉取可用模型表，避免浏览器 CORS 或暴露已存密钥。
+   */
+  readonly onFetchModels?: (
+    req: FetchModelsRequest,
+  ) => Promise<FetchModelsOutcome> | FetchModelsOutcome;
   readonly log: (line: string) => void;
 }
 
@@ -457,11 +483,101 @@ export function mountVoiceHost(options: HostMountOptions): HostMountHandle {
     }));
   };
 
+  const serveConfig = (): void => {
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: CONFIG_PATH,
+      handler: guard(async (req, res) => {
+        if (methodOf(req) !== 'POST') {
+          writeMethodNotAllowed(res, 'POST');
+          drain(req);
+          return;
+        }
+        const body = await readLimitedBody(req, MAX_SESSION_BODY_BYTES);
+        if (!body.ok) {
+          const error = body.status === 413 ? 'body too large' : 'invalid body';
+          writeJson(res, body.status, { ok: false, error });
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body.text);
+        } catch {
+          writeJson(res, 400, { ok: false, error: 'invalid json' });
+          return;
+        }
+        const checked = sanitizeVoiceConfigUpdate(parsed);
+        if (!checked.ok) {
+          writeJson(res, 400, { ok: false, error: checked.error });
+          return;
+        }
+        const update = options.onUpdateConfig;
+        if (update === undefined) {
+          writeJson(res, 400, { ok: false, error: 'voice config update unavailable' });
+          return;
+        }
+        const nextState = await update(
+          checked.reset ? { reset: true } : { reset: false, value: checked.value },
+        );
+        writeJson(res, 200, { ok: true, state: nextState });
+      }),
+    }));
+  };
+
+  const serveModels = (): void => {
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: MODELS_PATH,
+      handler: guard(async (req, res) => {
+        if (methodOf(req) !== 'POST') {
+          writeMethodNotAllowed(res, 'POST');
+          drain(req);
+          return;
+        }
+        const body = await readLimitedBody(req, MAX_SESSION_BODY_BYTES);
+        if (!body.ok) {
+          const error = body.status === 413 ? 'body too large' : 'invalid body';
+          writeJson(res, body.status, { ok: false, error });
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body.text);
+        } catch {
+          writeJson(res, 400, { ok: false, error: 'invalid json' });
+          return;
+        }
+        const checked = sanitizeFetchModelsRequest(parsed);
+        if (!checked.ok) {
+          writeJson(res, 400, { ok: false, error: checked.error });
+          return;
+        }
+        const fetcher = options.onFetchModels;
+        if (fetcher === undefined) {
+          writeJson(res, 400, { ok: false, error: 'model catalog unavailable' });
+          return;
+        }
+        const outcome = await fetcher(checked.value);
+        if (!outcome.ok) {
+          writeJson(res, outcome.status, { ok: false, error: outcome.error });
+          return;
+        }
+        writeJson(res, 200, {
+          ok: true,
+          endpoint: outcome.endpoint,
+          models: outcome.models,
+        });
+      }),
+    }));
+  };
+
   try {
     serveWidget();
     serveAssets();
     serveState();
     serveSession();
+    serveConfig();
+    serveModels();
     disposers.push(webServer.registerUpgrade({
       path: WS_UPGRADE_PATH,
       handler: (req, socket, head) => {

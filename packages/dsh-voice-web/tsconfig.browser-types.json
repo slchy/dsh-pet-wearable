@@ -7,5 +7,10 @@
     "outDir": "lib/browser-types",
     "rootDir": "src/browser"
   },
-  "include": ["src/browser/**/*.ts"]
+  "include": [
+    "src/browser/client.ts",
+    "src/browser/capture.ts",
+    "src/browser/frames.ts",
+    "src/browser/playback.ts"
+  ]
 }

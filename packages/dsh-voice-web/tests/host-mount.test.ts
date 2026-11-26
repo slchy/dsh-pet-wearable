@@ -13,7 +13,9 @@ import { WebSocket, type RawData } from 'ws';
 import { HostSecurityGuard } from '../src/host-security.ts';
 import {
   ASSETS_PREFIX,
+  CONFIG_PATH,
   DESKTOP_WIDGET_ROW_TEXT,
+  MODELS_PATH,
   PET_SPRITE_NAMES,
   SESSION_PATH,
   STATE_PATH,
@@ -29,6 +31,11 @@ import {
   type HostWebServer,
   type HostWebUpgradeRoute,
 } from '../src/host-mount.ts';
+import {
+  maskApiKey,
+  type FetchModelsRequest,
+  type VoiceConfigUpdateRequest,
+} from '../src/voice-overrides.ts';
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -147,6 +154,8 @@ test('widget、精灵白名单和状态', { timeout: 15_000 }, async () => {
   });
   try {
     assert.deepEqual(fixture.routeKeys().sort(), [
+      'exact /dsh-voice/config',
+      'exact /dsh-voice/models',
       'exact /dsh-voice/session',
       'exact /dsh-voice/state',
       'exact /dsh-voice/widget.js',
@@ -230,6 +239,187 @@ test('widget、精灵白名单和状态', { timeout: 15_000 }, async () => {
       wsPath: WS_UPGRADE_PATH,
       assetsPrefix: ASSETS_PREFIX,
     });
+  } finally {
+    await fixture.stop();
+  }
+});
+
+test('POST /dsh-voice/config 与 /dsh-voice/models：安全栅栏、防注入、脱敏回显与模型拉取', { timeout: 15_000 }, async () => {
+  const configCalls: Array<{ reset: true } | { reset: false; value: VoiceConfigUpdateRequest }> = [];
+  const modelCalls: FetchModelsRequest[] = [];
+  let mode: 'default' | 'live' | 'cascade' = 'default';
+  let dashKey = '';
+  let liveBaseUrl = '';
+  let liveKey = '';
+  let liveModel = '';
+  const makeState = (): HostPetState => ({
+    ok: true,
+    pipelineMode: mode === 'cascade' ? 'cascade' : 'live',
+    boundSessionId: null,
+    sessions: [],
+    wsPath: WS_UPGRADE_PATH,
+    assetsPrefix: ASSETS_PREFIX,
+    voiceReady: true,
+    voiceError: null,
+    voiceConfig: {
+      mode,
+      defaultMode: {
+        apiKeyMasked: maskApiKey(dashKey),
+        hasApiKey: dashKey !== '',
+      },
+      live: {
+        baseUrl: liveBaseUrl,
+        apiKeyMasked: maskApiKey(liveKey),
+        hasApiKey: liveKey !== '',
+        model: liveModel,
+        asrModel: '',
+      },
+      cascade: {
+        sttBaseUrl: '',
+        sttApiKeyMasked: null,
+        hasSttApiKey: false,
+        sttModel: '',
+        ttsReuseStt: false,
+        ttsBaseUrl: '',
+        ttsApiKeyMasked: null,
+        hasTtsApiKey: false,
+        ttsModel: '',
+        ttsVoice: '',
+      },
+      active: {
+        mode,
+        pipeline: mode === 'cascade' ? 'cascade' : 'live',
+        detail: mode === 'default' ? '默认优化' : `${mode} · ${liveModel}`,
+      },
+      envFileHint: '~/.dsh/.env',
+      reloading: false,
+    },
+  });
+  const fixture = await startFixture({
+    getState: makeState,
+    onUpdateConfig(req) {
+      configCalls.push(req);
+      if (req.reset) {
+        mode = 'default';
+      } else {
+        mode = req.value.mode;
+        if (req.value.defaultMode?.apiKey !== undefined) dashKey = req.value.defaultMode.apiKey;
+        if (req.value.live?.baseUrl !== undefined) liveBaseUrl = req.value.live.baseUrl;
+        if (req.value.live?.apiKey !== undefined) liveKey = req.value.live.apiKey;
+        if (req.value.live?.model !== undefined) liveModel = req.value.live.model;
+      }
+      return makeState();
+    },
+    onFetchModels(req) {
+      modelCalls.push(req);
+      return {
+        ok: true,
+        endpoint: 'https://relay.example.com/v1/models',
+        models: [
+          { id: 'gpt-realtime', ownedBy: 'openai' },
+          { id: 'gpt-4o-mini-transcribe', ownedBy: 'openai' },
+        ],
+      };
+    },
+  });
+  try {
+    // 非 POST 返回 405
+    assert.equal((await httpCall(fixture.port, 'GET', CONFIG_PATH)).status, 405);
+    assert.equal((await httpCall(fixture.port, 'GET', MODELS_PATH)).status, 405);
+
+    // 非回环 Host 写请求拒绝
+    const remoteBody = JSON.stringify({ mode: 'cascade' });
+    const remote = await httpCall(fixture.port, 'POST', CONFIG_PATH, {
+      headers: {
+        host: 'evil.example',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(remoteBody)),
+      },
+      body: remoteBody,
+    });
+    assert.equal(remote.status, 403);
+    assert.equal(configCalls.length, 0);
+
+    // 换行 .env 注入与非法 URL 协议拒绝（400）
+    const injectBody = JSON.stringify({ mode: 'default', defaultMode: { apiKey: 'sk-a\nINJECT=1' } });
+    const rejected = await httpCall(fixture.port, 'POST', CONFIG_PATH, {
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(injectBody)),
+      },
+      body: injectBody,
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(configCalls.length, 0);
+
+    // 写入自定义 Live Base URL + API Key，回传脱敏密钥且不含明文
+    const rawSecret = 'sk-live-supersecret-4321';
+    const custom = JSON.stringify({
+      mode: 'live',
+      live: {
+        baseUrl: 'https://relay.example.com/v1',
+        apiKey: rawSecret,
+        model: 'gpt-realtime',
+      },
+    });
+    const ok = await httpCall(fixture.port, 'POST', CONFIG_PATH, {
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(custom)),
+      },
+      body: custom,
+    });
+    assert.equal(ok.status, 200);
+    const rawRespText = ok.body.toString('utf8');
+    assert.equal(rawRespText.includes(rawSecret), false);
+    const body = JSON.parse(rawRespText) as { ok: boolean; state: HostPetState };
+    assert.equal(body.ok, true);
+    assert.equal(body.state.voiceConfig?.mode, 'live');
+    assert.equal(body.state.voiceConfig?.live.apiKeyMasked, 'sk-liv****4321');
+    assert.equal(configCalls.length, 1);
+
+    // 拉取可用模型表（/dsh-voice/models）
+    const fetchBody = JSON.stringify({ slot: 'live', baseUrl: 'https://relay.example.com/v1' });
+    const fetched = await httpCall(fixture.port, 'POST', MODELS_PATH, {
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(fetchBody)),
+      },
+      body: fetchBody,
+    });
+    assert.equal(fetched.status, 200);
+    const fetchedJson = JSON.parse(fetched.body.toString('utf8')) as {
+      ok: boolean;
+      endpoint: string;
+      models: Array<{ id: string }>;
+    };
+    assert.equal(fetchedJson.ok, true);
+    assert.equal(fetchedJson.models[0]?.id, 'gpt-realtime');
+    assert.equal(modelCalls.length, 1);
+
+    // 非回环 POST /dsh-voice/models 也受安全栅栏拦截
+    const remoteModels = await httpCall(fixture.port, 'POST', MODELS_PATH, {
+      headers: {
+        host: 'evil.example',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(fetchBody)),
+      },
+      body: fetchBody,
+    });
+    assert.equal(remoteModels.status, 403);
+
+    // 切回默认优化方案
+    const resetBody = JSON.stringify({ reset: true });
+    const resetRes = await httpCall(fixture.port, 'POST', CONFIG_PATH, {
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(resetBody)),
+      },
+      body: resetBody,
+    });
+    assert.equal(resetRes.status, 200);
+    const resetParsed = JSON.parse(resetRes.body.toString('utf8')) as { ok: boolean; state: HostPetState };
+    assert.equal(resetParsed.state.voiceConfig?.mode, 'default');
   } finally {
     await fixture.stop();
   }
@@ -526,6 +716,8 @@ async function startFixture(partial?: {
   readonly voicePort?: HostMountOptions['voicePort'];
   readonly getVoiceError?: HostMountOptions['getVoiceError'];
   readonly onSelectSession?: HostMountOptions['onSelectSession'];
+  readonly onUpdateConfig?: HostMountOptions['onUpdateConfig'];
+  readonly onFetchModels?: HostMountOptions['onFetchModels'];
   readonly getState?: HostMountOptions['getState'];
 }): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-host-'));
@@ -601,6 +793,8 @@ async function startFixture(partial?: {
         bound = sessionId;
         return { sessionId };
       }),
+      ...(partial?.onUpdateConfig === undefined ? {} : { onUpdateConfig: partial.onUpdateConfig }),
+      ...(partial?.onFetchModels === undefined ? {} : { onFetchModels: partial.onFetchModels }),
       log() {},
     });
   } catch (error) {

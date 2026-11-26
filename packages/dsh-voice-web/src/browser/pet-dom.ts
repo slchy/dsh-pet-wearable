@@ -18,6 +18,18 @@ import {
   spriteUrl,
   type SpriteName,
 } from './pet-sprites.ts';
+import {
+  DEFAULT_CASCADE_STT_MODEL,
+  DEFAULT_CASCADE_TTS_MODEL,
+  DEFAULT_CASCADE_TTS_VOICE,
+  DEFAULT_LIVE_ASR_MODEL,
+  DEFAULT_LIVE_MODEL,
+  DEFAULT_OPENAI_BASE_URL,
+  OPTIMIZED_DEFAULT_TIP,
+  VOICE_MODES,
+  VOICE_MODE_LABELS,
+  type VoiceMode,
+} from '../voice-overrides.ts';
 import { WIDGET_CSS } from './pet-styles.ts';
 
 export const HOST_ID = 'dsh-voice-pet-host';
@@ -115,6 +127,22 @@ export function createCheckIcon(doc: Document): SVGSVGElement {
   return createSvgIcon(doc, 13, '2.1', CHECK_PARTS);
 }
 
+export interface ApiKeyFieldDom {
+  readonly row: HTMLDivElement;
+  readonly badge: HTMLSpanElement;
+  readonly clearBtn: HTMLButtonElement;
+  readonly input: HTMLInputElement;
+}
+
+export interface ModelPickerDom {
+  readonly container: HTMLDivElement;
+  readonly fetchBtn: HTMLButtonElement;
+  readonly status: HTMLSpanElement;
+  readonly tableWrap: HTMLDivElement;
+  readonly filterInput: HTMLInputElement;
+  readonly list: HTMLDivElement;
+}
+
 export interface PetShell {
   readonly host: HTMLDivElement;
   readonly shadow: ShadowRoot;
@@ -147,10 +175,43 @@ export interface PetShell {
   readonly stateMessage: HTMLDivElement;
   readonly sessionList: HTMLDivElement;
   readonly createBtn: HTMLButtonElement;
+  readonly configSection: HTMLDivElement;
+  readonly configDetails: HTMLDetailsElement;
+  readonly configSummaryValue: HTMLSpanElement;
+  readonly configTip: HTMLDivElement;
+  readonly configTipText: HTMLSpanElement;
+  readonly modeBtns: ReadonlyMap<VoiceMode, HTMLButtonElement>;
+  readonly defaultPane: HTMLDivElement;
+  readonly defaultKeyField: ApiKeyFieldDom;
+  readonly livePane: HTMLDivElement;
+  readonly liveBaseUrlInput: HTMLInputElement;
+  readonly liveKeyField: ApiKeyFieldDom;
+  readonly liveModelPicker: ModelPickerDom;
+  readonly liveModelInput: HTMLInputElement;
+  readonly liveAsrModelInput: HTMLInputElement;
+  readonly cascadePane: HTMLDivElement;
+  readonly cascadeSttBaseUrlInput: HTMLInputElement;
+  readonly cascadeSttKeyField: ApiKeyFieldDom;
+  readonly cascadeSttPicker: ModelPickerDom;
+  readonly cascadeSttModelInput: HTMLInputElement;
+  readonly cascadeTtsReuseInput: HTMLInputElement;
+  readonly cascadeTtsEndpointBox: HTMLDivElement;
+  readonly cascadeTtsBaseUrlInput: HTMLInputElement;
+  readonly cascadeTtsKeyField: ApiKeyFieldDom;
+  readonly cascadeTtsPicker: ModelPickerDom;
+  readonly cascadeTtsModelInput: HTMLInputElement;
+  readonly cascadeTtsVoiceInput: HTMLInputElement;
+  readonly configEnvHint: HTMLDivElement;
+  readonly configFeedback: HTMLDivElement;
+  readonly configResetBtn: HTMLButtonElement;
+  readonly configApplyBtn: HTMLButtonElement;
   readonly sizeInput: HTMLInputElement;
   readonly sizeReadout: HTMLSpanElement;
   readonly mirrorInput: HTMLInputElement;
   readonly bubbleInput: HTMLInputElement;
+  readonly soundInput: HTMLInputElement;
+  readonly retroInput: HTMLInputElement;
+  readonly sfxTestBtn: HTMLButtonElement;
   readonly exprDetails: HTMLDetailsElement;
   readonly exprCurrent: HTMLSpanElement;
   readonly chips: ReadonlyMap<SpriteName, HTMLButtonElement>;
@@ -196,6 +257,89 @@ function createSwitchRow(
   wrap.append(input, track);
   row.append(title, wrap);
   return { row, input };
+}
+
+function createFieldRow(
+  doc: Document,
+  labelText: string,
+  control: HTMLElement,
+): HTMLDivElement {
+  const field = element(doc, 'div', 'config-field');
+  const label = element(doc, 'label', 'config-label');
+  label.textContent = labelText;
+  field.append(label, control);
+  return field;
+}
+
+function createTextInput(
+  doc: Document,
+  ariaLabel: string,
+  placeholder: string,
+  maxLength = 128,
+): HTMLInputElement {
+  const input = element(doc, 'input', 'config-input');
+  input.type = 'text';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.maxLength = maxLength;
+  input.placeholder = placeholder;
+  input.setAttribute('aria-label', ariaLabel);
+  return input;
+}
+
+function createApiKeyField(
+  doc: Document,
+  labelText: string,
+  placeholder: string,
+): ApiKeyFieldDom {
+  const row = element(doc, 'div', 'config-field');
+  const head = element(doc, 'div', 'config-field-head');
+  const label = element(doc, 'label', 'config-label');
+  label.textContent = labelText;
+  const meta = element(doc, 'span', 'key-meta');
+  const badge = element(doc, 'span', 'key-badge');
+  badge.textContent = '未配置';
+  const clearBtn = element(doc, 'button', 'key-clear-btn');
+  clearBtn.type = 'button';
+  clearBtn.textContent = '清除';
+  clearBtn.hidden = true;
+  meta.append(badge, clearBtn);
+  head.append(label, meta);
+
+  const input = element(doc, 'input', 'config-input');
+  input.type = 'password';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.maxLength = 512;
+  input.placeholder = placeholder;
+  input.setAttribute('aria-label', labelText);
+  row.append(head, input);
+  return { row, badge, clearBtn, input };
+}
+
+function createModelPicker(doc: Document, fetchLabel: string): ModelPickerDom {
+  const container = element(doc, 'div', 'model-picker');
+  const bar = element(doc, 'div', 'model-fetch-bar');
+  const fetchBtn = element(doc, 'button', 'fetch-btn');
+  fetchBtn.type = 'button';
+  fetchBtn.textContent = fetchLabel;
+  const status = element(doc, 'span', 'model-fetch-status');
+  bar.append(fetchBtn, status);
+
+  const tableWrap = element(doc, 'div', 'model-table-wrap');
+  tableWrap.hidden = true;
+  const filterInput = element(doc, 'input', 'model-filter');
+  filterInput.type = 'text';
+  filterInput.autocomplete = 'off';
+  filterInput.spellcheck = false;
+  filterInput.placeholder = '筛选可用模型…';
+  filterInput.setAttribute('aria-label', '筛选可用模型');
+  filterInput.hidden = true;
+  const list = element(doc, 'div', 'model-table-list');
+  tableWrap.append(filterInput, list);
+
+  container.append(bar, tableWrap);
+  return { container, fetchBtn, status, tableWrap, filterInput, list };
 }
 
 export function buildPetShell(doc: Document, prefs: PetPrefs): PetShell {
@@ -305,7 +449,188 @@ export function buildPetShell(doc: Document, prefs: PetPrefs): PetShell {
   const sessionList = element(doc, 'div', 'session-list');
   sessionSection.append(sessionHead, stateMessage, sessionList);
 
-  // 区块 2：外观
+  // 区块 2：语音引擎（默认优化 / Live / 级联；填 Base URL + API Key 拉取可用模型表，写入 ~/.dsh/.env）
+  const configSection = element(doc, 'div', 'panel-section');
+  const configDetails = element(doc, 'details', 'panel-details config-details');
+  const configSummary = element(doc, 'summary');
+  const configTitle = element(doc, 'span');
+  configTitle.textContent = '语音引擎';
+  const configSummaryRight = element(doc, 'span', 'details-summary-right');
+  const configSummaryValue = element(doc, 'span', 'config-summary-val');
+  configSummaryValue.textContent = '默认优化';
+  const configChevron = element(doc, 'span', 'details-chevron');
+  configChevron.append(createSvgIcon(doc, 13, '1.9', CHEVRON_PARTS));
+  configSummaryRight.append(configSummaryValue, configChevron);
+  configSummary.append(configTitle, configSummaryRight);
+
+  const configForm = element(doc, 'div', 'config-form');
+
+  // 模式切换：默认 / Live / 级联
+  const modeGroup = element(doc, 'div', 'seg-group');
+  modeGroup.setAttribute('role', 'radiogroup');
+  modeGroup.setAttribute('aria-label', '语音引擎模式');
+  const modeBtns = new Map<VoiceMode, HTMLButtonElement>();
+  for (const mode of VOICE_MODES) {
+    const btn = element(doc, 'button', 'seg-btn');
+    btn.type = 'button';
+    btn.setAttribute('role', 'radio');
+    btn.setAttribute('aria-checked', mode === 'default' ? 'true' : 'false');
+    btn.textContent = VOICE_MODE_LABELS[mode];
+    modeGroup.append(btn);
+    modeBtns.set(mode, btn);
+  }
+  const modeField = createFieldRow(doc, '运行模式', modeGroup);
+
+  const configTip = element(doc, 'div', 'config-tip');
+  const configTipIcon = element(doc, 'span', 'config-tip-icon');
+  configTipIcon.append(createSvgIcon(doc, 12, '1.9', SPARK_PARTS));
+  const configTipText = element(doc, 'span');
+  configTipText.textContent = OPTIMIZED_DEFAULT_TIP;
+  configTip.append(configTipIcon, configTipText);
+
+  // 面板 A：默认（深度调优推荐方案，仅需一个 DASHSCOPE_API_KEY）
+  const defaultPane = element(doc, 'div', 'config-pane');
+  const defaultKeyField = createApiKeyField(
+    doc,
+    'DASHSCOPE_API_KEY',
+    '输入 DashScope API Key',
+  );
+  defaultPane.append(defaultKeyField.row);
+
+  // 面板 B：Live（自定义 OpenAI Realtime 兼容端点）
+  const livePane = element(doc, 'div', 'config-pane');
+  livePane.hidden = true;
+  const liveCard = element(doc, 'div', 'config-subgroup');
+  const liveBaseUrlInput = createTextInput(
+    doc,
+    'Live Base URL',
+    DEFAULT_OPENAI_BASE_URL,
+    512,
+  );
+  const liveKeyField = createApiKeyField(doc, 'API Key', '输入 OpenAI 兼容 API Key');
+  const liveModelPicker = createModelPicker(doc, '拉取可用模型');
+  const liveModelInput = createTextInput(
+    doc,
+    'Live 模型',
+    `默认：${DEFAULT_LIVE_MODEL}`,
+  );
+  const liveAsrModelInput = createTextInput(
+    doc,
+    '转写模型（可选）',
+    `默认：${DEFAULT_LIVE_ASR_MODEL}`,
+  );
+  liveCard.append(
+    createFieldRow(doc, 'Base URL', liveBaseUrlInput),
+    liveKeyField.row,
+    liveModelPicker.container,
+    createFieldRow(doc, 'Live 模型', liveModelInput),
+    createFieldRow(doc, '转写模型（可选）', liveAsrModelInput),
+  );
+  livePane.append(liveCard);
+
+  // 面板 C：级联（独立 STT + TTS，支持一键复用 STT 端点与 Key）
+  const cascadePane = element(doc, 'div', 'config-pane');
+  cascadePane.hidden = true;
+
+  const sttCard = element(doc, 'div', 'config-subgroup');
+  const sttCardHead = element(doc, 'div', 'config-card-head');
+  const sttCardTitle = element(doc, 'span', 'config-card-title');
+  sttCardTitle.textContent = 'STT · 语音识别';
+  sttCardHead.append(sttCardTitle);
+  const sttSubtip = element(doc, 'div', 'config-subtip');
+  sttSubtip.textContent = 'HTTP 地址走 /audio/transcriptions，wss:// 走 Realtime 转写';
+  const cascadeSttBaseUrlInput = createTextInput(
+    doc,
+    'STT Base URL',
+    DEFAULT_OPENAI_BASE_URL,
+    512,
+  );
+  const cascadeSttKeyField = createApiKeyField(doc, 'STT API Key', '输入 STT API Key');
+  const cascadeSttPicker = createModelPicker(doc, '拉取 STT 模型');
+  const cascadeSttModelInput = createTextInput(
+    doc,
+    'STT 模型',
+    `默认：${DEFAULT_CASCADE_STT_MODEL}`,
+  );
+  sttCard.append(
+    sttCardHead,
+    sttSubtip,
+    createFieldRow(doc, 'Base URL', cascadeSttBaseUrlInput),
+    cascadeSttKeyField.row,
+    cascadeSttPicker.container,
+    createFieldRow(doc, 'STT 模型', cascadeSttModelInput),
+  );
+
+  const ttsCard = element(doc, 'div', 'config-subgroup');
+  const ttsCardHead = element(doc, 'div', 'config-card-head');
+  const ttsCardTitle = element(doc, 'span', 'config-card-title');
+  ttsCardTitle.textContent = 'TTS · 语音合成';
+  ttsCardHead.append(ttsCardTitle);
+  const cascadeTtsReuseSwitch = createSwitchRow(doc, '复用 STT 地址与 Key', false);
+  const cascadeTtsEndpointBox = element(doc, 'div', 'config-pane');
+  const cascadeTtsBaseUrlInput = createTextInput(
+    doc,
+    'TTS Base URL',
+    DEFAULT_OPENAI_BASE_URL,
+    512,
+  );
+  const cascadeTtsKeyField = createApiKeyField(doc, 'TTS API Key', '输入 TTS API Key');
+  cascadeTtsEndpointBox.append(
+    createFieldRow(doc, 'Base URL', cascadeTtsBaseUrlInput),
+    cascadeTtsKeyField.row,
+  );
+  const cascadeTtsPicker = createModelPicker(doc, '拉取 TTS 模型');
+  const cascadeTtsModelInput = createTextInput(
+    doc,
+    'TTS 模型',
+    `默认：${DEFAULT_CASCADE_TTS_MODEL}`,
+  );
+  const cascadeTtsVoiceInput = createTextInput(
+    doc,
+    'TTS 音色（可选）',
+    `默认：${DEFAULT_CASCADE_TTS_VOICE}`,
+  );
+  ttsCard.append(
+    ttsCardHead,
+    cascadeTtsReuseSwitch.row,
+    cascadeTtsEndpointBox,
+    cascadeTtsPicker.container,
+    createFieldRow(doc, 'TTS 模型', cascadeTtsModelInput),
+    createFieldRow(doc, '音色（可选）', cascadeTtsVoiceInput),
+  );
+  cascadePane.append(sttCard, ttsCard);
+
+  const configEnvHint = element(doc, 'div', 'config-env-hint');
+  configEnvHint.textContent = '保存后写入 ~/.dsh/.env';
+
+  const configFeedback = element(doc, 'div', 'config-feedback');
+  configFeedback.hidden = true;
+
+  const configActions = element(doc, 'div', 'config-actions');
+  const configResetBtn = element(doc, 'button', 'ghost-action');
+  configResetBtn.type = 'button';
+  configResetBtn.textContent = '恢复默认优化';
+  configResetBtn.disabled = true;
+  const configApplyBtn = element(doc, 'button', 'primary-action');
+  configApplyBtn.type = 'button';
+  configApplyBtn.textContent = '写入 .env 并重载';
+  configApplyBtn.disabled = true;
+  configActions.append(configResetBtn, configApplyBtn);
+
+  configForm.append(
+    modeField,
+    configTip,
+    defaultPane,
+    livePane,
+    cascadePane,
+    configEnvHint,
+    configFeedback,
+    configActions,
+  );
+  configDetails.append(configSummary, configForm);
+  configSection.append(configDetails);
+
+  // 区块 3：外观
   const appearSection = element(doc, 'div', 'panel-section');
   const appearLabel = element(doc, 'span', 'section-label');
   appearLabel.textContent = '外观';
@@ -327,18 +652,38 @@ export function buildPetShell(doc: Document, prefs: PetPrefs): PetShell {
 
   const bubbleSwitch = createSwitchRow(doc, '显示字幕气泡', prefs.showBubble);
   const mirrorSwitch = createSwitchRow(doc, '贴左镜像立绘', prefs.mirrorOnLeft);
-  appearSection.append(appearLabel, sizeRow, bubbleSwitch.row, mirrorSwitch.row);
+  const soundSwitch = createSwitchRow(doc, '动态音效', prefs.soundEnabled);
+  const retroSwitch = createSwitchRow(doc, '8-bit 星芒彩蛋', prefs.retroSpark);
 
-  // 区块 3：默认折叠的表情预览
+  const sfxTestRow = element(doc, 'div', 'setting-row sfx-test-row');
+  const sfxTestTitle = element(doc, 'span', 'row-title');
+  sfxTestTitle.textContent = '开麦音效试听';
+  const sfxTestBtn = element(doc, 'button', 'ghost-action');
+  sfxTestBtn.type = 'button';
+  sfxTestBtn.textContent = '试听';
+  sfxTestBtn.setAttribute('aria-label', '试听开麦音效');
+  sfxTestRow.append(sfxTestTitle, sfxTestBtn);
+
+  appearSection.append(
+    appearLabel,
+    sizeRow,
+    bubbleSwitch.row,
+    mirrorSwitch.row,
+    soundSwitch.row,
+    retroSwitch.row,
+    sfxTestRow,
+  );
+
+  // 区块 4：默认折叠的表情预览
   const exprSection = element(doc, 'div', 'panel-section');
-  const exprDetails = element(doc, 'details', 'expr-details');
+  const exprDetails = element(doc, 'details', 'panel-details expr-details');
   const exprSummary = element(doc, 'summary');
   const exprTitle = element(doc, 'span');
   exprTitle.textContent = '表情预览';
-  const exprSummaryRight = element(doc, 'span', 'expr-summary-right');
+  const exprSummaryRight = element(doc, 'span', 'details-summary-right');
   const exprCurrent = element(doc, 'span');
   exprCurrent.textContent = SPRITE_LABELS.calm;
-  const exprChevron = element(doc, 'span', 'expr-chevron');
+  const exprChevron = element(doc, 'span', 'details-chevron');
   exprChevron.append(createSvgIcon(doc, 13, '1.9', CHEVRON_PARTS));
   exprSummaryRight.append(exprCurrent, exprChevron);
   exprSummary.append(exprTitle, exprSummaryRight);
@@ -363,7 +708,7 @@ export function buildPetShell(doc: Document, prefs: PetPrefs): PetShell {
   exprDetails.append(exprSummary, exprStrip);
   exprSection.append(exprDetails);
 
-  panelBody.append(sessionSection, appearSection, exprSection);
+  panelBody.append(sessionSection, configSection, appearSection, exprSection);
 
   // 固定底栏：绑定会话 ID + 重置位置
   const panelFoot = element(doc, 'div', 'panel-foot');
@@ -416,10 +761,43 @@ export function buildPetShell(doc: Document, prefs: PetPrefs): PetShell {
     stateMessage,
     sessionList,
     createBtn,
+    configSection,
+    configDetails,
+    configSummaryValue,
+    configTip,
+    configTipText,
+    modeBtns,
+    defaultPane,
+    defaultKeyField,
+    livePane,
+    liveBaseUrlInput,
+    liveKeyField,
+    liveModelPicker,
+    liveModelInput,
+    liveAsrModelInput,
+    cascadePane,
+    cascadeSttBaseUrlInput,
+    cascadeSttKeyField,
+    cascadeSttPicker,
+    cascadeSttModelInput,
+    cascadeTtsReuseInput: cascadeTtsReuseSwitch.input,
+    cascadeTtsEndpointBox,
+    cascadeTtsBaseUrlInput,
+    cascadeTtsKeyField,
+    cascadeTtsPicker,
+    cascadeTtsModelInput,
+    cascadeTtsVoiceInput,
+    configEnvHint,
+    configFeedback,
+    configResetBtn,
+    configApplyBtn,
     sizeInput,
     sizeReadout,
     mirrorInput: mirrorSwitch.input,
     bubbleInput: bubbleSwitch.input,
+    soundInput: soundSwitch.input,
+    retroInput: retroSwitch.input,
+    sfxTestBtn,
     exprDetails,
     exprCurrent,
     chips,
