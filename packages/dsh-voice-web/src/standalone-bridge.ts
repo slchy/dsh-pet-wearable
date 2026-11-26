@@ -3,7 +3,7 @@
  *
  * 只有这条路径检查监听地址和桥证书。host 模式不听 config.host。
  */
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Context, Logger } from '@deepseek-ai/cordis'
 
@@ -78,18 +78,19 @@ export async function bootStandalone(
     if (listening === null) {
       throw new Error('语音栈没有起来，桥不接')
     }
+    const archivedDemoDir = join(import.meta.dirname, '..', '..', '..', 'archive', 'dsh-voice-web-demo')
+    const webDir = config.servePage && existsSync(archivedDemoDir) ? archivedDemoDir : ''
     bridge = await startWebBridge({
       port: config.port,
       host: config.host,
       voicePort: listening,
       ...(tls === undefined ? {} : { tls }),
       origins: config.origins,
-      // 编译产物在 lib/，页面在包根的 demo/ —— 两者都随包发布
-      webDir: config.servePage ? join(import.meta.dirname, '..', 'demo') : '',
+      webDir,
       log: report,
     })
     logger.info(`就绪：浏览器 → :${bridge.port} → 语音栈 127.0.0.1:${listening}`)
-    if (config.servePage) {
+    if (webDir !== '') {
       const scheme = tls === undefined ? 'http' : 'https'
       const shown = config.host === '0.0.0.0' ? '127.0.0.1' : config.host
       console.log(`\nweb       ${scheme}://${shown}:${bridge.port}/   ← 浏览器打开这个地址\n`)

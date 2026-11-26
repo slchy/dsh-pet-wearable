@@ -39,6 +39,11 @@ export interface HostSessionSummary {
   readonly blank?: boolean;
   readonly parentSessionId?: string;
   readonly cwd?: string;
+  readonly projections?: {
+    readonly kind?: 'cached' | 'sequenced';
+    readonly asOfSeq?: number;
+    readonly values?: Readonly<Record<string, unknown>>;
+  };
 }
 
 /**

@@ -75,3 +75,38 @@ test('voiceReady === false 才报未就绪，字段缺失不当成失败', () =>
   assert.equal(missing.statusText, '读不到会话状态');
   assert.deepEqual(missing.sessions, []);
 });
+
+test('读取 dsh 真实 projections.values.title，空白会话显示「新会话」，底栏 boundTitle 优先取标题', () => {
+  assert.deepEqual(readSession({
+    sessionId: '019abc',
+    blank: false,
+    projections: { kind: 'cached', asOfSeq: 8, values: { title: '语音挂件样式重构' } },
+  }), { id: '019abc', title: '语音挂件样式重构' });
+
+  assert.deepEqual(readSession({
+    sessionId: '019blank',
+    blank: true,
+    projections: { kind: 'sequenced', asOfSeq: 0, values: { title: null } },
+  }), { id: '019blank', title: '新会话' });
+
+  assert.deepEqual(readSession({
+    sessionId: '019obj',
+    projections: { values: { title: { title: '嵌套标题对象' } } },
+  }), { id: '019obj', title: '嵌套标题对象' });
+
+  const state = projectHostState({
+    pipelineMode: 'live',
+    boundSessionId: '019abc',
+    sessions: [
+      { sessionId: '019abc', projections: { values: { title: '语音挂件样式重构' } } },
+      { sessionId: '019blank', blank: true, projections: { values: { title: null } } },
+    ],
+  });
+  assert.equal(state.boundTitle, '语音挂件样式重构');
+  assert.deepEqual(state.sessions, [
+    { id: '019abc', title: '语音挂件样式重构' },
+    { id: '019blank', title: '新会话' },
+  ]);
+  assert.equal(projectHostState({ boundSessionId: 'unlisted' }).boundTitle, 'unlisted');
+  assert.equal(projectHostState({ boundSessionId: '' }).boundTitle, '未绑定');
+});

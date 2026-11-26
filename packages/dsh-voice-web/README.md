@@ -78,7 +78,7 @@ src/browser/pet-geometry.ts pet-prefs.ts pet-session.ts
 
 ## 语音栈从哪来
 
-`packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/`、`demo/`、`assets/`、`cordis.patch.yml` 和 `PROVENANCE.md`。
+`packages/dsh-voice-web/scripts/sync-voice.mjs` 把仓根 `src/` 复制到 `packages/dsh-voice-web/src/voice/`。这份副本**不进 git**，`npm run build`、`typecheck`、`prepack` 都会重跑同步刷新；只排除 `driver.ts`、`fsm-trace.ts`、`latency-report.ts`、`pair.ts`、`pairing.ts`、`pet/sim/`。`package.json` 发布的是编译后的 `lib/`、`assets/`、`cordis.patch.yml` 和 `PROVENANCE.md`（早期冒烟联调用的独立 `demo/` 已归档至仓根 `archive/dsh-voice-web-demo/`，不再随包发布）。
 
 为什么不是软连接：实测 npm 11.16 的 packlist **直接跳过 symlink** —— `files: ["src"]`、显式列 `src/voice`、`src/voice/**` 三种写法打出来的 tarball 里都没有链接目标，本地能跑、发出去是空包。
 
@@ -131,7 +131,7 @@ npm test                   # sync:voice，再 node --test tests/*.test.ts（77 �
 `npx tsc --noEmit` 单跑不等于 typecheck：`npm run typecheck` 会先 `sync:voice`，
 副本没同步时缺模块的报错（`Cannot find module './voice/turn-judge.ts'`）才是真的。
 离线验收一把梭：`typecheck` → `build` → `npm pack --dry-run`（后者确认 tarball 里
-`lib/driver.js`、`lib/voice/main.js`、`demo/index.html` 都在）。
+`lib/driver.js`、`lib/voice/main.js`、`lib/widget.js`、`assets/pet/*.webp` 都在，且不含已归档的 `demo/`）。
 
 `dsh --profile <装了本插件的 profile>` 启动后终端会打出：
 

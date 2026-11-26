@@ -6,8 +6,8 @@
  * - **host / auto**：挂到宿主 `webServer` 的 `/dsh-voice/*` 与 `/dsh-voice/ws`，
  *   不另开端口。`agent: dsh` 且宿主有 `sessionController` 时走进程内
  *   `InProcessDshAgent`。
- * - **standalone**（以及 auto 等不到 `webServer`）：原来的 `startWebBridge`，
- *   浏览器 ⇄ WS ⇄ 本进程的桥 ⇄ TCP 127.0.0.1 ⇄ 本进程内的语音栈。`demo/` 仍走这条。
+ * - **standalone**（以及 auto 等不到 `webServer`）：`startWebBridge`，
+ *   浏览器 ⇄ WS ⇄ 本进程的桥 ⇄ TCP 127.0.0.1 ⇄ 本进程内的语音栈（纯 WS 桥；历史 demo 已归档）。
  *
  * 语音栈就是包① 那一套（`src/voice/` 是它的副本，由 `scripts/sync-voice.mjs`
  * 生成、不进 git），装配直接调用 `voice/runtime/` 里与 CLI 相同的函数
@@ -72,7 +72,7 @@ export const Config: Schema<VoiceWebConfig> = Schema.object({
   port: Schema.natural().max(65535).default(8767).description('浏览器连的 WS 端口'),
   host: Schema.string().default('127.0.0.1').description('监听地址；非本机地址要求 TLS 与来源白名单同时配齐'),
   origins: Schema.array(Schema.string()).default([]).description('允许的页面来源，如 https://<域名>；留空只放同源'),
-  servePage: Schema.boolean().default(true).description('是否在同一端口把页面发出去（关掉就只提供 WS）'),
+  servePage: Schema.boolean().default(false).description('（已归档）历史独立演示页开关，现默认关闭，独立桥仅提供 WS'),
   tls: Schema.object({
     keyPath: Schema.string().default('').description('TLS 私钥路径'),
     certPath: Schema.string().default('').description('TLS 证书路径'),

@@ -25,6 +25,7 @@ import {
 import {
   GUARD_STYLE_ID,
   buildPetShell,
+  createCheckIcon,
 } from './pet-dom.ts';
 import {
   classifyRelease,
@@ -39,6 +40,7 @@ import {
   type SessionRow,
 } from './pet-session.ts';
 import {
+  SPRITE_LABELS,
   SPRITE_NAMES,
   armPreview,
   nextSpriteDelay,
@@ -126,10 +128,10 @@ function mountNow(): void {
   installHostGuard();
   const {
     host, root, mirror, squish, talk, img, bubble, hint, hintDismiss,
-    asrLine, asrBody, replyLine, replyLane, replyBody, badge, note, dot,
-    tools, micBtn, muteBtn, gearBtn, panel, panelClose, pipelineLine,
-    boundLine, stateMessage, sessionList, createBtn, sizeInput, sizeReadout,
-    mirrorInput, bubbleInput, chips, resetBtn,
+    asrLine, asrBody, replyLine, replyLane, replyBody, badge, note,
+    statusBar, statusText, tools, micBtn, muteBtn, gearBtn, panel, panelClose,
+    pipelineTag, boundId, stateMessage, sessionList, createBtn, sizeInput,
+    sizeReadout, mirrorInput, bubbleInput, exprDetails, exprCurrent, chips, resetBtn,
   } = buildPetShell(document, prefs);
 
   let ui: PetUiState = initialPetUiState(prefs);
@@ -163,18 +165,24 @@ function mountNow(): void {
     mirror.style.transform = shouldMirrorArt(bubbleSide, prefs.mirrorOnLeft) ? 'scaleX(-1)' : 'none';
   }
 
+  function targetTop(): number {
+    const parsed = Number.parseFloat(host.style.top);
+    return Number.isFinite(parsed) ? parsed : host.getBoundingClientRect().top;
+  }
+
   function placeTools(): void {
-    const rect = host.getBoundingClientRect();
-    tools.classList.toggle('below', rect.top < 52);
+    tools.classList.toggle('below', targetTop() < 52);
   }
 
   function placeFloating(node: HTMLElement, side: 'left' | 'right'): void {
+    const alignTop = targetTop() + prefs.sizePx / 2 < window.innerHeight / 2;
     node.classList.toggle('side-left', side === 'left');
     node.classList.toggle('side-right', side === 'right');
-    node.style.transform = 'none';
+    node.classList.toggle('align-top', alignTop);
+    node.style.transform = '';
     const rect = node.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
-    const margin = 8;
+    const margin = 10;
     const maxLeft = Math.max(margin, window.innerWidth - margin - rect.width);
     const maxTop = Math.max(margin, window.innerHeight - margin - rect.height);
     const dx = clamp(rect.left, margin, maxLeft) - rect.left;
@@ -233,6 +241,7 @@ function mountNow(): void {
     }
     const next = spriteUrl(selected.name);
     if (img.getAttribute('src') !== next) img.src = next;
+    exprCurrent.textContent = SPRITE_LABELS[selected.name];
     for (const [sprite, chip] of chips) {
       chip.setAttribute('aria-pressed', sprite === selected.name ? 'true' : 'false');
     }
@@ -247,11 +256,16 @@ function mountNow(): void {
 
   function renderStatus(): void {
     const view = statusView(ui);
-    dot.className = view.className;
-    dot.setAttribute('aria-label', view.label);
+    const visible = view.mode !== 'off';
+    statusBar.className = visible ? `pet-status is-visible is-${view.mode}` : 'pet-status is-off';
+    statusBar.setAttribute('aria-label', view.label);
+    statusText.textContent = visible ? view.label : '';
     micBtn.title = view.micLabel;
     micBtn.setAttribute('aria-label', view.micLabel);
     micBtn.setAttribute('aria-pressed', view.micPressed ? 'true' : 'false');
+    micBtn.classList.toggle('is-mic-live', view.mode === 'live' || view.mode === 'speaking');
+    muteBtn.disabled = ui.link !== 'live';
+    muteBtn.classList.toggle('is-mute-hot', ui.speaking);
   }
 
   function renderBubble(): void {
@@ -531,10 +545,15 @@ function mountNow(): void {
     }
   }
 
+  function setStateMessage(text: string): void {
+    stateMessage.textContent = text;
+    stateMessage.hidden = text === '';
+  }
+
   function renderSessions(rows: readonly SessionRow[]): void {
     sessionList.replaceChildren();
     if (rows.length === 0) {
-      const empty = element('div', 'state-line');
+      const empty = element('div', 'session-empty');
       empty.textContent = '没有会话';
       sessionList.append(empty);
       return;
@@ -544,9 +563,11 @@ function mountNow(): void {
       button.type = 'button';
       button.title = row.id;
       button.setAttribute('aria-pressed', row.id === boundSessionId ? 'true' : 'false');
-      const title = element('span');
+      const title = element('span', 's-title');
       title.textContent = row.title;
-      button.append(title);
+      const check = element('span', 's-check');
+      check.append(createCheckIcon(document));
+      button.append(title, check);
       button.addEventListener('click', () => {
         void selectSession({ sessionId: row.id });
       });
@@ -558,19 +579,25 @@ function mountNow(): void {
   function renderState(payload: unknown): void {
     const view = projectHostState(payload);
     if (!view.known) {
-      stateMessage.textContent = view.statusText;
+      setStateMessage(view.statusText);
+      if (settingsOpen) placeFloating(panel, bubbleSide);
       return;
     }
-    pipelineLine.textContent = view.pipelineLabel;
+    pipelineTag.textContent = view.pipelineLabel.replace(/^管线：/u, '') || '未知';
+    pipelineTag.title = view.pipelineLabel;
     boundSessionId = view.boundSessionId;
-    boundLine.textContent = view.boundLabel;
-    stateMessage.textContent = view.statusText;
+    boundId.textContent = view.boundTitle;
+    boundId.title = view.boundSessionId === null
+      ? view.boundLabel
+      : `${view.boundTitle}（${view.boundSessionId}）`;
+    setStateMessage(view.statusText);
     renderSessions(view.sessions);
+    if (settingsOpen) placeFloating(panel, bubbleSide);
   }
 
   async function loadState(): Promise<void> {
     const ticket = ++stateTicket;
-    stateMessage.textContent = '正在读取…';
+    setStateMessage('正在读取…');
     try {
       const response = await fetch('/dsh-voice/state', { cache: 'no-store' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -579,7 +606,8 @@ function mountNow(): void {
       renderState(payload);
     } catch {
       if (ticket !== stateTicket) return;
-      stateMessage.textContent = '读不到会话状态';
+      setStateMessage('读不到会话状态');
+      if (settingsOpen) placeFloating(panel, bubbleSide);
     }
   }
 
@@ -587,7 +615,7 @@ function mountNow(): void {
     if (sessionBusy) return;
     sessionBusy = true;
     syncSessionButtons();
-    stateMessage.textContent = '正在切换…';
+    setStateMessage('正在切换…');
     try {
       const response = await fetch('/dsh-voice/session', {
         method: 'POST',
@@ -599,7 +627,7 @@ function mountNow(): void {
       if (isRecord(payload) && payload['ok'] === false) throw new Error('会话切换失败');
       await loadState();
     } catch {
-      stateMessage.textContent = '会话切换失败';
+      setStateMessage('会话切换失败');
     } finally {
       sessionBusy = false;
       syncSessionButtons();
@@ -609,6 +637,8 @@ function mountNow(): void {
   function openSettings(): void {
     settingsOpen = true;
     panel.hidden = false;
+    root.classList.add('panel-open');
+    gearBtn.setAttribute('aria-pressed', 'true');
     placeFloating(panel, bubbleSide);
     void loadState();
   }
@@ -616,6 +646,8 @@ function mountNow(): void {
   function closeSettings(): void {
     settingsOpen = false;
     panel.hidden = true;
+    root.classList.remove('panel-open');
+    gearBtn.setAttribute('aria-pressed', 'false');
   }
 
   function resetPosition(): void {
@@ -680,8 +712,8 @@ function mountNow(): void {
   }
 
   applyBoxSize();
-  pipelineLine.textContent = '管线：…';
-  boundLine.textContent = '当前会话：…';
+  pipelineTag.textContent = '…';
+  boundId.textContent = '…';
   document.body.appendChild(host);
   layoutFromAnchor(true);
   renderBubble();
@@ -776,7 +808,16 @@ function mountNow(): void {
   for (const [name, chip] of chips) {
     chip.addEventListener('click', () => { previewSprite(name); });
   }
+  exprDetails.addEventListener('toggle', () => {
+    if (settingsOpen) placeFloating(panel, bubbleSide);
+  });
 
+  host.addEventListener('transitionend', (event) => {
+    if (event.target !== host) return;
+    placeTools();
+    placeFloating(bubble, bubbleSide);
+    if (settingsOpen) placeFloating(panel, bubbleSide);
+  });
   window.addEventListener('resize', () => {
     if (drag?.active === true) return;
     const previous = host.style.transition;

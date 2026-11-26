@@ -6,7 +6,7 @@
 
 | 范围 | 许可 |
 | :--- | :--- |
-| `src/`、`lib/`、`demo/`、`cordis.patch.yml`、`package.json`、文档与构建脚本 | **MIT**（见仓根 `LICENSE`） |
+| `src/`、`lib/`、`cordis.patch.yml`、`package.json`、文档与构建脚本 | **MIT**（见仓根 `LICENSE`） |
 | `assets/pet/**`（Gemini 娘 10 帧表情精灵 WebP） | **不适用 MIT**：由维护者借助 AI 工具生成并人工挑选、抠图对齐后随本包按 **as-is** 分发，**仅限用于运行本插件**；**不授予再许可**，亦不声明为原创作品。 |
 
 这样划分的原因：程序代码可以明确授予 MIT 许可，而 AI 生成的二次元拟人化形象美术素材无法对下游作出再许可承诺；因此将代码与美术资源严格隔离。

@@ -44,7 +44,6 @@
   "types": "./lib/driver.d.ts",
   "files": [
     "lib",
-    "demo",
     "assets",
     "cordis.patch.yml",
     "PROVENANCE.md"
@@ -60,10 +59,9 @@
     "build:browser": "esbuild src/browser/client.ts --bundle --format=esm --outfile=lib/browser.mjs",
     "build:widget": "esbuild src/browser/pet-widget.ts --bundle --format=iife --outfile=lib/widget.js",
     "build:browser-types": "tsc -p tsconfig.browser-types.json",
-    "build": "npm run sync:voice && npm run build:node && npm run build:browser && npm run build:widget && npm run build:browser-types && npm run demo:build",
+    "build": "npm run sync:voice && npm run build:node && npm run build:browser && npm run build:widget && npm run build:browser-types",
     "typecheck": "npm run sync:voice && tsc --noEmit && tsc --noEmit -p tsconfig.browser.json",
     "test": "npm run sync:voice && node --test tests/*.test.ts",
-    "demo:build": "esbuild demo/main.ts --bundle --format=esm --outfile=demo/main.js",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm test"
   },
