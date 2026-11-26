@@ -122,7 +122,9 @@ export async function readStream(
       held = '';
     }
   }
-  return finish(text.trim().startsWith(DELEGATE));
+  // 流没等到 `[DONE]` 就 EOF（代理截断 / 服务端提前关）：判据必须和正常出口一致，
+  // 否则 `allowDelegate=false` 的纯聊天模式会被 EOF 静默翻成「委派」。
+  return finish(allowDelegate && text.trim().startsWith(DELEGATE));
 }
 
 /** 发出去的一条消息（OpenAI 兼容格式）。 */
@@ -296,9 +298,13 @@ export class FastLlmClient {
         }).then(
           (r) => {
             this.inFlight -= 1;
+            const emptyBody = r.ok && r.body === null;
             outcomes[index] = `#${index} 头@${(this.now() - startedAt).toFixed(0)}ms`
-              + (r.ok ? '' : ` HTTP ${r.status}`);
-            if (!r.ok || r.body === null) throw new Error(`HTTP ${r.status}`);
+              + (r.ok ? '' : ` HTTP ${r.status}`)
+              + (emptyBody ? '（空响应体）' : '');
+            if (!r.ok || r.body === null) {
+              throw new Error(`HTTP ${r.status}${emptyBody ? '（空响应体）' : ''}`);
+            }
             return { r, c };
           },
           (e) => {

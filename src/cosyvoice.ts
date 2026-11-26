@@ -1576,5 +1576,9 @@ export function cosyVoiceTts(options: CosyVoiceOptions = {}): TtsProvider {
         onChunk,
       ), em);
     },
+    /** 幂等：没有连接时什么都不做；下一次合成会自己重建。 */
+    close() {
+      drop();
+    },
   };
 }

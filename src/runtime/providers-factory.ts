@@ -29,20 +29,96 @@ import { sampleSocket } from '../socket-stats.ts';
 import type { AuditSink } from './audit-slot.ts';
 
 /**
- * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` 工厂（或 default）。
+ * 插件加载：`<path>` 指向一个模块，导出 `stt()` / `tts()` / `agent()` 工厂（或 default）。
  *
  * 这是 `cloud/` 唯一的扩展点 —— 换厂商不用改本文件，也不用 fork。将来开源时
  * 别人照这个签名写自己的模块即可（见 `docs/BACKLOG.md` B-004）。
+ *
+ * **工厂返回后必须过形状校验**：裸 cast 会把「少了 open / name」这种错误留到
+ * 第一通电话里才炸，现场表现是「连上了但永远不出字」，从日志上看不出是插件写错。
+ * 校验只发生在启动期 / 换 provider 时，不在热路径上。
  */
-async function loadProvider<T>(spec: string, exportName: string): Promise<T> {
+async function loadProvider<T>(
+  spec: string,
+  exportName: string,
+  validate: (value: unknown, spec: string) => T,
+): Promise<T> {
   const isPath = /^[./]/.test(spec) || /^[A-Za-z]:[\\/]/.test(spec);
   const url = isPath ? pathToFileURL(resolve(spec)).href : spec;
   const mod = (await import(url)) as Record<string, unknown>;
-  const factory = (mod.default ?? mod[exportName]) as (() => T) | undefined;
+  const factory = (mod.default ?? mod[exportName]) as (() => unknown) | undefined;
   if (typeof factory !== 'function') {
     throw new Error(`${spec} 必须导出 ${exportName}() 工厂（或 default 导出工厂）`);
   }
-  return factory();
+  return validate(factory(), spec);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function shapeError(spec: string, kind: string, detail: string): Error {
+  return new Error(`${spec} 的 ${kind} provider 形状不合法：${detail}`);
+}
+
+function requireName(value: Record<string, unknown>, spec: string, kind: string): string {
+  const name = value['name'];
+  if (typeof name !== 'string' || name.trim() === '') {
+    throw shapeError(spec, kind, '缺少非空字符串 name');
+  }
+  return name;
+}
+
+/** STT 插件的最小形状：`name` + `open(handlers)`。 */
+export function validateSttProvider(value: unknown, spec: string): SttProvider {
+  if (!isRecord(value)) {
+    throw shapeError(spec, 'STT', `工厂必须返回对象（得到 ${value === null ? 'null' : typeof value}）`);
+  }
+  requireName(value, spec, 'STT');
+  if (typeof value['open'] !== 'function') {
+    throw shapeError(spec, 'STT', '缺少 open() 函数');
+  }
+  return value as unknown as SttProvider;
+}
+
+const OPTIONAL_TTS_MEMBERS = ['synthesizeStream', 'warm', 'prewarm', 'close'] as const;
+
+/** TTS 插件的最小形状：`name` + 正有限 `sampleRate` + `synthesize`；可选方法若存在必须是函数。 */
+export function validateTtsProvider(value: unknown, spec: string): TtsProvider {
+  if (!isRecord(value)) {
+    throw shapeError(spec, 'TTS', `工厂必须返回对象（得到 ${value === null ? 'null' : typeof value}）`);
+  }
+  requireName(value, spec, 'TTS');
+  const sampleRate = value['sampleRate'];
+  if (typeof sampleRate !== 'number' || !Number.isFinite(sampleRate) || sampleRate <= 0) {
+    throw shapeError(
+      spec,
+      'TTS',
+      `sampleRate 必须是正有限数（得到 ${String(sampleRate)}）`,
+    );
+  }
+  if (typeof value['synthesize'] !== 'function') {
+    throw shapeError(spec, 'TTS', '缺少 synthesize() 函数');
+  }
+  for (const key of OPTIONAL_TTS_MEMBERS) {
+    const member = value[key];
+    if (member !== undefined && typeof member !== 'function') {
+      throw shapeError(spec, 'TTS', `${key} 必须是函数（得到 ${typeof member}）`);
+    }
+  }
+  return value as unknown as TtsProvider;
+}
+
+/** Agent 插件的最小形状：`name` + `reply()`。 */
+export function validateAgentProvider(value: unknown, spec: string): AgentProvider {
+  if (!isRecord(value)) {
+    throw shapeError(spec, 'Agent', `工厂必须返回对象（得到 ${value === null ? 'null' : typeof value}）`);
+  }
+  requireName(value, spec, 'Agent');
+  if (typeof value['reply'] !== 'function') {
+    throw shapeError(spec, 'Agent', '缺少 reply() 函数');
+  }
+  return value as unknown as AgentProvider;
 }
 
 /** `--stt aliyun|qwen-realtime|noop|canned|<path>` */
@@ -80,7 +156,7 @@ export async function buildStt(
       (line) => { console.log(`  [asr] ${line}`); },
     );
   }
-  return loadProvider<SttProvider>(spec, 'stt');
+  return loadProvider<SttProvider>(spec, 'stt', validateSttProvider);
 }
 
 /**
@@ -154,7 +230,7 @@ export async function buildTts(spec: string, audit?: AuditSink): Promise<TtsProv
       ),
     });
   }
-  return loadProvider<TtsProvider>(spec, 'tts');
+  return loadProvider<TtsProvider>(spec, 'tts', validateTtsProvider);
 }
 
 interface AgentBundle {
@@ -208,5 +284,5 @@ export async function buildAgent(
 
     return { agent: new VoiceAgent(session, dsh.log, announceStore), dsh: session };
   }
-  return { agent: await loadProvider<AgentProvider>(spec, 'agent'), dsh: null };
+  return { agent: await loadProvider<AgentProvider>(spec, 'agent', validateAgentProvider), dsh: null };
 }

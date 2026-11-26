@@ -213,3 +213,13 @@ test('上游挂了就说没查到，不要编', async () => {
     assert.ok((result.content[0]?.text ?? '').includes('别猜'), '失败文本要明确禁止编造');
   }, { fail: true });
 });
+
+test('city / symbol 非字符串时明确报错，不拿 String() 静默转换', async () => {
+  const badCity = await withServer({}, (server) => server.call('get_weather', { city: 123 }));
+  assert.equal(badCity.isError, true);
+  assert.ok((badCity.content[0]?.text ?? '').includes('city 必须是字符串'));
+
+  const badSymbol = await withServer({}, (server) => server.call('get_market', { symbol: { x: 1 } }));
+  assert.equal(badSymbol.isError, true);
+  assert.ok((badSymbol.content[0]?.text ?? '').includes('symbol 必须是字符串'));
+});

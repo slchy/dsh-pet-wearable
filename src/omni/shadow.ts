@@ -68,6 +68,8 @@ import type {
   OmniShadowState,
   PendingResponse,
   QueuedSpeech,
+  RealtimeErrorEvent,
+  RealtimeResponseDoneEvent,
   RealtimeSocket,
   RealtimeSocketFactory,
   ResponsePhase,
@@ -1276,7 +1278,7 @@ export class OmniShadow {
     }
   }
 
-  private onError(ev: ServerEvent): void {
+  private onError(ev: RealtimeErrorEvent): void {
     const message = ev.error?.message ?? '';
     const verdict = this.socket.observeProtocolError(message);
     // 「忙时 create」这类错误说明我们的状态机和服务端已经不同步了。
@@ -1286,7 +1288,7 @@ export class OmniShadow {
     }
   }
 
-  private finish(ev: ServerEvent): void {
+  private finish(ev: RealtimeResponseDoneEvent): void {
     const resp = this.resp;
     this.resp = null;
     this.clearResponseTimer();

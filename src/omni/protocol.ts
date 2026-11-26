@@ -4,7 +4,7 @@
  */
 import { OMNI_SHORT_INSTRUCTIONS } from '../persona.ts';
 
-import type { ServerEvent } from './types.ts';
+import type { RealtimeResponseDoneEvent } from './types.ts';
 
 /** 上行格式：与 `UplinkPipeline` 一致（16 kHz / 单声道 / s16le） */
 export const UPSTREAM_RATE = 16_000;
@@ -260,7 +260,7 @@ export function buildSessionUpdate(input: SessionUpdateInput): Record<string, un
 }
 
 /** 一条 `response.done` 里所有助手项和 `function_call` 项的 id（`conversation.item.delete` 要它） */
-export function assistantItemIds(ev: ServerEvent): string[] {
+export function assistantItemIds(ev: RealtimeResponseDoneEvent): string[] {
   const output = ev.response?.output ?? [];
   const ids = output
     .filter((it) =>

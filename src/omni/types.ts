@@ -187,25 +187,17 @@ export interface QueuedSpeech {
   cancelled: boolean;
 }
 
-export interface ServerEvent {
-  type?: string;
-  delta?: string;
-  call_id?: string;
-  arguments?: unknown;
-  item?: { id?: string; role?: string; type?: string; call_id?: string };
-  error?: { code?: string; message?: string; type?: string };
-  response?: {
-    status?: string;
-    /** `response.done` 的终态产物 —— item id 从这里拿最稳（`output_item.added` 可能没到） */
-    output?: Array<{ id?: string; role?: string; status?: string; type?: string; call_id?: string }>;
-    usage?: {
-      input_tokens?: number;
-      output_tokens?: number;
-      input_tokens_details?: { audio_tokens?: number; text_tokens?: number };
-      output_tokens_details?: { audio_tokens?: number; text_tokens?: number };
-    };
-  };
-}
+/**
+ * 服务端事件的**判别联合**（唯一一份，见 `../realtime-events.ts`）。
+ *
+ * 旧导入 `import type { ServerEvent } from './types.ts'` 一个字都不用改；
+ * `response.done` / `error` 的窄类型另外导出，函数签名别再拿宽联合去访问字段。
+ */
+export type {
+  DashScopeRealtimeEvent as ServerEvent,
+  RealtimeErrorEvent,
+  RealtimeResponseDoneEvent,
+} from '../realtime-events.ts';
 
 /** 没人认领就 completed 的一份回复。下一轮开口时连 user 项一起删。 */
 export interface OrphanRecord {

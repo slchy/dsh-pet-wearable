@@ -26,6 +26,7 @@
 import WebSocket from 'ws';
 
 import type { SttProvider } from './providers.ts';
+import type { DashScopeRealtimeEvent as ServerEvent } from './realtime-events.ts';
 
 const OPEN = 1;
 const CLOSING = 2;
@@ -113,14 +114,6 @@ export interface QwenRealtimeAsrOptions {
 }
 
 export class QwenRealtimeAsrError extends Error {}
-
-interface ServerEvent {
-  type?: string;
-  text?: string;
-  stash?: string;
-  transcript?: string;
-  error?: { code?: string; message?: string };
-}
 
 export class QwenRealtimeAsr {
   private readonly opts: QwenRealtimeAsrOptions;

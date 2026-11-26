@@ -74,6 +74,9 @@ function stamp() {
 }
 
 function remember(rawText) {
+  if (rawText !== undefined && rawText !== null && typeof rawText !== 'string') {
+    throw new Error('要记的内容必须是字符串');
+  }
   const text = String(rawText ?? '').replace(/\s+/g, ' ').trim();
   if (text === '') throw new Error('要记的内容是空的');
 
@@ -112,6 +115,7 @@ function callTool(id, name, args) {
 }
 
 function handle(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
   const { id, method, params } = msg;
   switch (method) {
     case 'initialize':

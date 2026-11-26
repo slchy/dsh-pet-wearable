@@ -31,6 +31,7 @@
 import WebSocket from 'ws';
 
 import type { TtsProvider } from './providers.ts';
+import type { DashScopeRealtimeEvent as ServerEvent } from './realtime-events.ts';
 
 const DEFAULT_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime';
 const DEFAULT_MODEL = 'qwen3.8-omni-flash-realtime';
@@ -66,14 +67,6 @@ export interface RealtimeLike {
   send(data: string): void;
   close(): void;
   on(event: string, cb: (...args: never[]) => void): void;
-}
-
-interface ServerEvent {
-  type?: string;
-  delta?: string;
-  item?: { id?: string; role?: string };
-  error?: { message?: string };
-  response?: { status?: string; output?: Array<{ id?: string; role?: string }> };
 }
 
 const CLOSED = 3;
@@ -466,6 +459,10 @@ export function omniTts(options: OmniTtsOptions): TtsProvider {
         all += part;
       }
       yield* readOne(all);
+    },
+    /** 幂等：没建过连接 / 已经关过都只是回到初值。下一次合成会自己重连。 */
+    close(): void {
+      close();
     },
   };
 }

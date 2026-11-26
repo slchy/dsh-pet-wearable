@@ -137,6 +137,7 @@ async function callTool(id, name) {
 }
 
 async function handle(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
   const { id, method, params } = msg;
   switch (method) {
     case 'initialize':

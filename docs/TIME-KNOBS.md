@@ -90,10 +90,10 @@
 | `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio（服务端） | `src/main.ts:199` | 仅旧 NLS 路径（`--stt aliyun`）：服务端判句纯静音等待；`qwen-realtime` 与 Pure Live 不用 | — |
 | `DEFAULT_PET_TICK_MS` | 3000 | wall | `src/main.ts:202` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_PET_MIC_OPEN_TIMEOUT_MS` | 1500 | wall | `src/main.ts:204` | 无关首声（不在停嘴→出声路径上） | — |
-| `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:120` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
+| `ABANDON_TIMEOUT_MS` | 3000 | wall | `src/omni-tts.ts:113` | 无关首声（只在「上一条合成已作废」时出现；正常轮等到 done 就走，不进这个循环） | — |
 | `DEFAULT_CAPTURE_TIMEOUT_MS` | 20000 | wall | `src/photo-inbox.ts:38` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_CONFIRM_TIMEOUT_MS` | 40000 | wall | `src/photo-inbox.ts:45` | 无关首声（不在停嘴→出声路径上） | — |
-| `DEFAULT_DECODE_TIMEOUT_MS` | 8000 | wall | `src/qwen-realtime-asr.ts:40` | 无关首声（纯防卡死看门狗：正常 ASR 定稿 ~200 ms 即拆掉，只在服务端丢回包时触发解锁） | — |
+| `DEFAULT_DECODE_TIMEOUT_MS` | 8000 | wall | `src/qwen-realtime-asr.ts:41` | 无关首声（纯防卡死看门狗：正常 ASR 定稿 ~200 ms 即拆掉，只在服务端丢回包时触发解锁） | — |
 | `DEFAULT_TIMEOUT_MS` | 400 | wall | `src/semantic-endpoint.ts:48` | 模块兜底默认（生产由 `SEMANTIC_END_TAG_BUDGET_MS` 覆写；仅直接调 `semanticEndpoint` 未传 `timeoutMs` 时生效） | — |
 | `SUPERSEDED_TTL_MS` | 7 * 24 * 60 * 60 * 1_000 | wall | `src/session/superseded.ts:10` | 无关首声（不在停嘴→出声路径上） | — |
 | `CANCEL_GRACE_MS` | 2000 | wall | `src/session.ts:84` | 无关首声（不在停嘴→出声路径上） | — |

@@ -156,7 +156,11 @@ async function callTime() {
 }
 
 async function callWeather(args) {
-  const city = String(args?.city ?? CITY).trim();
+  const rawCity = args?.city;
+  if (rawCity !== undefined && rawCity !== null && typeof rawCity !== 'string') {
+    throw new Error('city 必须是字符串');
+  }
+  const city = String(rawCity ?? CITY).trim();
   // 不猜城市：按服务器 IP 猜出来的是机房所在地，念给哥听是**确定性的错**。
   // 没城市就把话递回去让模型问一句，比答错一个城市的天气强。
   if (!city) return '还不知道哥在哪个城市 —— 先问一句他在哪个城市，拿到城市再查。';
@@ -166,7 +170,11 @@ async function callWeather(args) {
 }
 
 async function callMarket(args) {
-  const symbol = String(args?.symbol ?? '').trim().toLowerCase();
+  const rawSymbol = args?.symbol;
+  if (rawSymbol !== undefined && rawSymbol !== null && typeof rawSymbol !== 'string') {
+    throw new Error('symbol 必须是字符串');
+  }
+  const symbol = String(rawSymbol ?? '').trim().toLowerCase();
   if (!symbol) throw new Error('缺少 symbol');
   const text = decodeGbk(await getText(`${MARKET_BASE}/q=${encodeURIComponent(symbol)}`));
   return marketText(text, symbol);
@@ -208,6 +216,7 @@ async function callTool(id, name, args) {
 }
 
 function handle(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
   const { id, method, params } = msg;
   switch (method) {
     case 'initialize':

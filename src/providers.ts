@@ -626,6 +626,13 @@ export interface TtsProvider {
    */
   prewarm?(): void;
   /**
+   * 可选能力：**关闭底层连接**（宿主退出 / 测试收尾用）。
+   *
+   * 必须幂等：没建过连接、已经关过、连续调多次都不能抛错。
+   * 关掉之后下一次 `synthesize*` 应当自己重建（懒加载语义）。
+   */
+  close?(): void;
+  /**
    * 边生成边合成（可选）：文本块一进来就送服务端，首包与模型生成重叠。
    * 没实现就退回 {@link synthesize} 整段合成。
    */
@@ -657,9 +664,15 @@ export function silentTts(sampleRate: number, seconds = 0.5): TtsProvider {
   return {
     name: 'silent',
     sampleRate,
-    async* synthesize() {
+    async* synthesize(text: string) {
+      // 空白文本不合成：调用方偶尔会拿清洗后的空串来试，产出一段静音会被当成
+      // 「这一轮说过话」。零音频是明确语义，不是漏了。
+      if (text.trim() === '') return;
       const bytes = Math.round(sampleRate * 2 * seconds);
       yield Buffer.alloc(bytes);
+    },
+    close() {
+      // 没有底层连接；存在只是为了满足 `TtsProvider.close?` 的幂等契约。
     },
   };
 }
@@ -691,9 +704,10 @@ export function cannedStt(
     open: (handlers) => {
       let seen = 0;
       let fired = false;
+      let closed = false;
       return {
         feed: (pcm) => {
-          if (fired) {
+          if (closed || fired) {
             return;
           }
           seen += pcm.length;
@@ -703,7 +717,7 @@ export function cannedStt(
           }
         },
         hangup: () => {},
-        close: () => {},
+        close: () => { closed = true; },
       };
     },
   };

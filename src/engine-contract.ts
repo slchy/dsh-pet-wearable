@@ -271,9 +271,23 @@ export interface FastVoiceEngine {
   /** 定稿：同上 */
   onAsrFinal?(text: string, commitSeq: number): void;
 
-  /** 唯一出话入口 */
+  /**
+   * 唯一出话入口。
+   *
+   * **abort 契约（三条硬约束）**：
+   * 1. 调用前 `signal.aborted === true` 时必须产出 **0 条事件**并立即结束；
+   * 2. 流中途 `signal` 触发 abort 后，**禁止再 yield 任何 `EngineEvent`**
+   *    （含 `audio` / `text` / `delegate` / `meta` / `done`），并尽快释放底层读端退出；
+   * 3. 上一轮被中止 / 作废后的残留数据（音频块、增量、队列尾巴）不得串到下一轮。
+   */
   respond(turn: TurnInput, signal: AbortSignal): AsyncIterable<EngineEvent>;
 
-  /** 放弃在途投机（交给 dsh / 被新轮顶掉 / 被插话） */
+  /**
+   * 放弃在途投机（交给 dsh / 被新轮顶掉 / 被插话）。
+   *
+   * **必须幂等且不抛错**：同一个原因连调多次、三种原因交替连调，都只能是
+   * 「没有在途投机时什么都不做」。内部异常不许漏给内核 —— 中止是收尾动作，
+   * 不能因为它把一轮结算带下水。
+   */
   abortSpeculation(reason: 'delegated' | 'superseded' | 'barge_in'): void;
 }

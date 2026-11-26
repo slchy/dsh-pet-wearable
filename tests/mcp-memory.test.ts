@@ -70,6 +70,11 @@ class Server {
     return result['result'] as CallResult;
   }
 
+  /** 直接写一行原始帧（测非对象 JSON 不打崩进程） */
+  raw(line: string): void {
+    this.child.stdin.write(`${line}\n`);
+  }
+
   stop(): void {
     this.child.stdin.end();
     this.child.kill();
@@ -150,6 +155,36 @@ test('空内容不写', async () => {
     const result = await withServer(ctx.env, (server) => server.call('remember', { text: '   ' }));
     assert.equal(result.isError, true);
     assert.equal(existsSync(ctx.file), false, '没内容就别建空文件');
+  } finally {
+    rmSync(ctx.dir, { recursive: true, force: true });
+  }
+});
+
+test('非对象 JSON 帧不会打崩进程', async () => {
+  const ctx = tempMemory();
+  try {
+    await withServer(ctx.env, async (server) => {
+      server.raw('123');
+      server.raw('"hello"');
+      server.raw('[1,2]');
+      const pong = await server.request('ping');
+      assert.deepEqual(pong['result'], {}, '坏帧之后进程仍要活着');
+    });
+  } finally {
+    rmSync(ctx.dir, { recursive: true, force: true });
+  }
+});
+
+test('remember 的非字符串内容明确报错，不静默写成 [object Object]', async () => {
+  const ctx = tempMemory();
+  try {
+    const result = await withServer(
+      ctx.env,
+      (server) => server.call('remember', { text: { bad: 1 } }),
+    );
+    assert.equal(result.isError, true);
+    assert.ok((result.content[0]?.text ?? '').includes('字符串'));
+    assert.equal(existsSync(ctx.file), false, '非法入参不该建文件');
   } finally {
     rmSync(ctx.dir, { recursive: true, force: true });
   }

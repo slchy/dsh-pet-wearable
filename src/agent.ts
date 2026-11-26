@@ -19,7 +19,7 @@
 import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
 import type { AnnounceStore } from './announce-store.ts';
-import type { DelegateReason } from './providers.ts';
+import type { AgentProvider, DelegateReason } from './providers.ts';
 import { cleanForSpeech, parseEmotion } from './emotion.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
@@ -64,7 +64,7 @@ export interface AgentReply extends AskResult {
   delegate?: DelegateReason;
 }
 
-export class VoiceAgent {
+export class VoiceAgent implements AgentProvider {
   /** 供日志/诊断显示 */
   readonly name = 'dsh';
 

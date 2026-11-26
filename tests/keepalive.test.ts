@@ -18,6 +18,7 @@ import {
   type KeepaliveClock,
 } from '../src/keepalive.ts';
 import type { AgentProvider, AgentReplyView } from '../src/providers.ts';
+import { OPTIONAL_AGENT_KEYS } from './contracts/agent-optional-keys.ts';
 
 /** 手动推进的时钟。 */
 class FakeClock implements KeepaliveClock {
@@ -245,39 +246,11 @@ test('保活输入不像用户的话', () => {
 });
 
 test('trackActivity 透传**全部**可选能力（漏一个就是静默降级，不报错）', () => {
-  // 这个列表就是 `AgentProvider` 上的可选能力清单。
-  // 加新能力时**这里也要加**——否则线上表现是"那个功能就是不生效"，从现象看不出来。
+  // 清单在 `contracts/agent-optional-keys.ts` 里用 `satisfies Record<OptionalAgentKey, true>`
+  // 锁死：`AgentProvider` 每新增一个可选方法，漏登记就**编译失败**。
   // （2026-11-23：`attachAudioLane` / `willServeAudio` / `noteServedTurn` 漏了，
   //  omni 一晚上 4 轮全部静默退回文本快车道。）
-  const optional = [
-    'setAnnouncer',
-    'setDetachedAnswerSink',
-    'attachLiveSink',
-    'cancelTurn',
-    'setDelegateHook',
-    'interruptTurn',
-    'detachTurn',
-    'dshBusy',
-    'taskStatus',
-    // Pure Live 后台任务：漏了 → 完成汇报没人接、用户说「算了」也取消不掉，而且不报错。
-    'setTaskReporter',
-    'cancelBackgroundTasks',
-    'prefetch',
-    'speculatePartial',
-    'attachAudioLane',
-    'willServeAudio',
-    'noteServedTurn',
-    'rollbackTurn',
-    'takeRollbackOutcome',
-    // 委派轮回注：漏了 → omni 永远不知道 dsh 答了什么，下一轮顺着追问就答非所问。
-    // 同样是**静默**的：没有它 omni 照样能答，只是答的内容是错的。
-    'injectAnsweredTurn',
-    // 内核端口（`kernel-runtime.ts`）：掐投机、按票据结算、重连时播种上一轮车道。
-    // 漏了不报错 —— 表现分别是「投机白跑到超时」「账本与内核各说一套」「重连后失忆」。
-    'dropPrefetch',
-    'reconcileTurnOutcome',
-    'lastLedgerLane',
-  ] as const;
+  const optional = Object.keys(OPTIONAL_AGENT_KEYS);
 
   const inner = { name: 'fake', reply: async () => ({ text: '', speech: '' }) } as Record<string, unknown>;
   for (const key of optional) {

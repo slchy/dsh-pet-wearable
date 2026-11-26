@@ -190,6 +190,7 @@ function callTool(id, name, args) {
 }
 
 function handle(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
   const { id, method, params } = msg;
   switch (method) {
     case 'initialize':
