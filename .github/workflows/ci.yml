@@ -72,8 +72,10 @@ jobs:
           - os: ubuntu-latest
             node: '24'
             pack: false
+          # Windows 跑 Node 24（避开 Node 22.x Windows 下 node:test #processRawBuffer 的偶发 IPC 抖动；
+          # Node 22 下限兼容性继续由 ubuntu-latest / Node 22 守住）
           - os: windows-latest
-            node: '22'
+            node: '24'
             pack: false
     steps:
       - uses: actions/checkout@v4
