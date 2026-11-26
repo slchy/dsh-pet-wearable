@@ -302,7 +302,15 @@ export class VoiceConnection {
           : {}),
         onAnnounce: (pending, spoken) => { this.app?.announce(pending, spoken); },
         onTurnStart: (text, hasImage) => {
-          this.archive?.event(EVENTS.turnStart, { text_len: text.length, image: hasImage });
+          // `base_commit_seq`：开轮瞬间已发出的最大 ASR commit 序号。它和票据上
+          // 锁存的水位线同源，档案里据此判「这段转写是开轮前录的还是开轮后的」，
+          // 不必再靠到达时刻猜。ASR 不提供序号时（老实现）不写这个键。
+          const baseCommitSeq = this.stt.commitSeq?.();
+          this.archive?.event(EVENTS.turnStart, {
+            text_len: text.length,
+            image: hasImage,
+            ...(baseCommitSeq === undefined ? {} : { base_commit_seq: baseCommitSeq }),
+          });
         },
         // 话筒占用/释放由状态机转移驱动（见 `AppSession.onDialogState`）
         onDialogState: (state) => {
@@ -411,6 +419,8 @@ export class VoiceConnection {
       now: this.assemblerNow,
       log,
       onJudge: (fact) => { this.archive?.event(EVENTS.judge, { ...fact }); },
+      // 语义判停真的等了一趟才落这一条（纯 Live 不开语义端点时零开销）
+      onSemanticWait: (fact) => { this.archive?.event(EVENTS.semanticGate, { ...fact }); },
       onCommit: (silenceMs) => {
         const laneSeq = this.asr.nextSealSeq();
         // 车道起跑（omni 的 `seal`）。**ASR 的 commit 在更晚的 `onSttCommit`**，

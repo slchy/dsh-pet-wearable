@@ -5,6 +5,7 @@
  * 否则进程退不掉。
  */
 import { UtteranceAssembler, type JudgeFact } from '../utterance-assembler.ts';
+import type { SemanticGateFact } from '../assembler/semantic-gate.ts';
 import { DEFAULT_TRAILING_TRIM_MS } from '../voice-config.ts';
 import { UPSTREAM_SAMPLE_RATE, type VoiceSessionOptions } from './session-options.ts';
 
@@ -99,6 +100,8 @@ export interface AssemblerWirePorts {
   readonly now: () => number;
   readonly log: (line: string) => void;
   onJudge(fact: JudgeFact): void;
+  /** 语义判停真的等了一趟（只有配了语义端点才会有） */
+  onSemanticWait(fact: SemanticGateFact): void;
   onCommit(silenceMs: number): void;
   onSttCommit(silenceMs: number): void;
   onUtterance(text: string): void;
@@ -137,6 +140,8 @@ export function wireAssembler(ports: AssemblerWirePorts): UtteranceAssembler {
         ...(options.semanticBudgetMs === undefined
           ? {}
           : { semanticBudgetMs: options.semanticBudgetMs }),
+        // 真正 await 那一步才回调（见 `SemanticGateOptions.onSemanticWait`）
+        onSemanticWait: (fact: SemanticGateFact) => { ports.onSemanticWait(fact); },
       }),
     recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * ASSEMBLER_RECENT_SECONDS,
     // 尾巴上多的静音会把 p 拉低（停嘴处 0.95 → +300 ms 0.35），而 p 正是

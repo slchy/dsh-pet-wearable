@@ -101,6 +101,23 @@ export type SemanticFlushDecision =
   | { readonly action: 'stale' }
   | { readonly action: 'extend'; readonly waitMs: number; readonly text: string };
 
+/**
+ * 一次**真的等了**的语义判停事实（只有 `awaitSemantics` 被走到时才产生）。
+ *
+ * 为什么要它：`judge.decide` 的 `waitedMs` 是**累计**等待，分不出「语义说 end
+ * （0 成本）」和「语义超时（白等一整拍）」。`verdict` 把那次等待的结局说清楚：
+ * - `end` / `more`：端点回话了；
+ * - `timeout`：预算用完，按「说完了」放行；
+ * - `unsure`：端点失败或回 `null`（拿不准）。
+ */
+export interface SemanticGateFact {
+  /** 真的等了多久（ms，`now()` 之差） */
+  readonly waitedMs: number;
+  readonly verdict: 'end' | 'more' | 'timeout' | 'unsure';
+  /** 这次等待的预算（ms） */
+  readonly budgetMs: number;
+}
+
 export interface SemanticGateOptions {
   readonly semanticEndpoint?: (text: string) => Promise<'end' | 'more' | null>;
   readonly semanticBudgetMs?: number;
@@ -111,6 +128,13 @@ export interface SemanticGateOptions {
   readonly fragmentWaitMs: number;
   /** 没有判停器时结果没人读，{@link SemanticGate.ask} 直接回 `null`。 */
   readonly hasPredictor: boolean;
+  /**
+   * 真的 `await awaitSemantics(text)` 之后回调**一次**（档案 `semantic.gate`）。
+   *
+   * 只有走到「等语义回话」那一步才调：已落定 / 高把握 / 前缀判定都是 0 ms，
+   * 不产生事件。Pure Live 默认不开 `SEMANTIC_END_TAG` 时这条路根本不存在。
+   */
+  readonly onSemanticWait?: (fact: SemanticGateFact) => void;
   readonly now: () => number;
   readonly lastVoicedAtMs: () => number;
   readonly log: (line: string) => void;
@@ -268,7 +292,15 @@ export class SemanticGate {
       // 仍走上面两条。半句（的话 / 因为 / 如果 …）不走这里。
       verdict = 'end';
     } else {
+      // 真的等了一趟：从发起等待到判定回来（含超时）的墙钟时间。
+      // 这是唯一会「白等」的分支，落一条档案才分得清 ② 的慢是排队还是等语义。
+      const waitedFrom = this.options.now();
       verdict = await this.awaitSemantics(text);
+      this.options.onSemanticWait?.({
+        waitedMs: Math.max(0, this.options.now() - waitedFrom),
+        verdict: verdict === null ? 'unsure' : verdict,
+        budgetMs: this.options.semanticBudgetMs ?? DEFAULT_SEMANTIC_BUDGET_MS,
+      });
     }
     if (isStale()) {
       return { action: 'stale' };

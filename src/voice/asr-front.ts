@@ -136,7 +136,11 @@ export class AsrFront {
 
   onSentence(text: string, index: number, commitSeq?: number): void {
     console.log(`  句 ${index}  ${JSON.stringify(text)}`);
-    this.ports.archive(EVENTS.asrSentence, { text, index });
+    // `commit_seq` 是这条定稿的出生证：档案里 `asr.sentence` 与 `asr.commit` 的配对
+    // 一直靠「窗口里只有一条 commit」这个假设，一句封了两次段时 ①b 只能记 null。
+    // 带上它，`latency-report.ts` 能精确配对（老档案没有这个字段，退回原判据）。
+    const stamp = commitSeq === undefined ? {} : { commit_seq: commitSeq };
+    this.ports.archive(EVENTS.asrSentence, { text, index, ...stamp });
     // 解码窗口结束（`.completed` 回来了）—— 这是**事实**，与「这段文本用不用」
     // 无关，所以放在所有丢弃判据之前。共享内核据此放掉 `awaitingDecode`；
     // 迟到的 `.completed` 由内核按 `commitSeq` 比较挡掉，不会抹掉更新的那一发。
@@ -158,7 +162,7 @@ export class AsrFront {
     });
     if (effects.some((effect) => effect.type === 'drop' && effect.why === 'pre-turn')) {
       console.log(`  句 ${index}  ↳ 开轮前录的那段定稿 → 不当插话，也不开轮`);
-      this.ports.archive(EVENTS.asrSentence, { text, index, dropped: 'pre-turn' });
+      this.ports.archive(EVENTS.asrSentence, { text, index, ...stamp, dropped: 'pre-turn' });
       return;
     }
     if (text.trim() !== '') {

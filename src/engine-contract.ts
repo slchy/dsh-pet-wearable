@@ -111,6 +111,20 @@ export interface TurnInput {
 }
 
 /**
+ * 结算的**回注口气**：一句话说清「外部记忆该不该知道这一轮」。
+ *
+ * - `spoken`：用户听全了 → 内容与口气都成立，注；
+ * - `unspoken`：这一轮有结论（比如 dsh 答了），但一个字都没播出去 → 内容仍要注，
+ *   否则下一轮它会把同一件事再编一遍（真机 `20261123-053719` 第 2 轮）；
+ * - `none`：用户少听了一段 → 不注。
+ *
+ * **家在这里而不是 `kernel.ts`**：`turn-report.ts` 要引用它，而 `kernel.ts` 又要
+ * 引用 `turn-report.ts` 的 `TurnReport` —— 放进内核就成模块环了。`kernel.ts`
+ * 原样转出，既有 `from './kernel.ts'` 的导入一个字都不用改。
+ */
+export type SettlementInject = 'spoken' | 'unspoken' | 'none';
+
+/**
  * 一轮的**结果**，控制面与内容面分开。
  *
  * `stale`（票据被作废）与 `truncated`（用户少听了）是两件事：
@@ -207,6 +221,9 @@ export type EngineEvent =
    * - `path`：这一轮由哪条路径答的（`'omni' | 'fast' | 'dsh'`）
    * - `firstTokenMs`：模型首 token 延迟（进 `llm.first`）
    * - `firstSynthAtMs`：送给 TTS 的起始墙钟时刻（算 `tts.first`）
+   * - `ttsFirstMs`：首段送合成 → 首块音频（ms）。**由引擎用自己那把时钟算好** ——
+   *   跨进程/跨基准的绝对时刻相减会得到负值（`CascadeAgent` 的 `now` 缺省是
+   *   `Date.now`，宿主的 `clock.now` 是进程单调毫秒），这个字段从结构上消灭那次减法
    * - `delegate`：进入慢车道的原因（`turn.end.delegate`）
    * - `nonBlocking`：为真表示引擎已在后台异步派单，本轮播完垫话即收尾，不阻塞等结果
    */
@@ -215,6 +232,7 @@ export type EngineEvent =
     readonly path?: 'fast' | 'dsh' | 'omni';
     readonly firstTokenMs?: number;
     readonly firstSynthAtMs?: number;
+    readonly ttsFirstMs?: number;
     readonly delegate?: string;
     readonly nonBlocking?: boolean;
   }

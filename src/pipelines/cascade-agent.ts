@@ -883,6 +883,14 @@ class CascadeTurnEngine implements FastVoiceEngine {
     const tokens = new TokenQueue();
     let streamedRaw = '';
     let firstSynthAtMs: number | undefined;
+    /**
+     * 首块音频的时刻。**与 `firstSynthAtMs` 同一把 `this.now()`** —— 两个都是
+     * 引擎自己的时钟；拿宿主 `clock.now()` 去减 `Date.now()` 会得到负值。
+     */
+    let firstAudioAtMs: number | undefined;
+    const markAudio = (): void => {
+      if (firstAudioAtMs === undefined) firstAudioAtMs = this.now();
+    };
     const markSynth = (): void => {
       if (firstSynthAtMs === undefined) firstSynthAtMs = this.now();
     };
@@ -903,6 +911,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
         ? new SentencePump({
           synthesize: (sentence, emotion) => this.tts.synthesize(sentence, emotion),
           onChunk: (pcm) => {
+            markAudio();
             queue.push({ type: 'audio', pcm: asBuffer(pcm), sampleRate: this.tts.sampleRate });
           },
           clean: cleanForSpeech,
@@ -926,7 +935,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
       const streaming = (async (): Promise<void> => {
         if (pump !== null || stream === undefined) return;
         try {
-          await this.playIterable(stream.call(this.tts, tokens), signal, queue);
+          await this.playIterable(stream.call(this.tts, tokens), signal, queue, markAudio);
         } catch (error) {
           streamFailed = true;
           this.log(`  流式    ✗ ${(error as Error).message}，退回整段合成`);
@@ -964,13 +973,15 @@ class CascadeTurnEngine implements FastVoiceEngine {
       if (streamFailed && reply !== null) {
         markSynth();
         try {
-          await this.playIterable(this.tts.synthesize(reply.speech, reply.emotion), signal, queue);
+          await this.playIterable(
+            this.tts.synthesize(reply.speech, reply.emotion), signal, queue, markAudio,
+          );
         } catch (error) {
           this.log(`  流式    ✗ 整段合成失败：${(error as Error).message}`);
         }
       }
       if (signal.aborted) return;
-      this.emitTail(queue, reply, streamedRaw, firstSynthAtMs);
+      this.emitTail(queue, reply, streamedRaw, firstSynthAtMs, firstAudioAtMs);
     } finally {
       signal.removeEventListener('abort', onAbort);
     }
@@ -981,7 +992,19 @@ class CascadeTurnEngine implements FastVoiceEngine {
     reply: AgentReplyView | null,
     streamedRaw: string,
     firstSynthAtMs: number | undefined,
+    firstAudioAtMs: number | undefined,
   ): void {
+    /**
+     * 「首段送合成 → 首块音频」由**同一把 `this.now()`** 算好再交给宿主。
+     *
+     * 以前宿主拿自己的 `clock.now()` 减这个 `firstSynthAtMs`：生产装配没给
+     * `CascadeAgent` 传 `now`（缺省 `Date.now`），而宿主是进程单调毫秒 ——
+     * 差值恒为负，`turn.end.tts_first_ms` 记出一个负数，报告只能按缺仪表处理。
+     * 负差值保持 `undefined`，不伪造 0。
+     */
+    const ttsFirstMs = firstSynthAtMs !== undefined && firstAudioAtMs !== undefined
+      ? Math.max(0, firstAudioAtMs - firstSynthAtMs)
+      : undefined;
     if (reply === null) {
       const speech = spokenFromStream(streamedRaw);
       queue.push({ type: 'done', fullText: streamedRaw, speech });
@@ -997,6 +1020,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
       ...(reply.path === undefined ? {} : { path: reply.path }),
       ...(reply.firstTokenMs === undefined ? {} : { firstTokenMs: reply.firstTokenMs }),
       ...(firstSynthAtMs === undefined ? {} : { firstSynthAtMs }),
+      ...(ttsFirstMs === undefined ? {} : { ttsFirstMs }),
       ...(reply.delegate === undefined ? {} : { delegate: reply.delegate }),
     });
     queue.push({ type: 'done', fullText: raw, speech });
@@ -1007,6 +1031,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
     iterable: AsyncIterable<Buffer>,
     signal: AbortSignal,
     queue: EventQueue<EngineEvent>,
+    onFirstAudio: () => void,
   ): Promise<void> {
     const gate = createAbortGate(signal);
     const iter = iterable[Symbol.asyncIterator]();
@@ -1024,6 +1049,7 @@ class CascadeTurnEngine implements FastVoiceEngine {
         if (winner.kind === 'aborted' || signal.aborted) return;
         if (!winner.value.ok) throw winner.value.error;
         if (winner.value.step.done === true) return;
+        onFirstAudio();
         queue.push({
           type: 'audio',
           pcm: asBuffer(winner.value.step.value),

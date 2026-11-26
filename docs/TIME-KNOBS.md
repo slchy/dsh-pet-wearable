@@ -52,11 +52,11 @@
 | `PREWARM_TTL_MS` | 3000 | wall | `src/cosyvoice.ts:414` | 定稿→开轮之间（正常 0–600 ms，用不完） | — |
 | `DEFAULT_RING_MS` | 150 | audio | `src/omni/protocol.ts:43` | 无（Omni 影子旁路静音期环形预卷长度，防软起音被裁，不加延迟） | — |
 | `VAD_FRAME_MS` | 32 | audio | `src/uplink-pipeline.ts:16` | 无（神经 VAD 的帧长，时间戳按它倒推，不加额外等待） | — |
-| `DEFAULT_DECODE_WAIT_MS` | 240 | wall | `src/utterance-assembler.ts:371` | 开轮前硬等在途 ASR 解码收尾上限（直接计入首声；超时按当前文本放行） | — |
-| `DEFAULT_SHORT_FRAGMENT_WAIT_MS` | 400 | wall | `src/utterance-assembler.ts:377` | 短碎片与语义 more 的单拍兜底上限（实际受 `TURN_JUDGE_WAIT_BUDGET_MS` / `TURN_JUDGE_MAX_OPEN_SILENCE_MS` 夹住） | — |
-| `DEFAULT_SHORT_FRAGMENT_WINDOW_MS` | 1200 | wall | `src/utterance-assembler.ts:380` | 距上一轮收下多久内的极短句算碎片（时间邻接判据，命中后触发短碎片等待） | — |
-| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice/endpoint-wire.ts:50` | 仅在无判停器且未设开轮静音门槛（服务端 VAD / NLS）时生效；手动端点配了 `VOICE_OPEN_QUIET_MS` 时不再盲等 600 ms | — |
-| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | wall | `src/voice/endpoint-wire.ts:63` | ASR 出句之前 | — |
+| `DEFAULT_DECODE_WAIT_MS` | 240 | wall | `src/utterance-assembler.ts:378` | 开轮前硬等在途 ASR 解码收尾上限（直接计入首声；超时按当前文本放行） | — |
+| `DEFAULT_SHORT_FRAGMENT_WAIT_MS` | 400 | wall | `src/utterance-assembler.ts:384` | 短碎片与语义 more 的单拍兜底上限（实际受 `TURN_JUDGE_WAIT_BUDGET_MS` / `TURN_JUDGE_MAX_OPEN_SILENCE_MS` 夹住） | — |
+| `DEFAULT_SHORT_FRAGMENT_WINDOW_MS` | 1200 | wall | `src/utterance-assembler.ts:387` | 距上一轮收下多久内的极短句算碎片（时间邻接判据，命中后触发短碎片等待） | — |
+| `ASSEMBLER_FALLBACK_WINDOW_MS` | 600 | wall | `src/voice/endpoint-wire.ts:51` | 仅在无判停器且未设开轮静音门槛（服务端 VAD / NLS）时生效；手动端点配了 `VOICE_OPEN_QUIET_MS` 时不再盲等 600 ms | — |
+| `ASSEMBLER_PREDICT_LEAD_MS` | 65 | wall | `src/voice/endpoint-wire.ts:64` | ASR 出句之前 | — |
 | `DEFAULT_GATE_HOLD_MS` | 2000 | wall | `src/voice-config.ts:38` | 无（决定 gate.close 何时落，① 的起点；必须大于封段与开轮静音天花板） | — |
 | `DEFAULT_GATE_PREROLL_MS` | 800 | audio | `src/voice-config.ts:40` | 无（它是滑窗长度，不加延迟） | — |
 | `DEFAULT_MIN_SPEECH_MS` | 120 | audio | `src/voice-config.ts:45` | 无（单段有效有声不足 120 ms 不封段、不投机、不预跑；够了才进入静音门槛，不加额外等待） | — |
@@ -78,14 +78,14 @@
 | `DEFAULT_SEMANTIC_BUDGET_MS` | 300 | wall | `src/assembler/semantic-gate.ts:70` | 模块兜底默认（生产由 `SEMANTIC_END_TAG_BUDGET_MS` 覆写；仅直接调 `UtteranceAssembler` 未传 `semanticBudgetMs` 时生效） | — |
 | `CLOCK_MISMATCH_MS` | 1e9 | —（判据） | `src/barge-voicing.ts:52` | 无（纯判据：只用来发现两把时钟接错，不放慢任何东西） | — |
 | `STALL_PROBE_MS` | 600 | wall | `src/cosyvoice.ts:252` | 无（纯诊断看门狗：正常轮首块 ~350 ms 就拆掉，不产生任何等待） | — |
-| `TRUNCATED_EPSILON_MS` | 300 | —（判据） | `src/engine-contract.ts:139` | 无（纯判据：轮末判「用户少听了没有」，不产生任何等待） | — |
+| `TRUNCATED_EPSILON_MS` | 300 | —（判据） | `src/engine-contract.ts:153` | 无（纯判据：轮末判「用户少听了没有」，不产生任何等待） | — |
 | `DEFAULT_MAX_TURN_MS` | 45000 | wall | `src/fsm-trace.ts:71` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_MAX_STOP_TO_FIRST_MS` | 15000 | wall | `src/fsm-trace.ts:72` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_BARGE_STOP_WITHIN_MS` | 500 | wall | `src/fsm-trace.ts:73` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_KEEPALIVE_MS` | 50000 | wall（连接空闲） | `src/http-agent.ts:27` | 无关首声（不产生延迟，只在超过服务端空闲时导致连接失效） | — |
-| `WAITED_THRESHOLD_MS` | 100 | —（统计判据） | `src/latency-report.ts:185` | 无（报告分组门槛，不参与调度） | — |
-| `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:614` | 无（它是报警线，不约束任何环节） | — |
-| `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:617` | 无（报告里的「慢轮」门槛） | — |
+| `WAITED_THRESHOLD_MS` | 100 | —（统计判据） | `src/latency-report.ts:210` | 无（报告分组门槛，不参与调度） | — |
+| `FIRST_WORD_BUDGET_MS` | 1200 | wall | `src/latency-report.ts:717` | 无（它是报警线，不约束任何环节） | — |
+| `SLOW_TURN_MS` | 1500 | —（统计判据） | `src/latency-report.ts:720` | 无（报告里的「慢轮」门槛） | — |
 | `RESOLUTION_MS` | 25 | wall | `src/loop-lag.ts:29` | 无关首声（不在停嘴→出声路径上） | — |
 | `DEFAULT_SENTENCE_SILENCE_MS` | 200 | audio（服务端） | `src/main.ts:199` | 仅旧 NLS 路径（`--stt aliyun`）：服务端判句纯静音等待；`qwen-realtime` 与 Pure Live 不用 | — |
 | `DEFAULT_PET_TICK_MS` | 3000 | wall | `src/main.ts:202` | 无关首声（不在停嘴→出声路径上） | — |
@@ -99,10 +99,10 @@
 | `CANCEL_GRACE_MS` | 2000 | wall | `src/session.ts:84` | 无关首声（不在停嘴→出声路径上） | — |
 | `FORK_TIMEOUT_MS` | 2000 | wall | `src/session.ts:93` | 无关首声（不在停嘴→出声路径上） | — |
 | `RECENT_MS` | 120000 | wall | `src/task-board.ts:44` | 无关首声（不在停嘴→出声路径上） | — |
-| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:61` | 设备播报期间（轮询，不加延迟） | — |
-| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:69` | 无关首声（不在停嘴→出声路径上） | — |
-| `SPEAKING_WATCHDOG_MIN_MS` | 350 | wall | `src/utterance-assembler.ts:386` | 无关首声（`speaking_more` 断流兜底定时器最短等待；持续说话期间每帧刷新，仅彻底停帧时防卡死） | — |
-| `SPEAKING_WATCHDOG_MARGIN_MS` | 100 | wall | `src/utterance-assembler.ts:392` | 无关首声（`speaking_more` 断流兜底相对静默/延长门槛的余量，确保晚于正常静音收口） | — |
+| `PLAYBACK_POLL_MS` | 100 | wall | `src/turn-runner.ts:68` | 设备播报期间（轮询，不加延迟） | — |
+| `PLAYED_GRACE_MS` | 3000 | wall | `src/turn-runner.ts:76` | 无关首声（不在停嘴→出声路径上） | — |
+| `SPEAKING_WATCHDOG_MIN_MS` | 350 | wall | `src/utterance-assembler.ts:393` | 无关首声（`speaking_more` 断流兜底定时器最短等待；持续说话期间每帧刷新，仅彻底停帧时防卡死） | — |
+| `SPEAKING_WATCHDOG_MARGIN_MS` | 100 | wall | `src/utterance-assembler.ts:399` | 无关首声（`speaking_more` 断流兜底相对静默/延长门槛的余量，确保晚于正常静音收口） | — |
 | `HANDSHAKE_WAIT_MS` | 1000 | wall | `src/voice/handshake.ts:21` | 无关首声（不在停嘴→出声路径上） | — |
 | `INITIAL_LISTEN_MS` | 60000 | wall | `src/voice/mic-phase.ts:22` | 无关首声（不在停嘴→出声路径上） | — |
 | `CAPTURE_GRACE_MS` | 1500 | wall | `src/voice/mic-phase.ts:33` | 无关首声（不在停嘴→出声路径上） | — |

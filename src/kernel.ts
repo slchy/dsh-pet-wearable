@@ -75,8 +75,9 @@
  * | 有结论但一个字都没播出去 | `unspoken` | `false` | 仍要告知上下文，但不是「他听到了」 |
  */
 import { isPreTurnSegment, isStaleTicket } from './causal.ts';
-import { outcomeOf, type TurnOutcome } from './engine-contract.ts';
+import { outcomeOf, type SettlementInject, type TurnOutcome } from './engine-contract.ts';
 import type { Lane } from './turn-router.ts';
+import type { TurnReport } from './turn-report.ts';
 
 /**
  * 对话相位。
@@ -168,8 +169,11 @@ export interface PlaybackRegion {
  * - `unspoken`：这一轮有结论（比如 dsh 答了），但一个字都没播出去 → 内容仍要注，
  *   否则下一轮它会把同一件事再编一遍（真机 `20261123-053719` 第 2 轮）；
  * - `none`：用户少听了一段 → 不注。
+ *
+ * 定义搬去 `engine-contract.ts`（`turn-report.ts` 也要用它，放在这里会与
+ * `turn-report.ts` 形成模块环）；这里**原样转出**，既有导入零破坏。
  */
-export type SettlementInject = 'spoken' | 'unspoken' | 'none';
+export type { SettlementInject } from './engine-contract.ts';
 
 /** 对话账本区域：唯一真相源 */
 export interface LedgerRegion {
@@ -194,6 +198,13 @@ export interface LedgerRegion {
     /** 结算时刻（宿主时钟）。与 `outcome` 同源，重述时不许换一个时刻 */
     readonly endedAtMs: number;
   } | null;
+  /**
+   * 最近一轮的**结构化结算快照**（`turn-report.ts`）。
+   *
+   * 只由 `turnReport` 事件写入，**不参与任何判定** —— 它不改相位、不产意图，
+   * 连接进了吸收态 `closed` 之后仍然可以落账（失败轮的收尾就在那之后）。
+   */
+  readonly lastReport: TurnReport | null;
 }
 
 /** 内核状态：四个正交区域的快照。**不含 socket / promise / timer** */
@@ -237,6 +248,14 @@ export type KernelEvent =
   | { readonly type: 'ticketInvalidated'; readonly ticket: TurnTicket }
   /** 一轮由谁答的（快/慢/omni），记账用 */
   | { readonly type: 'turnAnswered'; readonly lane: Lane }
+  /**
+   * 一轮的**结算快照**（`turn-report.ts`）。
+   *
+   * 不是判定输入：只写 `ledger.lastReport`，不碰 `dialog.phase`、不产任何 `Effect`。
+   * **故意不进 {@link PHASE_EVENTS}** —— 连接已进吸收态 `closed` 时，本轮收尾
+   * 仍要能落账（失败轮的 `turnEnded` 与它都在那之后）。
+   */
+  | { readonly type: 'turnReport'; readonly report: TurnReport }
   | { readonly type: 'closed' }
   // ------------------------------------------------------------ 对话相位（唯一真相源）
   /**
@@ -348,7 +367,7 @@ type InputKernelEvent = Extract<
 >;
 type PlaybackKernelEvent = Extract<
   KernelEvent,
-  { type: 'audioSent' | 'devicePlayed' | 'turnAnswered' | 'turnEnded' }
+  { type: 'audioSent' | 'devicePlayed' | 'turnAnswered' | 'turnEnded' | 'turnReport' }
 >;
 type DialogKernelEvent = Exclude<KernelEvent, InputKernelEvent | PlaybackKernelEvent>;
 
@@ -370,6 +389,7 @@ export function initialKernelState(gateSeq = 0, initialLane: Lane | null = null)
       lastAnsweredAtMs: null,
       lastOutcome: null,
       lastSettled: null,
+      lastReport: null,
     },
   };
 }
@@ -640,6 +660,7 @@ export function step(state: KernelState, event: KernelEvent): [KernelState, Effe
     case 'devicePlayed':
     case 'turnAnswered':
     case 'turnEnded':
+    case 'turnReport':
       return stepPlayback(state, event);
     default:
       return stepDialog(state, event);
@@ -718,6 +739,14 @@ function stepPlayback(state: KernelState, event: PlaybackKernelEvent): [KernelSt
         [],
       ];
 
+    /**
+     * 结算快照只进账本。**不改相位、不产意图**：它不是判定，是留痕。
+     * 连接已进 `closed` 时也要能落账，所以 `turnReport` 不在 `PHASE_EVENTS` 里，
+     * 上面那道吸收态守门拦不到它。
+     */
+    case 'turnReport':
+      return [{ ...state, ledger: { ...state.ledger, lastReport: event.report } }, []];
+
     case 'turnEnded': {
       // 已经结算过（打断那一刻就结了）：原样再声明一次，别拿空播放区重算
       const settled = state.ledger.lastSettled;
@@ -748,7 +777,15 @@ function stepPlayback(state: KernelState, event: PlaybackKernelEvent): [KernelSt
       return [
         {
           ...state,
-          playback: { ...state.playback, ticket: null, firstAudioAtMs: null, sentMediaMs: 0 },
+          playback: {
+            ...state.playback,
+            ticket: null,
+            firstAudioAtMs: null,
+            sentMediaMs: 0,
+            // 上一轮的回执时刻不能残留在空播放区里：`turn-end` 之后读它的人
+            // 会以为「这一轮播完了」，而实际只是账清空了。
+            playedAtMs: null,
+          },
           ledger: { ...recordSettle(state.ledger, effect), lastAnsweredAtMs: event.atMs },
         },
         [effect],

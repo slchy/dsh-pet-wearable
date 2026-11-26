@@ -872,7 +872,9 @@ export class LiveOrchestrator implements AgentProvider {
       turnContext(turn),
     );
     if (signal.aborted || this.disposed) return;
-    yield meta;
+    // dsh 也是文本 LLM：首 token 延迟是真的，照实透出（`llm.first` / `turn.report`）。
+    // omni 直出那条没有这个相位，所以只在这一条兜底路径上补。
+    yield reply.firstTokenMs === undefined ? meta : { ...meta, firstTokenMs: reply.firstTokenMs };
     // Pure Live 禁止调用外部 TTS：车道若已恢复则尝试让 omni 自己说，否则仅下发文本收尾。
     if (reply.speech.trim() !== '') {
       const prompt = buildLiveReportPrompt({ query: turn.text, summary: reply.speech });

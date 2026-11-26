@@ -39,7 +39,7 @@
  */
 import { AudioSnapshotBuffer } from './assembler/audio-snapshot.ts';
 import { SemanticGate, looksUnfinished, stripTail } from './assembler/semantic-gate.ts';
-import type { SemanticBudgetContext } from './assembler/semantic-gate.ts';
+import type { SemanticBudgetContext, SemanticGateFact } from './assembler/semantic-gate.ts';
 import type { AudioFrame } from './engine-contract.ts';
 import { pcm16PeakDbfs } from './pcm.ts';
 import { SilenceTriggers } from './silence-triggers.ts';
@@ -70,6 +70,13 @@ export interface UtteranceAssemblerOptions {
    * 生产运行时由 `SEMANTIC_END_TAG_BUDGET_MS` 传入覆写。
    */
   readonly semanticBudgetMs?: number;
+  /**
+   * 语义判停**真的等了一趟**之后回调一次（见 `SemanticGateFact`）。
+   *
+   * 宿主拿去落 `semantic.gate`：② 的慢是「语义还在想」还是「我们自己排队」，
+   * 以前只能从 `judge.decide.waitedMs` 反推。
+   */
+  readonly onSemanticWait?: (fact: SemanticGateFact) => void;
   /** 一轮最多延长几次（**总预算**，四种原因共用） */
   readonly maxExtensions: number;
   /**
@@ -542,6 +549,7 @@ export class UtteranceAssembler {
     this.semanticGate = new SemanticGate({
       semanticEndpoint: options.semanticEndpoint,
       semanticBudgetMs: options.semanticBudgetMs,
+      ...(options.onSemanticWait === undefined ? {} : { onSemanticWait: options.onSemanticWait }),
       maxOpenSilenceMs: options.maxOpenSilenceMs,
       waitBudgetSequenceMs: options.waitBudgetSequenceMs,
       extendMs: options.extendMs,

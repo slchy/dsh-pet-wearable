@@ -75,6 +75,21 @@ export interface ArchiveEvent {  /** 相对会话开始的毫秒数 */
   readonly feed_ms?: unknown;
   /** `tts.task` 专有：「首包」段（首批文本送出 → 首块音频，ms） */
   readonly first_ms?: unknown;
+  /**
+   * `asr.sentence` 专有：产出这条定稿的 ASR commit 序号（出生证）。
+   *
+   * 有它才能把 `①b 封段→定稿` 精确配到**那一条** `asr.commit`；旧档案没有，
+   * 只能退回「窗口里恰好一条 commit」的假设。
+   */
+  readonly commit_seq?: unknown;
+  /** `asr.commit` 专有：这一发封段的序号（与 `asr.sentence.commit_seq` 配对） */
+  readonly seq?: unknown;
+  /** `judge.decide` 专有：这次决定的动作（`accept` / `extend` / `error`） */
+  readonly action?: unknown;
+  /** `judge.decide` 专有：截至这次决定，这一轮累计等了多少（ms） */
+  readonly waitedMs?: unknown;
+  /** `turn.report` 专有：模型首 token 延迟（ms）。`llm.first` 缺仪表时的退路 */
+  readonly llm_first_ms?: unknown;
 }
 
 /** 一轮里可能缺席的时刻名。 */
@@ -157,6 +172,16 @@ export interface TurnLatency {
    * 这是**启发式**，不是结论 —— 报告里出现可疑样本要回看录音确认。
    */
   readonly category: 'normal' | 'filler' | 'noise';
+  /**
+   * 模型首 token 延迟（ms）：本轮窗口内的 `llm.first.ms`；缺了退回
+   * `turn.report.llm_first_ms`；再缺为 `null`（旧档案 / Omni 直出）。
+   */
+  readonly llmFirstMs: number | null;
+  /**
+   * 本轮判停真的等掉多少（ms）：窗口内 `judge.decide.waitedMs` 的**最大/末次**值。
+   * 没有 `judge.decide`（旧档案）时为 `null`。
+   */
+  readonly judgeWaitedMs: number | null;
   /**
    * 这一轮是不是**坏样本**（`① < 0`，见 `computeTurns` 里的说明）。
    *
@@ -291,6 +316,11 @@ export function parseEvents(jsonl: string): ArchiveEvent[] {
       setup_ms: obj['setup_ms'],
       feed_ms: obj['feed_ms'],
       first_ms: obj['first_ms'],
+      commit_seq: obj['commit_seq'],
+      seq: obj['seq'],
+      action: obj['action'],
+      waitedMs: obj['waitedMs'],
+      llm_first_ms: obj['llm_first_ms'],
     });
   }
   return out;
@@ -455,6 +485,45 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       }
     }
 
+    // `asr.sentence` 的**出生证**：按序号精确配对产出它的那一条 `asr.commit`。
+    // 老档案没有 `commit_seq`（`matchedCommitAt` 留 -1），下面退回原判据。
+    const sentenceCommitSeq = asrAt < 0 ? undefined : num(events[asrAt]?.commit_seq);
+    let matchedCommitAt = -1;
+    if (sentenceCommitSeq !== undefined) {
+      for (let i = asrAt - 1; i > prevAt; i -= 1) {
+        const ev = events[i];
+        if (ev?.ev === EVENTS.asrCommit && num(ev.seq) === sentenceCommitSeq) {
+          matchedCommitAt = i;
+          break;
+        }
+      }
+    }
+
+    // 判停的**实际动作**：`judge.decide` 落在本轮 `asr.sentence` 之后、开轮之前。
+    // 有它就按 `action === 'extend'` 判「等没等」——`asrToTurn >= 100` 那个代理
+    // 有 37% 误报、14% 漏报。没有它（旧档案 / 合成黄金测试）才退回代理判据。
+    //
+    // 上界按**时刻**比 `turn.start`：决定与开轮常常落在同一毫秒，按文件下标会
+    // 把「同一毫秒但写在 turn.start 之后」的那条漏掉（归档顺序不保证）。
+    const turnStartT = events[at]?.t ?? 0;
+    let judgeCount = 0;
+    let judgeExtended = false;
+    let judgeWaited: number | null = null;
+    for (let i = prevAt < 0 ? 0 : prevAt + 1; i < nextAt; i += 1) {
+      const ev = events[i];
+      if (ev?.ev !== EVENTS.judge || ev.t > turnStartT) {
+        continue;
+      }
+      judgeCount += 1;
+      if (ev.action === 'extend') {
+        judgeExtended = true;
+      }
+      const waited = num(ev.waitedMs);
+      if (waited !== undefined) {
+        judgeWaited = judgeWaited === null ? waited : Math.max(judgeWaited, waited);
+      }
+    }
+
     // ③④ 的终点：本轮范围内
     let firstAt = -1;
     for (let i = at; i < nextAt; i += 1) {
@@ -479,10 +548,16 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
     // ① 的两段。缺 `asr.commit`（旧档案 / 主动播报）就都是 `null` —— 不拿 0 冒充。
     const commitEv = commitAt < 0 ? undefined : events[commitAt];
     const stopToCommitMs = stopAt === null || commitEv === undefined ? null : commitEv.t - stopAt;
-    // 多条 commit 时 ①b 说不清从哪条算（见上面的注释）→ 记 null，不猜
-    const commitToFinalMs = commitEv === undefined || asrEv === undefined || commitCount !== 1
-      ? null
-      : asrEv.t - commitEv.t;
+    // ①b 的配对：
+    // - `asr.sentence` 带 `commit_seq` 且窗口里找到同号 `asr.commit` → 精确算，
+    //   即使 `commitCount > 1` 也不用丢成 null；
+    // - 否则（老档案）保持原判据：多条 commit 说不清从哪条算（见上面的注释）。
+    const matchedCommit = matchedCommitAt < 0 ? undefined : events[matchedCommitAt];
+    const commitToFinalMs = matchedCommit !== undefined && asrEv !== undefined
+      ? asrEv.t - matchedCommit.t
+      : commitEv === undefined || asrEv === undefined || commitCount !== 1
+        ? null
+        : asrEv.t - commitEv.t;
     const asrToTurn = delta(events, at, asrAt);
     const turnToAudio = delta(events, firstAt, at);
     const playbackMs = delta(events, endAt, firstAt);
@@ -537,6 +612,29 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       ttsFeed = durationMs(ev.feed_ms, ttsFeed);
       ttsSynth = durationMs(ev.first_ms, ttsSynth);
     }
+
+    // 模型首 token：优先 `llm.first`（引擎一拿到就发），缺了退回 `turn.report`
+    // 里结算时锁存的那一份。两者都没有（Omni 直出 / 旧档案）记 `null`。
+    let llmFirst: number | null = null;
+    for (let i = at; i < nextAt; i += 1) {
+      const ev = events[i];
+      if (ev?.ev !== EVENTS.llmFirst) continue;
+      const parsed = durationMs(ev.ms, null);
+      if (parsed !== null) {
+        llmFirst = parsed;
+      }
+    }
+    if (llmFirst === null) {
+      for (let i = at; i < nextAt; i += 1) {
+        const ev = events[i];
+        if (ev?.ev !== EVENTS.turnReport) continue;
+        const parsed = durationMs(ev.llm_first_ms, null);
+        if (parsed !== null) {
+          llmFirst = parsed;
+          break;
+        }
+      }
+    }
     out.push({
       turn: n + 1,
       silenceToAsr,
@@ -555,7 +653,12 @@ export function computeTurns(events: readonly ArchiveEvent[]): TurnLatency[] {
       interrupted: end?.interrupted === true,
       text: preview(asrAt < 0 ? undefined : events[asrAt]?.text),
       path: typeof end?.path === 'string' ? end.path : null,
-      waitedInJudge: asrToTurn !== null && asrToTurn >= WAITED_THRESHOLD_MS,
+      // 有真实判停决定就按 `action` 判；没有才退回 `②` 这个代理（老档案 / 黄金测试）
+      waitedInJudge: judgeCount > 0
+        ? judgeExtended
+        : asrToTurn !== null && asrToTurn >= WAITED_THRESHOLD_MS,
+      judgeWaitedMs: judgeWaited,
+      llmFirstMs: llmFirst,
       category: categorize(asrAt < 0 ? undefined : events[asrAt]?.text),
       badSample,
       missing,

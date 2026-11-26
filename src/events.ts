@@ -75,6 +75,14 @@ export const EVENTS = {
   /** 一轮结束。带 `dsh_session` 时可与 dsh 自己的会话档案对齐 */
   turnEnd: 'turn.end',
   /**
+   * 一轮的**结构化结算快照**（`turn-report.ts` 的 `turnReportToArchiveFields`）。
+   *
+   * 与 `turn.end` 的分工：那个是延迟报告用的扁平仪表（字段不许动），这个是
+   * 判定结果（`status` / `path` / `delegated` / `stale` / `inject` / `llm_first_ms` …）。
+   * **一轮恰好一条**，在 `turn.end` 之后落盘。
+   */
+  turnReport: 'turn.report',
+  /**
    * 每条 TCP 连接自己的重传 / RTO（`ss -tin` 读出来的每 socket 累计值）。
    *
    * **为什么不能只用 `turn.end.net_*`**：那是**整机**计数 —— 分不出是谁在重传。
@@ -164,6 +172,18 @@ export const EVENTS = {
    * 是「在等设备静音窗」还是「排队」，而这两种原因的修法完全相反。
    */
   judge: 'judge.decide',
+
+  /**
+   * 语义判停**真的等了一趟**（`SemanticGate.allowsFlush` 里 `await awaitSemantics`）。
+   *
+   * `② 定稿→开轮` 里最贵的那一段是「等语义标签」。以前只有「等到没有」能从
+   * `judge.decide` 的 `waitedMs` 反推，分不出「语义说 end（0 成本）」和
+   * 「语义超时（白等一整拍）」。字段：`waitedMs` / `verdict`（`end` / `more` /
+   * `timeout` / `unsure`）/ `budgetMs`。
+   *
+   * Pure Live 默认不开 `SEMANTIC_END_TAG`，这条事件**零开销**（没有端点就没有等待）。
+   */
+  semanticGate: 'semantic.gate',
 
   /**
    * omni 影子旁路：一份 seal 的「封段 → 首块音频」。
