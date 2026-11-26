@@ -25,7 +25,7 @@ import { execFile } from 'node:child_process';
 export interface SocketStat {
   /**
    * 本端 `IP:端口`。**必须留着**：同一个对端会有多条连接（重连），只按对端汇总会在
-   * 换代那一刻算出**负增量**（2026-11-21 实测踩过：`220.197.201.66 −3`）。
+   * 换代那一刻算出**负增量**（2026-11-21 实测踩过：换到新对端后 −3）。
    * 按 `local` 识别 socket 才做得对。
    */
   readonly local: string;
@@ -48,7 +48,7 @@ export interface SocketStat {
 export function parseSsOutput(text: string): SocketStat[] {
   const out: SocketStat[] = [];
   /**
-   * 地址 token：`1.2.3.4:443` / `[::1]:443` / `*:63993`。
+   * 地址 token：`192.0.2.4:443` / `[::1]:443` / `*:63993`。
    *
    * **不能靠状态列**：`ss -tin state established …` 的输出里**没有 `ESTAB` 列**
    * （只有不带过滤的默认列表才打状态），拿状态列当块首判据会把所有连接都丢掉 ——
@@ -119,7 +119,7 @@ export function sampleSockets(port = 443, listenPort = 0): Promise<SocketStat[]>
  * 从一堆连接里挑出**本端端口正好等于 `localPort`** 的那一条。
  *
  * 不能用 `includes`：`:4123` 会匹配到 `:41234`。而厂商入口是共享的
- * （2026-11-22 实测 ASR 和 TTS 都连 `39.96.213.166:443`），只按 IP 挑会把
+ * （2026-11-22 实测 ASR 和 TTS 都连同一个厂商入口），只按 IP 挑会把
  * ASR 的 `retrans` 记到 TTS 头上。
  */
 export function selectSocket(stats: readonly SocketStat[], localPort: number): SocketStat | null {

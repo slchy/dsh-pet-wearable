@@ -55,6 +55,9 @@
     "test:web": "npm --prefix packages/dsh-voice-web test",
     "test:all": "npm test && npm run test:bench && npm run test:web",
     "mutate": "python scripts/mutation-check.py",
+    "verify:formal": "node tests/fsm-verify.ts && node tests/backchannel-verify.ts",
+    "verify:secrets": "node scripts/secret-scan.mjs",
+    "verify:pack": "npm pack --dry-run && npm --prefix packages/dsh-voice-web pack --dry-run",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {

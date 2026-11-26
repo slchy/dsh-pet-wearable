@@ -2,9 +2,10 @@
 
 <div align="center">
 
+[![CI](https://github.com/slchy/dsh-pet-wearable/actions/workflows/ci.yml/badge.svg)](https://github.com/slchy/dsh-pet-wearable/actions/workflows/ci.yml)
+[![Model Parity](https://github.com/slchy/dsh-pet-wearable/actions/workflows/model-parity.yml/badge.svg)](https://github.com/slchy/dsh-pet-wearable/actions/workflows/model-parity.yml)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22.18.0-brightgreen.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/tests-1545%20passing-success.svg)](#开发与验证)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 **面向智能穿戴设备的云端全双工语音伴生 Agent（基于 `dsh` / DeepSeek Harness）**
@@ -23,7 +24,7 @@
 - **统一单泵与确定性内核**：`TurnRunner` 仅消费 `FastVoiceEngine.respond()` 事件流；相位、打断与结算唯一归口纯函数 [kernel.ts](./src/kernel.ts)（因果序号 `commitSeq` / `{no, gen}` + 媒体时间尺子），所有副作用经 `KernelRuntime.dispatchAndApply()` 唯一执行。
 - **全双工即时打断与话筒仲裁**：Silero v5 神经 VAD（缺模型或 `VOICE_VAD=energy|0|off|false` 时自动退回能量门）+ TurnJudge（进程内 ONNX）声学判停免唤醒切句，文本语义补判（END 标签）可选；用户开口立刻下发 `audio.stop` 并抢占话筒（`user > reply > announce / pet > reflex`）。
 - **硬件无关线协议**：`src/devices/` 仅定义 6 个下行指令与 6 个上行事件，握手期按能力集动态降级，接入新设备（如[雷鸟 X3 Pro](./docs/devices/RAYNEO-X3-PRO.md)）不改核心状态机。
-- **零密钥本地闭环与虚拟时间仿真**：内置 `canned / silent / echo` 离线桩、`npm run sim` 纯虚拟时间模拟器、330 转移穷尽状态验证。当前 `npm run test:all` 为 **1545**（根 1444 + bench 24 + web 77）。
+- **零密钥本地闭环与虚拟时间仿真**：内置 `canned / silent / echo` 离线桩、`npm run sim` 纯虚拟时间模拟器、330 转移穷尽状态验证。当前 `npm run test:all` 为 **1645**（根 1544 含契约套件 + bench 24 + web 77）。
 
 ---
 
@@ -135,13 +136,16 @@ VOICE_PIPELINE=cascade node src/main.ts --listen 8766 --stt qwen-realtime --tts 
 ## 开发与验证
 
 ```bash
-npm test                                          # 云端运行时测试（1444），与部署自检同一批 tests/*.test.ts
+npm test                                          # 云端运行时与契约测试（1544，含 tests/contracts/*.test.ts）
 npm run test:bench                                # bench/eval 与 bench/replay（24）
 npm run test:web                                  # packages/dsh-voice-web（77）
-npm run test:all                                  # 全仓：1444 根 + 24 bench + 77 web = 1545
+npm run test:all                                  # 全仓：1544 根 + 24 bench + 77 web = 1645
 npm run typecheck                                 # TypeScript 严格检查
 npm run sim                                       # 40 场景虚拟时间仿真
 node --experimental-strip-types tests/fsm-verify.ts  # DialogFsm 穷尽状态验证（330 转移）
+npm run verify:formal                             # 形式验证入口：DialogFsm + 回话词穷尽检查
+npm run verify:secrets                            # 公开仓防泄漏扫描（禁入路径 + 高置信度密钥/公网 IPv4）
+npm run verify:pack                               # 两个包的 npm pack --dry-run（发包内容体检）
 npm run mutate                                    # 定向变异检查（单独执行，勿与 npm test 并行）
 python scripts/time-knobs.py --write              # 修改时间参数后重新生成 TIME-KNOBS.md
 node scripts/observe.ts <档案目录>                # 会话综合诊断（分段 / 审计 / dsh 对齐）
@@ -149,6 +153,16 @@ node scripts/probe-omni-inject-speak.mjs          # 真 DashScope 后台同嗓�
 ```
 
 完整工具矩阵与回放脚本见 [docs/TOOLS.md](./docs/TOOLS.md)。
+
+### 持续集成
+
+`.github/workflows/` 下有两个工作流，只在 GitHub 上跑，本地不需要它们：
+
+- `ci.yml`：`guards`（防泄漏扫描、两端 typecheck、时间参数不变量、形式验证、变异检查）
+  与 `test-matrix`（Linux Node 22/24 + Windows Node 22 跑 `npm run test:all`，
+  Linux Node 22 额外做 `verify:pack`）。
+- `model-parity.yml`：只在 VAD / 判停 / 特征相关文件变动时拉取两个 ONNX 模型，
+  按 SHA256 校验后跑真模型单测，并断言 `skipped 0`、`fail 0`（防止静默跳过假绿）。
 
 ---
 

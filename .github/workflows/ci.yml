@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  guards:
+    name: Guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            packages/dsh-voice-web/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies (root)
+        run: npm ci
+
+      - name: Install dependencies (web package)
+        run: npm --prefix packages/dsh-voice-web ci
+
+      - name: Secret scan
+        run: npm run verify:secrets
+
+      - name: Typecheck (root)
+        run: npm run typecheck
+
+      - name: Typecheck (web package)
+        run: npm --prefix packages/dsh-voice-web run typecheck
+
+      - name: Time knob invariants
+        run: python scripts/time-knobs.py --check
+
+      - name: Formal verification (FSM + backchannel)
+        run: npm run verify:formal
+
+      - name: Mutation check
+        run: npm run mutate
+
+  test-matrix:
+    name: Test ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: '22'
+            pack: true
+          - os: ubuntu-latest
+            node: '24'
+            pack: false
+          - os: windows-latest
+            node: '22'
+            pack: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            packages/dsh-voice-web/package-lock.json
+
+      - name: Install dependencies (root)
+        run: npm ci
+
+      - name: Install dependencies (web package)
+        run: npm --prefix packages/dsh-voice-web ci
+
+      - name: Run all tests
+        run: npm run test:all
+
+      - name: Build web package
+        if: matrix.pack
+        run: npm --prefix packages/dsh-voice-web run build
+
+      - name: Verify package contents
+        if: matrix.pack
+        run: npm run verify:pack

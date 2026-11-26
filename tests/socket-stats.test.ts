@@ -52,7 +52,7 @@ test('按块解析：对端地址、retrans（取斜杠后面那个总数）、r
 
 test('没有 retrans 字段时记 null —— 读不到不拿 0 冒充「没重传」', () => {
   const out = parseSsOutput([
-    'ESTAB 0 0 10.0.0.8:1 1.2.3.4:443',
+    'ESTAB 0 0 10.0.0.8:1 192.0.2.4:443',
     '\t cubic rto:200 rtt:1.0/0.1',
   ].join('\n'));
   assert.equal(out[0]?.retrans, null);
@@ -61,7 +61,7 @@ test('没有 retrans 字段时记 null —— 读不到不拿 0 冒充「没重�
 
 test('retrans:0/0 是读到了零次，仍为 0', () => {
   const out = parseSsOutput([
-    'ESTAB 0 0 10.0.0.8:1 1.2.3.4:443',
+    'ESTAB 0 0 10.0.0.8:1 192.0.2.4:443',
     '\t cubic retrans:0/0 rto:200',
   ].join('\n'));
   assert.equal(out[0]?.retrans, 0);

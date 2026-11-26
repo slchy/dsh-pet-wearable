@@ -1,0 +1,85 @@
+name: Model Parity (ONNX)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/vad.ts
+      - src/turn-judge.ts
+      - src/whisper-features.ts
+      - src/runtime/vad-bootstrap.ts
+      - src/runtime/turn-judge-bootstrap.ts
+      - tests/vad-uplink.test.ts
+      - tests/turn-judge.test.ts
+      - models/README.md
+      - .github/workflows/model-parity.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - src/vad.ts
+      - src/turn-judge.ts
+      - src/whisper-features.ts
+      - src/runtime/vad-bootstrap.ts
+      - src/runtime/turn-judge-bootstrap.ts
+      - tests/vad-uplink.test.ts
+      - tests/turn-judge.test.ts
+      - models/README.md
+      - .github/workflows/model-parity.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-parity-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  onnx-parity:
+    name: Real ONNX models
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache ONNX models
+        uses: actions/cache@v4
+        with:
+          path: models/*.onnx
+          key: onnx-models-f6f4407b-2bb02631
+
+      - name: Download models and verify SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          if [ ! -f models/silero_vad.onnx ]; then
+            curl -fsSL -o models/silero_vad.onnx \
+              "https://cdn.jsdelivr.net/gh/snakers4/silero-vad@master/src/silero_vad/data/silero_vad.onnx"
+          fi
+          if [ ! -f models/smart-turn-v3.2-cpu.onnx ]; then
+            curl -fsSL -o models/smart-turn-v3.2-cpu.onnx \
+              "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx"
+          fi
+          cat > /tmp/onnx-models.sha256 <<'EOF'
+          f6f4407b41e05e277e7f5cfd9b9ae957b1dfe763c6076a934734c0b448e09b31  models/silero_vad.onnx
+          2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f  models/smart-turn-v3.2-cpu.onnx
+          EOF
+          sha256sum -c /tmp/onnx-models.sha256
+
+      - name: Run real-model tests (no silent skips)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test tests/vad-uplink.test.ts tests/turn-judge.test.ts | tee /tmp/model-parity.log
+          grep -Eq '^ℹ skipped 0$' /tmp/model-parity.log
+          grep -Eq '^ℹ fail 0$' /tmp/model-parity.log
