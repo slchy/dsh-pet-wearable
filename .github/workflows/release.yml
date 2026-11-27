@@ -154,7 +154,8 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          TARBALL="dist-release/dsh-voice-web-${VERSION}.tgz"
+          # 必须用绝对路径或 ./ 前缀：否则 npm 11 会把 `dir/file.tgz` 误解析为 GitHub owner/repo 简写。
+          TARBALL="${PWD}/dist-release/dsh-voice-web-${VERSION}.tgz"
           if [ ! -f "${TARBALL}" ]; then
             echo "找不到发布包 ${TARBALL}" >&2
             exit 1
