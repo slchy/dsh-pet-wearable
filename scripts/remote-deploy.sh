@@ -28,6 +28,8 @@
 # 本文件必须保持 LF 行尾（见 .gitattributes）：CRLF 会让 heredoc / 续行在 Linux 上失效。
 
 set -euo pipefail
+umask 022
+export PATH="/usr/local/bin:${PATH}"
 
 die() {
   printf 'remote-deploy: %s\n' "$1" >&2
@@ -150,9 +152,11 @@ RELEASE_DIR_REAL="$(readlink -f "${RELEASE_DIR}" 2>/dev/null || printf '%s' "${R
 
 echo "remote-deploy: 解压 ${BUNDLE_PATH} → ${RELEASE_DIR}"
 tar -xzf "${BUNDLE_PATH}" -C "${RELEASE_DIR}"
+# 保证 systemd 服务用户（与 deploy 不同用户时）也能只读访问新版本代码。
+chmod -R u+rwX,go+rX,go-w "${RELEASE_DIR}"
 
 # 只「从 shared 链进来」，绝不反向写 shared。
-for item in .env models tokens.txt MEMORY.md archives certs announce.jsonl; do
+for item in .env models tokens.txt MEMORY.md archives certs tls plugins announce.jsonl; do
   if [ -e "${DEPLOY_PATH}/shared/${item}" ] || [ -L "${DEPLOY_PATH}/shared/${item}" ]; then
     rm -rf -- "${RELEASE_DIR:?}/${item}"
     ln -sfn "${DEPLOY_PATH}/shared/${item}" "${RELEASE_DIR}/${item}"

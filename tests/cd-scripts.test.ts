@@ -363,6 +363,8 @@ test('remote-deploy.sh 是 LF、原子切换、带回滚', () => {
     'cleanup_pre_switch',
     'RELEASE_DIR_REAL',
     'node --input-type=module',
+    'umask 022',
+    'tls',
   ]) {
     assert.ok(script.includes(needle), `缺少 ${needle}`);
   }
