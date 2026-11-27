@@ -13,7 +13,7 @@
 | 产物 | `smart-turn-v3.2-cpu.onnx` · 8 679 182 字节 · SHA-256 `2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f` |
 | 上游 | 模型 <https://huggingface.co/pipecat-ai/smart-turn-v3> · 代码 <https://github.com/pipecat-ai/smart-turn> |
 | 许可证 | **BSD 2-Clause** · `Copyright (c) 2024–2025, Daily`（正文见 §4.1） |
-| 随本仓分发？ | **否**。`models/*.onnx` 在 `.gitignore` 里，按 [models/README.md](./models/README.md) 自己下 |
+| 随本仓分发？ | **不进 git / npm 包**；作为 GitHub Release 可选附件随本 `THIRD-PARTY-NOTICES.md` 一并分发，首次启动亦可自动拉取并校验 SHA-256（见 [models/README.md](./models/README.md)） |
 | 训练数据 | `pipecat-ai/smart-turn-data-v3.1-train`，**CC BY 4.0** —— 我们不下载也不分发它 |
 
 **约束只有两条**：再分发时保留版权声明与免责声明；不得用 Daily 或 pipecat 的名义
@@ -45,7 +45,7 @@ Apache-2.0 §4(a) 还要求**给接收方一份许可证副本** —— 就是 �
 | 产物 | `silero_vad.onnx` · 2 327 524 字节 |
 | 上游 | <https://github.com/snakers4/silero-vad> |
 | 许可证 | **MIT** |
-| 随本仓分发？ | 否（自己下，见 [models/README.md](./models/README.md)） |
+| 随本仓分发？ | 不进 git / npm 包；作为 GitHub Release 可选附件随本声明一并分发（见 [models/README.md](./models/README.md)） |
 
 ## 3.1 TurnSense 音频前端（`bench/eot/turnsense_adapter.py` 里 vendored 的一段）
 

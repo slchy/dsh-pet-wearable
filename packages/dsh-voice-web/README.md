@@ -45,6 +45,12 @@ DASHSCOPE_API_KEY=your_api_key_here
 
 启动 `dsh web` 或 Desktop 后，插件在默认的 `mode: "auto"` 下会自动挂载到宿主的 `/dsh-voice/*` 与 `/dsh-voice/ws`（无需另开端口）；点击右下角桌宠或展开面板即可开麦对话。
 
+### 3. 可选 ONNX 模型放哪（神经 VAD + 声学判停）
+
+- **默认目录**：放入 `~/.voice-agent/models/`（`silero_vad.onnx` 与 `smart-turn-v3.2-cpu.onnx`；也可放当前工作目录 `models/`，或用 `VOICE_MODELS_DIR` / `VOICE_VAD_MODEL` / `TURN_JUDGE_MODEL` 指定）。
+- **首次启动自动获取**：未找到本地模型时默认自动从 [GitHub Releases](https://github.com/slchy/dsh-pet-wearable/releases/latest) / 上游镜像下载到 `~/.voice-agent/models/` 并强制校验 SHA-256（设 `VOICE_AUTO_DOWNLOAD_MODELS=0` 可关闭）。
+- **离线手动放置 / 零模型降级**：可直接从 [GitHub Releases](https://github.com/slchy/dsh-pet-wearable/releases/latest) 下载两个 `.onnx` 附件放入上述目录；不放模型也能正常运行（自动退回能量门与固定窗口）。
+
 ---
 
 ## 核心特性

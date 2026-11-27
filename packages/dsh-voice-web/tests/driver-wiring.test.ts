@@ -428,4 +428,6 @@ test('README 面向 npm 用户且不含旧占位或相对仓库死链', () => {
     false,
     'npm README 不应包含在 npmjs.com 上会 404 的相对仓库链接',
   );
+  assert.ok(readme.includes('~/.voice-agent/models/'), 'npm README 应说明可选 ONNX 模型放置目录');
+  assert.ok(readme.includes('silero_vad.onnx') && readme.includes('smart-turn-v3.2-cpu.onnx'));
 });

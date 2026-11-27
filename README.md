@@ -122,6 +122,11 @@ VOICE_PIPELINE=cascade node src/main.ts --listen 8766 --stt qwen-realtime --tts 
 
 完整 72 项时间旋钮见 [docs/TIME-KNOBS.md](https://github.com/slchy/dsh-pet-wearable/blob/main/docs/TIME-KNOBS.md)（`scripts/time-knobs.py` 守 17 条不变量），部署与 TLS 运维细节见 [docs/OPERATIONS.md](https://github.com/slchy/dsh-pet-wearable/blob/main/docs/OPERATIONS.md)。
 
+> **可选 ONNX 模型放哪**（`silero_vad.onnx` / `smart-turn-v3.2-cpu.onnx`）：
+> - 默认查找 `models/` 与 `~/.voice-agent/models/`（可用 `VOICE_MODELS_DIR` / `VOICE_VAD_MODEL` / `TURN_JUDGE_MODEL` 覆盖）；
+> - 首次启动未找到时自动从 [GitHub Releases](https://github.com/slchy/dsh-pet-wearable/releases/latest) / 上游镜像下载并校验 SHA-256（设 `VOICE_AUTO_DOWNLOAD_MODELS=0` 关闭）；
+> - 离线环境可直接从 [GitHub Releases](https://github.com/slchy/dsh-pet-wearable/releases/latest) 手动下载两个 `.onnx` 附件放入上述目录，缺模型自动降级不阻断启动。
+
 | 环境变量 / 参数 | 默认值 | 说明 |
 |:---|:---:|:---|
 | `VOICE_PIPELINE` | （未设则推断） | `live` 或 `cascade`（显式值优先，非法值启动即拒；未设时 `OMNI_SHADOW=1` 且 `OMNI_ANSWER!=off` 推断为 `live`） |

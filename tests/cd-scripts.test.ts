@@ -421,6 +421,12 @@ test('release.yml 有质量闸门、最小权限与双模 npm 发布', () => {
     yaml.includes('publish_root_npm') && yaml.includes('dsh-pet-wearable-${VERSION}.tgz'),
     'release.yml 应支持可选的 publish_root_npm 刷新根包 npm 页面',
   );
+  assert.ok(
+    yaml.includes('fetch-onnx-models.mjs')
+      && yaml.includes('dist-models/silero_vad.onnx')
+      && yaml.includes('dist-models/smart-turn-v3.2-cpu.onnx'),
+    'release.yml 应将两个经 SHA-256 校验的可选 ONNX 模型挂为 GitHub Release 附件',
+  );
   assert.ok(!yaml.includes('StrictHostKeyChecking=no'));
 });
 

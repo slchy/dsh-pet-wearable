@@ -229,10 +229,30 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/fetch-onnx-models.mjs
+            THIRD-PARTY-NOTICES.md
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - uses: actions/download-artifact@v4
         with:
           name: dist-release
           path: dist-release
+
+      - name: Cache optional ONNX models
+        uses: actions/cache@v4
+        with:
+          path: dist-models/*.onnx
+          key: onnx-models-f6f4407b-2bb02631
+
+      - name: Fetch optional ONNX model assets (verified SHA-256)
+        run: node scripts/fetch-onnx-models.mjs --out-dir dist-models
 
       - name: Create or update release
         env:
@@ -247,6 +267,9 @@ jobs:
             "dist-release/dsh-voice-web-${VERSION}.tgz"
             "dist-release/dsh-pet-wearable-server-${VERSION}.tar.gz"
             "dist-release/SHA256SUMS.txt"
+            "dist-models/silero_vad.onnx"
+            "dist-models/smart-turn-v3.2-cpu.onnx"
+            "THIRD-PARTY-NOTICES.md"
           )
           for file in "${FILES[@]}"; do
             if [ ! -f "${file}" ]; then
