@@ -47,7 +47,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: |
             package-lock.json
@@ -103,7 +103,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: |
             package-lock.json
@@ -145,7 +145,7 @@ jobs:
       # 未配置 NPM_TOKEN 的 Trusted Publishing 分支会先撞上「变量未定义」。
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Publish to npm
         env:

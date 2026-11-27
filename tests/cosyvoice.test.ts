@@ -625,7 +625,12 @@ test('首块迟迟不到：看门狗在**事中**报一次，并带上本端端�
 
     assert.ok(bytes > 0, '这一轮最终还是要出声');
     assert.equal(stalls.length, 1, '一轮只报一次');
-    assert.ok(stalls[0]!.elapsed_ms >= 80, `elapsed_ms=${stalls[0]!.elapsed_ms} 应 >= 阈值`);
+    // libuv setTimeout 按整毫秒 tick 调度，Linux 上 80ms 定时偶发以 performance.now() 量出 79ms；
+    // 放宽 5ms 抖动容差，同时断言 < 300ms 证明确实是在首块到达前的「事中」触发。
+    assert.ok(
+      stalls[0]!.elapsed_ms >= 75 && stalls[0]!.elapsed_ms < 300,
+      `elapsed_ms=${stalls[0]!.elapsed_ms} 应在看门狗阈值附近且早于首块到达`,
+    );
     // 没有本端端口就没法按 socket 精确采 ss —— 那这个事件等于废的
     assert.ok(stalls[0]!.local_port > 0, `local_port=${stalls[0]!.local_port}`);
   } finally {

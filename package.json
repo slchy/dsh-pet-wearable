@@ -57,7 +57,7 @@
     "mutate": "python scripts/mutation-check.py",
     "verify:formal": "node tests/fsm-verify.ts && node tests/backchannel-verify.ts",
     "verify:secrets": "node scripts/secret-scan.mjs",
-    "verify:pack": "npm pack --dry-run && npm --prefix packages/dsh-voice-web pack --dry-run",
+    "verify:pack": "npm pack --dry-run && cd packages/dsh-voice-web && npm pack --dry-run",
     "version:bump": "node scripts/bump-version.mjs",
     "verify:release": "node scripts/verify-release-pack.mjs --out-dir tmp/release-check",
     "prepublishOnly": "npm run typecheck && npm test"

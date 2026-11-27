@@ -24,7 +24,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: |
             package-lock.json
@@ -68,15 +68,18 @@ jobs:
         include:
           - os: ubuntu-latest
             node: '22'
-            pack: true
+            pack: false
+            low_concurrency: true
           - os: ubuntu-latest
             node: '24'
-            pack: false
+            pack: true
+            low_concurrency: false
           # Windows 跑 Node 24（避开 Node 22.x Windows 下 node:test #processRawBuffer 的偶发 IPC 抖动；
           # Node 22 下限兼容性继续由 ubuntu-latest / Node 22 守住）
           - os: windows-latest
             node: '24'
             pack: false
+            low_concurrency: false
     steps:
       - uses: actions/checkout@v4
 
@@ -95,7 +98,15 @@ jobs:
         run: npm --prefix packages/dsh-voice-web ci
 
       - name: Run all tests
+        if: ${{ !matrix.low_concurrency }}
         run: npm run test:all
+
+      - name: Run all tests (Node 22 low concurrency)
+        if: ${{ matrix.low_concurrency }}
+        run: |
+          node --test --test-concurrency=2 tests/*.test.ts tests/contracts/*.test.ts
+          npm run test:bench
+          npm run test:web
 
       - name: Build web package
         if: matrix.pack

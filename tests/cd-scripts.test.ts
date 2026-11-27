@@ -435,3 +435,19 @@ test('deploy.yml 用 known_hosts 严格校验并只走 SSH', () => {
   const ips = yaml.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) ?? [];
   assert.deepEqual([...new Set(ips)], [], '工作流里不允许出现 IPv4');
 });
+
+test('dsh-voice-web README 面向 npm 用户且无死链或旧占位', () => {
+  const readme = readFileSync(join(repoRoot, 'packages', 'dsh-voice-web', 'README.md'), 'utf8');
+  assert.ok(!readme.includes('0.0.0-stage'), 'npm README 不应残留 0.0.0-stage 占位文案');
+  assert.ok(!readme.includes('尚未发布'), 'npm README 不应残留「尚未发布」文案');
+  assert.ok(readme.includes('dsh plugin --profile web add dsh-voice-web'), '缺少 npm 安装命令');
+  assert.ok(
+    readme.includes('https://github.com/slchy/dsh-pet-wearable'),
+    '缺少指向主项目 GitHub 的绝对链接',
+  );
+  assert.equal(
+    /\]\(\s*(?:\.\/(?:docs|src)\/|\.\.\/)/.test(readme),
+    false,
+    'npm README 不应包含在 npmjs.com 上会 404 的相对仓库链接',
+  );
+});
