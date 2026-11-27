@@ -736,8 +736,9 @@ test('注入 CascadeVoiceEngine：插话通过 AbortSignal 取消在途请求', 
   );
 });
 
-test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻停并留下残句', async () => {
+test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻发 audio.stop 并留下残句', async () => {
   const sent: Buffer[] = [];
+  const calls: string[] = [];
   const fsm = new DialogFsm(() => {}, { now: () => clock.now() });
   const runner = new TurnRunner({
     clock,
@@ -747,6 +748,7 @@ test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻停�
       sendAudio: (pcm) => { sent.push(pcm); },
       sendControl: () => {},
     },
+    sendCall: (call) => { calls.push(call.op); },
     fsm,
     playbackTailMs: 0,
     onTurnFinished: () => {},
@@ -777,6 +779,18 @@ test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻停�
   const before = sent.length;
   const cancelledAt = Date.now();
   runner.cancelCanned();
+  // 重复取消不发第二条 audio.stop
+  runner.cancelCanned();
+  assert.deepEqual(calls, ['audio.stop'], '播报打断必须立刻下发一次 audio.stop 清设备缓冲');
+  // 同步取走残句（模拟 DialogRuntime.interruptCanned / clearAnnounce），结束后不得写回复活
+  const residue = runner.takeCannedResidue();
+  assert.ok(residue, '没念完的部分要同步留在 takeCannedResidue');
+  assert.ok(residue.text.length > 0);
+  assert.ok(
+    full.includes(residue.text.replace(/\s+/g, '')),
+    `残句应当是原文的一段，实际「${residue.text}」`,
+  );
+
   const result = await pending;
 
   assert.equal(result.interrupted, true);
@@ -787,14 +801,41 @@ test('speakAudioAnswer：流式下发、播放等待中 cancelCanned 立刻停�
     Date.now() - cancelledAt < 400,
     `掐断后还等了 ${Date.now() - cancelledAt} ms（不该把剩下的播放等完）`,
   );
-  const residue = runner.takeCannedResidue();
-  assert.ok(residue, '没念完的部分要留在 takeCannedResidue');
-  assert.ok(residue.text.length > 0);
-  assert.ok(
-    full.includes(residue.text.replace(/\s+/g, '')),
-    `残句应当是原文的一段，实际「${residue.text}」`,
-  );
-  assert.equal(runner.takeCannedResidue(), null, '取一次就没了');
+  assert.equal(runner.takeCannedResidue(), null, '取一次就没了，播放循环退出后不能再复活');
+});
+
+test('speakCanned 正常播完后释放令牌：事后 cancelCanned 不误发 audio.stop', async () => {
+  const vclock = new VirtualClock();
+  const calls: string[] = [];
+  const fsm = new DialogFsm(() => {}, { now: () => vclock.now() });
+  const runner = new TurnRunner({
+    clock: vclock,
+    agent: unusedAgent(),
+    tts: {
+      name: 'stub',
+      sampleRate: 24_000,
+      async *synthesize() {
+        yield Buffer.alloc(4_800, 1); // 100 ms
+      },
+    },
+    downlink: {
+      sendAudio: () => {},
+      sendControl: () => {},
+    },
+    sendCall: (call) => { calls.push(call.op); },
+    fsm,
+    playbackTailMs: 0,
+    onTurnFinished: () => {},
+    log: () => {},
+  });
+
+  const done = runner.speakCanned('简短提示');
+  await vclock.runUntil(vclock.now() + 500);
+  await done;
+
+  runner.cancelCanned();
+  assert.deepEqual(calls, [], '播报已经自然结束，后续说话不该误发 audio.stop');
+  assert.equal(runner.takeCannedResidue(), null);
 });
 
 test('thinking→thinking 顶掉旧轮后，旧轮恢复时不再下发音频', async () => {

@@ -305,9 +305,9 @@ function openLive(): LiveRig {
     originalReconcile(info);
   };
   const originalCanned = runtime.runner.cancelCanned.bind(runtime.runner);
-  runtime.runner.cancelCanned = () => {
+  runtime.runner.cancelCanned = (opts) => {
     stops.canned += 1;
-    originalCanned();
+    originalCanned(opts);
   };
   live.setTaskReporter((report) => {
     reports.push(report);
@@ -557,9 +557,15 @@ test('插话不取消后台 dsh；忙时 defer；播报中再插话立刻停', a
         await h.clock.drain();
         const bytes = downlinkBytes(h);
         assert.ok(bytes > 0);
+        const beforeAudioStops = h.calls.filter((call) => call.op === 'audio.stop').length;
         h.runtime.dispatch({ type: 'partial', text: '等一下' });
         assert.equal(h.stops.announce, beforeAnnounce + 1, 'cancelAnnounce 要立刻停 omni 汇报');
         assert.equal(h.stops.canned, beforeCanned + 1, 'cancelCanned 要立刻停下行');
+        assert.equal(
+          h.calls.filter((call) => call.op === 'audio.stop').length,
+          beforeAudioStops + 1,
+          '播报中插话必须下发 audio.stop 清空设备/浏览器播放缓冲',
+        );
         assert.equal(h.socket.count('response.cancel'), beforeCancels + 1);
         assert.equal(downlinkBytes(h), bytes, '插话之后不得再往下发音频');
         h.socket.message({ type: 'response.done', response: { status: 'cancelled' } });

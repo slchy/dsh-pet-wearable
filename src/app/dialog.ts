@@ -901,7 +901,7 @@ export class DialogRuntime {
     }
     this.announceRetry?.();
     this.announceRetry = null;
-    this.runner.cancelCanned();
+    this.runner.cancelCanned({ stopAudio: false });
     this.photos.dispose();
     // 回执钩子是**进程级 agent 上的一个槽**：只有「我还是当前那条连接」时才摘。
     // 旧连接的 `dispose()` 晚于新连接挂载是弱网重连的常态，无条件摘会把新连接

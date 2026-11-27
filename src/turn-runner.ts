@@ -269,6 +269,8 @@ export class TurnRunner {
     cancelled: boolean;
     /** 缺省用 TTS 采样率。实时音频流（`speakAudioAnswer`）可以不同 */
     sampleRate?: number;
+    /** 实时音频流的当前转写（`cancelCanned` 同步读一次，避免结束后再次覆盖残句） */
+    readText?: () => string;
   } | null = null;
   /** 被打断的旁白还没念完的那一段，等下一轮结束再补播。一次性。 */
   private cannedResidue: { text: string; emotion?: string } | null = null;
@@ -447,45 +449,51 @@ export class TurnRunner {
     const current = { text, emotion, sentBytes: 0, firstChunkAt: -1, cancelled: false, ephemeral };
     this.canned = current;
     const run = async (): Promise<void> => {
-      if (!current.cancelled && this.options.fsm.state !== 'closed' && text.trim() !== '') {
-        safeEmitUi(this.options.onUiEvent, {
-          type: 'announce',
-          text,
-          emotion: asEmotion(emotion),
-        });
-      }
-      const startedAt = this.options.clock.now();
-      let firstChunkAtMs = -1;
-      for await (const chunk of this.options.tts.synthesize(text, emotion)) {
-        if (current.cancelled || this.options.fsm.state === 'closed') {
-          if (current.cancelled) {
-            this.log(ephemeral ? '  回执    被正式回答顶掉，停止下发' : '  旁白    被打断，停止下发');
-          } else {
-            this.log(ephemeral ? '  回执    连接已关闭，停止下发' : '  旁白    连接已关闭，停止下发');
+      try {
+        if (!current.cancelled && this.options.fsm.state !== 'closed' && text.trim() !== '') {
+          safeEmitUi(this.options.onUiEvent, {
+            type: 'announce',
+            text,
+            emotion: asEmotion(emotion),
+          });
+        }
+        const startedAt = this.options.clock.now();
+        let firstChunkAtMs = -1;
+        for await (const chunk of this.options.tts.synthesize(text, emotion)) {
+          if (current.cancelled || this.options.fsm.state === 'closed') {
+            if (current.cancelled) {
+              this.log(ephemeral ? '  回执    被正式回答顶掉，停止下发' : '  旁白    被打断，停止下发');
+            } else {
+              this.log(ephemeral ? '  回执    连接已关闭，停止下发' : '  旁白    连接已关闭，停止下发');
+            }
+            return;
           }
-          return;
+          if (firstChunkAtMs < 0) {
+            firstChunkAtMs = this.options.clock.now() - startedAt;
+            current.firstChunkAt = this.options.clock.now();
+          }
+          current.sentBytes += chunk.length;
+          this.options.onDownlinkChunk?.(chunk);
+          this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
         }
-        if (firstChunkAtMs < 0) {
-          firstChunkAtMs = this.options.clock.now() - startedAt;
-          current.firstChunkAt = this.options.clock.now();
+        const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
+        this.log(
+          `  ${ephemeral ? '回执' : '旁白'}    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
+          + `（首块 ${firstChunkAtMs < 0 ? '—' : `${Math.round(firstChunkAtMs)}ms`}）`,
+        );
+        // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
+        const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
+        while (
+          this.options.clock.now() < until
+          && !current.cancelled
+          && this.options.fsm.state !== 'closed'
+        ) {
+          await this.wait(PLAYBACK_POLL_MS);
         }
-        current.sentBytes += chunk.length;
-        this.options.onDownlinkChunk?.(chunk);
-        this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
-      }
-      const seconds = pcm16DurationMs(current.sentBytes, this.options.tts.sampleRate) / 1000;
-      this.log(
-        `  ${ephemeral ? '回执' : '旁白'}    ${JSON.stringify(text)} ${current.sentBytes} B / ${seconds.toFixed(2)} s`
-        + `（首块 ${firstChunkAtMs < 0 ? '—' : `${Math.round(firstChunkAtMs)}ms`}）`,
-      );
-      // 每 100 ms 看一眼有没有被取消：用户说完「算了」不该还要等这段音频"播完"
-      const until = this.options.clock.now() + seconds * 1000 + this.options.playbackTailMs;
-      while (
-        this.options.clock.now() < until
-        && !current.cancelled
-        && this.options.fsm.state !== 'closed'
-      ) {
-        await this.wait(PLAYBACK_POLL_MS);
+      } finally {
+        if (this.canned === current) {
+          this.canned = null;
+        }
       }
     };
     const next = this.speechChain.then(run, run);
@@ -509,10 +517,12 @@ export class TurnRunner {
     this.cannedResidue = null;
     const token = {
       text: '',
+      ...(emotion === undefined ? {} : { emotion }),
       sentBytes: 0,
       firstChunkAt: -1,
       cancelled: false,
       sampleRate: answer.sampleRate,
+      readText: () => answer.transcript(),
     };
     this.canned = token;
     const run = async (): Promise<{
@@ -537,6 +547,18 @@ export class TurnRunner {
           this.options.onDownlinkChunk?.(chunk);
           this.options.downlink.sendAudio(pcm16Gain(chunk, this.options.ttsGain ?? 1));
         }
+        // 流式块收齐且没被打断时立刻推浮层气泡，不等整段播放等待结束；
+        // 一个字节都没播（调用方会退回 speakCanned）或已被打断时不再补播报气泡。
+        if (!token.cancelled && spokenBytes > 0 && this.options.onUiEvent !== undefined) {
+          const spoken = answer.transcript();
+          if (spoken.trim() !== '') {
+            safeEmitUi(this.options.onUiEvent, {
+              type: 'announce',
+              text: spoken,
+              emotion: asEmotion(emotion),
+            });
+          }
+        }
         if (!token.cancelled && spokenBytes > 0 && firstAudioAt >= 0) {
           const until = firstAudioAt
             + pcm16DurationMs(spokenBytes, answer.sampleRate)
@@ -547,25 +569,6 @@ export class TurnRunner {
             && this.options.fsm.state !== 'closed'
           ) {
             await this.wait(PLAYBACK_POLL_MS);
-          }
-        }
-        if (token.cancelled && spokenBytes > 0) {
-          const audioSeconds = pcm16DurationMs(spokenBytes, answer.sampleRate) / 1000;
-          const playedSeconds = firstAudioAt >= 0
-            ? Math.min(audioSeconds, (this.options.clock.now() - firstAudioAt) / 1000)
-            : 0;
-          const rest = remainingSpeech(answer.transcript(), playedSeconds);
-          this.cannedResidue = rest === '' ? null : { text: rest };
-        }
-        // 一个字节都没播、也没被掐：调用方会退回 `speakCanned`，别在这里先发一条空播报。
-        if (this.options.onUiEvent !== undefined && (spokenBytes > 0 || token.cancelled)) {
-          const spoken = answer.transcript();
-          if (spoken.trim() !== '') {
-            safeEmitUi(this.options.onUiEvent, {
-              type: 'announce',
-              text: spoken,
-              emotion: asEmotion(emotion),
-            });
           }
         }
         return {
@@ -734,7 +737,7 @@ export class TurnRunner {
    * 和从首块到现在过了多久（播放快不起来，也就是它更小的情况）。只取前者会
    * 严重高估 —— TTS 一次性把整段吐出来时，字节数等于全长，剩余部分就成了空串。
    */
-  cancelCanned(): void {
+  cancelCanned(options?: { readonly stopAudio?: boolean }): void {
     const current = this.canned;
     if (current === null || current.cancelled) {
       return;
@@ -748,13 +751,18 @@ export class TurnRunner {
       ? 0
       : this.options.clock.now() - current.firstChunkAt;
     const heardMs = Math.min(sentMs, elapsedMs);
-    // **一个字都没发出去**：这不是「念了一半」，是全没念。记残句的后果是下一轮收到
-    // 「刚才那条后台汇报你只念了一半」的注记，模型会把用户从没听过的整条汇报
-    // 塞进回答里。合成首包那 ~300 ms 里被掐，只可能是这种情况。
+    // **一个字都没发出去**：设备缓冲里还没有这段音频，不发 audio.stop，也不记残句
+    // （记残句会让下一轮收到「刚才那条后台汇报你只念了一半」的假注记）。
     if (current.sentBytes === 0) {
       return;
     }
-    const rest = remainingSpeech(current.text, heardMs / 1000);
+    // 音频常以 4–6 倍速提前灌进设备/浏览器缓冲；光停服务端循环挡不住已经排进播放器的那十几秒，
+    // 必须立刻下发 audio.stop 清缓冲（旁白不占状态机，KernelPorts.stopDeviceAudio 不会替它发）。
+    if (options?.stopAudio !== false && this.options.fsm.state !== 'closed') {
+      this.options.sendCall?.({ op: 'audio.stop' });
+    }
+    const fullText = current.readText?.() ?? current.text;
+    const rest = remainingSpeech(fullText, heardMs / 1000);
     if (rest !== '') {
       this.cannedResidue = {
         text: rest,

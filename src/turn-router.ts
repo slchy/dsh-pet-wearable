@@ -113,27 +113,137 @@ export function isRealtimeFactRequest(text: string): boolean {
 }
 
 /**
- * 「不要了」——用户**显式下令取消**在跑的委派任务。
+ * 「不要了 / 取消任务」——用户**显式下令取消**在跑的委派任务。
  *
  * 与「插话」严格分开：插话是"我先说别的"，dsh 那一轮**不取消**（活儿取消不了，
  * 取消只作废下游输出，丢的是用户唯一能听到的答案），跑完的答案回注记忆；
  * 只有这一句才是真的"别查了"。
  *
- * 判据要求整句就是那几个说法：`算了算了他算得对` 这种是正常说话，不能当中断指令。
+ * 判据要求整句完全由取消短语（及可选口语前缀/语气词）拼接而成：
+ * 支持「取消任务」「不用查了，取消任务」「取消任务取消任务」这类组合或连喊，
+ * 同时挡住「算了算了他算得对」「为什么没有取消任务」等含其他实义的正常说话。
  */
-const CANCEL_CUES: ReadonlySet<string> = new Set([
-  '算了', '不要了', '不用了', '别查了', '不查了', '不用查了',
-  '取消', '停下', '停', '停一下', '别弄了', '不用弄了',
-]);
+const CANCEL_PHRASES: readonly string[] = [
+  '把刚才的任务取消掉',
+  '把这个任务取消掉',
+  '把那个任务取消掉',
+  '把当前任务取消掉',
+  '把刚才的任务取消',
+  '把这个任务取消',
+  '把那个任务取消',
+  '把当前任务取消',
+  '取消刚才的任务',
+  '把任务取消掉',
+  '取消这个任务',
+  '取消那个任务',
+  '取消当前任务',
+  '把任务取消',
+  '把任务停掉',
+  '把任务停了',
+  '不要执行了',
+  '不用执行了',
+  '取消任务',
+  '任务取消',
+  '停止任务',
+  '终止任务',
+  '中止任务',
+  '中断任务',
+  '撤销任务',
+  '撤回任务',
+  '停止执行',
+  '别执行了',
+  '不执行了',
+  '不要查了',
+  '不用查了',
+  '不要弄了',
+  '不用弄了',
+  '不要做了',
+  '不用做了',
+  '不要管了',
+  '不用管了',
+  '不用跑了',
+  '不用搜了',
+  '取消掉',
+  '不要了',
+  '不用了',
+  '别查了',
+  '不查了',
+  '停一下',
+  '停一停',
+  '别弄了',
+  '不弄了',
+  '别做了',
+  '不做了',
+  '别管了',
+  '不管了',
+  '别跑了',
+  '不跑了',
+  '别搜了',
+  '不搜了',
+  '算了',
+  '取消',
+  '停止',
+  '终止',
+  '中止',
+  '中断',
+  '撤销',
+  '停下',
+  '停掉',
+  '停了',
+  '停',
+].sort((a, b) => b.length - a.length);
+
+const CANCEL_PREFIX_SOFTENERS: readonly string[] = [
+  '那就', '帮我', '行了', '好了', '请', '先', '那', '哎', '诶', '唉',
+].sort((a, b) => b.length - a.length);
+
+const CANCEL_TRAILING_PARTICLES = new Set(['了', '吧', '啊', '呀', '嘛', '呗', '哈', '啦']);
 
 /** 这句是不是"取消在跑的任务"。调用方还要自己确认真有活儿在跑 */
 export function isCancelRequest(text: string): boolean {
-  const t = text.replace(/[\s，。、！？；：,.!?;:"'“”‘’]/gu, '');
-  if ([...t].length > 8) {
+  const t = text.replace(/[\s，。、！？；：,.!?;:"'“”‘’~～]/gu, '');
+  if (t.length === 0 || [...t].length > 16) {
     return false;
   }
-  const bare = t.replace(/(吧|啊|呀|嘛|呗|哈)$/u, '');
-  return CANCEL_CUES.has(bare) || CANCEL_CUES.has(t);
+
+  let idx = 0;
+  let cancelMatches = 0;
+  while (idx < t.length) {
+    // 允许每段取消短语前带口语过渡词（如「哎，先帮我取消任务」「好了，不用查了」），
+    // 但过渡词本身不计为取消，不能单凭「好了」「行了」触发取消。
+    let consumedSoftener = true;
+    while (consumedSoftener && idx < t.length) {
+      consumedSoftener = false;
+      for (const prefix of CANCEL_PREFIX_SOFTENERS) {
+        if (t.startsWith(prefix, idx)) {
+          idx += prefix.length;
+          consumedSoftener = true;
+          break;
+        }
+      }
+    }
+    if (idx >= t.length) {
+      return false;
+    }
+
+    let matched = false;
+    for (const phrase of CANCEL_PHRASES) {
+      if (t.startsWith(phrase, idx)) {
+        idx += phrase.length;
+        cancelMatches += 1;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return false;
+    }
+
+    while (idx < t.length && CANCEL_TRAILING_PARTICLES.has(t[idx]!)) {
+      idx += 1;
+    }
+  }
+  return cancelMatches > 0;
 }
 
 // ---------------------------------------------------------------- 句子的形态

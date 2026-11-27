@@ -55,6 +55,11 @@ test('「嗯」一声不算打断：不重新合成，也不留残句', async ()
       null,
       '语气词不该把旁白掐断 —— 掐了就得重新合成，等于白念一遍',
     );
+    assert.equal(
+      sim.calls.filter((call) => call.op === 'audio.stop').length,
+      0,
+      '语气词不能发 audio.stop',
+    );
     await sim.until(6_000);
     assert.equal(sim.downlink.bytes, full, '没被打断就不该多合成一遍');
   } finally {
@@ -73,6 +78,11 @@ test('真打断之后：不自动重播，但把没念完的部分交给下一�
     //   `cancelCanned` 取「已下发」和「已过时间」的较小值，所以进度按时间走。）
     await sim.until(2_000);
     await sim.partial('等一下');
+    assert.equal(
+      sim.calls.filter((call) => call.op === 'audio.stop').length,
+      1,
+      '播报中插话必须立刻下发 audio.stop 清空设备/浏览器播放缓冲',
+    );
 
     await sim.until(9_000);
     assert.equal(
@@ -106,6 +116,11 @@ test('双击「别念了」之后，连注记都不留', async () => {
     sim.announce(REPORT);
     await sim.until(500);
     sim.runtime.clearAnnounce();
+    assert.equal(
+      sim.calls.filter((call) => call.op === 'audio.stop').length,
+      1,
+      '双击关播报必须下发 audio.stop',
+    );
     await sim.until(9_000);
     assert.equal(sim.downlink.bytes, full, '明确要求别念了，就不该自己补播回来');
 
