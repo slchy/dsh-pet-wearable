@@ -365,6 +365,7 @@ test('remote-deploy.sh 是 LF、原子切换、带回滚', () => {
     'node --input-type=module',
     'umask 022',
     'tls',
+    'ONNXRUNTIME_NODE_INSTALL',
   ]) {
     assert.ok(script.includes(needle), `缺少 ${needle}`);
   }

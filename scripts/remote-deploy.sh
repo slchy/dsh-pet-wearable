@@ -166,7 +166,8 @@ done
 
 if [ "${SKIP_NPM_CI}" != "1" ]; then
   echo "remote-deploy: npm ci --omit=dev"
-  ( cd "${RELEASE_DIR}" && npm ci --omit=dev --no-audit --no-fund )
+  # 服务端仅跑 CPU ONNX（Silero VAD / Smart Turn），默认跳过 onnxruntime-node 从 NuGet 拉取 CUDA/TensorRT GPU 库。
+  ( cd "${RELEASE_DIR}" && ONNXRUNTIME_NODE_INSTALL="${ONNXRUNTIME_NODE_INSTALL:-skip}" npm ci --omit=dev --no-audit --no-fund )
 fi
 
 # ---------------------------------------------------------------- 切软链与回滚
