@@ -1,0 +1,236 @@
+name: Deploy
+
+# 服务端部署：从指定 ref 打一份干净部署包，上传到服务器，交给
+# `scripts/remote-deploy.sh` 做「releases/<id> + shared + current 软链」原子切换、
+# systemd 重启、探活与失败回滚。
+#
+# 两个入口：
+#   - `workflow_call`：`release.yml` 在 GitHub Release 之后自动调用；
+#   - `workflow_dispatch`：人肉指定任意 ref 热部署（填历史 tag 就是回滚）。
+#
+# 凭据只经 SSH 密钥与 known_hosts 传递；日志里不打印任何 secret 值。
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: '要部署的 git ref（tag / branch / SHA）'
+        required: true
+        type: string
+      dry_run:
+        description: '只打包并打印配置摘要，不连服务器'
+        required: false
+        type: boolean
+        default: false
+      skip_npm_ci:
+        description: '跳过服务器上的 npm ci（依赖没变时用）'
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要部署的 git ref（tag / branch / SHA）'
+        required: true
+        type: string
+        default: 'main'
+      dry_run:
+        description: '只打包并打印配置摘要，不连服务器'
+        type: boolean
+        default: false
+      skip_npm_ci:
+        description: '跳过服务器上的 npm ci（依赖没变时用）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Secret scan
+        run: npm run verify:secrets
+
+      - name: Pack server bundle
+        run: node scripts/pack-server-bundle.mjs --out "${RUNNER_TEMP}/dsh-server.tar.gz"
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run == true }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE }}
+        run: |
+          set -euo pipefail
+          echo "部署包：${RUNNER_TEMP}/dsh-server.tar.gz"
+          ls -lh "${RUNNER_TEMP}/dsh-server.tar.gz"
+          sha256sum "${RUNNER_TEMP}/dsh-server.tar.gz"
+          echo
+          echo "配置状态（只报有/无，不打印值）："
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DEPLOY_PATH DEPLOY_SERVICE; do
+            value="${!name:-}"
+            if [ -n "${value}" ]; then
+              echo "  ${name}: 已配置"
+            else
+              echo "  ${name}: 缺失"
+            fi
+          done
+          if [ -n "${DEPLOY_PORT:-}" ]; then
+            echo "  DEPLOY_PORT: 已配置（可选）"
+          else
+            echo "  DEPLOY_PORT: 未配置（缺省 22）"
+          fi
+          echo
+          echo "dry-run：不连接服务器。"
+
+      - name: Check deploy configuration
+        if: ${{ inputs.dry_run != true }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DEPLOY_PATH DEPLOY_SERVICE; do
+            value="${!name:-}"
+            if [ -z "${value}" ]; then
+              missing+=("${name}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "缺少部署配置：${missing[*]}" >&2
+            echo "在 GitHub → Settings → Environments → production 里补齐 Secrets / Variables。" >&2
+            echo "完整清单与获取方式见 docs/CD.md。" >&2
+            exit 1
+          fi
+          # DEPLOY_PORT 选填；填了就必须是 1..65535 的纯数字。
+          if [ -n "${DEPLOY_PORT:-}" ]; then
+            case "${DEPLOY_PORT}" in
+              *[!0-9]*)
+                echo "DEPLOY_PORT 必须是 1..65535 的纯数字（收到非数字值）" >&2
+                exit 1
+                ;;
+            esac
+            if [ "${DEPLOY_PORT}" -lt 1 ] || [ "${DEPLOY_PORT}" -gt 65535 ]; then
+              echo "DEPLOY_PORT 超出 1..65535" >&2
+              exit 1
+            fi
+            echo "DEPLOY_PORT：已配置（可选）。"
+          else
+            echo "DEPLOY_PORT：未配置，使用缺省 22。"
+          fi
+          echo "部署配置齐全（未打印任何值）。"
+
+      - name: Write SSH credentials
+        if: ${{ inputs.dry_run != true }}
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${DEPLOY_SSH_KEY}" > "${RUNNER_TEMP}/deploy_key"
+          chmod 600 "${RUNNER_TEMP}/deploy_key"
+          printf '%s\n' "${DEPLOY_KNOWN_HOSTS}" > "${RUNNER_TEMP}/known_hosts"
+          chmod 600 "${RUNNER_TEMP}/known_hosts"
+
+      - name: Upload bundle and deploy over SSH
+        if: ${{ inputs.dry_run != true }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE }}
+          DEPLOY_HEALTH_PORT: ${{ vars.DEPLOY_HEALTH_PORT }}
+          DEPLOY_KEEP_RELEASES: ${{ vars.DEPLOY_KEEP_RELEASES }}
+          DEPLOY_EXTRA_SERVICES: ${{ vars.DEPLOY_EXTRA_SERVICES }}
+          SKIP_NPM_CI_INPUT: ${{ inputs.skip_npm_ci }}
+        run: |
+          set -euo pipefail
+          REMOTE_DIR="/tmp/dsh-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # 带上短 SHA，服务器 releases/ 目录里一眼能对上本次部署的 commit。
+          RELEASE_ID="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:7}"
+          BUNDLE_PATH="${REMOTE_DIR}/dsh-server.tar.gz"
+          SSH_KEY="${RUNNER_TEMP}/deploy_key"
+          KNOWN_HOSTS="${RUNNER_TEMP}/known_hosts"
+          # `-o Port=` 对 ssh 与 scp 同时生效，不必区分 -p / -P。
+          SSH_OPTS=(
+            -i "${SSH_KEY}"
+            -o Port="${DEPLOY_PORT:-22}"
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${KNOWN_HOSTS}"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o ConnectTimeout=20
+          )
+
+          if [ "${SKIP_NPM_CI_INPUT}" = "true" ]; then
+            SKIP_NPM_CI_VALUE=1
+          else
+            SKIP_NPM_CI_VALUE=0
+          fi
+
+          # 远端命令里用到的值先做 shell 安全转义（%q），避免值含空格 / 引号时拼坏命令。
+          printf -v Q_REMOTE_DIR '%q' "${REMOTE_DIR}"
+          printf -v Q_RELEASE_ID '%q' "${RELEASE_ID}"
+          printf -v Q_DEPLOY_PATH '%q' "${DEPLOY_PATH}"
+          printf -v Q_DEPLOY_SERVICE '%q' "${DEPLOY_SERVICE}"
+          printf -v Q_BUNDLE_PATH '%q' "${BUNDLE_PATH}"
+          printf -v Q_DEPLOY_HEALTH_PORT '%q' "${DEPLOY_HEALTH_PORT:-}"
+          printf -v Q_DEPLOY_KEEP_RELEASES '%q' "${DEPLOY_KEEP_RELEASES:-5}"
+          printf -v Q_DEPLOY_EXTRA_SERVICES '%q' "${DEPLOY_EXTRA_SERVICES:-}"
+          printf -v Q_SKIP_NPM_CI '%q' "${SKIP_NPM_CI_VALUE}"
+
+          echo "创建远端临时目录 ${REMOTE_DIR}"
+          ssh "${SSH_OPTS[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p ${Q_REMOTE_DIR}"
+
+          echo "上传部署包与部署脚本"
+          scp -q "${SSH_OPTS[@]}" \
+            "${RUNNER_TEMP}/dsh-server.tar.gz" \
+            scripts/remote-deploy.sh \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_DIR}/"
+
+          echo "远端执行 remote-deploy.sh"
+          ssh "${SSH_OPTS[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -euo pipefail
+             trap 'rm -rf ${Q_REMOTE_DIR}' EXIT
+             DEPLOY_PATH=${Q_DEPLOY_PATH} \
+             DEPLOY_SERVICE=${Q_DEPLOY_SERVICE} \
+             RELEASE_ID=${Q_RELEASE_ID} \
+             BUNDLE_PATH=${Q_BUNDLE_PATH} \
+             DEPLOY_HEALTH_PORT=${Q_DEPLOY_HEALTH_PORT} \
+             DEPLOY_KEEP_RELEASES=${Q_DEPLOY_KEEP_RELEASES} \
+             DEPLOY_EXTRA_SERVICES=${Q_DEPLOY_EXTRA_SERVICES} \
+             SKIP_NPM_CI=${Q_SKIP_NPM_CI} \
+             bash ${Q_REMOTE_DIR}/remote-deploy.sh"
+
+      - name: Clean up local credentials
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/deploy_key" "${RUNNER_TEMP}/known_hosts"

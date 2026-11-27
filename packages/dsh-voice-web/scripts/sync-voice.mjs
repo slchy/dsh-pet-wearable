@@ -78,3 +78,11 @@ for (const rel of files) {
 
 const skipped = total - files.length;
 console.log(`同步语音栈：${files.length} 个文件 → ${relative(repo, dest)}（源 ${total} 个，跳过 ${skipped}）`);
+
+// LICENSE 只留仓根一份：npm 包必须带它，但复制品不进 git（见 .gitignore），
+// 每次同步时从仓根覆盖，避免两份文本漂移。
+const license = join(repo, 'LICENSE');
+if (existsSync(license)) {
+  cpSync(license, join(repo, 'packages', 'dsh-voice-web', 'LICENSE'));
+  console.log('同步 LICENSE → packages/dsh-voice-web/LICENSE');
+}

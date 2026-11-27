@@ -1,0 +1,261 @@
+name: Release
+
+# 打 `vX.Y.Z` / `vX.Y.Z-beta.1` tag 即发布。三份产物出自同一次构建：
+# `dsh-voice-web-<ver>.tgz`（npm 包）、`dsh-pet-wearable-server-<ver>.tar.gz`
+# （服务器干净部署包）、`SHA256SUMS.txt`。
+#
+# 顺序是刻意的：gate（版本 + 全套闸门）→ pack（真打包 + 冒烟）→ npm → GitHub
+# Release → 云端部署。任何一步失败，后面的都不会跑；npm 已发布但 Release 失败时，
+# 重跑会走幂等分支，不会重复发版。
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只构建与校验，不发布 npm / 不建 Release / 不部署'
+        type: boolean
+        default: true
+      skip_npm:
+        description: '跳过 npm 发布（仍建 GitHub Release 并部署）'
+        type: boolean
+        default: false
+      skip_deploy:
+        description: '跳过云端部署'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      dist_tag: ${{ steps.version.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            packages/dsh-voice-web/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies (root)
+        run: npm ci
+
+      - name: Install dependencies (web package)
+        run: npm --prefix packages/dsh-voice-web ci
+
+      - name: Check version (tag must match repo)
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            node scripts/bump-version.mjs --check "${GITHUB_REF_NAME}"
+          else
+            node scripts/bump-version.mjs --check
+          fi
+
+      - name: Secret scan
+        run: npm run verify:secrets
+
+      - name: Typecheck (root)
+        run: npm run typecheck
+
+      - name: Typecheck (web package)
+        run: npm --prefix packages/dsh-voice-web run typecheck
+
+      - name: Time knob invariants
+        run: python scripts/time-knobs.py --check
+
+      - name: Formal verification (FSM + backchannel)
+        run: npm run verify:formal
+
+      - name: Mutation check
+        run: npm run mutate
+
+      - name: All tests
+        run: npm run test:all
+
+  pack:
+    name: Pack
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            packages/dsh-voice-web/package-lock.json
+
+      - name: Install dependencies (root)
+        run: npm ci
+
+      - name: Install dependencies (web package)
+        run: npm --prefix packages/dsh-voice-web ci
+
+      - name: Build and verify release packs
+        run: node scripts/verify-release-pack.mjs --out-dir dist-release --version "${{ needs.gate.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-release
+          path: dist-release/*
+          retention-days: 7
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm
+    needs: [gate, pack]
+    if: ${{ inputs.dry_run != true && inputs.skip_npm != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-release
+          path: dist-release
+
+      # 故意不传 registry-url：它会把 `${NODE_AUTH_TOKEN}` 写进 .npmrc，
+      # 未配置 NPM_TOKEN 的 Trusted Publishing 分支会先撞上「变量未定义」。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Publish to npm
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          DIST_TAG: ${{ needs.gate.outputs.dist_tag }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARBALL="dist-release/dsh-voice-web-${VERSION}.tgz"
+          if [ ! -f "${TARBALL}" ]; then
+            echo "找不到发布包 ${TARBALL}" >&2
+            exit 1
+          fi
+
+          if npm view "dsh-voice-web@${VERSION}" version >/dev/null 2>&1; then
+            echo "npm 上已存在 dsh-voice-web@${VERSION}，跳过发布（幂等）"
+            exit 0
+          fi
+
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "使用 NPM_TOKEN（Automation token）发布"
+            # 失败退出时也要删掉含 token 的 .npmrc（set -e 下后续 rm 不会执行）。
+            trap 'rm -f "${HOME}/.npmrc"' EXIT
+            printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_TOKEN}" > "${HOME}/.npmrc"
+            chmod 600 "${HOME}/.npmrc"
+            npm publish "${TARBALL}" --access public --tag "${DIST_TAG}" --provenance
+            exit 0
+          fi
+
+          echo "未配置 NPM_TOKEN：走 npm Trusted Publishing（GitHub OIDC）"
+          CURRENT_NPM="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' '11.5.1' "${CURRENT_NPM}" | sort -V | head -n1)" != "11.5.1" ]; then
+            echo "npm ${CURRENT_NPM} < 11.5.1，升级 npm"
+            npm install -g npm@latest
+          fi
+          if ! npm publish "${TARBALL}" --access public --tag "${DIST_TAG}" --provenance; then
+            printf '%s\n' \
+              'npm 发布失败。未配置 NPM_TOKEN 时需要 Trusted Publishing 已生效：' \
+              '' \
+              '  1. 打开 npmjs.com → dsh-voice-web → Settings → Trusted Publisher；' \
+              '  2. 选择 GitHub Actions，填写 Organization/User、Repository、' \
+              '     Workflow filename=release.yml、Environment=npm；' \
+              '  3. 确认本仓库的 npm environment 已创建，并允许从 tag 运行；' \
+              '  4. 或者改用 Automation token：把 NPM_TOKEN 加到 npm environment 的 Secrets。' \
+              '' \
+              '详见 docs/CD.md。' >&2
+            exit 1
+          fi
+
+  github-release:
+    name: GitHub Release
+    needs: [gate, pack, publish-npm]
+    if: >-
+      always()
+      && needs.gate.result == 'success'
+      && needs.pack.result == 'success'
+      && (needs.publish-npm.result == 'success' || needs.publish-npm.result == 'skipped')
+      && startsWith(github.ref, 'refs/tags/v')
+      && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-release
+          path: dist-release
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          FILES=(
+            "dist-release/dsh-voice-web-${VERSION}.tgz"
+            "dist-release/dsh-pet-wearable-server-${VERSION}.tar.gz"
+            "dist-release/SHA256SUMS.txt"
+          )
+          for file in "${FILES[@]}"; do
+            if [ ! -f "${file}" ]; then
+              echo "缺少附件 ${file}" >&2
+              exit 1
+            fi
+          done
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，覆盖上传附件"
+            gh release upload "${TAG}" "${FILES[@]}" --clobber
+          else
+            ARGS=(--title "${TAG}" --generate-notes)
+            if [ "${PRERELEASE}" = "true" ]; then
+              ARGS+=(--prerelease)
+            fi
+            gh release create "${TAG}" "${FILES[@]}" "${ARGS[@]}"
+          fi
+
+  deploy:
+    name: Deploy production
+    needs: [gate, pack, github-release]
+    if: >-
+      always()
+      && needs.github-release.result == 'success'
+      && startsWith(github.ref, 'refs/tags/v')
+      && inputs.dry_run != true
+      && inputs.skip_deploy != true
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ github.ref_name }}
+    secrets: inherit
