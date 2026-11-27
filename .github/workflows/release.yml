@@ -25,6 +25,10 @@ on:
         description: '跳过云端部署'
         type: boolean
         default: false
+      publish_root_npm:
+        description: '同时发布根包 dsh-pet-wearable 到 npm（用于刷新其 npm 页面）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -118,6 +122,10 @@ jobs:
       - name: Build and verify release packs
         run: node scripts/verify-release-pack.mjs --out-dir dist-release --version "${{ needs.gate.outputs.version }}"
 
+      - name: Pack root package for npm (optional)
+        if: ${{ inputs.publish_root_npm == true }}
+        run: npm pack --pack-destination dist-release
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-release
@@ -152,19 +160,11 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
           DIST_TAG: ${{ needs.gate.outputs.dist_tag }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PUBLISH_ROOT_NPM: ${{ inputs.publish_root_npm }}
         run: |
           set -euo pipefail
           # 必须用绝对路径或 ./ 前缀：否则 npm 11 会把 `dir/file.tgz` 误解析为 GitHub owner/repo 简写。
           TARBALL="${PWD}/dist-release/dsh-voice-web-${VERSION}.tgz"
-          if [ ! -f "${TARBALL}" ]; then
-            echo "找不到发布包 ${TARBALL}" >&2
-            exit 1
-          fi
-
-          if npm view "dsh-voice-web@${VERSION}" version >/dev/null 2>&1; then
-            echo "npm 上已存在 dsh-voice-web@${VERSION}，跳过发布（幂等）"
-            exit 0
-          fi
 
           if [ -n "${NPM_TOKEN:-}" ]; then
             echo "使用 NPM_TOKEN（Automation token）发布"
@@ -172,28 +172,46 @@ jobs:
             trap 'rm -f "${HOME}/.npmrc"' EXIT
             printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_TOKEN}" > "${HOME}/.npmrc"
             chmod 600 "${HOME}/.npmrc"
-            npm publish "${TARBALL}" --access public --tag "${DIST_TAG}" --provenance
-            exit 0
+          else
+            echo "未配置 NPM_TOKEN：走 npm Trusted Publishing（GitHub OIDC）"
+            CURRENT_NPM="$(npm --version)"
+            if [ "$(printf '%s\n%s\n' '11.5.1' "${CURRENT_NPM}" | sort -V | head -n1)" != "11.5.1" ]; then
+              echo "npm ${CURRENT_NPM} < 11.5.1，升级 npm"
+              npm install -g npm@latest
+            fi
           fi
 
-          echo "未配置 NPM_TOKEN：走 npm Trusted Publishing（GitHub OIDC）"
-          CURRENT_NPM="$(npm --version)"
-          if [ "$(printf '%s\n%s\n' '11.5.1' "${CURRENT_NPM}" | sort -V | head -n1)" != "11.5.1" ]; then
-            echo "npm ${CURRENT_NPM} < 11.5.1，升级 npm"
-            npm install -g npm@latest
-          fi
-          if ! npm publish "${TARBALL}" --access public --tag "${DIST_TAG}" --provenance; then
-            printf '%s\n' \
-              'npm 发布失败。未配置 NPM_TOKEN 时需要 Trusted Publishing 已生效：' \
-              '' \
-              '  1. 打开 npmjs.com → dsh-voice-web → Settings → Trusted Publisher；' \
-              '  2. 选择 GitHub Actions，填写 Organization/User、Repository、' \
-              '     Workflow filename=release.yml、Environment=npm；' \
-              '  3. 确认本仓库的 npm environment 已创建，并允许从 tag 运行；' \
-              '  4. 或者改用 Automation token：把 NPM_TOKEN 加到 npm environment 的 Secrets。' \
-              '' \
-              '详见 docs/CD.md。' >&2
-            exit 1
+          publish_one() {
+            local pkg="$1"
+            local tgz="$2"
+            if [ ! -f "${tgz}" ]; then
+              echo "找不到发布包 ${tgz}" >&2
+              exit 1
+            fi
+            if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
+              echo "npm 上已存在 ${pkg}@${VERSION}，跳过发布（幂等）"
+              return 0
+            fi
+            if ! npm publish "${tgz}" --access public --tag "${DIST_TAG}" --provenance; then
+              printf '%s\n' \
+                "npm 发布 ${pkg}@${VERSION} 失败。未配置 NPM_TOKEN 时需要 Trusted Publishing 已生效：" \
+                '' \
+                "  1. 打开 npmjs.com → ${pkg} → Settings → Trusted Publisher；" \
+                '  2. 选择 GitHub Actions，填写 Organization/User、Repository、' \
+                '     Workflow filename=release.yml、Environment=npm、勾选 Publish directly；' \
+                '  3. 确认本仓库的 npm environment 已创建，并允许从 main / tag 运行；' \
+                '  4. 或者改用 Automation token：把 NPM_TOKEN 加到 npm environment 的 Secrets。' \
+                '' \
+                '详见 docs/CD.md。' >&2
+              exit 1
+            fi
+          }
+
+          publish_one "dsh-voice-web" "${TARBALL}"
+
+          if [ "${PUBLISH_ROOT_NPM}" = "true" ]; then
+            ROOT_TARBALL="${PWD}/dist-release/dsh-pet-wearable-${VERSION}.tgz"
+            publish_one "dsh-pet-wearable" "${ROOT_TARBALL}"
           fi
 
   github-release:

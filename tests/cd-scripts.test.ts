@@ -417,6 +417,10 @@ test('release.yml 有质量闸门、最小权限与双模 npm 发布', () => {
     yaml.includes('GH_REPO: ${{ github.repository }}') && yaml.includes('--verify-tag'),
     'release.yml 的 github-release 未检出仓库，必须显式传 GH_REPO 与 --verify-tag',
   );
+  assert.ok(
+    yaml.includes('publish_root_npm') && yaml.includes('dsh-pet-wearable-${VERSION}.tgz'),
+    'release.yml 应支持可选的 publish_root_npm 刷新根包 npm 页面',
+  );
   assert.ok(!yaml.includes('StrictHostKeyChecking=no'));
 });
 
