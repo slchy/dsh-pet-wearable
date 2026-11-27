@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice-web",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Web compatibility for the dsh pet voice stack: WebSocket bridge plus browser capture and playback, reusing the voice stack from dsh-pet-wearable.",
   "type": "module",
   "license": "MIT",
