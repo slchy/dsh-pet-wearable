@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet-wearable",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Full-duplex voice agent for smart wearables, powered by cloud dsh. Speak anytime, interrupt anytime - it speaks up on its own too.",
   "type": "module",
   "license": "MIT",
