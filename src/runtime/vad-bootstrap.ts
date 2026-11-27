@@ -63,9 +63,7 @@ export async function loadSharedVad(
     modelPath = await ensureOnnxModel('silero-vad', env, report);
   }
   if (modelPath === null || !existsSync(modelPath)) {
-    report(
-      `VAD      退回能量门（未找到 ${MODEL_FILE}，可放入 ${defaultModelCacheDir(env)} 或设 VOICE_VAD_MODEL）`,
-    );
+    report('VAD      退回能量门（未找到 models/silero_vad.onnx，可设 VOICE_VAD_MODEL 指定）');
     return null;
   }
 
