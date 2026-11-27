@@ -101,22 +101,22 @@ jobs:
         if: ${{ !matrix.low_concurrency }}
         run: npm run test:all
 
-      # Node 22.x 的 `node --test` 默认 `--test-isolation=process` 会在父子 IPC 管线里偶发触发
-      # `#processRawBuffer: Unable to deserialize cloned data`（上游在 Node 24 修复）。
-      # 用 xargs 按单文件起独立进程 + `--test-isolation=none`：保持 100% 进程级隔离，同时彻底绕开该 IPC 路径。
+      # Node 22.x 的 `node --test` 默认在父子 IPC 管线里偶发触发
+      # `#processRawBuffer: Unable to deserialize cloned data`（上游在 Node 24 修复，且 Node 22 不支持 --test-isolation=none）。
+      # 用 xargs 按单文件直接 `node <file>`：每文件依然独立进程隔离、单测失败非零退出，且完全不走 FileTest IPC。
       - name: Run all tests (Node 22 per-file process isolation)
         if: ${{ matrix.low_concurrency }}
         run: |
           set -euo pipefail
           printf '%s\n' tests/*.test.ts tests/contracts/*.test.ts \
-            | xargs -r -P 4 -n 1 node --test --test-isolation=none
+            | xargs -r -P 4 -n 1 node
           printf '%s\n' bench/eval/*.test.ts bench/replay/*.test.ts \
-            | xargs -r -P 4 -n 1 node --test --test-isolation=none
+            | xargs -r -P 4 -n 1 node
           (
             cd packages/dsh-voice-web
             npm run sync:voice
             printf '%s\n' tests/*.test.ts \
-              | xargs -r -P 4 -n 1 node --test --test-isolation=none
+              | xargs -r -P 4 -n 1 node
           )
 
       - name: Build web package
