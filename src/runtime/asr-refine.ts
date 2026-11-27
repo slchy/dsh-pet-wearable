@@ -226,11 +226,13 @@ export function createAsrRefiner(opts: AsrRefinerOptions): AsrRefiner {
     const onAbort = (): void => { controller.abort(); };
     if (signal !== undefined) signal.addEventListener('abort', onAbort, { once: true });
     let timedOut = false;
+    // 不调用 unref()：`finally` 一定会 `clearTimeout(timer)`，不会挂住进程；
+    // 若 unref，Node 22 直接执行单测文件且 fetchImpl 为纯 Promise 桩时，
+    // 事件循环会因零活跃句柄提前退出而报 Promise pending。
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, timeoutMs);
-    timer.unref?.();
 
     try {
       const wav = encodePcm16MonoWav(req.pcm, SAMPLE_RATE);
