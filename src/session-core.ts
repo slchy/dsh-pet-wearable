@@ -41,7 +41,12 @@ export type CoreEvent =
    */
   | { readonly type: 'sentence'; readonly text: string; readonly commitSeq?: number }
   /** 一句话合并定稿（判停窗口已关） */
-  | { readonly type: 'utterance'; readonly text: string }
+  | {
+    readonly type: 'utterance';
+    readonly text: string;
+    /** 本轮未切碎的完整 16 kHz PCM16（整句精转用，跨多次 ASR commit） */
+    readonly utterancePcm?: Buffer;
+  }
   /** STT 的中间结果（插话判据）。`commitSeq` 同上 */
   | { readonly type: 'partial'; readonly text: string; readonly commitSeq?: number }
   /** 设备回了一张图，且没有拍照请求在等它 */
@@ -73,6 +78,8 @@ export type CoreEffect =
     readonly text: string;
     readonly image?: ImageAttachment;
     readonly ticket: TurnTicket;
+    /** 透传给 `TurnInput.utterancePcm`（整句精转用） */
+    readonly utterancePcm?: Buffer;
   }
   /**
    * 一个**设备操作**。判定核只说做什么，怎么说（v1 控制串 / v2 操作帧）
@@ -131,7 +138,13 @@ export class SessionCore {
    * 放在这里而不是宿主里：它是**状态**（`awaiting_shot` 期间有效），要随
    * `abortAwaitShot` / `closed` 一起清掉，放宿主一定会漏。
    */
-  private pendingShot: { text: string; ticket: TurnTicket; id: string } | null = null;
+  private pendingShot: {
+    text: string;
+    ticket: TurnTicket;
+    id: string;
+    /** `capture → shotResult` 路径同样不许丢整句 PCM */
+    readonly utterancePcm?: Buffer;
+  } | null = null;
 
   constructor(options: SessionCoreOptions) {
     this.options = options;
@@ -237,14 +250,24 @@ export class SessionCore {
               intent: 'detail',
               needsUser: mode.needsUser,
             };
-            this.pendingShot = { text: event.text, ticket: shotTicket, id: request.id };
+            this.pendingShot = {
+              text: event.text,
+              ticket: shotTicket,
+              id: request.id,
+              ...(event.utterancePcm === undefined ? {} : { utterancePcm: event.utterancePcm }),
+            };
             this.options.log(
               `  拍照    用户要求看清细节 → ${mode.needsUser ? '等用户在设备上动手' : '直接拍'}`,
             );
             return [...effects, { type: 'capture', request, text: event.text, ticket: shotTicket }];
           }
         }
-        return [...effects, { type: 'turn', text: event.text, ticket: this.fsm.ticket() }];
+        return [...effects, {
+          type: 'turn',
+          text: event.text,
+          ticket: this.fsm.ticket(),
+          ...(event.utterancePcm === undefined ? {} : { utterancePcm: event.utterancePcm }),
+        }];
       }
 
       case 'shotResult': {
@@ -260,6 +283,7 @@ export class SessionCore {
             text: `${pending.text}\n（已附一张高清晰度照片，直接根据它回答，不要再调用拍照工具。）`,
             image: { mimeType: 'image/jpeg', data: event.jpeg.toString('base64') },
             ticket: this.fsm.ticket(),
+            ...(pending.utterancePcm === undefined ? {} : { utterancePcm: pending.utterancePcm }),
           }];
         }
         const failure: CaptureFailure = event.failure ?? { code: 'failed' };
@@ -272,6 +296,7 @@ export class SessionCore {
           type: 'turn',
           text: `${pending.text}\n（${captureFailureHint(failure)}）`,
           ticket: this.fsm.ticket(),
+          ...(pending.utterancePcm === undefined ? {} : { utterancePcm: pending.utterancePcm }),
         }];
       }
 

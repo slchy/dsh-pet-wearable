@@ -13,6 +13,7 @@
 import { DialogRuntime, type AnnounceItem } from '../app/dialog.ts';
 import { SystemClock, type Clock } from '../app/clock.ts';
 import { AppSession } from '../app/session.ts';
+import { AudioSnapshotBuffer } from '../assembler/audio-snapshot.ts';
 import { SessionArchive } from '../archive.ts';
 import {
   captureMode,
@@ -161,6 +162,22 @@ export class VoiceConnection {
   private readonly asr: AsrFront;
 
   /**
+   * 本轮**整句未切碎**的 PCM（跨多次 `asr.commit`，句中最长 30 s）。
+   *
+   * 与判停器的 8 秒滚动窗完全分开：那份窗按每一句 reset、按 `snapshot()` 裁尾，
+   * 判停概率 `p` 只读它；这份从第一个字留到最后一个字，只在整句定稿
+   * （`onUtterance`）时取走，供需要委派 `dsh` 的轮次做高精度精转。
+   */
+  private readonly utteranceAudio: AudioSnapshotBuffer;
+  /**
+   * 这一句已经往合并器里送过（`env.assemble`）。
+   *
+   * 句中换气会让能量门闭门又开门；有这一句在手上时，`onSpeechOpen` 不许把
+   * {@link utteranceAudio} 清成新一句的预卷。
+   */
+  private utteranceHasPendingSentence = false;
+
+  /**
    * 这条连接挂到服务级控制口上的 handlers（`setHandlers(null, this)` 的令牌）。
    *
    * 断开时**必须原样带回去**：新连接可能已经接管了控制口，无令牌的 `null` 会把
@@ -199,6 +216,15 @@ export class VoiceConnection {
     this.caps = link.capabilities;
     this.v1 = link.v1;
     this.uplinkCodec = this.caps.audioIn;
+
+    // 整句精转的原料：30 s 上限（16000 × 2 B × 30），独立于判停器 8 s 窗 ——
+    // `silenceDb` / `trailingTrimMs` 只影响快照裁尾，判停概率 `p` 一个字节都不读它。
+    this.utteranceAudio = new AudioSnapshotBuffer({
+      recentMaxBytes: UPSTREAM_SAMPLE_RATE * 2 * 30,
+      sampleRate: UPSTREAM_SAMPLE_RATE,
+      silenceDb: options.gate.thresholdDbfs,
+      trailingTrimMs: 200,
+    });
 
     const proactive = options.proactive;
     this.micOpenTimeoutMs = proactive?.params?.micOpenTimeoutMs ?? DEFAULT_PET_PARAMS.micOpenTimeoutMs;
@@ -262,7 +288,12 @@ export class VoiceConnection {
       },
       env: {
         call: (call) => this.device.sendCall(call),
-        assemble: (text) => { this.assembler.addSentence(text); },
+        assemble: (text) => {
+          // 必须先置位再 addSentence：若合并器同步触发 onUtterance 清零该标志，
+          // 后置位会把刚收尾的轮次误标为「仍有待合并句」。
+          this.utteranceHasPendingSentence = true;
+          this.assembler.addSentence(text);
+        },
         deviceNote: () => this.device.deviceNote(),
         // 收尾前先明说「这次会话结束了」。
         //
@@ -475,7 +506,16 @@ export class VoiceConnection {
         if (text.trim() !== '') {
           safeEmitUi(this.options.onUiEvent, { type: 'asr', text, final: true });
         }
-        this.dialog.dispatch({ type: 'utterance', text });
+        // 整句定稿：取走完整 PCM 再清缓冲。空 Buffer 不带字段，
+        // 下游按 `undefined` 判「这轮没有可精转的原料」。
+        const pcm = this.utteranceAudio.snapshot();
+        this.utteranceAudio.clear();
+        this.utteranceHasPendingSentence = false;
+        this.dialog.dispatch({
+          type: 'utterance',
+          text,
+          ...(pcm.byteLength > 0 ? { utterancePcm: pcm } : {}),
+        });
       },
       awaitDecode: () => this.stt?.whenDecoded?.() ?? null,
     });
@@ -536,6 +576,16 @@ export class VoiceConnection {
           }
           asrPcm = tailByBytes(preroll, (chunk) => chunk.length, budget);
         }
+        // 整句 PCM：新一句的起点是**裁过预卷**的开头，不带开门前的长静音。
+        // 已经有待合并的句子（句中换气闭门又开门）就不清空，而是把这次开门的预卷接在后面，
+        // 避免第二半句的首音节因为闭门期间没走 onFrame 而丢失。
+        if (!this.utteranceHasPendingSentence) {
+          this.utteranceAudio.reset(asrPcm);
+        } else {
+          for (const chunk of asrPcm) {
+            this.utteranceAudio.push(chunk);
+          }
+        }
         // 预卷的 voiced 由能量门按同一条门限标好。这里直接喂，不再重算峰值。
         for (const part of asrFrames ?? []) {
           this.stt.feed(part.pcm, part.voiced);
@@ -550,6 +600,9 @@ export class VoiceConnection {
         // 先记下这一帧的静音，再交给装配器：封段在 addFrame 里同步发生，
         // 档案的 front_silence_ms 要和回调里的 silence_ms 是同一个数。
         this.asr.noteFrame(frame.silenceMs);
+        // 整句精转的原料：门开着就每一帧都留，`onSttCommit` 绝不清它。
+        // 放在 `addFrame` 之前：将来若封段改成同步触发定稿，这一帧也不会漏。
+        this.utteranceAudio.push(frame.pcm);
         // 声学前端的**唯一出口**：`voiced` / `silenceMs` / `tsMs` 都是门算好的，
         // 装配器不再按 `silenceDb` 重算一遍。
         this.assembler.addFrame(frame);
@@ -812,6 +865,7 @@ export class VoiceConnection {
     // 之后仍能发出（端口不许在 dispose 里摘掉），所以 dispatch 放在这六步之后。
     this.uplink.end();
     this.assembler.dispose();
+    this.utteranceAudio.clear();
     this.app?.close();
     this.app?.dispose();
     this.omni?.stop();

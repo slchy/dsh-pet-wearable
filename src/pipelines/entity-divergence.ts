@@ -24,7 +24,7 @@ const ASK_INTRO = /^(?:介绍一下|讲一下|解释一下|科普一下)(.{2,14}
 /** 口语外框：「你知道齐主是谁吗？」剥掉之后才对得上「X 是谁」。 */
 const KNOW_PREFIXES = ['你听说过', '你听过', '你知道', '你了解'] as const;
 
-const ASK_WHAT = /^(.{2,14}?)(?:是什么|是啥|讲(?:的|了)?什么|是谁|什么意思|讲啥)(?:吗|呢|呀|啊)?[？?。！!]*$/u;
+const ASK_WHAT = /^(.{2,14}?)(?:是什么东西|是什么|是啥|是怎么回事|怎么回事|讲(?:的|了)?什么|是谁|什么意思|讲啥)(?:吗|呢|呀|啊)?[？?。！!]*$/u;
 
 /**
  * 「你知道 X 吗 / 你听说过 X 吗」这种窄句型。
@@ -218,6 +218,27 @@ function extractSubject(raw: string): string | null {
 
   if (!text.startsWith('那') || NA_DEMONSTRATIVE.test(text)) return null;
   return acceptSubject(matchSubject(trimPunct(text.slice(1))));
+}
+
+/**
+ * 这句话问的是哪个专名/实体事件；不是窄句型时返回 `null`。
+ *
+ * 给编排器在路由前取主语用：拿到主语就去单槽里查「是不是已经核实过」，
+ * 已核实过的追问不再重复派 dsh。
+ */
+export function extractQuestionSubject(text: string): string | null {
+  return extractSubject(text);
+}
+
+/**
+ * 这一句是不是在问某个具体专名（「你知道 X 吗」「X 是什么」「介绍一下 X」）。
+ *
+ * 复用 {@link extractSubject} 的窄句型与代词/泛词/非专名从句排除规则，
+ * 让编排器在**首块音频发出之前**就把这类问句收进守卫轮（`live_with_bg_guard`），
+ * 不再放任前台说完一段听岔答复后再事后补派后台。
+ */
+export function hasEntityQuery(text: string): boolean {
+  return extractSubject(text) !== null;
 }
 
 function bookTitles(reply: string): string[] {

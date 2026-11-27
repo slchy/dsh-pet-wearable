@@ -322,6 +322,7 @@ async function main(): Promise<void> {
     readonly dshAgent: AgentProvider;
     readonly activity: ActivityState;
     readonly memory: (text: string) => string;
+    readonly refineHotwords: string;
     readonly taskStatus: () => string;
     readonly speculate: boolean; readonly memorySummary?: () => string; readonly asrCorpusText?: string; readonly asrLanguage?: string;
   } | null = null;
@@ -475,6 +476,7 @@ async function main(): Promise<void> {
       activity,
       // 直播编排要一整段；级联在 assembleStreamingAgent 里再拆回逐条。
       memory: (text) => memoryFile.relevant(text).join('\n'),
+      refineHotwords: memoryFile.hotwordHints(),
       taskStatus: () => session.taskStatus(),
       speculate, memorySummary: () => memoryFile.summary(), asrCorpusText: corpusText, asrLanguage: language,
     });
@@ -592,6 +594,7 @@ async function main(): Promise<void> {
       tts: ttsForPipeline,
       activity: pending.activity,
       memory: pending.memory,
+      refineHotwords: pending.refineHotwords,
       taskStatus: pending.taskStatus,
       audit: (name, data) => { auditSlot.emit(name, data); },
       speculate: pending.speculate,

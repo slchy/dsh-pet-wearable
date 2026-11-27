@@ -874,7 +874,12 @@ export class TurnRunner {
    *
    * 返回时 `fsm` 已推进到下一状态；调用方据 `fsm.state` 决定是否挂断。
    */
-  async run(text: string, image?: ImageAttachment, note?: string): Promise<TurnResult | null> {
+  async run(
+    text: string,
+    image?: ImageAttachment,
+    note?: string,
+    utterancePcm?: Buffer,
+  ): Promise<TurnResult | null> {
     const { fsm, agent, downlink } = this.options;
     // 整机 TCP 计数器在本轮开始/结束时各读一次，增量落 `turn.end`：
     // 把「多出来的 270 ms」分成「链路丢包」和「服务端内部慢」靠它（见 `net-counters.ts`）。
@@ -1287,6 +1292,7 @@ export class TurnRunner {
         hasImage: image !== undefined,
         ...(image === undefined ? {} : { image: turnImage(image) }),
         ...(note === undefined ? {} : { note }),
+        ...(utterancePcm === undefined ? {} : { utterancePcm }),
         ticket,
       };
       for await (const ev of this.engine.respond(turnInput, turnAbort.signal)) {

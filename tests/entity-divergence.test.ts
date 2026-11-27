@@ -6,6 +6,8 @@ import { test } from 'node:test';
 
 import {
   detectSubjectHallucination,
+  extractQuestionSubject,
+  hasEntityQuery,
   type SubjectHallucination,
 } from '../src/pipelines/entity-divergence.ts';
 
@@ -120,5 +122,23 @@ test('闲聊、常识、代词问句即使答复像在编书，也不报听岔',
   ];
   for (const phrase of phrases) {
     assert.equal(detectSubjectHallucination(phrase, WRONG_BOOK), null, phrase);
+  }
+});
+
+test('实体事件问句取出主语：X是怎么回事 / X是什么东西', () => {
+  assert.equal(extractQuestionSubject('黄仁勋离职是怎么回事？'), '黄仁勋离职');
+  assert.equal(extractQuestionSubject('管理层剧变是什么东西？'), '管理层剧变');
+  assert.equal(hasEntityQuery('黄仁勋离职是怎么回事？'), true);
+  assert.equal(hasEntityQuery('管理层剧变是什么东西？'), true);
+});
+
+test('代词与口语事件问句不是专名，抽取和守卫都要放过', () => {
+  for (const phrase of ['今天怎么回事？', '这怎么回事？', '怎么回事？', '你最近怎么回事？']) {
+    assert.equal(extractQuestionSubject(phrase), null, phrase);
+    assert.equal(hasEntityQuery(phrase), false, phrase);
+  }
+  for (const phrase of ['水在标准大气压下多少度沸腾？', '你看过星球大战没？']) {
+    assert.equal(extractQuestionSubject(phrase), null, phrase);
+    assert.equal(hasEntityQuery(phrase), false, phrase);
   }
 });

@@ -101,6 +101,14 @@ export interface TurnInput {
   readonly image?: { readonly bytes: Buffer; readonly mime: string; readonly name?: string };
   /** 可选：本轮系统注记（设备现状 / 打断续话尾巴） */
   readonly note?: string;
+  /**
+   * 可选：本轮**未切碎**的完整 16 kHz PCM16 上行音频。
+   *
+   * 一句长话中途换气会触发多次 `asr.commit`，流式 ASR 拿到的是被切开的几段；
+   * 这一份是「第一个字到最后一个字」的原始字节，供要委派 `dsh` 的轮次做
+   * 高精度整句精转（见 `runtime/asr-refine.ts`）。引擎不许拿它替代 `text`。
+   */
+  readonly utterancePcm?: Buffer;
   /** 可选：完整票据（供需要按票据取消/回滚的引擎使用） */
   readonly ticket?: {
     readonly no: number;

@@ -98,6 +98,20 @@ async function resolveSpeculate(
   return canCancel;
 }
 
+/**
+ * 显式给出合法数字才返回；没设 / 空串 / 非法值都返回 undefined。
+ * 用于「默认不覆盖看门狗，只有环境变量真的写了才透传」。
+ */
+function optionalEnvMs(
+  env: Readonly<Record<string, string | undefined>>,
+  name: string,
+): number | undefined {
+  const raw = env[name]
+  if (raw === undefined || raw.trim() === '') return undefined
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
 export interface HostVoiceRuntime {
   backend: VoiceBackendState
   activeSummary?: string | null
@@ -228,6 +242,9 @@ export async function bootVoiceStack(
       const configured = config.sessionId.trim()
       const effectiveSessionId = state.inProcessAgent?.sessionId
         ?? (configured !== '' ? configured : loadPersistedSessionId() ?? undefined)
+      // 默认不传：沿用 InProcessDshAgent 的默认看门狗，长编译 / 长构建稳过。
+      const idleTimeoutMs = optionalEnvMs(effectiveEnv, 'MIAI_DSH_IDLE_TIMEOUT_MS')
+      const maxDurationMs = optionalEnvMs(effectiveEnv, 'MIAI_DSH_MAX_DURATION_MS')
       state.inProcessAgent?.dispose()
       inProcessAgent = new InProcessDshAgent({
         controller: sessionController,
@@ -235,6 +252,8 @@ export async function bootVoiceStack(
         sessionId: effectiveSessionId,
         log: report,
         announceStore,
+        ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
+        ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
       })
       state.inProcessAgent = inProcessAgent
       baseAgent = inProcessAgent
@@ -329,6 +348,10 @@ export async function bootVoiceStack(
         memorySummary: () => memoryFile.summary(),
         asrCorpusText: corpusText,
         asrLanguage: language,
+        refineHotwords: memoryFile.hotwordHints(),
+        onAsrRefined: (text, previous) => {
+          state.hostMount?.broadcastUi({ type: 'asr.replace', text, previous })
+        },
       })
       const agentForKeepalive = baseAgent
       baseAgent = streaming.agent

@@ -14,8 +14,31 @@ import type { TurnTicket } from './voice/dialog-fsm.ts';
 import { cleanForSpeech, parseEmotion } from './voice/emotion.ts';
 import type { AgentImage, AgentProvider, AgentReplyView, TurnContext } from './voice/providers.ts';
 
-/** 等一轮答复的上限，跟子进程 `DshSession` 的默认超时同一档。 */
-const TURN_TIMEOUT_MS = 60_000;
+/**
+ * 空闲看门狗默认时长：这么久没有任何属于本轮的帧才判死。
+ *
+ * 不能再看墙钟总时长：跑一次 3–20 分钟的 `pwsh` 编译/构建时宿主一直在干活，
+ * 只是不往 follow 里吐帧。60 s 死等会把正在编译的轮次掐掉，语音侧报失败、
+ * dsh 网页端还在跑（脑裂）。
+ */
+const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+/** 总时长硬上限默认关闭，长编译/长构建才能跑完。 */
+const DEFAULT_MAX_DURATION_MS = 0;
+
+/** 宿主侧取消这一轮时抛的错。上游据此记 `cancelled` 而不是 `failed`。 */
+export function createTurnAbortedError(): Error {
+  const error = new Error('任务已在宿主侧取消');
+  error.name = 'AbortError';
+  (error as Error & { code?: string }).code = 'TURN_ABORTED';
+  return error;
+}
+
+export function isTurnAbortedError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const name = (error as { name?: unknown }).name;
+  const code = (error as { code?: unknown }).code;
+  return name === 'AbortError' && code === 'TURN_ABORTED';
+}
 
 const EMPTY_REPLY: AgentReplyView = {
   text: '',
@@ -117,6 +140,18 @@ export interface InProcessDshAgentOptions {
   readonly sessionId?: string;
   readonly log?: (line: string) => void;
   readonly announceStore?: AnnounceStore | null;
+  /**
+   * 空闲看门狗：这么久没有任何属于本轮的帧、也没有活跃的 `job` / `subagent`
+   * 才判死。默认 2 分钟；`<= 0` 关闭。
+   */
+  readonly idleTimeoutMs?: number;
+  /**
+   * 可选的轮次总时长硬上限。默认 `0` = 不设短墙钟上限，长编译/长构建稳过；
+   * 只有调用方显式传 `> 0` 才启用。
+   */
+  readonly maxDurationMs?: number;
+  /** 可选时钟，单测用来把看门狗压到毫秒级。 */
+  readonly now?: () => number;
 }
 
 interface NormalizedEvent {
@@ -132,7 +167,7 @@ interface NormalizedEvent {
  */
 class TurnState {
   readonly abort = new AbortController();
-  readonly startedAt = Date.now();
+  readonly startedAt: number;
   readonly sessionId: string;
   readonly userText: string;
   readonly ticket: TurnTicket | null;
@@ -140,6 +175,8 @@ class TurnState {
   readonly early: Promise<void>;
   readonly done: Promise<void>;
 
+  /** 最近一次收到属于本轮的非 `snapshot` 帧的时刻。看门狗只认它。 */
+  lastActivityAt: number;
   baseline = -1;
   sawSnapshot = false;
   streamed = '';
@@ -148,16 +185,32 @@ class TurnState {
   detached = false;
   cancelled = false;
   settled = false;
+  /** 宿主侧取消（`turn/end` `reason.kind === 'aborted' | 'cancelled'`）。 */
+  hostAborted = false;
+  /** 已经把 `prompt` 交给宿主。这之前收到的终态帧属于上一轮。 */
+  promptDispatched = false;
+  /** 打开 follow 时会话还忙：先到的终态帧可能是队列里上一轮的收尾。 */
+  awaitingPriorTurnEnd = false;
+  sawTurnStart = false;
   error: Error | null = null;
+  /** 当前续期中的看门狗句柄，`finally` 里清掉。 */
+  watchdog: ReturnType<typeof setTimeout> | null = null;
 
   private openResolve: (() => void) | null = null;
   private earlyResolve: (() => void) | null = null;
   private doneResolve: (() => void) | null = null;
 
-  constructor(sessionId: string, userText: string, ticket: TurnTicket | null) {
+  constructor(
+    sessionId: string,
+    userText: string,
+    ticket: TurnTicket | null,
+    now: () => number,
+  ) {
     this.sessionId = sessionId;
     this.userText = userText;
     this.ticket = ticket;
+    this.startedAt = now();
+    this.lastActivityAt = this.startedAt;
     this.opened = new Promise((resolve) => {
       this.openResolve = resolve;
     });
@@ -167,6 +220,10 @@ class TurnState {
     this.done = new Promise((resolve) => {
       this.doneResolve = resolve;
     });
+  }
+
+  touch(at: number): void {
+    if (at > this.lastActivityAt) this.lastActivityAt = at;
   }
 
   releaseOpened(): void {
@@ -226,6 +283,11 @@ class TaskMemo {
     this.mainSessionId = mainSessionId;
   }
 
+  /** 宿主还有在跑的 `job` / 派出去没回结果的子代理。看门狗据此续命。 */
+  hasActiveWork(): boolean {
+    return this.running.size > 0 || this.children.size > 0;
+  }
+
   observe(sessionId: string, type: string, data: Record<string, unknown> | undefined): void {
     if (type === 'job/registered') {
       const jobId = typeof data?.['jobId'] === 'string' ? data['jobId'] : '';
@@ -266,6 +328,18 @@ class TaskMemo {
     }
     if (type === 'turn/start' && sessionId === this.mainSessionId()) {
       this.children.clear();
+      return;
+    }
+    /*
+     * 宿主 aborted 时 `job/settled` 可能永远不来。轮次收尾后还留着「在跑」的
+     * 记录，`hasActiveWork()` 就永远为真，看门狗再也不会判死。正常有
+     * `job/settled` 时这里早就删掉了，只剩 aborted 的残渣。
+     */
+    if (type === 'turn/end' && sessionId === this.mainSessionId()) {
+      this.children.clear();
+      for (const [jobId, job] of this.running) {
+        if (job.owner === sessionId) this.running.delete(jobId);
+      }
     }
   }
 
@@ -301,6 +375,9 @@ export class InProcessDshAgent implements AgentProvider {
   private readonly log: (line: string) => void;
   private readonly announceStore: AnnounceStore | null;
   private readonly tasks: TaskMemo;
+  private readonly idleTimeoutMs: number;
+  private readonly maxDurationMs: number;
+  private readonly now: () => number;
 
   /** 构造时带来的 id，仅用于首次未绑定时的初始收养；显式指定或清空后作废。 */
   private configuredId: string | null;
@@ -323,6 +400,9 @@ export class InProcessDshAgent implements AgentProvider {
     this.configuredId = configured === undefined || configured === '' ? null : configured;
     this.log = options.log ?? (() => {});
     this.announceStore = options.announceStore ?? null;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.maxDurationMs = options.maxDurationMs ?? DEFAULT_MAX_DURATION_MS;
+    this.now = options.now ?? (() => Date.now());
     this.tasks = new TaskMemo(() => this.boundSessionId);
   }
 
@@ -544,20 +624,89 @@ export class InProcessDshAgent implements AgentProvider {
     const promptText = formatPrompt(asrText, note);
     const sessionId = await this.ensureSession();
     if (this.disposed) throw new Error('InProcessDshAgent 已关闭');
-    const turn = new TurnState(sessionId, promptText, turnContext?.ticket ?? null);
+    const turn = new TurnState(sessionId, promptText, turnContext?.ticket ?? null, this.now);
     this.active = turn;
-    const timer = setTimeout(() => {
-      if (turn.detached || turn.settled) return;
-      turn.error = new Error(`等待 turn 结束超时（${TURN_TIMEOUT_MS} ms）`);
-      this.log(`  dsh     ${turn.error.message}`);
-      this.markDone(turn);
-    }, TURN_TIMEOUT_MS);
-    timer.unref?.();
+    this.armWatchdog(turn, this.initialWatchdogDelay(turn));
     try {
       return await this.runTurn(turn, promptText, image);
     } finally {
-      clearTimeout(timer);
+      this.clearWatchdog(turn);
       if (this.active === turn) this.active = null;
+    }
+  }
+
+  private initialWatchdogDelay(turn: TurnState): number | null {
+    const idle = this.idleTimeoutMs > 0 ? this.idleTimeoutMs : null;
+    const max = this.maxDurationMs > 0
+      ? Math.max(1, this.maxDurationMs - (this.now() - turn.startedAt))
+      : null;
+    if (idle === null) return max;
+    if (max === null) return idle;
+    return Math.min(idle, max);
+  }
+
+  /** 续期看门狗。每次到期自己决定「再排一次」还是判死。 */
+  private armWatchdog(turn: TurnState, delay: number | null): void {
+    this.clearWatchdog(turn);
+    if (delay === null) return;
+    const timer = setTimeout(() => {
+      turn.watchdog = null;
+      this.onWatchdogExpired(turn);
+    }, Math.max(10, delay));
+    timer.unref?.();
+    turn.watchdog = timer;
+  }
+
+  private clearWatchdog(turn: TurnState): void {
+    if (turn.watchdog === null) return;
+    clearTimeout(turn.watchdog);
+    turn.watchdog = null;
+  }
+
+  /**
+   * 看门狗到期。只有「既没有活跃 job/subagent，又持续 `idleTimeoutMs` 零事件」
+   * 才是真卡死；真卡死时先把宿主那一轮也取消，避免语音侧报失败而网页端还在跑。
+   */
+  private onWatchdogExpired(turn: TurnState): void {
+    if (turn.detached || turn.settled || turn.cancelled) return;
+    if (this.maxDurationMs > 0 && this.now() - turn.startedAt >= this.maxDurationMs) {
+      this.cancelHostBestEffort(turn.sessionId);
+      turn.error = new Error(`等待 turn 总时长超时（${this.maxDurationMs} ms）`);
+      this.log(`  dsh     ${turn.error.message}`);
+      this.markDone(turn);
+      return;
+    }
+    if (this.tasks.hasActiveWork()) {
+      // 长编译/长构建还在跑，只是不吐帧。续命，不判超时。
+      turn.touch(this.now());
+      this.armWatchdog(turn, this.initialWatchdogDelay(turn));
+      return;
+    }
+    if (this.idleTimeoutMs <= 0) {
+      // 空闲看门狗关着，只剩总时长上限；没到上限就按剩余时间再排一次。
+      this.armWatchdog(turn, this.initialWatchdogDelay(turn));
+      return;
+    }
+    const idleFor = this.now() - turn.lastActivityAt;
+    if (idleFor < this.idleTimeoutMs) {
+      const remainingIdle = Math.max(10, this.idleTimeoutMs - idleFor);
+      const remainingMax = this.maxDurationMs > 0
+        ? Math.max(10, this.maxDurationMs - (this.now() - turn.startedAt))
+        : remainingIdle;
+      this.armWatchdog(turn, Math.min(remainingIdle, remainingMax));
+      return;
+    }
+    this.cancelHostBestEffort(turn.sessionId);
+    turn.error = new Error(`等待 turn 空闲超时（${this.idleTimeoutMs} ms）`);
+    this.log(`  dsh     ${turn.error.message}`);
+    this.markDone(turn);
+  }
+
+  private cancelHostBestEffort(sessionId: string): void {
+    try {
+      void Promise.resolve(this.controller.cancel({ sessionId })).catch(() => {});
+    } catch {
+      // 取消本身失败也不能把看门狗带走。
     }
   }
 
@@ -589,6 +738,7 @@ export class InProcessDshAgent implements AgentProvider {
     });
 
     await turn.opened;
+    if (turn.hostAborted) throw createTurnAbortedError();
     if (turn.cancelled) return EMPTY_REPLY;
     if (!turn.sawSnapshot) {
       throw turn.error ?? new Error('follow 在收到 snapshot 之前结束');
@@ -603,6 +753,8 @@ export class InProcessDshAgent implements AgentProvider {
     }
 
     if (!turn.cancelled && !turn.settled) {
+      // 从这一帧起，终态帧才算本轮的；之前的都属于队列里上一轮。
+      turn.promptDispatched = true;
       try {
         await this.controller.prompt({
           requestId: randomUUID(),
@@ -623,10 +775,12 @@ export class InProcessDshAgent implements AgentProvider {
       }
     }
 
+    if (turn.hostAborted) throw createTurnAbortedError();
     if (turn.cancelled) return EMPTY_REPLY;
     if (turn.detached) return EMPTY_REPLY;
     if (turn.error !== null) throw turn.error;
     if (!turn.settled) await this.waitCaller(turn);
+    if (turn.hostAborted) throw createTurnAbortedError();
     if (turn.cancelled) return EMPTY_REPLY;
     if (turn.detached) return EMPTY_REPLY;
     if (turn.error !== null) throw turn.error;
@@ -663,14 +817,14 @@ export class InProcessDshAgent implements AgentProvider {
         const frame = next.value;
         if (!turn.sawSnapshot) {
           if (frame.type !== 'snapshot') continue;
-          turn.baseline = cursorOf(frame);
-          turn.sawSnapshot = true;
+          this.applySnapshot(turn, frame);
           // 先唤醒 runTurn（它要把 live 置上），再拉下一帧。
           // 反过来的话，紧跟着的增量会在 live 还是 false 时被推进 pending，
           // 而 runTurn 已经开始 prompt，那一截就再也不会被当成本轮的增量。
           turn.releaseOpened();
           continue;
         }
+        if (frame.type !== 'snapshot') turn.touch(this.now());
         if (!gate.live) {
           pending.push(frame);
           continue;
@@ -706,8 +860,15 @@ export class InProcessDshAgent implements AgentProvider {
   }
 
   private consumeFrame(turn: TurnState, frame: HostSessionFollowFrame): void {
-    if (turn.settled || frame.type === 'snapshot') return;
+    if (turn.settled) return;
+    if (frame.type === 'snapshot') {
+      this.applySnapshot(turn, frame);
+      return;
+    }
     if (isAssistantType(frame.type)) {
+      turn.touch(this.now());
+      // 队列前面还有旧轮在收尾：不要把旧轮的流式正文混进本轮。
+      if (turn.awaitingPriorTurnEnd && !turn.sawTurnStart) return;
       this.consumeAssistant(turn, frame);
       return;
     }
@@ -717,7 +878,12 @@ export class InProcessDshAgent implements AgentProvider {
     const owner = event.sessionId ?? turn.sessionId;
     this.tasks.observe(owner, event.type, event.data);
     if (event.sessionId !== null && event.sessionId !== turn.sessionId) return;
+    turn.touch(this.now());
+    if (turn.promptDispatched && (event.type === 'turn/start' || event.type === 'user/message')) {
+      turn.sawTurnStart = true;
+    }
     if (event.type === 'assistant/message') {
+      if (turn.awaitingPriorTurnEnd && !turn.sawTurnStart) return;
       const text = textFromAssistantData(event.data);
       if (text !== '') {
         turn.committed = text;
@@ -725,7 +891,32 @@ export class InProcessDshAgent implements AgentProvider {
       }
       return;
     }
-    if (isTerminalEvent(event.type, event.data)) this.markDone(turn);
+    if (!isTerminalEvent(event.type, event.data)) return;
+    if (!turn.promptDispatched) {
+      // prompt 还没发出去，这是宿主上一轮的收尾帧，与本次无关。
+      turn.awaitingPriorTurnEnd = false;
+      return;
+    }
+    if (turn.awaitingPriorTurnEnd && !turn.sawTurnStart) {
+      // 队列前面那轮刚收尾。继续等本轮的 turn/start / 正文 / turn/end。
+      turn.awaitingPriorTurnEnd = false;
+      return;
+    }
+    if (isAbortedTerminal(event.type, event.data) && !turn.cancelled) {
+      turn.hostAborted = true;
+      // 同时置 cancelled，确保 markDone 不会走 handout 的播报 / 回注。
+      turn.cancelled = true;
+    }
+    this.markDone(turn);
+  }
+
+  /** 开场与运行中的 snapshot：只更新基线，以及「打开时会话是否还忙」。 */
+  private applySnapshot(turn: TurnState, frame: HostSessionFollowFrame): void {
+    if (!turn.sawSnapshot) {
+      turn.baseline = cursorOf(frame);
+      turn.sawSnapshot = true;
+    }
+    if (!turn.promptDispatched) turn.awaitingPriorTurnEnd = isSnapshotBusy(frame);
   }
 
   private consumeAssistant(turn: TurnState, frame: HostSessionFollowFrame): void {
@@ -805,7 +996,7 @@ export class InProcessDshAgent implements AgentProvider {
     if (delta === '' || turn.settled || turn.cancelled) return;
     turn.streamed += delta;
     if (turn.firstTokenMs === null && delta.trim() !== '') {
-      turn.firstTokenMs = Date.now() - turn.startedAt;
+      turn.firstTokenMs = this.now() - turn.startedAt;
     }
     // 放手之后这条流不再属于当前 TTS，别把后半句灌进下一轮的 sink。
     if (!turn.detached) this.liveSink?.(delta);
@@ -1005,6 +1196,32 @@ function isTerminalEvent(type: string, data: Record<string, unknown> | undefined
     return data?.['status'] === 'idle';
   }
   return false;
+}
+
+/** `snapshot` 的 `status` / `projections` 里任一处说会话还在跑。 */
+function isSnapshotBusy(frame: HostSessionFollowFrame): boolean {
+  if (frame.status === 'running' || frame.status === 'busy') return true;
+  const projections = asRecord(frame.projections);
+  if (projections === null) return false;
+  if (projections['status'] === 'running') return true;
+  const values = asRecord(projections['values']);
+  if (values === null) return false;
+  if (values['running'] === true) return true;
+  return values['status'] === 'running';
+}
+
+function isAbortReason(value: unknown): boolean {
+  return value === 'aborted' || value === 'cancelled' || value === 'canceled';
+}
+
+/** 终态事件里的宿主侧取消：`reason.kind` / `reason` 字符串 / `status`。 */
+function isAbortedTerminal(type: string, data: Record<string, unknown> | undefined): boolean {
+  if (!isTerminalEvent(type, data)) return false;
+  const reason = data?.['reason'];
+  if (typeof reason === 'string' && isAbortReason(reason)) return true;
+  const record = asRecord(reason);
+  if (record !== null && isAbortReason(record['kind'])) return true;
+  return isAbortReason(data?.['status']);
 }
 
 function textFromAssistantData(data: Record<string, unknown> | undefined): string {

@@ -116,6 +116,8 @@ export interface BackgroundTaskRequest {
   readonly source: BackgroundTaskSource;
   readonly image?: AgentImage;
   readonly note?: string;
+  /** 触发这条任务那一整句的高精度人声 PCM，可选透传给执行器。 */
+  readonly utterancePcm?: Buffer;
   /** 为真时不触发任何播报/前台汇报（用于 `memory_silent` 后台静默写入 MEMORY.md） */
   readonly silent?: boolean;
 }
@@ -140,6 +142,8 @@ export interface BackgroundTaskRunner {
     readonly image?: AgentImage;
     readonly note?: string;
     readonly silent: boolean;
+    /** 整句高精度人声；调用方没给就不带这个键。 */
+    readonly utterancePcm?: Buffer;
     readonly signal: AbortSignal;
   }): Promise<{ readonly text: string; readonly speech?: string; readonly emotion?: string }>;
   /** 显式取消正在运行的底层 dsh 轮次/后台任务 */
@@ -226,6 +230,7 @@ interface TaskRecord {
   readonly source: BackgroundTaskSource;
   image?: AgentImage;
   note?: string;
+  utterancePcm?: Buffer;
   readonly silent: boolean;
   state: BackgroundTaskState;
   controller: AbortController | null;
@@ -258,6 +263,14 @@ function move(task: TaskRecord, to: BackgroundTaskState): boolean {
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+/** 上游因宿主侧取消抛出的错（`InProcessDshAgent` 的 `TURN_ABORTED` 走这里）。 */
+function isAbortError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'AbortError') return true;
+  const code = (err as { code?: unknown }).code;
+  return code === 'ABORT_ERR' || code === 'TURN_ABORTED';
 }
 
 function preview(text: string): string {
@@ -350,6 +363,7 @@ export class BackgroundTaskBus {
       if (upgraded) {
         existing.query = req.query;
         if (req.note !== undefined) existing.note = req.note;
+        if (req.utterancePcm !== undefined) existing.utterancePcm = req.utterancePcm;
       }
       this.writeLog(
         `  后台    去重 ${existing.taskId} turn=${String(req.turnNo)}${upgraded ? ' 升级查询' : ''}`,
@@ -474,6 +488,7 @@ export class BackgroundTaskBus {
       source: req.source,
       image: req.image,
       note: req.note,
+      utterancePcm: req.utterancePcm,
       silent: isSilentRequest(req),
       epoch: this.sessionEpoch,
       state: 'queued',
@@ -604,11 +619,14 @@ export class BackgroundTaskBus {
         image: task.image,
         note: task.note,
         silent: task.silent,
+        ...(task.utterancePcm === undefined ? {} : { utterancePcm: task.utterancePcm }),
         signal: controller.signal,
       });
       this.finishOk(task, result);
     } catch (err) {
-      this.finishErr(task, err);
+      // 宿主侧取消不算失败：不播「刚才那个任务没跑成」。
+      if (isAbortError(err)) this.finishCancelled(task, 'host_aborted');
+      else this.finishErr(task, err);
     } finally {
       if (this.running === task) this.running = null;
       task.controller = null;
@@ -637,6 +655,18 @@ export class BackgroundTaskBus {
         : { type: 'completed', ...this.taskLifecycle(task), report },
     );
     if (report !== undefined) this.deliver(report);
+  }
+
+  /**
+   * 上游因宿主侧取消收尾：记 `cancelled`、摘掉同轮索引，**不发失败汇报**。
+   * 用户自己按了停止，再说「刚才那个任务没跑成」是噪音。
+   */
+  private finishCancelled(task: TaskRecord, reason: string): void {
+    if (task.state !== 'running' || this.phase === 'disposed') return;
+    if (!move(task, 'cancelled')) return;
+    this.dropTurn(task);
+    this.writeLog(`  后台    取消 ${task.taskId}（${reason}）`);
+    this.emitLifecycle({ type: 'cancelled', ...this.taskLifecycle(task), reason });
   }
 
   private finishErr(task: TaskRecord, err: unknown): void {

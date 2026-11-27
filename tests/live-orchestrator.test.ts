@@ -30,6 +30,7 @@ import type {
   TtsProvider,
   TurnContext,
 } from '../src/providers.ts';
+import type { AsrRefiner } from '../src/runtime/asr-refine.ts';
 
 const PCM = Buffer.from([1, 2, 3, 4]);
 const TTS_PCM = Buffer.from([9, 9]);
@@ -1418,6 +1419,154 @@ test('decideLiveTurn 把前台分支收成显式种类', () => {
   }), 'fallback_dsh');
 });
 
+test('decideLiveTurn 把纠正、核查与实时事实收进守卫轮，闲聊仍直答', () => {
+  const base: LiveTurnFacts = {
+    text: '你好呀',
+    hasImage: false,
+    cancelActive: false,
+    photoHandOff: false,
+    laneCanAnswer: true,
+    willServe: true,
+    canTryText: true,
+  };
+  for (const text of [
+    '我说的是本古迷',
+    '你不是有工具调用能力吗？你去看看那个任务还在跑没有？',
+  ]) {
+    assert.equal(decideLiveTurn({ ...base, text }), 'live_with_bg_guard', text);
+  }
+  for (const text of [
+    '今天发生了哪些新闻？',
+    '本机活跃开发的项目有哪些？',
+    '千问 Live 模型支持双语吗？',
+    '你知道班公秘吗？',
+    '你知道波兰作家莱姆吗？',
+    '奇耻之身是什么？',
+  ]) {
+    assert.equal(decideLiveTurn({ ...base, text }), 'live_with_bg_guard', text);
+  }
+  for (const text of ['你好呀', '查好没？', '你看过星球大战没？']) {
+    assert.equal(decideLiveTurn({ ...base, text }), 'live_direct', text);
+  }
+});
+
+test('委派 dsh 前用整句 PCM 精转，注记留流式初转参考', async () => {
+  const streaming = '你去查一下 d s h 插件的液态。';
+  const refinedText = '你去查一下 dsh 插件的生态。';
+  const pfcm = Buffer.alloc(16_000, 1);
+  const refined: Array<{ pcm: Buffer; streamingText: string }> = [];
+  const subtitles: Array<{ text: string; previous: string }> = [];
+  const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
+  dsh.hold();
+  const lane = ssotLane({
+    answer: () => audioAnswer([PCM], '我查查。', { reason: 'delegate', text: null }),
+  });
+  const host = orch(dsh.agent, scriptedTts().tts, lane, {
+    refineAsr: async (req) => {
+      refined.push({ pcm: req.pcm, streamingText: req.streamingText });
+      return refinedText;
+    },
+    onAsrRefined: (text, previous) => {
+      subtitles.push({ text, previous });
+    },
+  });
+
+  await collect(host.toEngine().respond(
+    turnOf(streaming, { no: 1, utterancePcm: pfcm }),
+    new AbortController().signal,
+  ));
+  await settle();
+
+  assert.equal(refined.length, 1);
+  assert.equal(refined[0]?.pcm.byteLength, 16_000, '精转必须拿到未切碎的整句 PCM');
+  assert.equal(refined[0]?.pcm.equals(pfcm), true);
+  assert.equal(refined[0]?.streamingText, streaming);
+  const call = must(dsh.calls[0], '委派 dsh');
+  assert.equal(call.text, refinedText);
+  assert.match(call.note ?? '', /【流式初转参考】你去查一下 d s h 插件的液态。/);
+  assert.deepEqual(subtitles, [{ text: refinedText, previous: streaming }]);
+
+  dsh.release();
+  await settle();
+});
+
+test('闲聊直答不精转；静默记忆写入也不精转', async () => {
+  let refineCalls = 0;
+  const refiner: AsrRefiner = async () => {
+    refineCalls += 1;
+    return '改写后的句子';
+  };
+  const dsh = fakeDsh();
+  const chitchat = orch(dsh.agent, scriptedTts().tts, fakeLane(), { refineAsr: refiner });
+  await collect(chitchat.toEngine().respond(
+    turnOf('你好呀', { utterancePcm: PCM }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(refineCalls, 0, 'live_direct 不委派，不该精转');
+  assert.equal(dsh.calls.length, 0);
+
+  const memorized = orch(dsh.agent, scriptedTts().tts, fakeLane(), { refineAsr: refiner });
+  await collect(memorized.toEngine().respond(
+    turnOf('记住我喜欢下雨天', { utterancePcm: PCM }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(refineCalls, 0, 'memory_silent 静默写入不精转');
+});
+
+test('精转返回 null 时继续用流式初转委派 dsh', async () => {
+  const streaming = '你去查一下 d s h 插件的液态。';
+  const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
+  dsh.hold();
+  const lane = ssotLane({
+    answer: () => audioAnswer([PCM], '我查查。', { reason: 'delegate', text: null }),
+  });
+  const host = orch(dsh.agent, scriptedTts().tts, lane, { refineAsr: async () => null });
+
+  await collect(host.toEngine().respond(
+    turnOf(streaming, { no: 1, utterancePcm: Buffer.alloc(16_000, 1) }),
+    new AbortController().signal,
+  ));
+  await settle();
+
+  const call = must(dsh.calls[0], '委派 dsh');
+  assert.equal(call.text, streaming);
+  assert.equal((call.note ?? '').includes('【流式初转参考】'), false);
+  dsh.release();
+  await settle();
+});
+
+test('dsh 抛 AbortError 时只记取消，不发失败播报，单槽快照为 cancelled', async () => {
+  const abortAgent: AgentProvider = {
+    name: 'dsh',
+    sessionId: 'sess-live',
+    reply() {
+      const error = new Error('turn aborted');
+      error.name = 'AbortError';
+      return Promise.reject(error);
+    },
+  };
+  const lane = ssotLane({
+    answer: () => audioAnswer([PCM], '我查查。', { reason: 'delegate', text: null }),
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(abortAgent, scriptedTts().tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+
+  await collect(host.toEngine().respond(
+    turnOf('帮我查一下北之战', { no: 1 }),
+    new AbortController().signal,
+  ));
+  await settle();
+
+  assert.equal(reports.length, 0, '宿主侧取消不是失败，不能播「刚才那个任务没跑成」');
+  assert.match(lastSnapshot(lane), /状态=cancelled/);
+  assert.doesNotMatch(lastSnapshot(lane), /状态=failed/);
+});
+
 test('动作轮在 delegate 到达前不派单，到达后主查询仍是用户原话', async () => {
   const dsh = fakeDsh({ text: '晴', speech: '晴' });
   dsh.hold();
@@ -1816,17 +1965,16 @@ test('WorkBuddy 原意纠偏写进汇报、单槽快照和下一轮前文', asyn
   await settle();
 });
 
-test('专名听岔且答复零重叠时派后台复核，注记带上文和听岔提示', async () => {
-  const dsh = fakeDsh({ text: '其主之声是莱姆的小说', speech: '其主之声是莱姆的小说' });
+test('专名问句提前收进守卫轮：前台未调工具时在首块前拦截丢弃，绝不直答和后台双触发', async () => {
+  const dsh = fakeDsh({
+    text: '[原意: 你知道 Bangumi 吗？]\nBangumi 番组计划是中文 ACG 社区。',
+    speech: 'Bangumi 番组计划是中文 ACG 社区。',
+  });
   dsh.hold();
   const voice = scriptedTts();
-  const replies = [
-    '知道，莱姆是波兰科幻作家。',
-    '《技术哲学》是莱姆探讨科技与人类关系的随笔集。',
-  ];
-  let cursor = 0;
+  const leaked = Buffer.from([7, 7, 7, 7]);
   const lane = fakeLane({
-    answer: () => audioAnswer([PCM], replies[cursor++] ?? '嗯。'),
+    answer: () => audioAnswer([leaked], '我当然知道《半部论语》，意思是把论语学透一半。'),
   });
   const logs: string[] = [];
   const reports: BackgroundTaskReport[] = [];
@@ -1840,64 +1988,53 @@ test('专名听岔且答复零重叠时派后台复核，注记带上文和听�
   });
   const engine = host.toEngine();
 
-  await collect(engine.respond(
-    turnOf('你知道波兰作家莱姆吗？', { no: 1 }),
-    new AbortController().signal,
-  ));
-  await settle();
-  assert.equal(dsh.calls.length, 0, '上一轮闲聊不得派单');
-
   const events = await collect(engine.respond(
-    turnOf('奇耻之身是什么？', { no: 2 }),
+    turnOf('你知道班公秘吗？', { no: 1 }),
     new AbortController().signal,
   ));
-  assert.equal(doneOf(events).speech, '《技术哲学》是莱姆探讨科技与人类关系的随笔集。');
+  assert.equal(events.some((ev) => ev.type === 'audio' && ev.pcm.equals(leaked)), false, '未核实直答音频不得泄漏');
+  assert.equal(events.some((ev) => ev.type === 'text' && ev.delta.includes('半部论语')), false, '未核实文本不得泄漏');
+  assert.deepEqual(audioOf(events), [PCM]);
+  assert.equal(doneOf(events).speech, '好，我查查。');
+  assert.equal(lane.discards, 1);
+  assert.equal(lane.speaks.length, 1);
+  assert.equal(lane.speaks[0]?.kind, 'ack');
+  assert.ok(logs.some((line) => line.includes('守卫轮前台未调工具，拦截未核实音频并转交后台')));
   await settle();
 
   assert.equal(dsh.calls.length, 1);
-  const call = must(dsh.calls[0], '听岔复核');
-  assert.equal(call.text, '奇耻之身是什么？');
+  const call = must(dsh.calls[0], '专名守卫');
+  assert.equal(call.text, '你知道班公秘吗？');
   const note = call.note ?? '';
-  assert.ok(note.includes('用户：你知道波兰作家莱姆吗？'));
-  assert.ok(note.includes('【听岔复核提示】'));
-  assert.ok(note.includes('可能听岔成「《技术哲学》」'));
   assert.ok(note.includes('[原意: 纠正后的用户原话]'));
-  const dialogAt = note.indexOf('用户：你知道波兰作家莱姆吗？');
-  const hintAt = note.indexOf('【听岔复核提示】');
-  assert.ok(dialogAt >= 0 && hintAt > dialogAt, '上文要写在听岔提示前面');
-  assert.ok(logs.some((line) => line.includes(
-    '检测到听岔风险（ASR「奇耻之身」与前台答复「《技术哲学》」无重叠）→ 后台派 dsh 结合上文核实',
-  )));
+  assert.equal(note.includes('【听岔复核提示】'), false, '不再走事后听岔复核');
 
   dsh.release();
   await settle();
   assert.equal(reports.length, 1);
   assert.equal(must(reports[0], '汇报').source, 'early_rule');
-  assert.equal(must(reports[0], '汇报').query, '奇耻之身是什么？');
+  assert.equal(must(reports[0], '汇报').query, '你知道班公秘吗？');
   assert.deepEqual(voice.texts, []);
 });
 
-test('专名答对了有重叠时不派后台', async () => {
+test('直答轮放完后不再事后补派后台，保证前台直答与后台任务严格互斥', async () => {
   const dsh = fakeDsh({ text: '不该派', speech: '不该派' });
   const voice = scriptedTts();
-  const logs: string[] = [];
+  const spoken = Buffer.from([5, 5, 5, 5]);
   const lane = fakeLane({
-    answer: () => audioAnswer([PCM], '《索拉里斯星》是莱姆的代表作。'),
+    answer: () => audioAnswer([spoken], '《星球大战》我觉得老三部曲最经典。'),
   });
-  const host = orch(dsh.agent, voice.tts, lane, {
-    log: (line) => {
-      logs.push(line);
-    },
-  });
+  const host = orch(dsh.agent, voice.tts, lane);
   const events = await collect(host.toEngine().respond(
-    turnOf('索拉里斯星是什么？', { no: 3 }),
+    turnOf('你看过星球大战没？', { no: 1 }),
     new AbortController().signal,
   ));
 
-  assert.equal(doneOf(events).speech, '《索拉里斯星》是莱姆的代表作。');
+  assert.deepEqual(audioOf(events), [spoken]);
+  assert.equal(doneOf(events).speech, '《星球大战》我觉得老三部曲最经典。');
+  assert.equal(lane.discards, 0);
   await settle();
   assert.equal(dsh.calls.length, 0);
-  assert.equal(logs.some((line) => line.includes('检测到听岔风险')), false);
   assert.deepEqual(voice.texts, []);
 });
 
@@ -2064,4 +2201,152 @@ test('前台只答敷衍话时，后台任务仍会正常播报', async () => {
   assert.equal(outcome, 'spoken');
   assert.equal(lane.speaks.length, 1, '没被前台讲过，空窗要正常播报');
   assert.match(lastSnapshot(lane), /已口头告知哥/);
+});
+
+const NV_REPORT = '英伟达最近的三件事。第一，第三季度财报显示数据中心收入同比增长百分之九十四，毛利率维持在七成以上。'
+  + '第二，对华出口管制再次收紧，部分高端芯片的交付许可被推迟，公司正在申请新的豁免，并强调会遵守所有适用法规。'
+  + '第三，11月12日黄仁勋辞去CEO职务，11月23日复职，期间由临时管理委员会代行职责，管理层剧变引发市场关注。'
+  + '补充：公司同时披露了供应链、产能与回购计划的更多细节，具体数据以公司公告为准。';
+
+test('decideLiveTurn 放行已核实实体追问，显式细查仍进守卫轮', () => {
+  const base: LiveTurnFacts = {
+    text: '你好呀',
+    hasImage: false,
+    cancelActive: false,
+    photoHandOff: false,
+    laneCanAnswer: true,
+    willServe: true,
+    canTryText: true,
+  };
+  assert.equal(decideLiveTurn({ ...base, text: '黄仁勋离职是怎么回事？' }), 'live_with_bg_guard');
+  assert.equal(decideLiveTurn({ ...base, text: '管理层剧变是什么东西？' }), 'live_with_bg_guard');
+  assert.equal(decideLiveTurn({
+    ...base,
+    text: '黄仁勋离职是怎么回事？',
+    entityAlreadyVerified: true,
+  }), 'live_direct');
+  assert.equal(decideLiveTurn({
+    ...base,
+    text: '去细查一下黄仁勋辞职的原因',
+    entityAlreadyVerified: true,
+  }), 'live_with_bg_guard');
+});
+
+test('冷启动的实体事件问句进守卫轮，编造的「没离职」一字节不外放', async () => {
+  const dsh = fakeDsh({ text: '查到了', speech: '查到了' });
+  dsh.hold();
+  const voice = scriptedTts();
+  const leaked = Buffer.from([7, 6, 5, 4]);
+  const lane = fakeLane({
+    answer: () => audioAnswer([leaked], '黄仁勋没离职，那是谣言。'),
+  });
+  const host = orch(dsh.agent, voice.tts, lane);
+
+  const events = await collect(host.toEngine().respond(
+    turnOf('黄仁勋离职是怎么回事？', { no: 1 }),
+    new AbortController().signal,
+  ));
+
+  assert.equal(events.some((ev) => ev.type === 'audio' && ev.pcm.equals(leaked)), false);
+  assert.equal(events.some((ev) => ev.type === 'text' && ev.delta.includes('没离职')), false);
+  assert.deepEqual(audioOf(events), [PCM]);
+  assert.equal(doneOf(events).speech, '好，我查查。');
+  assert.equal(lane.discards, 1);
+  assert.equal(lane.speaks[0]?.kind, 'ack');
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  assert.equal(must(dsh.calls[0], '守卫派单').text, '黄仁勋离职是怎么回事？');
+  dsh.release();
+  await settle();
+});
+
+test('已核实的追问直接 live_direct，Omni 读全量单槽作答，不再重复派 dsh', async () => {
+  const dsh = fakeDsh({ text: NV_REPORT, speech: NV_REPORT });
+  dsh.hold();
+  const voice = scriptedTts();
+  let phase = 0;
+  const lane = ssotLane({
+    answer: () => {
+      phase += 1;
+      if (phase === 1) {
+        return answerWithIds([PCM], '我查查。', {
+          delegate: { reason: 'delegate', text: '英伟达最近新闻' },
+          callId: 'call-nv',
+        });
+      }
+      return audioAnswer([PCM], '他11月12日辞去CEO，11月23日就复职了。');
+    },
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+
+  await collect(host.toEngine().respond(
+    turnOf('查一下英伟达最近的新闻', { no: 1 }),
+    new AbortController().signal,
+  ));
+  dsh.release();
+  await settle();
+  const report = must(reports[0], '长报告');
+  assert.equal(report.summary.length, 160, '播报摘要仍然是 160 字');
+  assert.match(report.verbatim ?? '', /11月12日黄仁勋辞去CEO职务/);
+  assert.match(lastSnapshot(lane), /管理层剧变/);
+  assert.match(lastSnapshot(lane), /11月23日复职/);
+
+  const before = dsh.calls.length;
+  const events = await collect(host.toEngine().respond(
+    turnOf('黄仁勋离职是怎么回事？', { no: 2 }),
+    new AbortController().signal,
+  ));
+  assert.deepEqual(audioOf(events), [PCM]);
+  assert.equal(doneOf(events).speech, '他11月12日辞去CEO，11月23日就复职了。');
+  assert.equal(lane.claims, 2, '第二轮由 Omni 自己认领');
+  assert.equal(lane.discards, 0, '已核实的追问不再拦截');
+  await settle();
+  assert.equal(dsh.calls.length, before, '已核实的追问不得再派 dsh');
+});
+
+test('已有核实上下文时，显式要求细查仍走守卫轮', async () => {
+  const dsh = fakeDsh({ text: NV_REPORT, speech: NV_REPORT });
+  dsh.hold();
+  const voice = scriptedTts();
+  let phase = 0;
+  const lane = ssotLane({
+    answer: () => {
+      phase += 1;
+      if (phase === 1) {
+        return answerWithIds([PCM], '我查查。', {
+          delegate: { reason: 'delegate', text: '英伟达最近新闻' },
+          callId: 'call-nv-2',
+        });
+      }
+      return audioAnswer([PCM], '他11月12日辞去CEO，11月23日就复职了。');
+    },
+  });
+  const host = orch(dsh.agent, voice.tts, lane);
+
+  await collect(host.toEngine().respond(
+    turnOf('查一下英伟达最近的新闻', { no: 1 }),
+    new AbortController().signal,
+  ));
+  dsh.release();
+  await settle();
+  assert.match(lastSnapshot(lane), /11月12日黄仁勋辞去CEO职务/);
+
+  const before = dsh.calls.length;
+  dsh.hold();
+  const events = await collect(host.toEngine().respond(
+    turnOf('去细查一下黄仁勋辞职的原因', { no: 2 }),
+    new AbortController().signal,
+  ));
+  assert.deepEqual(audioOf(events), [PCM]);
+  assert.equal(doneOf(events).speech, '好，我查查。');
+  assert.equal(lane.discards, 1, '显式细查仍要拦下未核实的直答');
+  await settle();
+  assert.equal(dsh.calls.length, before + 1);
+  assert.equal(must(dsh.calls[before], '细查').text, '去细查一下黄仁勋辞职的原因');
+  dsh.release();
+  await settle();
 });

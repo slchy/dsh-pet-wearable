@@ -527,7 +527,7 @@ export class DialogRuntime {
           env.assemble(effect.text);
           break;
         case 'turn':
-          void this.enqueueTurn(effect.text, effect.image, effect.ticket);
+          void this.enqueueTurn(effect.text, effect.image, effect.ticket, effect.utterancePcm);
           break;
         case 'capture':
           this.enqueueCapture(effect.request, effect.ticket);
@@ -554,6 +554,7 @@ export class DialogRuntime {
     text: string,
     image: ImageAttachment | undefined,
     ticket: TurnTicket,
+    utterancePcm?: Buffer,
   ): Promise<void> {
     this.queued += 1;
     this.serialChain = this.serialChain.then(async () => {
@@ -571,7 +572,7 @@ export class DialogRuntime {
       // 「眼镜还剩多少电」「我刚才说到哪」这类只能靠上下文的问题。
       const note = composeTurnNote(this.options.env.deviceNote?.(), this.takeTailNote());
       try {
-        const result = await this.runner.run(text, image, note);
+        const result = await this.runner.run(text, image, note, utterancePcm);
         if (result !== null) {
           // 不只看 `interrupted`：真机 2026-11-23 第 11/13 轮，41–45 字的答案只合成出
           // 1.1–1.4 s 音频（TTS 那边把上一条被放弃的流的残留当成了自己的），

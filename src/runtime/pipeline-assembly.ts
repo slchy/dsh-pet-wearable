@@ -17,7 +17,8 @@ import type { AgentProvider, BackgroundTaskReport, TtsProvider } from '../provid
 import { realtimeLiveDefaults, resolveRealtimeDialect } from '../realtime-dialect.ts';
 import { resolveLiveApiKey } from '../voice-config.ts';
 import type { VoiceSessionOptions } from '../voice-session.ts';
-import { formatCurrentDateContext } from './asr-context.ts';
+import { formatCurrentDateContext, loadRefineHotwords } from './asr-context.ts';
+import { resolveAsrRefiner, type AsrRefiner } from './asr-refine.ts';
 
 /** `FrontedAgent` 的装配结论，见 {@link shouldCreateFrontedAgent}。 */
 export interface FrontedPlan {
@@ -265,6 +266,12 @@ export interface AssembleStreamingAgentDeps {
   readonly clockContext?: () => string;
   readonly asrCorpusText?: string;
   readonly asrLanguage?: string;
+  /** 显式注入精转器（`null` = 关闭）；不传则按 `env` 自己解析。 */
+  readonly refineAsr?: AsrRefiner | null;
+  /** 记忆里的热词提示，拼进精转的静态 corpus。 */
+  readonly refineHotwords?: string;
+  /** 精转替换流式初转时回调（Web 端用来更新浮层字幕）。 */
+  readonly onAsrRefined?: (text: string, previous: string) => void;
 }
 
 /** `VOICE_PIPELINE=live | cascade` 装配完、可以直接交给 `runVoiceServer` 的那一套。 */
@@ -303,12 +310,24 @@ export function assembleStreamingAgent(input: AssembleStreamingAgentDeps): Assem
       asrCorpusText: input.asrCorpusText,
       asrLanguage: input.asrLanguage,
     });
+    const refineAsr = input.refineAsr !== undefined
+      ? input.refineAsr
+      : resolveAsrRefiner(env, {
+        staticContext: loadRefineHotwords(input.refineHotwords ?? '', env),
+        ...(input.asrLanguage === undefined ? {} : { language: input.asrLanguage }),
+        log,
+      });
+    if (refineAsr !== null) {
+      log('精转      委派 dsh 前自动整句高精度重转（VOICE_REFINE_ASR=0 关闭）');
+    }
     const orch = new LiveOrchestrator({
       inner: dshAgent,
       tts,
       // 编排器要的是一整段注记；记忆文件返回的是几条，调用方已经拼好。
       memory,
       log,
+      ...(refineAsr === null ? {} : { refineAsr }),
+      ...(input.onAsrRefined === undefined ? {} : { onAsrRefined: input.onAsrRefined }),
     });
     const surfaced = armLiveOfflineAnnounce(orch, announceStore, log);
     const agent = trackActivity(surfaced, activity);

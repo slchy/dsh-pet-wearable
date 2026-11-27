@@ -38,7 +38,9 @@ import type {
   TtsProvider,
   TurnContext,
 } from '../providers.ts';
+import type { AsrRefiner } from '../runtime/asr-refine.ts';
 import {
+  hasVerifiedContextFor,
   initialLiveSessionState,
   listUnspokenReports,
   projectDshRecentDialog,
@@ -48,13 +50,14 @@ import {
   type LiveSessionEvent,
   type LiveSessionState,
 } from './live-session-store.ts';
-import { detectSubjectHallucination } from './entity-divergence.ts';
+import { extractQuestionSubject, hasEntityQuery } from './entity-divergence.ts';
 import {
   isActionRequest,
   isCancelRequest,
   isClockTimeRequest,
   isRealtimeFactRequest,
   looksMemorable,
+  needsBackendVerification,
 } from '../turn-router.ts';
 
 /** 文本入口（无音频 `reply()`）用户取消时的返回值。语音轮一律由 omni 自己开口。 */
@@ -71,6 +74,13 @@ export interface LiveOrchestratorOptions {
   readonly log?: (line: string) => void;
   /** 可选：自定义 dsh 后台任务指令（默认 {@link LIVE_BACKEND_TASK_DIRECTIVE}） */
   readonly backendDirective?: string;
+  /**
+   * 可选：委派前整句高精度重转（见 `runtime/asr-refine.ts`）。
+   * `null` / 不传 = 关闭；只做加法，失败一律回落到流式初转。
+   */
+  readonly refineAsr?: AsrRefiner | null;
+  /** 精转结果替换了流式初转时回调（用于更新浮层字幕）。 */
+  readonly onAsrRefined?: (refinedText: string, previousText: string) => void;
 }
 
 interface SpokenItem {
@@ -146,6 +156,11 @@ export interface LiveTurnFacts {
   readonly willServe: boolean;
   /** 没封段时 `answerFromText` 在场。返回 null 由调用方再降级 */
   readonly canTryText: boolean;
+  /**
+   * 单槽快照里已经有覆盖这个专名的已核实结论（见 `hasVerifiedContextFor`）。
+   * 为真时专名守卫放行，让 Omni 直接读上下文回答，不再重复派 dsh。
+   */
+  readonly entityAlreadyVerified?: boolean;
 }
 
 export function decideLiveTurn(facts: LiveTurnFacts): LiveTurnDecision {
@@ -154,7 +169,11 @@ export function decideLiveTurn(facts: LiveTurnFacts): LiveTurnDecision {
   if (isClockTimeRequest(facts.text)) {
     return facts.laneCanAnswer ? 'clock_override' : 'fallback_dsh';
   }
-  const guard = isActionRequest(facts.text) || isRealtimeFactRequest(facts.text);
+  const entityGuard = hasEntityQuery(facts.text) && facts.entityAlreadyVerified !== true;
+  const guard = isActionRequest(facts.text)
+    || isRealtimeFactRequest(facts.text)
+    || needsBackendVerification(facts.text)
+    || entityGuard;
   if (facts.willServe || facts.canTryText) {
     return guard ? 'live_with_bg_guard' : 'live_direct';
   }
@@ -178,11 +197,6 @@ function primaryDelegateQuery(rawUserText: string, rewrittenQuery: string | null
   return rewrittenQuery ?? '';
 }
 
-/** 听岔复核的注记。dsh 要对照最近前台主题，不要顺着 Omni 刚编的书名往下讲。 */
-function subjectHallucinationHint(asrText: string, replySubject: string, omniReply: string): string {
-  return `【听岔复核提示】用户语音转写为「${asrText}」，前台实时模型可能听岔成「${replySubject}」并回复了「${omniReply}」。请结合最近前台对话主题判断用户实际想问的专有名词；若前台确实答偏，第一行写 [原意: 纠正后的用户原话]，第二行给出简洁准确的事实结论。`;
-}
-
 /**
  * 前台改写只作低权重参考。空的、或和用户原话（去首尾空白后）相同的，不另附。
  */
@@ -193,6 +207,17 @@ function composeDelegateHint(rewrittenQuery: string, rawUserText: string): strin
     '【前台对用户意图的猜测（仅供参考，可能听岔或跑偏；若与用户原话或最近前台对话冲突，例如用户在纠正或质疑编造，一律以用户原话和上文为准）】',
     rewrittenQuery,
   ].join('\n');
+}
+
+/**
+ * 精转替换了主查询时，把流式初转留在注记末尾，便于 dsh 对照专名与中英混读。
+ * 流式结果是空串就不添这一行。
+ */
+function appendStreamingReference(note: string | undefined, streamingText: string): string | undefined {
+  if (streamingText.trim() === '') return note;
+  const line = `【流式初转参考】${streamingText}`;
+  if (note === undefined || note.trim() === '') return line;
+  return `${note}\n${line}`;
 }
 
 /**
@@ -207,6 +232,8 @@ export class LiveOrchestrator implements AgentProvider {
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   private readonly backendDirective: string;
+  private readonly refineAsr: AsrRefiner | null;
+  private readonly onAsrRefined: ((refinedText: string, previousText: string) => void) | undefined;
   private readonly bus: BackgroundTaskBus;
   private state: LiveSessionState = initialLiveSessionState();
   /**
@@ -233,12 +260,22 @@ export class LiveOrchestrator implements AgentProvider {
     this.now = options.now ?? (() => Date.now());
     this.log = options.log ?? (() => {});
     this.backendDirective = options.backendDirective ?? LIVE_BACKEND_TASK_DIRECTIVE;
+    this.refineAsr = options.refineAsr ?? null;
+    this.onAsrRefined = options.onAsrRefined;
     this.bus = new BackgroundTaskBus({
       now: this.now,
       log: this.log,
       runner: {
         execute: async (req) => {
-          const reply = await this.inner.reply(req.query, req.image, req.note);
+          let query = req.query;
+          let note = req.note;
+          // 精转跑在总线工人里：不占前台 Omni 的应声，dsh 拿到的却是整句高精度转写。
+          if (!req.silent) {
+            const refined = await this.refineForBackend(req.query, req.utterancePcm, req.note, req.signal);
+            query = refined.query;
+            note = refined.note;
+          }
+          const reply = await this.inner.reply(query, req.image, note);
           return { text: reply.text, speech: reply.speech, emotion: reply.emotion };
         },
         cancelRunning: () => {
@@ -706,6 +743,42 @@ export class LiveOrchestrator implements AgentProvider {
     return projectDshRecentDialog(this.state, 4);
   }
 
+  /**
+   * 委派前的整句高精度重转。只做加法：没有 PCM、精转关、空串、与流式一致
+   * 都原样返回；失败由 `AsrRefiner` 自己收成 `null`，绝不阻断委派。
+   */
+  private async refineForBackend(
+    query: string,
+    pcm: Buffer | undefined,
+    note: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ readonly query: string; readonly note: string | undefined; readonly refined: boolean }> {
+    const refiner = this.refineAsr;
+    if (pcm === undefined || refiner === null) {
+      return { query, note, refined: false };
+    }
+    const text = await refiner({
+      pcm,
+      streamingText: query,
+      context: this.recentDialogNote(),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (text === null) {
+      return { query, note, refined: false };
+    }
+    const refinedText = text.trim();
+    if (refinedText === '' || refinedText === query.trim()) {
+      return { query, note, refined: false };
+    }
+    this.writeLog(`  精转    ${JSON.stringify(query)} → ${JSON.stringify(refinedText)}`);
+    try {
+      this.onAsrRefined?.(refinedText, query);
+    } catch {
+      // 浮层回调异常不能阻断后台委派
+    }
+    return { query: refinedText, note: appendStreamingReference(note, query), refined: true };
+  }
+
   private readMemory(query: string): string {
     if (this.memory === undefined) return '';
     try {
@@ -865,10 +938,12 @@ export class LiveOrchestrator implements AgentProvider {
     meta: MetaEvent,
   ): AsyncGenerator<EngineEvent> {
     if (signal.aborted || this.disposed) return;
+    const refined = await this.refineForBackend(turn.text, turn.utterancePcm, turn.note, signal);
+    if (signal.aborted || this.disposed) return;
     const reply = await this.askForeground(
-      turn.text,
+      refined.query,
       toAgentImage(turn),
-      turn.note,
+      refined.note,
       turnContext(turn),
     );
     if (signal.aborted || this.disposed) return;
@@ -964,6 +1039,7 @@ export class LiveOrchestrator implements AgentProvider {
           source: 'tool_call',
           query,
           note: turn.note,
+          ...(turn.utterancePcm === undefined ? {} : { utterancePcm: turn.utterancePcm }),
         }, composeDelegateHint(ev.rewrittenQuery ?? '', turn.text));
         linkedTaskId = handle.taskId;
         this.apply({
@@ -1016,22 +1092,8 @@ export class LiveOrchestrator implements AgentProvider {
             if (signal.aborted || this.disposed) break;
           }
         }
-        // 专名听岔：没调工具，也没被实时事实守卫接走。没命中则不派、不等待。
-        if (!guardBackground && !sawDelegate && !signal.aborted && !this.disposed) {
-          const divergence = detectSubjectHallucination(turn.text, origSaid);
-          if (divergence !== null) {
-            this.writeLog(
-              `  直播    检测到听岔风险（ASR「${divergence.subject}」与前台答复「${divergence.replySubject}」无重叠）→ 后台派 dsh 结合上文核实`,
-            );
-            linkedTaskId = this.dispatchEarly(
-              turn,
-              answer?.assistantItemIds?.() ?? [],
-              subjectHallucinationHint(turn.text, divergence.replySubject, origSaid),
-            );
-            await Promise.resolve();
-            if (signal.aborted || this.disposed) break;
-          }
-        }
+        // 同一轮严格互斥：要么在首块音频前走守卫轮丢弃前台直答并派后台，
+        // 要么由前台直接回答；不再在直答放完后再事后补派 dsh 造成双答。
         if (signal.aborted || this.disposed) break;
         const said = preferAck ? (ackText || origSaid) : (origSaid !== '' ? origSaid : ackText);
         this.remember(turn, said, 'live', this.recordedExtra(answer, linkedTaskId));
@@ -1068,6 +1130,7 @@ export class LiveOrchestrator implements AgentProvider {
       source: 'early_rule',
       query: turn.text,
       note: turn.note,
+      ...(turn.utterancePcm === undefined ? {} : { utterancePcm: turn.utterancePcm }),
     }, delegateHint);
     this.apply({
       type: 'turn.early_guarded',
@@ -1086,6 +1149,8 @@ export class LiveOrchestrator implements AgentProvider {
     if (this.disposed || signal.aborted) return;
 
     const lane = this.audioLane;
+    const subject = extractQuestionSubject(turn.text);
+    const entityAlreadyVerified = subject !== null && hasVerifiedContextFor(this.state, subject);
     const decision = decideLiveTurn({
       text: turn.text,
       hasImage: turn.hasImage && turn.image !== undefined,
@@ -1094,6 +1159,7 @@ export class LiveOrchestrator implements AgentProvider {
       laneCanAnswer: this.laneCanAnswer(),
       willServe: lane?.willServe() === true,
       canTryText: typeof lane?.answerFromText === 'function',
+      ...(entityAlreadyVerified ? { entityAlreadyVerified: true } : {}),
     });
 
     if (decision !== 'cancel_bg' && decision !== 'photo_delegate' && looksMemorable(turn.text)) {
@@ -1115,6 +1181,7 @@ export class LiveOrchestrator implements AgentProvider {
           query: turn.text,
           image: toAgentImage(turn),
           note: turn.note,
+          ...(turn.utterancePcm === undefined ? {} : { utterancePcm: turn.utterancePcm }),
         });
         yield* this.speakAck(turn, signal, 'photo', {
           type: 'meta',

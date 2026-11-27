@@ -69,6 +69,25 @@ function followFrames(
   };
 }
 
+/** 按相对毫秒排期的 follow 脚本，用来让看门狗真的到期。 */
+function scheduledFrames(
+  steps: ReadonlyArray<{ at: number; frame: HostSessionFollowFrame }>,
+  signal: AbortSignal,
+): AsyncIterable<HostSessionFollowFrame> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      const started = Date.now();
+      for (const step of steps) {
+        if (signal.aborted) return;
+        const wait = step.at - (Date.now() - started);
+        if (wait > 0) await Promise.race([delay(wait), whenAborted(signal)]);
+        if (signal.aborted) return;
+        yield step.frame;
+      }
+    },
+  };
+}
+
 function plainFrames(text: string, cursor = 1): HostSessionFollowFrame[] {
   return [
     { type: 'snapshot', cursor, records: [], hasMore: false },
@@ -113,6 +132,10 @@ class MockController implements HostSessionController {
 
   enqueue(frames: readonly HostSessionFollowFrame[], hold?: Promise<void>): void {
     this.scripts.push((signal) => followFrames(frames, signal, hold));
+  }
+
+  enqueueScript(script: (signal: AbortSignal) => AsyncIterable<HostSessionFollowFrame>): void {
+    this.scripts.push(script);
   }
 
   list(
@@ -587,4 +610,198 @@ test('构造时传入已存在的跨目录会话直接采用，不误调 create'
   assert.deepEqual(mock.follows, ['existing-web-1']);
   assert.equal(mock.prompts[0]?.sessionId, 'existing-web-1');
   assert.equal(view.text, '直接续接成功');
+});
+
+test('长编译 job 在跑时不会被空闲看门狗误杀', OPTS, async () => {
+  const mock = new MockController();
+  const agent = new InProcessDshAgent({
+    controller: mock,
+    workDir: WORK,
+    idleTimeoutMs: 60,
+  });
+  const cursor = 10;
+  mock.enqueueScript((signal) => scheduledFrames([
+    { at: 0, frame: { type: 'snapshot', cursor, records: [], hasMore: false } },
+    {
+      at: 5,
+      frame: {
+        type: 'event',
+        event: {
+          type: 'job/registered',
+          seq: cursor + 1,
+          sessionId: 'sess-1',
+          data: { jobId: 'j1', kind: 'pwsh', label: 'npm run build' },
+        },
+      },
+    },
+    {
+      at: 150,
+      frame: {
+        type: 'event',
+        event: {
+          type: 'job/settled',
+          seq: cursor + 2,
+          sessionId: 'sess-1',
+          data: { jobId: 'j1' },
+        },
+      },
+    },
+    {
+      at: 160,
+      frame: {
+        type: 'event',
+        event: {
+          type: 'assistant/message',
+          seq: cursor + 3,
+          sessionId: 'sess-1',
+          data: { message: { content: [{ type: 'text', text: '编译通过' }] } },
+        },
+      },
+    },
+    {
+      at: 170,
+      frame: {
+        type: 'event',
+        event: {
+          type: 'turn/end',
+          seq: cursor + 4,
+          sessionId: 'sess-1',
+          data: { turn: 1, reason: { kind: 'stop' } },
+        },
+      },
+    },
+  ], signal));
+
+  const view = await agent.reply('跑个编译');
+  assert.equal(view.text, '编译通过');
+  assert.equal(view.path, 'dsh');
+  assert.deepEqual(mock.cancels, []);
+});
+
+test('多步活动不断续命，不会被空闲看门狗误杀', OPTS, async () => {
+  const mock = new MockController();
+  const agent = new InProcessDshAgent({
+    controller: mock,
+    workDir: WORK,
+    idleTimeoutMs: 60,
+  });
+  const cursor = 20;
+  const event = (
+    at: number,
+    type: string,
+    seq: number,
+    data: Record<string, unknown>,
+  ): { at: number; frame: HostSessionFollowFrame } => ({
+    at,
+    frame: { type: 'event', event: { type, seq, sessionId: 'sess-1', data } },
+  });
+  mock.enqueueScript((signal) => scheduledFrames([
+    { at: 0, frame: { type: 'snapshot', cursor, records: [], hasMore: false } },
+    event(35, 'step/start', cursor + 1, { stepId: 's1' }),
+    event(70, 'tool/call', cursor + 2, { tool: 'grep' }),
+    {
+      at: 105,
+      frame: {
+        type: 'assistant-stream',
+        frame: { type: 'chunk', chunk: { type: 'text-delta', text: '还在跑' } },
+      },
+    },
+    event(140, 'step/start', cursor + 3, { stepId: 's2' }),
+    event(175, 'assistant/message', cursor + 4, {
+      message: { content: [{ type: 'text', text: '多步完成' }] },
+    }),
+    event(200, 'turn/end', cursor + 5, { turn: 7, reason: { kind: 'stop' } }),
+  ], signal));
+
+  const view = await agent.reply('一步一步来');
+  assert.equal(view.text, '多步完成');
+  assert.deepEqual(mock.cancels, []);
+});
+
+test('真正卡死才超时，并同步取消宿主那一轮', OPTS, async () => {
+  const mock = new MockController();
+  const agent = new InProcessDshAgent({
+    controller: mock,
+    workDir: WORK,
+    idleTimeoutMs: 50,
+  });
+  const hold = deferred();
+  mock.enqueue(plainFrames('不会回到这里'), hold.promise);
+
+  await assert.rejects(agent.reply('卡住不动'), (error: unknown) => {
+    assert.equal(error instanceof Error, true);
+    assert.match((error as Error).message, /空闲超时/);
+    return true;
+  });
+  assert.deepEqual(mock.cancels, [{ sessionId: 'sess-1' }]);
+  hold.resolve();
+});
+
+test('宿主侧 turn/end aborted 抛 AbortError，不播报也不回注', OPTS, async () => {
+  const mock = new MockController();
+  const agent = new InProcessDshAgent({ controller: mock, workDir: WORK });
+  const announced: string[] = [];
+  const sunk: string[] = [];
+  agent.setAnnouncer((speech) => { announced.push(speech); });
+  agent.setDetachedAnswerSink((userText) => { sunk.push(userText); });
+  mock.enqueue([
+    { type: 'snapshot', cursor: 1, records: [], hasMore: false },
+    {
+      type: 'event',
+      event: {
+        type: 'turn/end',
+        seq: 2,
+        data: { turn: 29, reason: { kind: 'aborted', reason: { kind: 'user' } } },
+      },
+    },
+  ]);
+
+  await assert.rejects(agent.reply('跑一下'), (error: unknown) => {
+    assert.equal(error instanceof Error, true);
+    assert.equal((error as Error).name, 'AbortError');
+    assert.equal((error as { code?: unknown }).code, 'TURN_ABORTED');
+    return true;
+  });
+  assert.deepEqual(announced, []);
+  assert.deepEqual(sunk, []);
+  assert.equal(agent.dshBusy(), false);
+});
+
+test('队列模式忽略旧轮的 turn/end，不把上一轮收尾当本轮结束', OPTS, async () => {
+  const mock = new MockController();
+  const agent = new InProcessDshAgent({ controller: mock, workDir: WORK });
+  const cursor = 30;
+  mock.enqueue([
+    {
+      type: 'snapshot',
+      cursor,
+      status: 'running',
+      records: [],
+      hasMore: false,
+    },
+    {
+      type: 'event',
+      event: { type: 'turn/end', seq: cursor + 1, data: { turn: 4, reason: { kind: 'stop' } } },
+    },
+    {
+      type: 'event',
+      event: { type: 'turn/start', seq: cursor + 2, data: { turn: 5 } },
+    },
+    {
+      type: 'event',
+      event: {
+        type: 'assistant/message',
+        seq: cursor + 3,
+        data: { message: { content: [{ type: 'text', text: '本轮答案' }] } },
+      },
+    },
+    {
+      type: 'event',
+      event: { type: 'turn/end', seq: cursor + 4, data: { turn: 5, reason: { kind: 'stop' } } },
+    },
+  ]);
+
+  const view = await agent.reply('排队的问题');
+  assert.equal(view.text, '本轮答案');
+  assert.equal(view.speech, '本轮答案');
 });

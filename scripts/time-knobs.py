@@ -133,6 +133,8 @@ CLOCK: dict[str, str] = {
     "DEFAULT_CAPTURE_TIMEOUT_MS": "wall",
     "DEFAULT_CONFIRM_TIMEOUT_MS": "wall",
     "SUPERSEDED_TTL_MS": "wall",
+    "REFINE_TIMEOUT_MS": "wall",
+    "REFINE_MIN_DURATION_MS": "audio（门控）",
 }
 
 #: 布尔开关没有「时钟」这个概念 —— 它们开关的是机制，不是时长
@@ -246,6 +248,11 @@ SHADED_BY: dict[str, str] = {
         "模块兜底默认（生产由 `SEMANTIC_END_TAG_BUDGET_MS` 覆写；"
         "仅直接调 `semanticEndpoint` 未传 `timeoutMs` 时生效）"
     ),
+    "REFINE_TIMEOUT_MS": (
+        "无关首声（仅异步委派 dsh 前的整句精转超时；"
+        "前台 Omni 应声不等待它，超时安全回退流式初转）"
+    ),
+    "REFINE_MIN_DURATION_MS": "无（纯判据：整句 PCM 不足 200 ms 跳过精转，不加任何延迟）",
 }
 
 #: 上限：这条参数有没有硬顶
@@ -318,6 +325,9 @@ NOT_ON_PATH = {
     "SPEAKING_WATCHDOG_MIN_MS",
     "SPEAKING_WATCHDOG_MARGIN_MS",
     "DEFAULT_SEMANTIC_BUDGET_MS",
+    # 委派前整句高精度精转（异步后台旁路，不影响前台首声）
+    "REFINE_TIMEOUT_MS",
+    "REFINE_MIN_DURATION_MS",
 }
 
 ENV_RE = re.compile(

@@ -595,20 +595,24 @@ test('assembleStreamingAgent：live 的非法 OMNI_ANSWER 抛错，不退出进�
 
 // ---------------------------------------------------------------- 静态热词 / 日期 / 记忆摘要
 
-test('resolveAsrLanguage：默认中文，auto/off/空串不写语言', async () => {
-  assert.equal(resolveAsrLanguage({}), 'zh');
-  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: undefined }), 'zh');
+test('resolveAsrLanguage：默认 auto（不写语言），显式语言原样返回', async () => {
+  assert.equal(resolveAsrLanguage({}), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: undefined }), undefined);
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'auto' }), undefined);
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'off' }), undefined);
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: '' }), undefined);
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: '   ' }), undefined);
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: ' auto ' }), undefined);
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: ' off ' }), undefined);
+  assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'zh' }), 'zh');
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: '  en  ' }), 'en');
   assert.equal(resolveAsrLanguage({ QWEN_ASR_LANGUAGE: 'yue' }), 'yue');
 
   await withEnv({ QWEN_ASR_LANGUAGE: 'en' }, async () => {
     assert.equal(resolveAsrLanguage(), 'en');
+  });
+  await withEnv({ QWEN_ASR_LANGUAGE: undefined }, async () => {
+    assert.equal(resolveAsrLanguage(), undefined, '没有显式设置时不能默认锁中文');
   });
   await withEnv({ QWEN_ASR_LANGUAGE: '' }, async () => {
     assert.equal(resolveAsrLanguage(), undefined);

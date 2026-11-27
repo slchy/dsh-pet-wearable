@@ -7,6 +7,7 @@ import { test } from 'node:test';
 
 import {
   foregroundCoveredReport,
+  hasVerifiedContextFor,
   initialLiveSessionState,
   listUnspokenReports,
   projectDshRecentDialog,
@@ -266,7 +267,7 @@ test('task.completed 的核实说法写回同一轮并立刻进入前台对话',
 
   const expected = [
     SNAPSHOT_TITLE,
-    '- 任务 bg-air | 轮次 4 | 查询：把空调调到26度 | 状态=completed（已核实，尚未播报给哥） | 结论：空调已经调到26度',
+    '- 任务 bg-air | 轮次 4 | 查询：把空调调到26度 | 状态=completed（已核实，尚未播报给哥） | 结论：订单 AB1234',
     '- 已核实说法：第4轮「空调二十六」→「把空调调到26度」',
   ].join('\n');
   assert.deepEqual(done.effects.map((effect) => effect.type), [
@@ -284,7 +285,7 @@ test('task.completed 的核实说法写回同一轮并立刻进入前台对话',
   const sync = done.effects[1];
   assert.ok(sync !== undefined && sync.type === 'sync_omni_snapshot');
   assert.equal(sync.snapshot, expected);
-  assert.doesNotMatch(sync.snapshot, /AB1234/);
+  assert.match(sync.snapshot, /AB1234/, '逐字稿里的字面量必须进单槽，Omni 才念得准');
   const delivered = done.effects[2];
   assert.ok(delivered !== undefined && delivered.type === 'deliver_report');
   assert.equal(delivered.report, report);
@@ -670,7 +671,7 @@ test('memory_silent 不进入 Omni 快照', () => {
   assert.doesNotMatch(visible.state.lastSnapshot, /已悄悄记下/);
 });
 
-test('快照不超过 800 字，文本没变不重复同步', () => {
+test('快照不超过 3200 字，文本没变不重复同步', () => {
   const queryOf = (index: number): string => `标记${index}号${'长'.repeat(900)}`;
   let state = initialLiveSessionState();
   for (let index = 0; index < 6; index += 1) {
@@ -684,12 +685,16 @@ test('快照不超过 800 字，文本没变不重复同步', () => {
   }
   const snapshot = state.lastSnapshot;
   assert.equal(projectOmniSnapshot(state), snapshot);
-  assert.ok(snapshot.length <= 800);
-  assert.ok([...snapshot].length <= 800);
-  assert.equal([...snapshot].length, 800);
+  assert.ok(snapshot.length <= 3200);
+  assert.ok([...snapshot].length <= 3200);
+  assert.equal([...snapshot].length, 3200, '预算见底时最后一行裁到刚好用满');
   assert.ok(snapshot.startsWith(SNAPSHOT_TITLE));
   assert.match(snapshot, /bulk-0/);
   assert.match(snapshot, /标记0号/);
+  assert.match(snapshot, /bulk-3/);
+  assert.match(snapshot, /标记3号/);
+  assert.doesNotMatch(snapshot, /bulk-4/);
+  assert.doesNotMatch(snapshot, /标记4号/);
   assert.doesNotMatch(snapshot, /bulk-5/);
   assert.doesNotMatch(snapshot, /标记5号/);
   assert.ok([...projectOmniSnapshot(state, 80)].length <= 80);
@@ -867,8 +872,8 @@ test('前台轮次只留最近 12 条，终态快照只留最近 4 条', () => {
   assert.doesNotMatch(snapshot, /结论1/);
   assert.match(snapshot, /结论2/);
   assert.match(snapshot, /结论5/);
-  assert.ok(snapshot.indexOf('仍在排队') < snapshot.indexOf('结论2'));
-  assert.ok(snapshot.indexOf('结论2') < snapshot.indexOf('结论5'));
+  assert.ok(snapshot.indexOf('仍在排队') < snapshot.indexOf('结论5'), '在跑的任务永远排在终态前面');
+  assert.ok(snapshot.indexOf('结论5') < snapshot.indexOf('结论2'), '终态最新的排最前');
   assert.equal(listUnspokenReports(state).length, 6);
 });
 
@@ -1024,4 +1029,138 @@ test('前台只答敷衍、闲聊或本轮被打断时，任务保持 pending', 
   assert.equal(cut.state.turns.at(-1)?.truncated, true);
   assert.equal(taskOf(cut.state, 'bg-stay').delivered, 'pending');
   assert.deepEqual(listUnspokenReports(cut.state).map((task) => task.taskId), ['bg-stay']);
+});
+
+const NVIDIA_LEAD = '英伟达最近有三件事。第一，第三季度财报显示数据中心收入同比增长百分之九十四，游戏业务环比持平，'
+  + '毛利率维持在七成以上，公司还上调了下一季度指引。第二，对华出口管制再次收紧，'
+  + '部分高端芯片的交付许可被推迟，公司正在申请新的豁免，并强调会遵守所有适用法规。';
+const NVIDIA_FILLER = '补充背景：供应链、产能与回购计划的更多细节以公司公告为准。'.repeat(30);
+const NVIDIA_POINT3 = '第三，11月12日黄仁勋辞去CEO职务，11月23日复职；期间由临时管理委员会代行职责，管理层剧变引发市场关注。';
+const NVIDIA_SOURCES = '信源：[英伟达投资者关系](https://investor.nvidia.com/earnings) https://example.com/nvidia-news\n'
+  + '来源：https://example.com/nvidia-only-source';
+const NVIDIA_VERBATIM = `${NVIDIA_LEAD}${NVIDIA_FILLER}${NVIDIA_POINT3}\n${NVIDIA_SOURCES}`;
+const NVIDIA_SUMMARY = [...NVIDIA_VERBATIM].slice(0, 160).join('');
+
+function nvidiaCompletedState(): LiveSessionState {
+  return step(initialLiveSessionState(), {
+    type: 'task.completed',
+    report: {
+      taskId: 'bg-nv',
+      source: 'tool_call',
+      query: '查一下英伟达最近的新闻',
+      summary: NVIDIA_SUMMARY,
+      verbatim: NVIDIA_VERBATIM,
+    },
+  }).state;
+}
+
+test('长报告全文进 Omni 单槽：160 字 summary 之外的第三点也能被追问', () => {
+  assert.ok([...NVIDIA_VERBATIM].length > 1_000, '构造的是千字级长报告');
+  assert.equal([...NVIDIA_SUMMARY].length, 160);
+  assert.equal(NVIDIA_SUMMARY.includes('黄仁勋'), false, 'summary 只覆盖前半段，第三点被截在外面');
+
+  const snapshot = projectOmniSnapshot(nvidiaCompletedState());
+  assert.ok([...snapshot].length <= 3200);
+  assert.match(snapshot, /11月12日黄仁勋辞去CEO职务/);
+  assert.match(snapshot, /11月23日复职/);
+  assert.match(snapshot, /管理层剧变/);
+  assert.doesNotMatch(snapshot, /https?:\/\//, 'Markdown 与裸链接都要剥掉');
+  assert.match(snapshot, /英伟达投资者关系/, '链接文字保留');
+  assert.doesNotMatch(snapshot, /来源：/, '剥掉链接后只剩空标签的行整行抹掉');
+});
+
+test('多条终态时最新一条保真到 1800 字，旧的压到 260 字，不许挤掉最新', () => {
+  let state = initialLiveSessionState();
+  const older = [
+    { taskId: 'bg-old-a', query: '旧任务甲', body: `${'甲'.repeat(600)}甲尾部` },
+    { taskId: 'bg-old-b', query: '旧任务乙', body: `${'乙'.repeat(600)}乙尾部` },
+    { taskId: 'bg-old-c', query: '旧任务丙', body: `${'丙'.repeat(600)}丙尾部` },
+  ];
+  for (const row of older) {
+    state = step(state, {
+      type: 'task.completed',
+      report: {
+        taskId: row.taskId,
+        source: 'tool_call',
+        query: row.query,
+        summary: row.body.slice(0, 160),
+        verbatim: row.body,
+      },
+    }).state;
+  }
+  const latest = `${'新'.repeat(2_000)}最新报告尾部`;
+  state = step(state, {
+    type: 'task.completed',
+    report: {
+      taskId: 'bg-new',
+      source: 'tool_call',
+      query: '最新任务',
+      summary: latest.slice(0, 160),
+      verbatim: latest,
+    },
+  }).state;
+
+  const snapshot = projectOmniSnapshot(state);
+  assert.ok([...snapshot].length <= 3200);
+  assert.match(snapshot, /新{1799}…/u, '最新报告保真到 1800 字再裁');
+  assert.doesNotMatch(snapshot, /新{1800}/u);
+  assert.doesNotMatch(snapshot, /最新报告尾部/, '超出上限的尾部被裁掉');
+  assert.match(snapshot, /甲{259}…/u, '旧报告压到 260 字');
+  assert.doesNotMatch(snapshot, /甲{260}/u);
+  assert.doesNotMatch(snapshot, /甲尾部/);
+  assert.match(snapshot, /乙{259}…/u);
+  assert.match(snapshot, /丙{259}…/u);
+  assert.ok(snapshot.indexOf('最新任务') < snapshot.indexOf('旧任务丙'));
+  assert.ok(snapshot.indexOf('旧任务丙') < snapshot.indexOf('旧任务甲'), '终态最新的排最前');
+});
+
+test('hasVerifiedContextFor 认已核实实体事实，拒绝空会话、无关话题与上一代际', () => {
+  assert.equal(hasVerifiedContextFor(initialLiveSessionState(), '黄仁勋离职'), false);
+  const state = nvidiaCompletedState();
+  assert.equal(hasVerifiedContextFor(state, '黄仁勋离职'), true, '同义转述：离职 / 辞去');
+  assert.equal(hasVerifiedContextFor(state, '管理层巨变'), true, 'ASR 同音词：巨变 / 剧变');
+  assert.equal(hasVerifiedContextFor(state, '英伟达'), true, '原串直接命中');
+  assert.equal(hasVerifiedContextFor(state, '班公秘'), false);
+  assert.equal(hasVerifiedContextFor(state, ''), false);
+  assert.equal(hasVerifiedContextFor(state, '离'), false);
+
+  const replaced = step(state, { type: 'lane.replaced' }).state;
+  assert.equal(hasVerifiedContextFor(replaced, '黄仁勋离职'), false, '上一代际的任务不再算数');
+});
+
+test('前台口述长报告后半段也算代播，按 verbatim 覆盖而不是只看 160 字 summary', () => {
+  let state = step(initialLiveSessionState(), {
+    type: 'turn.delegated',
+    turnNo: 7,
+    rawAsr: '查一下英伟达最近的新闻',
+    query: '查一下英伟达最近的新闻',
+    taskId: 'bg-nv',
+  }).state;
+  state = step(state, {
+    type: 'task.completed',
+    report: {
+      taskId: 'bg-nv',
+      source: 'tool_call',
+      query: '查一下英伟达最近的新闻',
+      summary: NVIDIA_SUMMARY,
+      verbatim: NVIDIA_VERBATIM,
+    },
+    turnNo: 7,
+  }).state;
+  assert.equal(taskOf(state, 'bg-nv').delivered, 'pending');
+
+  const spoken = '第三，11月12日黄仁勋辞去CEO职务，11月23日复职；期间由临时管理委员会代行职责，管理层剧变引发市场关注。';
+  assert.equal(foregroundCoveredReport(spoken, NVIDIA_SUMMARY), false, '前半段 summary 覆盖不到第三点');
+
+  const covered = step(state, {
+    type: 'turn.recorded',
+    turnNo: 8,
+    rawAsr: '你刚刚查的管理层巨变是什么东西？',
+    lane: 'live',
+    assistantSpoken: spoken,
+    endedAtMs: 20_000,
+  });
+  assert.equal(taskOf(covered.state, 'bg-nv').delivered, 'spoken');
+  assert.match(covered.state.lastSnapshot, /已口头告知哥/);
+  assert.doesNotMatch(covered.state.lastSnapshot, /尚未播报给哥/);
 });

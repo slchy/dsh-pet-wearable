@@ -23,6 +23,7 @@ interface ExecCall {
   readonly image?: AgentImage;
   readonly note?: string;
   readonly silent: boolean;
+  readonly utterancePcm?: Buffer;
   readonly signal: AbortSignal;
 }
 
@@ -1518,4 +1519,95 @@ test('BusPhase：dispose 在 scheduled 挡住已入队 drain，取消未收尾�
   assert.equal(quiet.state(), 'completed');
   assert.equal(bus.activeCount(), 0);
   assert.deepEqual(reports, []);
+});
+
+test('上游 AbortError 记为取消，不播假失败，同轮可再派单', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const events: BackgroundTaskLifecycleEvent[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+    onLifecycle: (event) => { events.push(event); },
+  });
+  const task = bus.dispatch({ query: '会被宿主取消', source: 'tool_call', turnNo: 5 });
+  await flush();
+  assert.equal(task.state(), 'running');
+
+  const aborted = new Error('任务已在宿主侧取消');
+  aborted.name = 'AbortError';
+  (aborted as Error & { code?: string }).code = 'TURN_ABORTED';
+  must(held.pending[0], 'slot').reject(aborted);
+  await flush();
+
+  assert.equal(task.state(), 'cancelled');
+  assert.equal(reports.length, 0);
+  assert.equal(events.some((event) => event.type === 'failed'), false);
+  const cancelled = must(events.find((event) => event.type === 'cancelled'), 'cancel event');
+  assert.equal(cancelled.type, 'cancelled');
+  if (cancelled.type !== 'cancelled') return;
+  assert.equal(cancelled.taskId, task.taskId);
+  assert.equal(cancelled.reason, 'host_aborted');
+  assert.equal(cancelled.turnNo, 5);
+
+  const again = bus.dispatch({ query: '再来一次', source: 'tool_call', turnNo: 5 });
+  assert.equal(again.deduplicated, false);
+  assert.notEqual(again.taskId, task.taskId);
+  await flush();
+  assert.equal(again.state(), 'running');
+  must(held.pending[1], 'again slot').resolve({ text: '这次好了' });
+  await flush();
+  assert.equal(again.state(), 'completed');
+  assert.deepEqual(reports.map((report) => report.summary), ['这次好了']);
+});
+
+test('utterancePcm 透传 execute，early_rule 升级 tool_call 时保留', async () => {
+  const held = holdRunner();
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: () => {},
+  });
+  const pcm = Buffer.from([1, 2, 3, 4]);
+  const upgradedPcm = Buffer.from([5, 6, 7, 8]);
+
+  const early = bus.dispatch({
+    query: '原话',
+    source: 'early_rule',
+    turnNo: 2,
+    utterancePcm: pcm,
+  });
+  const tool = bus.dispatch({
+    query: '听见的完整问题',
+    source: 'tool_call',
+    turnNo: 2,
+    utterancePcm: upgradedPcm,
+  });
+  assert.equal(tool.deduplicated, true);
+  assert.equal(tool.taskId, early.taskId);
+  await flush();
+  const upgraded = must(held.calls[0], 'upgraded call');
+  assert.equal(upgraded.query, '听见的完整问题');
+  assert.equal(upgraded.utterancePcm, upgradedPcm);
+  must(held.pending[0], 'slot').resolve({ text: '好' });
+  await flush();
+  assert.equal(early.state(), 'completed');
+
+  const later = bus.dispatch({
+    query: '开跑之后不改',
+    source: 'tool_call',
+    turnNo: 2,
+    utterancePcm: pcm,
+  });
+  assert.equal(later.deduplicated, true);
+  await flush();
+  assert.equal(held.calls.length, 1);
+
+  const plain = bus.dispatch({ query: '没给人声', source: 'image' });
+  await flush();
+  const plainCall = must(held.calls[1], 'plain call');
+  assert.equal(plainCall.taskId, plain.taskId);
+  assert.equal(Object.hasOwn(plainCall, 'utterancePcm'), false);
+  must(held.pending[1], 'plain slot').resolve({ text: '好' });
+  await flush();
+  assert.equal(plain.state(), 'completed');
 });

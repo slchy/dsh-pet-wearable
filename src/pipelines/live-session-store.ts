@@ -160,7 +160,13 @@ interface Reduced {
 const MAX_TURNS = 12;
 const MAX_TERMINALS = 4;
 const MAX_CORRECTIONS = 3;
-const DEFAULT_SNAPSHOT_CHARS = 800;
+const DEFAULT_SNAPSHOT_CHARS = 3_200;
+/** 最近一条终态保留的正文长度。它是用户追问时唯一能答的那份材料。 */
+const LATEST_TERMINAL_BODY_CHARS = 1_800;
+/** 更早的终态只留开头：给最新的那条让路，又不至于完全消失。 */
+const OLDER_TERMINAL_BODY_CHARS = 260;
+/** 预算见底时，剩余这么多码点才值得裁一条非最新终态的行留下。 */
+const MIN_TAIL_CLIP_CHARS = 60;
 const DEFAULT_DIALOG_TURNS = 4;
 
 /** 去重口径：只留中文、字母、数字，空白与标点都不参与 2-gram。 */
@@ -205,7 +211,11 @@ export function reduceLiveSession(state: LiveSessionState, event: LiveSessionEve
  *
  * 只投影**当前代际**的非静默任务：全部仍在 `queued` / `running` 的，加上最近 4 条终态。
  * 另外附上最近 3 条「核实说法 ≠ ASR 原文」的轮次。两边都空就返回 `''`。
- * 逐字稿不进这里：精确数字走播报通道，避免 Omni 改写端口号和订单号。
+ *
+ * 终态正文优先用 `verbatim`（完整核实稿），不是 160 字的 `summary`：用户追问
+ * 「刚才那份报告第三点是什么」时，Omni 只能看见这里投影进来的东西。最新一条
+ * 保留 {@link LATEST_TERMINAL_BODY_CHARS}，更早的压到 {@link OLDER_TERMINAL_BODY_CHARS}，
+ * 保证最新结论不会被旧报告挤掉。
  */
 export function projectOmniSnapshot(state: LiveSessionState, maxChars = DEFAULT_SNAPSHOT_CHARS): string {
   const facts = snapshotFacts(state);
@@ -214,11 +224,22 @@ export function projectOmniSnapshot(state: LiveSessionState, maxChars = DEFAULT_
   if (budget <= 0) return '';
   const kept: string[] = [];
   for (const fact of facts) {
-    const next = joinSnapshot([...kept, fact]);
-    if (codePointLength(next) > budget) break;
-    kept.push(fact);
+    const next = joinSnapshot([...kept, fact.text]);
+    if (codePointLength(next) <= budget) {
+      kept.push(fact.text);
+      continue;
+    }
+    if (kept.length === 0) break;
+    // 最新一条终态哪怕只剩几个码点也要留个开头：整条丢掉，用户追问时就只剩
+    // 一句「没查到」。其它行只在剩余预算还够读时裁。
+    const used = codePointLength(joinSnapshot(kept));
+    const remaining = budget - used - 1;
+    if (remaining > 0 && (fact.latestTerminal === true || remaining >= MIN_TAIL_CLIP_CHARS)) {
+      kept.push(clipCodePoints(fact.text, remaining));
+    }
+    break;
   }
-  if (kept.length === 0) return clipCodePoints(joinSnapshot([facts[0] ?? '']), budget);
+  if (kept.length === 0) return clipCodePoints(joinSnapshot([facts[0]?.text ?? '']), budget);
   return joinSnapshot(kept);
 }
 
@@ -454,9 +475,13 @@ function markForegroundCoveredTasks(
     if (task === undefined || task.epoch !== state.epoch || isSilentTask(task)) continue;
     if (task.state !== 'completed' && task.state !== 'failed') continue;
     if (task.delivered !== 'pending') continue;
-    const summary = task.summary?.trim();
-    if (summary === undefined || summary === '') continue;
-    if (!foregroundCoveredReport(turn.assistantSpoken, summary)) continue;
+    // 完整核实稿也在比对范围内：Omni 念的是长报告的后半段时，160 字 summary
+    // 根本覆盖不到，只比 summary 会把已经讲过的任务又排进播报队列（双讲）。
+    const summary = task.summary?.trim() ?? '';
+    const verbatim = task.verbatim?.trim() ?? '';
+    const covered = (summary !== '' && foregroundCoveredReport(turn.assistantSpoken, summary))
+      || (verbatim !== '' && foregroundCoveredReport(turn.assistantSpoken, verbatim));
+    if (!covered) continue;
     if (tasks === null) tasks = { ...state.tasks };
     tasks[taskId] = { ...task, delivered: 'spoken', updatedSeq: seq };
   }
@@ -1022,51 +1047,138 @@ function createTask(draft: TaskDraft): LiveTaskRecord {
   };
 }
 
-function snapshotFacts(state: LiveSessionState): readonly string[] {
-  const active: string[] = [];
-  const terminals: LiveTaskRecord[] = [];
+/**
+ * 投影进 Omni 的一行事实。`latestTerminal` 只标在最近更新的那条终态上：
+ * 预算见底时它是唯一不许整条丢的行。
+ */
+interface SnapshotFact {
+  readonly text: string;
+  readonly latestTerminal?: boolean;
+}
+
+function snapshotFacts(state: LiveSessionState): readonly SnapshotFact[] {
+  const active: SnapshotFact[] = [];
   for (const taskId of state.taskOrder) {
     const task = state.tasks[taskId];
     if (task === undefined || task.epoch !== state.epoch || isSilentTask(task)) continue;
-    if (task.state === 'queued' || task.state === 'running') {
-      active.push(taskLine(task));
-      continue;
-    }
-    if (isTerminal(task.state)) terminals.push(task);
+    if (task.state !== 'queued' && task.state !== 'running') continue;
+    active.push({ text: taskLine(task) });
   }
-  terminals.sort((a, b) => a.updatedSeq - b.updatedSeq);
-  const recentTerminals = terminals.slice(-MAX_TERMINALS).map(taskLine);
-  const corrections: string[] = [];
+  // 最近的终态排前面：预算不够时先保最新完成的那条，旧的先压缩。
+  const terminals: SnapshotFact[] = recentTerminalTasks(state).map((task, index) => ({
+    text: taskLine(task, index === 0 ? LATEST_TERMINAL_BODY_CHARS : OLDER_TERMINAL_BODY_CHARS),
+    ...(index === 0 ? { latestTerminal: true } : {}),
+  }));
+  const corrections: SnapshotFact[] = [];
   for (let i = state.turns.length - 1; i >= 0 && corrections.length < MAX_CORRECTIONS; i -= 1) {
     const turn = state.turns[i];
     if (turn === undefined || turn.epoch !== state.epoch) continue;
     const canonical = turn.canonicalUser?.trim() ?? '';
     if (canonical === '' || canonical === turn.rawAsr.trim()) continue;
-    corrections.push(correctionLine(turn, canonical));
+    corrections.push({ text: correctionLine(turn, canonical) });
   }
   corrections.reverse();
-  return [...active, ...recentTerminals, ...corrections];
+  return [...active, ...terminals, ...corrections];
 }
 
-function taskLine(task: LiveTaskRecord): string {
+/** 投影进快照的终态任务：当前代际、非静默、最近 `MAX_TERMINALS` 条，最新在前。 */
+function recentTerminalTasks(state: LiveSessionState): readonly LiveTaskRecord[] {
+  const terminals: LiveTaskRecord[] = [];
+  for (const taskId of state.taskOrder) {
+    const task = state.tasks[taskId];
+    if (task === undefined || task.epoch !== state.epoch || isSilentTask(task)) continue;
+    if (isTerminal(task.state)) terminals.push(task);
+  }
+  terminals.sort((a, b) => b.updatedSeq - a.updatedSeq);
+  return terminals.slice(0, MAX_TERMINALS);
+}
+
+/**
+ * Omni 的单槽里是否已经有某条已核实的结论覆盖这个专名。
+ *
+ * 追问「黄仁勋离职是怎么回事」时，如果最近一条 completed 的核实稿已经写了
+ * 「黄仁勋辞去……」，就不必再派一次 dsh —— 那会让用户多等十几秒，答的还是同一份材料。
+ *
+ * 只认当前代际、非静默、最近 {@link MAX_TERMINALS} 条终态里的 completed，
+ * 和投影进快照的是同一批任务，不另开一份账。
+ * 先比去标点后的原串（短词只走这条）；四字以上再比 2-gram，
+ * ASR 同音词（巨变/剧变）与同义转述（离职/辞去）靠 40% 覆盖率兜住。
+ */
+export function hasVerifiedContextFor(state: LiveSessionState, subject: string): boolean {
+  const subjectCompact = compactOverlapText(subject);
+  const subjectLength = codePointLength(subjectCompact);
+  if (subjectLength < 2) return false;
+  const subjectBigrams = bigramsOf(subjectCompact);
+  const recent = recentTerminalTasks(state);
+  for (let index = 0; index < recent.length; index += 1) {
+    const task = recent[index];
+    if (task === undefined || task.state !== 'completed') continue;
+    // 与 projectOmniSnapshot 用同一档正文截断上限：只有真投影进 Omni 视野的文本才算已核实。
+    const bodyLimit = index === 0 ? LATEST_TERMINAL_BODY_CHARS : OLDER_TERMINAL_BODY_CHARS;
+    const corpus = compactOverlapText(`${task.query} ${snapshotBody(task, bodyLimit)}`);
+    if (corpus.includes(subjectCompact)) return true;
+    if (subjectLength < 4) continue;
+    let hits = 0;
+    for (const gram of subjectBigrams) {
+      if (corpus.includes(gram)) hits += 1;
+    }
+    if (hits >= 2 && hits / subjectBigrams.size >= 0.4) return true;
+  }
+  return false;
+}
+
+function taskLine(task: LiveTaskRecord, bodyLimit = 0): string {
   const head = task.turnNo === undefined
     ? `任务 ${task.taskId}`
     : `任务 ${task.taskId} | 轮次 ${task.turnNo}`;
-  return `- ${head} | 查询：${oneLine(task.query)} | ${statusClause(task)}`;
+  return `- ${head} | 查询：${oneLine(task.query)} | ${statusClause(task, bodyLimit)}`;
 }
 
-function statusClause(task: LiveTaskRecord): string {
+function statusClause(task: LiveTaskRecord, bodyLimit: number): string {
   if (task.state === 'queued' || task.state === 'running') {
     const extra = task.unverifiedReplyCleared === true ? '，此前口头回复未经执行核实' : '';
     return `状态=${task.state}（未执行完${extra}）`;
   }
   if (task.state === 'completed') {
-    return `状态=completed（已核实，${deliveryLabel(task.delivered)}） | 结论：${oneLine(task.summary ?? '')}${confirmClause(task)}`;
+    return `状态=completed（已核实，${deliveryLabel(task.delivered)}） | 结论：${snapshotBody(task, bodyLimit)}${confirmClause(task)}`;
   }
   if (task.state === 'failed') {
-    return `状态=failed（未成功，${deliveryLabel(task.delivered)}） | 说明：${oneLine(task.summary ?? '')}`;
+    return `状态=failed（未成功，${deliveryLabel(task.delivered)}） | 说明：${snapshotBody(task, bodyLimit)}`;
   }
   return '状态=cancelled（哥已取消，未执行完）';
+}
+
+/** Markdown 链接只留文字，来源 URL 本身没人要听。 */
+const MARKDOWN_LINK = /\[([^\]]*)\]\(https?:\/\/[^)\s]*\)/gu;
+const BARE_URL = /https?:\/\/\S+/gu;
+/** 剥掉链接之后只剩「信源：」「来源：」的残句。 */
+const SOURCE_LABEL_TAIL = /[（(]?\s*(?:信源|来源)\s*[：:]\s*[）)]?\s*$/u;
+
+/**
+ * 终态正文投影进 Omni 的版本。
+ *
+ * 优先 `verbatim`（完整核实稿），没有才退回 160 字 `summary`。
+ * 链接一律剥成文字、空来源标签整行抹掉，再用单行化与码点裁剪压进 `maxChars`：
+ * 一份券商报告里的 URL 会吃掉整段预算，而 Omni 从不念它。
+ */
+function snapshotBody(task: LiveTaskRecord, maxChars: number): string {
+  const raw = (task.verbatim ?? task.summary ?? '').trim();
+  const budget = maxChars <= 0 ? 0 : Math.floor(maxChars);
+  if (budget <= 0) return '';
+  const line = oneLine(stripLinkNoise(raw));
+  if (codePointLength(line) <= budget) return line;
+  if (budget === 1) return clipCodePoints(line, 1);
+  return `${clipCodePoints(line, budget - 1)}…`;
+}
+
+function stripLinkNoise(text: string): string {
+  const withoutLinks = text.replace(MARKDOWN_LINK, '$1').replace(BARE_URL, '');
+  const lines: string[] = [];
+  for (const line of withoutLinks.split('\n')) {
+    const cleaned = line.replace(SOURCE_LABEL_TAIL, '').trimEnd();
+    if (cleaned.trim() !== '') lines.push(cleaned);
+  }
+  return lines.join('\n');
 }
 
 function confirmClause(task: LiveTaskRecord): string {
