@@ -219,6 +219,7 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.gate.outputs.version }}
           PRERELEASE: ${{ needs.gate.outputs.prerelease }}
@@ -236,11 +237,11 @@ jobs:
             fi
           done
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
+          if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             echo "Release ${TAG} 已存在，覆盖上传附件"
-            gh release upload "${TAG}" "${FILES[@]}" --clobber
+            gh release upload "${TAG}" "${FILES[@]}" --repo "${GH_REPO}" --clobber
           else
-            ARGS=(--title "${TAG}" --generate-notes)
+            ARGS=(--repo "${GH_REPO}" --title "${TAG}" --verify-tag --generate-notes)
             if [ "${PRERELEASE}" = "true" ]; then
               ARGS+=(--prerelease)
             fi

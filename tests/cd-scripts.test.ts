@@ -412,6 +412,10 @@ test('release.yml 有质量闸门、最小权限与双模 npm 发布', () => {
     yaml.includes('TARBALL="${PWD}/dist-release/dsh-voice-web-${VERSION}.tgz"'),
     'release.yml 传给 npm publish 的 tarball 必须带绝对路径（避免 npm 11 误当成 GitHub owner/repo）',
   );
+  assert.ok(
+    yaml.includes('GH_REPO: ${{ github.repository }}') && yaml.includes('--verify-tag'),
+    'release.yml 的 github-release 未检出仓库，必须显式传 GH_REPO 与 --verify-tag',
+  );
   assert.ok(!yaml.includes('StrictHostKeyChecking=no'));
 });
 
