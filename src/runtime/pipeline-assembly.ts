@@ -13,7 +13,7 @@ import {
   type VoicePipelineMode,
 } from '../pipeline-mode.ts';
 import { CascadeAgent, LiveOrchestrator } from '../pipelines/index.ts';
-import type { AgentProvider, BackgroundTaskReport, TtsProvider } from '../providers.ts';
+import type { AgentAnnouncer, AgentProvider, BackgroundTaskReport, TtsProvider } from '../providers.ts';
 import { realtimeLiveDefaults, resolveRealtimeDialect } from '../realtime-dialect.ts';
 import { resolveLiveApiKey } from '../voice-config.ts';
 import type { VoiceSessionOptions } from '../voice-session.ts';
@@ -141,7 +141,7 @@ function armLiveOfflineAnnounce(
   };
   orch.setAnnouncer(fallbackAnnouncer);
   orch.setTaskReporter(fallbackReport);
-  const setAnnouncer = (cb: ((speech: string, emotion?: string) => void) | null): void => {
+  const setAnnouncer = (cb: AgentAnnouncer | null): void => {
     orch.setAnnouncer(cb ?? fallbackAnnouncer);
   };
   const setTaskReporter = (cb: ((report: BackgroundTaskReport) => void) | null): void => {

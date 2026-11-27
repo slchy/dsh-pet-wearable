@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import type { AnnounceStore } from './voice/announce-store.ts';
 import type { TurnTicket } from './voice/dialog-fsm.ts';
 import { cleanForSpeech, parseEmotion } from './voice/emotion.ts';
-import type { AgentImage, AgentProvider, AgentReplyView, TurnContext } from './voice/providers.ts';
+import type { AgentAnnouncer, AgentImage, AgentProvider, AgentReplyView, TurnContext } from './voice/providers.ts';
 
 /**
  * 空闲看门狗默认时长：这么久没有任何属于本轮的帧才判死。
@@ -24,6 +24,26 @@ import type { AgentImage, AgentProvider, AgentReplyView, TurnContext } from './v
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 /** 总时长硬上限默认关闭，长编译/长构建才能跑完。 */
 const DEFAULT_MAX_DURATION_MS = 0;
+
+/**
+ * 常驻自发轮看门口断线后的重连间隔。短到用户察觉不到，又不至于在宿主重启时
+ * 打出一串重连。
+ */
+const WATCHER_RETRY_MS = 500;
+
+/**
+ * 同一子代理的 `agent-message` 播报后，多久内到达的 `subagent-settled` 视为重复通知。
+ *
+ * 可续写子代理完成时，宿主先发 `agent-message`（带正文），约 300 ms 后补一条
+ * `subagent-settled`（只是形式通知）。后者没有新增结论，再念一遍就是复述。
+ */
+const SETTLED_DEDUP_WINDOW_MS = 60_000;
+
+/**
+ * 记住多少个语音侧 `requestId`。只用来认出「这一轮是我们自己 prompt 的」——
+ * 太久以前的 id 不可能再出现在 in-flight 的轮次里，留 32 条足够。
+ */
+const VOICE_RPC_CAP = 32;
 
 /** 宿主侧取消这一轮时抛的错。上游据此记 `cancelled` 而不是 `failed`。 */
 export function createTurnAbortedError(): Error {
@@ -128,6 +148,16 @@ export interface HostSessionController {
   ): AsyncIterable<HostSessionFollowFrame>;
 }
 
+/**
+ * 宿主 `jobController`：只认「杀掉一个后台 `job`」这一件事。
+ *
+ * `cancelTurn()` 拿它停 `bash` / `pwsh` 的 `run_in_background` 作业；没有这个
+ * 服务时任务会继续在宿主机上跑，但语音侧至少不会假装已经停掉。
+ */
+export interface HostJobController {
+  kill(request: { readonly sessionId: string; readonly jobId: string }): unknown;
+}
+
 export interface InProcessDshAgentOptions {
   readonly controller: HostSessionController;
   /** 传给 `session.create` 的 cwd。 */
@@ -140,6 +170,16 @@ export interface InProcessDshAgentOptions {
   readonly sessionId?: string;
   readonly log?: (line: string) => void;
   readonly announceStore?: AnnounceStore | null;
+  /** 可选：停后台 `job` 用。缺了只影响「取消得干不干净」。 */
+  readonly jobController?: HostJobController | null;
+  /**
+   * 常驻「自发轮」看门狗：dsh 把 `subagent` / 后台 `job` 跑完之后会自己开一轮
+   * 把结果说出来，那一轮没有语音侧发起的 prompt。开了这个开关才会把它的正文
+   * 转成播报。
+   *
+   * 默认 `false`：单测每轮只备一条 `follow` 脚本，多一条常驻 follow 会打乱脚本队列。
+   */
+  readonly watchSpontaneous?: boolean;
   /**
    * 空闲看门狗：这么久没有任何属于本轮的帧、也没有活跃的 `job` / `subagent`
    * 才判死。默认 2 分钟；`<= 0` 关闭。
@@ -192,6 +232,20 @@ class TurnState {
   /** 打开 follow 时会话还忙：先到的终态帧可能是队列里上一轮的收尾。 */
   awaitingPriorTurnEnd = false;
   sawTurnStart = false;
+  /**
+   * 这一轮派过 `subagent` / `subagent_fork`。dsh 的 async-first 模式会在派活后
+   * 立刻结束主轮，结果稍后由它自己开一轮说 —— 所以这种轮次不是终态答案。
+   */
+  spawnedSubagent = false;
+  /** 这一轮注册过的后台 `job`（`run_in_background: true`）。 */
+  readonly startedJobIds = new Set<string>();
+  /** 已经结算的后台 `job`；`job/settled` 可能永远不来（aborted）。 */
+  readonly settledJobIds = new Set<string>();
+  /**
+   * 异步移交绑定的目标 id：`subagent/catalog` 的 `childId`、`send_message` 的
+   * `agent_id`，或第一个注册的后台 `jobId`。回调时用它精确归并结算。
+   */
+  asyncTargetId: string | null = null;
   error: Error | null = null;
   /** 当前续期中的看门狗句柄，`finally` 里清掉。 */
   watchdog: ReturnType<typeof setTimeout> | null = null;
@@ -224,6 +278,24 @@ class TurnState {
 
   touch(at: number): void {
     if (at > this.lastActivityAt) this.lastActivityAt = at;
+  }
+
+  /** 主轮结束时还有没结算的异步活：`subagent` 没回结果，或 `job` 还没 `job/settled`。 */
+  hasUnsettledAsyncWork(): boolean {
+    if (this.spawnedSubagent) return true;
+    for (const jobId of this.startedJobIds) {
+      if (!this.settledJobIds.has(jobId)) return true;
+    }
+    return false;
+  }
+
+  /** 本轮异步移交绑定的目标：优先精确目标，否则取第一个还没结算的后台 job。 */
+  resolvedAsyncTargetId(): string | undefined {
+    if (this.asyncTargetId !== null && this.asyncTargetId !== '') return this.asyncTargetId;
+    for (const jobId of this.startedJobIds) {
+      if (!this.settledJobIds.has(jobId)) return jobId;
+    }
+    return undefined;
   }
 
   releaseOpened(): void {
@@ -288,7 +360,42 @@ class TaskMemo {
     return this.running.size > 0 || this.children.size > 0;
   }
 
-  observe(sessionId: string, type: string, data: Record<string, unknown> | undefined): void {
+  /** 在跑的 `job`（按开始时间，早的在前）。取消时按它逐个 `kill`。 */
+  activeJobList(): readonly JobFact[] {
+    return [...this.running.values()].sort((a, b) => a.startedAt - b.startedAt);
+  }
+
+  /** 还没回结果的子代理会话 id。取消时按它 `controller.cancel`。 */
+  activeChildIds(): readonly string[] {
+    return [...this.children.keys()];
+  }
+
+  forgetChildren(childIds: readonly string[]): void {
+    for (const childId of childIds) this.children.delete(childId);
+  }
+
+  forgetJobs(jobIds: readonly string[]): void {
+    for (const jobId of jobIds) this.running.delete(jobId);
+  }
+
+  /** 换绑 / 重置 / 关闭：旧会话上的事实全部作废。 */
+  clearAll(): void {
+    this.running.clear();
+    this.recent.length = 0;
+    this.children.clear();
+  }
+
+  /**
+   * @param aborted 这条终态帧是宿主侧取消。只有 aborted 才清「还在跑」的事实 ——
+   *   正常 `completed` 的 `turn/end` 之后，后台 `job` / 子代理往往还在跑
+   *   （dsh 的 async-first 模式），清掉就会让看门狗以为活干完了。
+   */
+  observe(
+    sessionId: string,
+    type: string,
+    data: Record<string, unknown> | undefined,
+    aborted = false,
+  ): void {
     if (type === 'job/registered') {
       const jobId = typeof data?.['jobId'] === 'string' ? data['jobId'] : '';
       if (jobId === '') return;
@@ -316,6 +423,8 @@ class TaskMemo {
       return;
     }
     if (type === 'subagent/catalog') {
+      // 只有 catalog 带真正的 `childId`（= 子代理会话 id，取消时要按它 `cancel`）。
+      // `tool/call` 里没有这个 id，所以不在这里造占位：用假 id 取消会打到不存在的会话。
       const childId = typeof data?.['childId'] === 'string' ? data['childId'] : '';
       const label = typeof data?.['label'] === 'string' ? data['label'] : '';
       if (childId === '') return;
@@ -326,16 +435,38 @@ class TaskMemo {
       });
       return;
     }
-    if (type === 'turn/start' && sessionId === this.mainSessionId()) {
-      this.children.clear();
+    /*
+     * 可续写子代理被 `send_message` 重新唤醒时不会再发 `subagent/catalog`。
+     * 这里补一条占位，用户说「别查了」时才能按 `sessionId` 取消到它。
+     */
+    if (type === 'tool/call' && sessionId === this.mainSessionId() && toolNameOf(data) === 'send_message') {
+      const targetId = subagentTargetIdFromToolCall(data);
+      if (targetId === '' || targetId === this.mainSessionId() || this.children.has(targetId)) return;
+      this.children.set(targetId, { childId: targetId, label: '继续子代理', at: Date.now() });
+      return;
+    }
+    if (type === 'subagent/settled' || type === 'subagent/end') {
+      const childId = typeof data?.['childId'] === 'string' ? data['childId'] : '';
+      if (childId !== '') this.children.delete(childId);
       return;
     }
     /*
-     * 宿主 aborted 时 `job/settled` 可能永远不来。轮次收尾后还留着「在跑」的
-     * 记录，`hasActiveWork()` 就永远为真，看门狗再也不会判死。正常有
-     * `job/settled` 时这里早就删掉了，只剩 aborted 的残渣。
+     * dsh 唤醒主会话时会把「谁回来了」写进 `source`：那正是子代理交结果的时刻。
+     * 以前这里靠「主会话下一次 `turn/start`」清，会把**还在跑**的兄弟子代理一起忘掉。
      */
-    if (type === 'turn/end' && sessionId === this.mainSessionId()) {
+    if (type === 'user/message' && sessionId === this.mainSessionId()) {
+      const source = asRecord(data?.['source']);
+      const kind = typeof source?.['kind'] === 'string' ? source['kind'] : '';
+      if (kind !== 'subagent-settled' && kind !== 'agent-message') return;
+      const childId = typeof source?.['senderSessionId'] === 'string' ? source['senderSessionId'] : '';
+      if (childId !== '') this.children.delete(childId);
+      return;
+    }
+    /*
+     * 宿主 aborted 时 `job/settled` 可能永远不来。轮次被取消后还留着「在跑」的
+     * 记录，`hasActiveWork()` 就永远为真，看门狗再也不会判死。
+     */
+    if (type === 'turn/end' && sessionId === this.mainSessionId() && aborted) {
       this.children.clear();
       for (const [jobId, job] of this.running) {
         if (job.owner === sessionId) this.running.delete(jobId);
@@ -367,6 +498,50 @@ class TaskMemo {
   }
 }
 
+/** 自发轮是谁开的。只有 `spontaneous`（以及无主轮在跑的 `unknown`）才播报。 */
+type WatcherOrigin = 'unknown' | 'voice_prompt' | 'web_user' | 'spontaneous';
+
+/**
+ * 常驻看门狗里「当前这一轮」的累加器。
+ *
+ * 与 `TurnState` 分开：这里不做看门狗 / 票据，只回答「这一轮结束时该不该念」。
+ */
+interface WatcherTurn {
+  seq: number;
+  origin: WatcherOrigin;
+  /** 唤醒这一轮的用户消息类型：`agent-message` / `subagent-settled` / `tool-jobs` / `schedule`。 */
+  sourceKind: string;
+  /** 这次唤醒来自哪个子代理 / 后台 job；空串 = 没有具体目标。 */
+  sourceTargetId: string;
+  committed: string;
+  streamed: string;
+  spawnedSubagent: boolean;
+  readonly startedJobIds: Set<string>;
+  readonly settledJobIds: Set<string>;
+}
+
+function newWatcherTurn(seq: number): WatcherTurn {
+  return {
+    seq,
+    origin: 'unknown',
+    sourceKind: '',
+    sourceTargetId: '',
+    committed: '',
+    streamed: '',
+    spawnedSubagent: false,
+    startedJobIds: new Set<string>(),
+    settledJobIds: new Set<string>(),
+  };
+}
+
+function watcherHasUnsettledAsync(turn: WatcherTurn): boolean {
+  if (turn.spawnedSubagent) return true;
+  for (const jobId of turn.startedJobIds) {
+    if (!turn.settledJobIds.has(jobId)) return true;
+  }
+  return false;
+}
+
 export class InProcessDshAgent implements AgentProvider {
   readonly name = 'dsh';
 
@@ -374,6 +549,8 @@ export class InProcessDshAgent implements AgentProvider {
   private readonly workDir: string;
   private readonly log: (line: string) => void;
   private readonly announceStore: AnnounceStore | null;
+  private readonly jobController: HostJobController | null;
+  private readonly watchSpontaneous: boolean;
   private readonly tasks: TaskMemo;
   private readonly idleTimeoutMs: number;
   private readonly maxDurationMs: number;
@@ -389,8 +566,21 @@ export class InProcessDshAgent implements AgentProvider {
   private background: TurnState | null = null;
   private tail: Promise<void> = Promise.resolve();
   private liveSink: ((text: string) => void) | null = null;
-  private announcer: ((speech: string, emotion?: string) => void) | null = null;
+  private announcer: AgentAnnouncer | null = null;
   private detachedSink: ((userText: string, answer: string, spoken: boolean) => void) | null = null;
+  /**
+   * 最近一次真正播报过的 `agent-message` 时刻，按子代理 id 记。
+   *
+   * 可续写子代理完成后，宿主先发 `agent-message` 再在约 300 ms 后补一条
+   * `subagent-settled`；后者内容重复，靠它静默抑制。再次 `send_message`
+   * 唤醒同一子代理、或取消它时删掉，避免误杀下一波。
+   */
+  private readonly recentAgentMessageAt = new Map<string, number>();
+  /** 语音侧自己发起的 prompt id：看门狗据此认出「这一轮不是自发轮」。 */
+  private readonly voiceRpcIds = new Set<string>();
+  private watcherAbort: AbortController | null = null;
+  private watcherSessionId: string | null = null;
+  private watcherRetry: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
 
   constructor(options: InProcessDshAgentOptions) {
@@ -400,6 +590,8 @@ export class InProcessDshAgent implements AgentProvider {
     this.configuredId = configured === undefined || configured === '' ? null : configured;
     this.log = options.log ?? (() => {});
     this.announceStore = options.announceStore ?? null;
+    this.jobController = options.jobController ?? null;
+    this.watchSpontaneous = options.watchSpontaneous === true;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.maxDurationMs = options.maxDurationMs ?? DEFAULT_MAX_DURATION_MS;
     this.now = options.now ?? (() => Date.now());
@@ -450,9 +642,13 @@ export class InProcessDshAgent implements AgentProvider {
     if (next === this.boundSessionId && this.configuredId === null) return;
     this.openEpoch += 1;
     this.opening = null;
+    this.stopWatcher();
     this.cancelInFlight();
     this.boundSessionId = next;
     this.configuredId = null;
+    this.tasks.clearAll();
+    this.recentAgentMessageAt.clear();
+    if (next !== null) this.ensureWatcher(next);
   }
 
   /** 用户可见会话：去掉子代理，按 `updatedAt` 从新到旧，最多 `limit` 条。 */
@@ -465,7 +661,7 @@ export class InProcessDshAgent implements AgentProvider {
     return visible.slice(0, cap);
   }
 
-  setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
+  setAnnouncer(cb: AgentAnnouncer | null): void {
     this.announcer = cb;
   }
 
@@ -479,9 +675,16 @@ export class InProcessDshAgent implements AgentProvider {
     this.liveSink = sink;
   }
 
-  /** 票据对不上当前在途轮就丢掉，避免迟到的取消杀掉下一轮。 */
+  /**
+   * 票据对不上当前在途轮就丢掉，避免迟到的取消杀掉下一轮。
+   *
+   * 没有票据 = 用户明说「别查了 / 取消任务」：除了停主轮，还要把这一轮派出去的
+   * 子代理和后台 `job` 一并停掉 —— 主轮早就结束了（async-first），只停主轮等于
+   * 什么都没停。
+   */
   cancelTurn(ticket?: TurnTicket): void {
     const turn = this.matchTurn(ticket);
+    if (ticket === undefined) this.cancelBackgroundWork();
     if (turn === null) {
       if (ticket !== undefined) {
         this.log(`  取消    票据过期（#${ticket.no}/${ticket.gen}）→ 丢弃`);
@@ -537,9 +740,12 @@ export class InProcessDshAgent implements AgentProvider {
   reset(): void {
     this.openEpoch += 1;
     this.opening = null;
+    this.stopWatcher();
     this.cancelInFlight();
     this.boundSessionId = null;
     this.configuredId = null;
+    this.tasks.clearAll();
+    this.recentAgentMessageAt.clear();
     this.log('  会话    已重置，下一轮重新创建');
   }
 
@@ -549,7 +755,11 @@ export class InProcessDshAgent implements AgentProvider {
     this.disposed = true;
     this.openEpoch += 1;
     this.opening = null;
+    this.stopWatcher();
     this.cancelInFlight();
+    this.tasks.clearAll();
+    this.recentAgentMessageAt.clear();
+    this.voiceRpcIds.clear();
     this.liveSink = null;
     this.announcer = null;
     this.detachedSink = null;
@@ -590,6 +800,7 @@ export class InProcessDshAgent implements AgentProvider {
         if (this.boundSessionId === null) this.boundSessionId = configured;
         this.configuredId = null;
         const bound = this.boundSessionId ?? configured;
+        this.ensureWatcher(bound);
         this.log(`  会话    采用已有 ${bound}`);
         return bound;
       }
@@ -610,6 +821,7 @@ export class InProcessDshAgent implements AgentProvider {
     if (this.boundSessionId === null) this.boundSessionId = id;
     this.configuredId = null;
     const bound = this.boundSessionId ?? id;
+    this.ensureWatcher(bound);
     this.log(`  会话    ${configured === null ? '新建' : '采用'} ${bound}`);
     return bound;
   }
@@ -624,6 +836,8 @@ export class InProcessDshAgent implements AgentProvider {
     const promptText = formatPrompt(asrText, note);
     const sessionId = await this.ensureSession();
     if (this.disposed) throw new Error('InProcessDshAgent 已关闭');
+    // 已经绑好的会话不会走 `openBoundSession`，这里再保一次常驻看门狗。
+    this.ensureWatcher(sessionId);
     const turn = new TurnState(sessionId, promptText, turnContext?.ticket ?? null, this.now);
     this.active = turn;
     this.armWatchdog(turn, this.initialWatchdogDelay(turn));
@@ -755,9 +969,12 @@ export class InProcessDshAgent implements AgentProvider {
     if (!turn.cancelled && !turn.settled) {
       // 从这一帧起，终态帧才算本轮的；之前的都属于队列里上一轮。
       turn.promptDispatched = true;
+      // 记在 prompt 之前：常驻看门狗靠它认出「这一轮是我们自己发起的」。
+      const requestId = randomUUID();
+      this.rememberVoiceRpc(requestId);
       try {
         await this.controller.prompt({
-          requestId: randomUUID(),
+          requestId,
           sessionId: turn.sessionId,
           mode: 'queue',
           content: promptContent(promptText, image),
@@ -876,7 +1093,8 @@ export class InProcessDshAgent implements AgentProvider {
     if (event === null) return;
     if (event.seq !== null && event.seq <= turn.baseline) return;
     const owner = event.sessionId ?? turn.sessionId;
-    this.tasks.observe(owner, event.type, event.data);
+    this.tasks.observe(owner, event.type, event.data, isAbortedTerminal(event.type, event.data));
+    this.noteAsyncWork(turn, event);
     if (event.sessionId !== null && event.sessionId !== turn.sessionId) return;
     turn.touch(this.now());
     if (turn.promptDispatched && (event.type === 'turn/start' || event.type === 'user/message')) {
@@ -910,6 +1128,54 @@ export class InProcessDshAgent implements AgentProvider {
     this.markDone(turn);
   }
 
+  /**
+   * dsh 的 async-first：主轮可以派完活立刻结束，结果之后由它自己开一轮说。
+   * 这一轮只要留下「还没结算的 subagent / job」，就不能当成终态答案播出去 ——
+   * 否则用户只听到一句「已启动后台任务」，真正的结果再也没人念。
+   */
+  private noteAsyncWork(turn: TurnState, event: NormalizedEvent): void {
+    // prompt 之前的帧属于队列里上一轮；开场 snapshot 忙碌时同理，等本轮 turn/start。
+    if (!turn.promptDispatched) return;
+    if (turn.awaitingPriorTurnEnd && !turn.sawTurnStart) return;
+    if (event.type === 'subagent/catalog') {
+      // catalog 可能挂在主会话上，也可能带子代理自己的 sessionId，两种都算派过活。
+      turn.spawnedSubagent = true;
+      const childId = typeof event.data?.['childId'] === 'string' ? event.data['childId'].trim() : '';
+      if (childId !== '') {
+        turn.asyncTargetId = childId;
+        // 新一波任务：不要再被上一波的 `agent-message` 去重记录误杀。
+        this.recentAgentMessageAt.delete(childId);
+      }
+      return;
+    }
+    if (event.sessionId !== null && event.sessionId !== turn.sessionId) return;
+    if (event.type === 'tool/call') {
+      const name = toolNameOf(event.data);
+      if (isSubagentTool(name)) turn.spawnedSubagent = true;
+      if (name === 'send_message') {
+        // 可续写子代理：`send_message` 是同一目标的下一波任务，绑定 id 便于回调归并。
+        const targetId = subagentTargetIdFromToolCall(event.data);
+        if (targetId !== '') {
+          turn.asyncTargetId = targetId;
+          this.recentAgentMessageAt.delete(targetId);
+        }
+      }
+      return;
+    }
+    if (event.type === 'job/registered') {
+      const jobId = jobIdOf(event.data);
+      if (jobId !== '') {
+        turn.startedJobIds.add(jobId);
+        if (turn.asyncTargetId === null) turn.asyncTargetId = jobId;
+      }
+      return;
+    }
+    if (event.type === 'job/settled') {
+      const jobId = jobIdOf(event.data);
+      if (jobId !== '') turn.settledJobIds.add(jobId);
+    }
+  }
+
   /** 开场与运行中的 snapshot：只更新基线，以及「打开时会话是否还忙」。 */
   private applySnapshot(turn: TurnState, frame: HostSessionFollowFrame): void {
     if (!turn.sawSnapshot) {
@@ -922,7 +1188,7 @@ export class InProcessDshAgent implements AgentProvider {
   private consumeAssistant(turn: TurnState, frame: HostSessionFollowFrame): void {
     const payload = frame.frame ?? frame.chunk ?? frame.data;
     if (payload !== undefined) {
-      this.consumeStreamPayload(turn, payload, 0);
+      this.consumeStreamPayload(turn, payload);
       return;
     }
     if (typeof frame.delta === 'string') {
@@ -932,64 +1198,14 @@ export class InProcessDshAgent implements AgentProvider {
     if (typeof frame.text === 'string') this.pushDelta(turn, frame.text);
   }
 
-  private consumeStreamPayload(turn: TurnState, payload: unknown, depth: number): void {
-    if (depth > 8 || turn.settled) return;
-    if (typeof payload === 'string') {
-      this.pushDelta(turn, payload);
-      return;
-    }
-    if (Array.isArray(payload)) {
-      for (const item of payload) this.consumeStreamPayload(turn, item, depth + 1);
-      return;
-    }
-    const rec = asRecord(payload);
-    if (rec === null) return;
-    const type = typeof rec['type'] === 'string' ? rec['type'] : '';
-    if (type === 'text-delta' || type === 'text_delta') {
-      if (typeof rec['text'] === 'string') this.pushDelta(turn, rec['text']);
-      return;
-    }
-    if (type === 'text-chunks' || type === 'text_chunks') {
-      const texts = rec['texts'];
-      if (Array.isArray(texts)) {
-        for (const piece of texts) {
-          if (typeof piece === 'string') this.pushDelta(turn, piece);
-        }
-      }
-      return;
-    }
-    if (
-      type === 'chunk'
-      || type === 'assistant-stream'
-      || type === 'assistant/stream'
-      || type === 'assistantStream'
-    ) {
-      if ('chunk' in rec) this.consumeStreamPayload(turn, rec['chunk'], depth + 1);
-      else if (typeof rec['delta'] === 'string') this.pushDelta(turn, rec['delta']);
-      else if (typeof rec['text'] === 'string') this.pushDelta(turn, rec['text']);
-      return;
-    }
-    if (type === 'block-end' || type === 'text') {
-      const block = type === 'block-end' ? asRecord(rec['block']) : rec;
-      if (block !== null && typeof block['text'] === 'string' && (type === 'text' || block['type'] === 'text')) {
-        this.pushFullText(turn, block['text']);
-      }
-      return;
-    }
-    if (
-      type === 'start'
-      || type === 'end'
-      || type === 'reasoning-delta'
-      || type === 'reasoning-chunks'
-      || type === 'tool-call-delta'
-      || type === 'tool-call-chunks'
-      || type === 'usage'
-      || type === 'finish'
-      || type === 'block-start'
-    ) {
-      return;
-    }
-    if (type === '' && typeof rec['text'] === 'string') this.pushDelta(turn, rec['text']);
+  private consumeStreamPayload(turn: TurnState, payload: unknown): void {
+    walkStreamPayload(
+      payload,
+      0,
+      (text) => { this.pushDelta(turn, text); },
+      (text) => { this.pushFullText(turn, text); },
+      () => turn.settled,
+    );
   }
 
   private pushDelta(turn: TurnState, delta: string): void {
@@ -1018,6 +1234,23 @@ export class InProcessDshAgent implements AgentProvider {
       ? turn.committed
       : turn.streamed).trim();
     const parsed = parseEmotion(raw);
+    /*
+     * `[ASYNC]` 是 dsh 明说「活派出去了，别等这一轮」；`hasUnsettledAsyncWork()`
+     * 兜住「模型忘了写标签」的情况。两种都必须立刻放开主对话 —— 让语音侧
+     * 干等一个已经结束的轮次，用户会以为卡死了。
+     */
+    if (isAsyncTagOnly(raw) || turn.hasUnsettledAsyncWork()) {
+      this.log('  dsh     已异步派发后台（subagent/job），立即释放主对话');
+      const asyncTargetId = turn.resolvedAsyncTargetId();
+      return {
+        text: '',
+        speech: '',
+        emotion: parsed.emotion,
+        path: 'dsh',
+        asyncDispatched: true,
+        ...(asyncTargetId === undefined ? {} : { asyncTargetId }),
+      };
+    }
     const speech = cleanForSpeech(parsed.rest);
     if (speech === '') throw new Error('清洗后没有可朗读的内容');
     if (turn.firstTokenMs === null) {
@@ -1051,13 +1284,15 @@ export class InProcessDshAgent implements AgentProvider {
     if (raw === '') return;
     const parsed = parseEmotion(raw);
     const speech = cleanForSpeech(parsed.rest);
-    const willSpeak = this.announcer !== null && this.active === null && speech !== '';
+    // 只有 `[ASYNC]` 的轮次没有内容可念（念出来就是「ASYNC」）；结果之后由看门狗转播。
+    const asyncOnly = isAsyncTagOnly(raw);
+    const willSpeak = !asyncOnly && this.announcer !== null && this.active === null && speech !== '';
     try {
       this.detachedSink?.(turn.userText, raw, willSpeak);
     } catch (error) {
       this.log(`  放手    ✗ 回注失败：${asError(error).message}`);
     }
-    if (speech === '') return;
+    if (speech === '' || asyncOnly) return;
     if (this.active !== null) {
       this.log('  放手    答案回来时用户已经问了新问题 → 不补播（已回注记忆）');
       return;
@@ -1109,6 +1344,366 @@ export class InProcessDshAgent implements AgentProvider {
     if (this.active !== null) this.cancelTurnNow(this.active);
     if (this.background !== null) this.cancelTurnNow(this.background);
   }
+
+  /**
+   * 用户明说取消：把这一轮派出去、还在跑的子代理和后台 `job` 一并停掉。
+   *
+   * async-first 模式下主轮早就结束了，`matchTurn()` 找不到东西可取消 —— 真正
+   * 该停的是 `subagent` 会话和 `run_in_background` 作业。
+   */
+  private cancelBackgroundWork(): void {
+    const childIds = this.tasks.activeChildIds();
+    const jobs = this.tasks.activeJobList();
+    if (childIds.length === 0 && jobs.length === 0) return;
+    const cancelledChildren: string[] = [];
+    for (const childId of childIds) {
+      try {
+        const result = this.controller.cancel({ sessionId: childId });
+        void Promise.resolve(result).catch(() => {});
+        cancelledChildren.push(childId);
+      } catch (error) {
+        this.log(`  取消    ✗ 子代理 ${childId}：${asError(error).message}`);
+      }
+    }
+    const cancelledJobs: string[] = [];
+    if (this.jobController === null) {
+      if (jobs.length > 0) this.log(`  取消    ✗ 宿主没有 jobController，停不掉 ${jobs.length} 个后台任务`);
+    } else {
+      for (const job of jobs) {
+        try {
+          this.jobController.kill({ sessionId: job.owner, jobId: job.jobId });
+          cancelledJobs.push(job.jobId);
+        } catch (error) {
+          this.log(`  取消    ✗ 后台任务 ${job.jobId}：${asError(error).message}`);
+        }
+      }
+    }
+    this.tasks.forgetChildren(cancelledChildren);
+    this.tasks.forgetJobs(cancelledJobs);
+    for (const childId of cancelledChildren) this.recentAgentMessageAt.delete(childId);
+    if (cancelledChildren.length > 0 || cancelledJobs.length > 0) {
+      this.log(`  取消    已停掉 ${cancelledChildren.length} 个子代理、${cancelledJobs.length} 个后台任务`);
+    }
+    if (
+      this.active === null
+      && this.background === null
+      && this.boundSessionId !== null
+      && (cancelledChildren.length > 0 || cancelledJobs.length > 0)
+    ) {
+      this.log('  取消    主对话空闲，后台工作已按用户要求停掉');
+    }
+  }
+
+  /** 记下语音侧发起的 prompt id；只留最近 `VOICE_RPC_CAP` 条。 */
+  private rememberVoiceRpc(requestId: string): void {
+    this.voiceRpcIds.add(requestId);
+    while (this.voiceRpcIds.size > VOICE_RPC_CAP) {
+      const oldest = this.voiceRpcIds.values().next().value;
+      if (oldest === undefined) break;
+      this.voiceRpcIds.delete(oldest);
+    }
+  }
+
+  /** 起常驻看门狗（幂等）。只在 `watchSpontaneous` 打开并且已绑定会话时生效。 */
+  private ensureWatcher(sessionId: string): void {
+    if (!this.watchSpontaneous || this.disposed) return;
+    if (this.watcherAbort !== null && this.watcherSessionId === sessionId) return;
+    this.stopWatcher();
+    const abort = new AbortController();
+    this.watcherAbort = abort;
+    this.watcherSessionId = sessionId;
+    void this.runWatcher(sessionId, abort);
+  }
+
+  private stopWatcher(): void {
+    const abort = this.watcherAbort;
+    this.watcherAbort = null;
+    this.watcherSessionId = null;
+    if (this.watcherRetry !== null) {
+      clearTimeout(this.watcherRetry);
+      this.watcherRetry = null;
+    }
+    if (abort !== null && !abort.signal.aborted) abort.abort();
+  }
+
+  /** 流自己结束（宿主重启 / 连接掉了）不能把自发播报永久掐死，短退避后重连。 */
+  private scheduleWatcherRetry(sessionId: string, abort: AbortController): void {
+    if (this.disposed || abort.signal.aborted) return;
+    if (this.watcherAbort !== abort || this.boundSessionId !== sessionId) return;
+    if (this.watcherRetry !== null) return;
+    const timer = setTimeout(() => {
+      this.watcherRetry = null;
+      if (this.disposed || abort.signal.aborted) return;
+      if (this.watcherAbort !== abort || this.boundSessionId !== sessionId) return;
+      void this.runWatcher(sessionId, abort);
+    }, WATCHER_RETRY_MS);
+    timer.unref?.();
+    this.watcherRetry = timer;
+  }
+
+  /**
+   * 常驻看门狗：只认「dsh 自己开的轮次」。
+   *
+   * 三种不该念：我们自己 prompt 的轮（`voice_prompt`，正文已经由 `reply()` 出）、
+   * 用户在网页里打的字（`web_user`）、以及又一次 `[ASYNC]` / 派活的轮。
+   * 其余 `agent-message` / `subagent-settled` / `tool-jobs` / `schedule` 唤醒的
+   * 轮次，就是后台任务的结果，念出来。
+   */
+  private async runWatcher(sessionId: string, abort: AbortController): Promise<void> {
+    let iterable: AsyncIterable<HostSessionFollowFrame>;
+    try {
+      iterable = this.controller.follow({
+        address: { kind: 'session', sessionId },
+        assistantStream: true,
+        maxMessages: 1,
+      }, abort.signal);
+    } catch {
+      this.scheduleWatcherRetry(sessionId, abort);
+      return;
+    }
+    let baseline = -1;
+    let opened = false;
+    let turnSeq = 0;
+    let turn = newWatcherTurn(0);
+    /** 最近一次 `job/settled` 的 id：`tool-jobs` 唤醒没带 `jobId` 时兜底。 */
+    let lastSettledJobId = '';
+    const iterator = iterable[Symbol.asyncIterator]();
+    try {
+      while (!abort.signal.aborted) {
+        let next: IteratorResult<HostSessionFollowFrame>;
+        try {
+          next = await iterator.next();
+        } catch {
+          break;
+        }
+        if (next.done === true) break;
+        const frame = next.value;
+        // 打开时还没拿到 snapshot：此刻的帧都是「历史」，别当成新播报。
+        if (!opened) {
+          if (frame.type !== 'snapshot') continue;
+          baseline = cursorOf(frame);
+          opened = true;
+          continue;
+        }
+        if (frame.type === 'snapshot') continue;
+        if (isAssistantType(frame.type)) {
+          this.consumeWatcherAssistant(turn, frame);
+          continue;
+        }
+        const event = readEvent(frame);
+        if (event === null) continue;
+        if (event.seq !== null && event.seq <= baseline) continue;
+        const owner = event.sessionId ?? sessionId;
+        const aborted = isAbortedTerminal(event.type, event.data);
+        this.tasks.observe(owner, event.type, event.data, aborted);
+        // `subagent/catalog` 可能带子代理自己的 sessionId；先记进本轮异步标记并清同目标去重，再按主会话过滤。
+        if (event.type === 'subagent/catalog') {
+          turn.spawnedSubagent = true;
+          const childId = typeof event.data?.['childId'] === 'string' ? event.data['childId'].trim() : '';
+          if (childId !== '') this.recentAgentMessageAt.delete(childId);
+        }
+        // 子代理的事件只喂 TaskMemo（它自己的 `job/*` 也要记），不参与本轮累加与主会话 job 兜底。
+        if (event.sessionId !== null && event.sessionId !== sessionId) continue;
+        if (event.type === 'job/settled') {
+          const settledJobId = jobIdOf(event.data);
+          if (settledJobId !== '') lastSettledJobId = settledJobId;
+        }
+        if (event.type === 'turn/start') {
+          turnSeq += 1;
+          turn = newWatcherTurn(turnSeq);
+          continue;
+        }
+        if (event.type === 'user/message') {
+          this.observeWatcherOrigin(turn, event.data, lastSettledJobId);
+          // 兜底 id 只归这一条 `tool-jobs` 通知用，消费完就丢。
+          if (turn.sourceKind === 'tool-jobs') lastSettledJobId = '';
+          continue;
+        }
+        if (event.type === 'assistant/message') {
+          if (turn.origin === 'voice_prompt' || turn.origin === 'web_user') continue;
+          const text = textFromAssistantData(event.data);
+          if (text !== '') {
+            turn.committed = text;
+            if (turn.streamed === '') turn.streamed = text;
+          }
+          continue;
+        }
+        this.observeWatcherAsync(turn, event);
+        if (!isTerminalEvent(event.type, event.data)) continue;
+        if (aborted) {
+          turn = newWatcherTurn(turnSeq);
+          continue;
+        }
+        this.emitWatcherTurn(turn);
+        turn = newWatcherTurn(turnSeq);
+      }
+    } finally {
+      try {
+        await iterator.return?.();
+      } catch {
+        // 流已经因 abort 结束
+      }
+    }
+    if (!abort.signal.aborted && !this.disposed && this.boundSessionId === sessionId) {
+      this.scheduleWatcherRetry(sessionId, abort);
+    }
+  }
+
+  private observeWatcherOrigin(
+    turn: WatcherTurn,
+    data: Record<string, unknown> | undefined,
+    lastSettledJobId = '',
+  ): void {
+    const source = asRecord(data?.['source']);
+    const kind = typeof source?.['kind'] === 'string' ? source['kind'] : '';
+    const rpcId = typeof source?.['rpcId'] === 'string' ? source['rpcId'] : '';
+    if (kind === 'user') {
+      turn.origin = rpcId !== '' && this.voiceRpcIds.has(rpcId) ? 'voice_prompt' : 'web_user';
+      return;
+    }
+    if (kind === 'agent-message' || kind === 'subagent-settled') {
+      turn.origin = 'spontaneous';
+      turn.sourceKind = kind;
+      turn.sourceTargetId = typeof source?.['senderSessionId'] === 'string'
+        ? source['senderSessionId'].trim()
+        : '';
+      return;
+    }
+    if (kind === 'tool-jobs') {
+      turn.origin = 'spontaneous';
+      turn.sourceKind = kind;
+      const jobId = typeof source?.['jobId'] === 'string' ? source['jobId'].trim() : '';
+      // `source.jobId` 最准；没有就用最近刚 `job/settled` 的那个当兜底。
+      turn.sourceTargetId = jobId !== '' ? jobId : lastSettledJobId;
+      return;
+    }
+    if (kind === 'schedule') {
+      turn.origin = 'spontaneous';
+      turn.sourceKind = kind;
+    }
+  }
+
+  /** 自发轮自己又派了活：这一轮只是转手，不是结果，别念。 */
+  private observeWatcherAsync(turn: WatcherTurn, event: NormalizedEvent): void {
+    if (event.type === 'subagent/catalog') {
+      turn.spawnedSubagent = true;
+      const childId = typeof event.data?.['childId'] === 'string' ? event.data['childId'].trim() : '';
+      if (childId !== '') this.recentAgentMessageAt.delete(childId);
+      return;
+    }
+    if (event.type === 'tool/call') {
+      const name = toolNameOf(event.data);
+      if (isSubagentTool(name)) turn.spawnedSubagent = true;
+      if (name === 'send_message') {
+        const targetId = subagentTargetIdFromToolCall(event.data);
+        if (targetId !== '') this.recentAgentMessageAt.delete(targetId);
+      }
+      // 回调轮读了哪个 job，就把这次回调精确绑到它上面 —— 覆盖 `job/settled` 的兜底。
+      // 不置 `spawnedSubagent`：`job_output` 只是读结果，不是又派了活。
+      if ((name === 'job_output' || name === 'job_status') && turn.sourceKind === 'tool-jobs') {
+        const jobId = jobIdFromJobOutputCall(event.data);
+        if (jobId !== '') turn.sourceTargetId = jobId;
+      }
+      return;
+    }
+    if (event.type === 'job/registered') {
+      const jobId = jobIdOf(event.data);
+      if (jobId !== '') turn.startedJobIds.add(jobId);
+      return;
+    }
+    if (event.type === 'job/settled') {
+      const jobId = jobIdOf(event.data);
+      if (jobId !== '') turn.settledJobIds.add(jobId);
+    }
+  }
+
+  private consumeWatcherAssistant(turn: WatcherTurn, frame: HostSessionFollowFrame): void {
+    if (turn.origin === 'voice_prompt' || turn.origin === 'web_user') return;
+    const payload = frame.frame ?? frame.chunk ?? frame.data;
+    if (payload !== undefined) {
+      walkStreamPayload(
+        payload,
+        0,
+        (text) => { turn.streamed += text; },
+        (text) => { if (text !== '') turn.committed = text; },
+        () => false,
+      );
+      return;
+    }
+    if (typeof frame.delta === 'string') {
+      turn.streamed += frame.delta;
+      return;
+    }
+    if (typeof frame.text === 'string') turn.streamed += frame.text;
+  }
+
+  /**
+   * 主轮结束（`turn/end`）时决定这一轮要不要念。
+   *
+   * `origin === 'unknown'` 只在完全没有主轮在跑时才算自发 —— 那多半是看门狗
+   * 连上时错过 `user/message` 的那一小段，宁可少念一句，也不要把用户刚问的
+   * 那一轮重复播一遍。
+   */
+  private emitWatcherTurn(turn: WatcherTurn): void {
+    if (turn.origin === 'voice_prompt' || turn.origin === 'web_user') return;
+    if (turn.origin === 'unknown' && (this.active !== null || this.background !== null)) return;
+    /*
+     * 可续写子代理：`agent-message` 已经播过正文，300 ms 后的 `subagent-settled`
+     * 只是「它结束了」的形式通知。内容重复就不再念第二遍。
+     * 没发过 `agent-message` 就失败 / 退出的子代理没有这条记录，仍然要播。
+     */
+    if (turn.sourceKind === 'subagent-settled' && turn.sourceTargetId !== '') {
+      const lastAt = this.recentAgentMessageAt.get(turn.sourceTargetId);
+      if (lastAt !== undefined) {
+        this.recentAgentMessageAt.delete(turn.sourceTargetId);
+        if (this.now() - lastAt <= SETTLED_DEDUP_WINDOW_MS) {
+          this.log(`  自发    跳过同子代理重复结算通知（${turn.sourceTargetId}）`);
+          return;
+        }
+      }
+    }
+    const raw = (turn.committed.trim() !== '' ? turn.committed : turn.streamed).trim();
+    if (raw === '') return;
+    if (watcherHasUnsettledAsync(turn)) return;
+    if (isAsyncTagOnly(raw)) return;
+    const parsed = parseEmotion(raw);
+    const canonical = CANONICAL_USER_TAG.exec(parsed.rest);
+    const canonicalPrefix = canonical !== null ? (canonical[0] ?? '') : '';
+    const body = canonicalPrefix !== '' ? parsed.rest.slice(canonicalPrefix.length) : parsed.rest;
+    const speech = cleanForSpeech(body);
+    if (speech === '') return;
+    // 只有真正播出去才算「这个子代理刚被念过」。记满 64 条时顺手删最旧的。
+    if (turn.sourceKind === 'agent-message' && turn.sourceTargetId !== '') {
+      this.recentAgentMessageAt.set(turn.sourceTargetId, this.now());
+      while (this.recentAgentMessageAt.size > 64) {
+        const oldest = this.recentAgentMessageAt.keys().next().value;
+        if (oldest === undefined) break;
+        this.recentAgentMessageAt.delete(oldest);
+      }
+    }
+    const out = canonicalPrefix !== '' ? `${canonicalPrefix.trimEnd()}\n${speech}` : speech;
+    this.deliverSpontaneous(out, speech, parsed.emotion, turn.sourceTargetId);
+  }
+
+  /** 自发轮的出口：有连接就播（保留原意标签给总线抽 canonicalUser），没连接就攒纯正文进待补播。 */
+  private deliverSpontaneous(
+    payload: string,
+    plainSpeech: string,
+    emotion: string,
+    targetId?: string,
+  ): void {
+    if (this.announcer === null) {
+      const backlog = this.announceStore?.push(plainSpeech, emotion) ?? 0;
+      this.log(`  自发    没有连接，存入待补播（积压 ${backlog} 条）`);
+      return;
+    }
+    this.log('  自发    后台跑完了 → 结果转成播报');
+    try {
+      this.announcer(payload, emotion, targetId !== undefined && targetId !== '' ? { targetId } : undefined);
+    } catch (error) {
+      this.log(`  自发    ✗ 播报失败：${asError(error).message}`);
+    }
+  }
 }
 
 function formatPrompt(asrText: string, note: string | undefined): string {
@@ -1127,6 +1722,155 @@ function promptContent(text: string, image: AgentImage | undefined): HostPromptP
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
+}
+
+/**
+ * 递归拆 dsh 的流式载荷。`onDelta` 收增量，`onFullText` 收整段（`text` /
+ * `block-end`）。主轮与常驻看门狗共用这一份 —— 两份解析器迟早漂开。
+ */
+function walkStreamPayload(
+  payload: unknown,
+  depth: number,
+  onDelta: (text: string) => void,
+  onFullText: (text: string) => void,
+  stopped: () => boolean,
+): void {
+  if (depth > 8 || stopped()) return;
+  if (typeof payload === 'string') {
+    onDelta(payload);
+    return;
+  }
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      walkStreamPayload(item, depth + 1, onDelta, onFullText, stopped);
+    }
+    return;
+  }
+  const rec = asRecord(payload);
+  if (rec === null) return;
+  const type = typeof rec['type'] === 'string' ? rec['type'] : '';
+  if (type === 'text-delta' || type === 'text_delta') {
+    if (typeof rec['text'] === 'string') onDelta(rec['text']);
+    return;
+  }
+  if (type === 'text-chunks' || type === 'text_chunks') {
+    const texts = rec['texts'];
+    if (Array.isArray(texts)) {
+      for (const piece of texts) {
+        if (typeof piece === 'string') onDelta(piece);
+      }
+    }
+    return;
+  }
+  if (
+    type === 'chunk'
+    || type === 'assistant-stream'
+    || type === 'assistant/stream'
+    || type === 'assistantStream'
+  ) {
+    if ('chunk' in rec) walkStreamPayload(rec['chunk'], depth + 1, onDelta, onFullText, stopped);
+    else if (typeof rec['delta'] === 'string') onDelta(rec['delta']);
+    else if (typeof rec['text'] === 'string') onDelta(rec['text']);
+    return;
+  }
+  if (type === 'block-end' || type === 'text') {
+    const block = type === 'block-end' ? asRecord(rec['block']) : rec;
+    if (block !== null && typeof block['text'] === 'string' && (type === 'text' || block['type'] === 'text')) {
+      onFullText(block['text']);
+    }
+    return;
+  }
+  if (
+    type === 'start'
+    || type === 'end'
+    || type === 'reasoning-delta'
+    || type === 'reasoning-chunks'
+    || type === 'tool-call-delta'
+    || type === 'tool-call-chunks'
+    || type === 'usage'
+    || type === 'finish'
+    || type === 'block-start'
+  ) {
+    return;
+  }
+  if (type === '' && typeof rec['text'] === 'string') onDelta(rec['text']);
+}
+
+/** dsh 派子代理的工具名（`subagent_fork` 是同一件事的分叉版，`send_message` 是续写同一个子代理）。 */
+function isSubagentTool(name: string): boolean {
+  return name === 'subagent' || name === 'subagent_fork' || name === 'send_message';
+}
+
+/**
+ * `tool/call` 的参数可能在 `arguments` / `args` / `input`，且可能是 JSON 字符串。
+ * 解析失败一律当空对象 —— 调用方只关心里面有没有目标 id。
+ */
+function parseToolArgs(data: Record<string, unknown> | undefined): Record<string, unknown> {
+  const keys = ['arguments', 'args', 'input'] as const;
+  for (const key of keys) {
+    const raw = data?.[key];
+    if (typeof raw === 'string') {
+      const parsed = asRecord(parseJson(raw));
+      if (parsed !== null) return parsed;
+      continue;
+    }
+    const record = asRecord(raw);
+    if (record !== null) return record;
+  }
+  return {};
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function readArgId(record: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+  }
+  return '';
+}
+
+/** `send_message` 的目标子代理 id：`agent_id` / `agentId` / `sessionId` / `childId`。 */
+function subagentTargetIdFromToolCall(data: Record<string, unknown> | undefined): string {
+  return readArgId(parseToolArgs(data), ['agent_id', 'agentId', 'sessionId', 'childId']);
+}
+
+/** 读后台 job 结果的工具调用里带的 `job_id` / `jobId`。 */
+function jobIdFromJobOutputCall(data: Record<string, unknown> | undefined): string {
+  return readArgId(parseToolArgs(data), ['job_id', 'jobId']);
+}
+
+/** `tool/call` 的载荷里工具名可能叫 `name` / `tool` / `toolName`。 */
+function toolNameOf(data: Record<string, unknown> | undefined): string {
+  const keys = ['name', 'tool', 'toolName'] as const;
+  for (const key of keys) {
+    const value = data?.[key];
+    if (typeof value === 'string' && value !== '') return value;
+  }
+  return '';
+}
+
+function jobIdOf(data: Record<string, unknown> | undefined): string {
+  const jobId = data?.['jobId'];
+  return typeof jobId === 'string' ? jobId : '';
+}
+
+/** 保留首行 `[原意: …]` 给上游总线抽 `canonicalUser`，避免被 `cleanForSpeech` 啃掉左括号。 */
+const CANONICAL_USER_TAG =
+  /^\s*[\[【][^\S\r\n]*原意[^\S\r\n]*[:：][^\S\r\n]*([^\r\n\]】]*?)[^\S\r\n]*[\]】][^\S\r\n]*(?:\r?\n)?/u;
+
+/**
+ * `[ASYNC]` / `【ASYNC】`（情绪标签可以写在前面）—— dsh 明说这一轮只是派活，
+ * 结果之后自己开一轮说。
+ */
+function isAsyncTagOnly(raw: string): boolean {
+  return /^[\[【]\s*ASYNC\s*[\]】]$/iu.test(parseEmotion(raw).rest.trim());
 }
 
 function asError(error: unknown): Error {

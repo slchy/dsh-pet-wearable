@@ -197,6 +197,20 @@ export interface FastLaneAudioLane {
  */
 export type InjectKind = 'spoken' | 'unspoken';
 
+/** `setAnnouncer` 回调的附加元信息。 */
+export interface AnnounceMeta {
+  /** 触发这次后台回调的目标 id（`subagent` 的 `senderSessionId` 或 `jobId`），用于与挂起任务精确归并结算。 */
+  readonly targetId?: string;
+}
+
+/**
+ * 后台播报出口。
+ *
+ * `meta.targetId` 让总线把同一次回调与挂起的任务精确配对：同一个可续写子代理
+ * 被 `send_message` 连续唤醒时，多条挂起任务能一次结清，也不误伤别的目标。
+ */
+export type AgentAnnouncer = (speech: string, emotion?: string, meta?: AnnounceMeta) => void;
+
 /**
  * Realtime 音频直出车道的**上行 + 认领完整端口**（供连接层 `VoiceConnection` 驱动）。
  *
@@ -252,6 +266,16 @@ export interface AgentReplyView {
    * 没有它，「这一轮为什么走 dsh」在日志里和「本地闸挡住」长得一模一样。
    */
   readonly delegate?: DelegateReason;
+  /**
+   * 这一轮 dsh 已将任务异步派发给后台 `subagent` 或 `job`（`run_in_background: true`）
+   * 并主动结束主对话轮次：结果稍后由 dsh 自发回调轮经播报口回流，调用方不应把它当成终态完成。
+   */
+  readonly asyncDispatched?: boolean;
+  /**
+   * 异步移交的底层目标 id（`subagent` 的 `childId`/`agent_id` 或后台 `jobId`），
+   * 用于回调时精确配对并归并同目标任务。
+   */
+  readonly asyncTargetId?: string;
 }
 
 export type BackgroundTaskSource =
@@ -493,7 +517,7 @@ export interface AgentProvider {
    * `emotion` 是模型写在回复开头的情绪标签。以前这条口只传 `speech`，后台
    * 汇报的语气标签在这里就被截掉了 —— 模型写 `[开心]跑完了`，播出来还是平静。
    */
-  setAnnouncer?(cb: ((speech: string, emotion?: string) => void) | null): void;
+  setAnnouncer?(cb: AgentAnnouncer | null): void;
   /**
    * 可选能力：**放手那一轮**（委派轮被打断、但没取消）跑完之后，把答案交出来。
    *

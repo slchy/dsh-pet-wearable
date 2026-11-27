@@ -28,7 +28,13 @@ interface ExecCall {
 }
 
 interface Slot {
-  readonly resolve: (value: { text: string; speech?: string; emotion?: string }) => void;
+  readonly resolve: (value: {
+    text: string;
+    speech?: string;
+    emotion?: string;
+    asyncDispatched?: boolean;
+    asyncTargetId?: string;
+  }) => void;
   readonly reject: (err: unknown) => void;
 }
 
@@ -1610,4 +1616,276 @@ test('utterancePcm 透传 execute，early_rule 升级 tool_call 时保留', asyn
   must(held.pending[1], 'plain slot').resolve({ text: '好' });
   await flush();
   assert.equal(plain.state(), 'completed');
+});
+
+// ---------------------------------------------------------------- 异步移交（asyncDispatched）
+
+test('asyncDispatched 立刻放开工人循环，后一条不等前一条，前一条仍算 running', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+
+  const first = bus.dispatch({ query: '多步任务一', source: 'tool_call', turnNo: 1 });
+  const second = bus.dispatch({ query: '单步任务二', source: 'early_rule', turnNo: 2 });
+
+  await flush();
+  assert.equal(held.calls.length, 1);
+  assert.equal(first.state(), 'running');
+  assert.equal(second.state(), 'queued');
+
+  // 第一条只回「已派出去」，工人循环必须马上取第二条
+  must(held.pending[0], 'first async slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+
+  assert.equal(first.state(), 'running', '异步移交后任务仍要留在 running，等回调结算');
+  assert.equal(second.state(), 'running', '第二条不得被第一条的异步任务堵住');
+  assert.equal(held.calls.length, 2);
+  assert.equal(reports.length, 0, '异步移交不是完成，不能提前发汇报');
+  assert.equal(bus.hasActiveReportable(), true);
+  assert.ok(bus.activeCount() >= 1);
+
+  // 第二条正常完成，第一条仍在等回调
+  must(held.pending[1], 'second slot').resolve({ text: '单步好了' });
+  await flush();
+  assert.equal(second.state(), 'completed');
+  assert.equal(first.state(), 'running');
+  assert.equal(reports.length, 1);
+  assert.equal(must(reports[0], 'second report').taskId, second.taskId);
+  assert.equal(bus.hasActiveReportable(), true);
+});
+
+test('异步回调结算 asyncPending：沿用 taskId/turnNo/query/原意与全文 verbatim', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const events: BackgroundTaskLifecycleEvent[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+    onLifecycle: (event) => { events.push(event); },
+  });
+
+  const task = bus.dispatch({ query: '查一下端口', source: 'tool_call', turnNo: 3 });
+  await flush();
+  must(held.pending[0], 'async slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+  assert.equal(task.state(), 'running');
+  events.length = 0;
+
+  bus.ingestExternalAnnouncement('[原意: 查一下端口]\n[VERBATIM][开心]端口 8766', undefined, '查一下端口');
+
+  assert.equal(task.state(), 'completed');
+  assert.equal(bus.hasActiveReportable(), false);
+  assert.equal(bus.activeCount(), 0);
+  assert.equal(reports.length, 1, '回调只发一次，不额外造 dsh_background');
+  const report = must(reports[0], 'report');
+  assert.equal(report.taskId, task.taskId, '沿用原 taskId，不能让快照里的任务对不上');
+  assert.equal(report.taskId.startsWith('bg-'), true);
+  assert.equal(report.turnNo, 3);
+  assert.equal(report.query, '查一下端口');
+  assert.equal(report.canonicalUser, '查一下端口');
+  assert.equal(report.summary, '端口 8766');
+  assert.equal(report.verbatim, '端口 8766');
+  assert.equal(report.source, 'tool_call');
+
+  const completed = must(events.find((event) => event.type === 'completed'), 'completed event');
+  assert.equal(completed.type, 'completed');
+  if (completed.type !== 'completed') return;
+  assert.equal(completed.taskId, task.taskId);
+  assert.equal(completed.turnNo, 3);
+  assert.equal(completed.query, '查一下端口');
+  assert.equal(completed.report, report);
+});
+
+test('ingestExternalAnnouncement 忽略 [ASYNC] / 【ASYNC】，不结算也不播报', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  const task = bus.dispatch({ query: '等回调', source: 'tool_call', turnNo: 1 });
+  await flush();
+  must(held.pending[0], 'async slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+
+  bus.ingestExternalAnnouncement('[ASYNC]');
+  bus.ingestExternalAnnouncement('【ASYNC】');
+  bus.ingestExternalAnnouncement('[开心][ASYNC]');
+
+  assert.equal(reports.length, 0);
+  assert.equal(task.state(), 'running');
+  assert.equal(bus.hasActiveReportable(), true);
+});
+
+test('只剩 asyncPending 时 cancelAll 仍取消任务并回传 cancelRunning', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const events: BackgroundTaskLifecycleEvent[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+    onLifecycle: (event) => { events.push(event); },
+  });
+  const task = bus.dispatch({ query: '等回调', source: 'tool_call', turnNo: 4 });
+  await flush();
+  must(held.pending[0], 'async slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+  assert.equal(bus.hasActiveReportable(), true);
+  assert.equal(bus.activeCount(), 1);
+
+  assert.equal(bus.cancelAll('user_cancel'), true);
+  assert.equal(task.state(), 'cancelled');
+  assert.deepEqual(held.cancels, ['user_cancel'], '异步任务也必须通知底层取消');
+  assert.equal(bus.hasActiveReportable(), false);
+  assert.equal(bus.activeCount(), 0);
+  assert.equal(reports.length, 0, '取消不播假失败');
+  assert.equal(bus.cancelAll(), false, '再取消一次没有活可停');
+
+  const cancelled = must(events.find((event) => event.type === 'cancelled'), 'cancel event');
+  assert.equal(cancelled.type, 'cancelled');
+  if (cancelled.type !== 'cancelled') return;
+  assert.equal(cancelled.taskId, task.taskId);
+  assert.equal(cancelled.reason, 'user_cancel');
+});
+
+test('多个 asyncPending 按查询重合度对号结算，完全不重合时 FIFO', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  const a = bus.dispatch({ query: '查一下明天北京天气', source: 'tool_call', turnNo: 1 });
+  const b = bus.dispatch({ query: '查一下英伟达股价', source: 'tool_call', turnNo: 2 });
+  const c = bus.dispatch({ query: '帮我订一杯咖啡', source: 'tool_call', turnNo: 3 });
+
+  await flush();
+  must(held.pending[0], 'a slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+  must(held.pending[1], 'b slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+  must(held.pending[2], 'c slot').resolve({ text: '', asyncDispatched: true });
+  await flush();
+  assert.equal(a.state(), 'running');
+  assert.equal(b.state(), 'running');
+  assert.equal(c.state(), 'running');
+  assert.equal(bus.activeCount(), 3);
+
+  // 股价先回来：只能结算 b，不能误伤最早的 a
+  bus.ingestExternalAnnouncement('涨了三个点', undefined, '英伟达股价');
+  assert.equal(b.state(), 'completed');
+  assert.equal(a.state(), 'running');
+  assert.equal(c.state(), 'running');
+  assert.equal(must(reports[0], 'b report').taskId, b.taskId);
+  assert.equal(must(reports[0], 'b report').query, '查一下英伟达股价');
+
+  // 完全不带 query 的回调没有重合 → FIFO 取最早还在等的 a
+  bus.ingestExternalAnnouncement('晴，二十度');
+  assert.equal(a.state(), 'completed');
+  assert.equal(c.state(), 'running');
+  assert.equal(must(reports[1], 'a report').taskId, a.taskId);
+
+  bus.ingestExternalAnnouncement('下好单了', undefined, '咖啡');
+  assert.equal(c.state(), 'completed');
+  assert.equal(must(reports[2], 'c report').taskId, c.taskId);
+  assert.deepEqual(reports.map((report) => report.taskId), [b.taskId, a.taskId, c.taskId]);
+});
+
+test('同一 asyncTargetId 的多条任务一次回调全部结算，只播报合并后的一条', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const events: BackgroundTaskLifecycleEvent[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+    onLifecycle: (event) => { events.push(event); },
+  });
+  const first = bus.dispatch({ query: '卷一', source: 'tool_call', turnNo: 1 });
+  const second = bus.dispatch({ query: '卷二', source: 'tool_call', turnNo: 2 });
+  const third = bus.dispatch({ query: '卷三', source: 'tool_call', turnNo: 3 });
+
+  for (let i = 0; i < 3; i += 1) {
+    await flush();
+    must(held.pending[i], `async slot ${i}`).resolve({
+      text: '',
+      asyncDispatched: true,
+      asyncTargetId: 'sub-1',
+    });
+  }
+  await flush();
+  assert.equal(first.state(), 'running');
+  assert.equal(second.state(), 'running');
+  assert.equal(third.state(), 'running');
+  assert.equal(bus.activeCount(), 3);
+  events.length = 0;
+
+  bus.ingestExternalAnnouncement('三卷都读完了', undefined, '卷一', 'sub-1');
+
+  assert.equal(first.state(), 'completed');
+  assert.equal(second.state(), 'completed');
+  assert.equal(third.state(), 'completed');
+  assert.equal(bus.hasActiveReportable(), false, '同目标的兄弟任务不得残留 running');
+  assert.equal(bus.activeCount(), 0);
+  assert.equal(reports.length, 1, '一次回调只播报一次');
+  const report = must(reports[0], 'merged report');
+  assert.equal(report.taskId, first.taskId);
+  assert.equal(report.query, '卷一；卷二；卷三');
+  assert.equal(report.summary, '三卷都读完了');
+
+  const completed = events.filter(
+    (event): event is Extract<BackgroundTaskLifecycleEvent, { type: 'completed' }> =>
+      event.type === 'completed',
+  );
+  assert.equal(completed.length, 3, '三条任务都要发 completed 生命周期');
+  const withReport = completed.filter((event) => event.report !== undefined);
+  assert.equal(withReport.length, 1, '只有 primary 带 report');
+  assert.equal(must(withReport[0], 'primary completed').taskId, first.taskId);
+  assert.equal(must(withReport[0], 'primary completed').query, '卷一；卷二；卷三');
+});
+
+test('按 targetId 精准结算：乱序回调只结对应任务，未知 target 不误吞已绑定的任务', async () => {
+  const held = holdRunner();
+  const reports: BackgroundTaskReport[] = [];
+  const bus = new BackgroundTaskBus({
+    runner: held.runner,
+    onReport: (report) => { reports.push(report); },
+  });
+  const subAgent = bus.dispatch({ query: '查子代理 A', source: 'tool_call', turnNo: 1 });
+  const job = bus.dispatch({ query: '跑后台 job B', source: 'tool_call', turnNo: 2 });
+
+  await flush();
+  must(held.pending[0], 'sub-A slot').resolve({
+    text: '',
+    asyncDispatched: true,
+    asyncTargetId: 'sub-A',
+  });
+  await flush();
+  must(held.pending[1], 'job-B slot').resolve({
+    text: '',
+    asyncDispatched: true,
+    asyncTargetId: 'job-B',
+  });
+  await flush();
+  assert.equal(bus.activeCount(), 2);
+
+  // 后派出的 job-B 先回来：只结 job-B，不碰更早的 sub-A。
+  bus.ingestExternalAnnouncement('B 跑完了', undefined, '跑后台 job B', 'job-B');
+  assert.equal(job.state(), 'completed');
+  assert.equal(subAgent.state(), 'running');
+  assert.equal(must(reports[0], 'job-B report').taskId, job.taskId);
+
+  // 未知 target 不得把任何一个已绑定的在跑任务算完成。
+  bus.ingestExternalAnnouncement('未知来源的公告', undefined, undefined, 'sub-UNKNOWN');
+  assert.equal(subAgent.state(), 'running', '未知 target 绝不误吞已绑定任务');
+  assert.equal(bus.activeCount(), 1);
+  assert.equal(reports.length, 2);
+  assert.equal(must(reports[1], 'external report').source, 'dsh_background');
+
+  bus.ingestExternalAnnouncement('A 也跑完了', undefined, '查子代理 A', 'sub-A');
+  assert.equal(subAgent.state(), 'completed');
+  assert.equal(bus.activeCount(), 0);
+  assert.equal(must(reports[2], 'sub-A report').taskId, subAgent.taskId);
 });

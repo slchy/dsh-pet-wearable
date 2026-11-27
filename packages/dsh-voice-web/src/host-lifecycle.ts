@@ -27,7 +27,11 @@ import {
   type HostWebServer,
 } from './host-mount.ts'
 import { HostSecurityGuard, type ConnectionFence } from './host-security.ts'
-import { InProcessDshAgent, type HostSessionController } from './in-process-agent.ts'
+import {
+  InProcessDshAgent,
+  type HostJobController,
+  type HostSessionController,
+} from './in-process-agent.ts'
 import { fetchAvailableModels } from './model-catalog.ts'
 import {
   applyVoiceProfile,
@@ -159,6 +163,18 @@ export function readSessionController(ctx: Context): HostSessionController | nul
   if (typeof controller.cancel !== 'function') return null
   if (typeof controller.follow !== 'function') return null
   return value as HostSessionController
+}
+
+/**
+ * 后台作业控制器：用户说「别查了」时要把还在跑的 `job`（`run_in_background: true`）
+ * 真的停掉。精简宿主不一定注入这个服务 —— 缺了只影响取消得干不干净，不影响对话。
+ */
+export function readJobController(ctx: Context): HostJobController | null {
+  const value = readHostService(ctx, 'jobController')
+  if (typeof value !== 'object' || value === null) return null
+  const controller = value as Partial<HostJobController>
+  if (typeof controller.kill !== 'function') return null
+  return value as HostJobController
 }
 
 function resolveConnectionFence(ctx: Context): ConnectionFence | null {

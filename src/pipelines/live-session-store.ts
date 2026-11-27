@@ -867,7 +867,7 @@ function taskForCompleted(
     turnNo: patch.turnNo,
     epoch: patch.epoch,
     source: existing?.source ?? event.report.source,
-    query: existing !== undefined && existing.query !== '' ? existing.query : event.report.query,
+    query: completedQuery(existing, event.report.query),
     canonicalUser: patch.canonical ?? existing?.canonicalUser,
     toolCallId: existing?.toolCallId,
     state: 'completed',
@@ -880,6 +880,20 @@ function taskForCompleted(
     delivered: patch.silent ? 'silent' : 'pending',
     updatedSeq: patch.seq,
   });
+}
+
+/**
+ * 完成时用哪条查询。
+ *
+ * 平时沿用任务创建时的查询（`event.report.query` 可能是回调正文的附带信息）。
+ * 唯一例外是**同目标多任务合并结算**：后台总线把 `卷一；卷二；卷三` 拼进
+ * `report.query`，带上原查询前缀说明这是同一批任务的合并结论，采用合并后的
+ * 完整查询，单槽快照才能反映全部任务项。
+ */
+function completedQuery(existing: LiveTaskRecord | undefined, incoming: string): string {
+  if (existing === undefined || existing.query === '') return incoming;
+  if (incoming.startsWith(`${existing.query}；`)) return incoming;
+  return existing.query;
 }
 
 function taskForFailed(

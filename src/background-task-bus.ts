@@ -70,6 +70,21 @@ export function stripVerbatimTag(text: string): string {
   return text.replace(/[\[【]\s*VERBATIM\s*[\]】]/g, '');
 }
 
+/** dsh 异步移交后只回这一行：`[ASYNC]` / `【ASYNC】`。 */
+const ASYNC_DISPATCH_TAG = /^\s*[\[【]\s*ASYNC\s*[\]】]\s*$/iu;
+
+/**
+ * 文本剥掉可选情绪标签后是不是纯异步移交标记。
+ *
+ * `[ASYNC]` 有 5 个字，`parseEmotion` 的标签括号只认 1–4 个字，不会把它当情绪；
+ * 但 `[开心][ASYNC]` 会先剥掉 `[开心]`。这里按剥完的结果判断。
+ */
+export function isAsyncDispatchTag(text: string): boolean {
+  if (typeof text !== 'string') return false;
+  const { rest } = parseEmotion(text);
+  return ASYNC_DISPATCH_TAG.test(rest.trim());
+}
+
 /**
  * 剥掉开头的 `[原意: …]` / `【原意：…】`。
  *
@@ -145,7 +160,18 @@ export interface BackgroundTaskRunner {
     /** 整句高精度人声；调用方没给就不带这个键。 */
     readonly utterancePcm?: Buffer;
     readonly signal: AbortSignal;
-  }): Promise<{ readonly text: string; readonly speech?: string; readonly emotion?: string }>;
+  }): Promise<{
+    readonly text: string;
+    readonly speech?: string;
+    readonly emotion?: string;
+    /**
+     * dsh 已把这条任务异步派给 `subagent` / 后台 `job`，本轮只是「已接下」而非终态。
+     * 工人循环必须立刻放开，等 dsh 自己的回调轮经 `ingestExternalAnnouncement` 结算。
+     */
+    readonly asyncDispatched?: boolean;
+    /** 异步移交的底层目标 id（`subagent` 的 `childId`/`agent_id` 或 `jobId`）。 */
+    readonly asyncTargetId?: string;
+  }>;
   /** 显式取消正在运行的底层 dsh 轮次/后台任务 */
   cancelRunning?(reason: string): void;
 }
@@ -234,6 +260,8 @@ interface TaskRecord {
   readonly silent: boolean;
   state: BackgroundTaskState;
   controller: AbortController | null;
+  /** 异步移交的目标 id：回调带同一个 id 时一次结清同目标的全部挂起任务。 */
+  asyncTargetId?: string;
 }
 
 interface Spoken {
@@ -278,6 +306,24 @@ function preview(text: string): string {
   return JSON.stringify(flat.length <= 60 ? flat : `${flat.slice(0, 60)}…`);
 }
 
+/** 去掉空白后的 2-gram 集合，用来判断两条查询是不是在说同一件事。 */
+function bigramsOf(text: string): ReadonlySet<string> {
+  const chars = [...text.replace(/\s+/g, '')];
+  const grams = new Set<string>();
+  for (let i = 0; i + 1 < chars.length; i += 1) {
+    grams.add(`${chars[i]}${chars[i + 1]}`);
+  }
+  return grams;
+}
+
+function overlapScore(query: string, haystack: ReadonlySet<string>): number {
+  let hits = 0;
+  for (const gram of bigramsOf(query)) {
+    if (haystack.has(gram)) hits += 1;
+  }
+  return hits;
+}
+
 function readResult(result: unknown): { text: string; speech?: string; emotion?: string } {
   if (typeof result !== 'object' || result === null) return { text: '' };
   const record = result as { text?: unknown; speech?: unknown; emotion?: unknown };
@@ -286,6 +332,33 @@ function readResult(result: unknown): { text: string; speech?: string; emotion?:
     speech: typeof record.speech === 'string' ? record.speech : undefined,
     emotion: typeof record.emotion === 'string' ? record.emotion : undefined,
   };
+}
+
+function readAsyncDispatched(result: unknown): boolean {
+  if (typeof result !== 'object' || result === null) return false;
+  return (result as { asyncDispatched?: unknown }).asyncDispatched === true;
+}
+
+/** 异步移交的目标 id（去空白；空串 / 非字符串都当没有）。 */
+function readAsyncTargetId(result: unknown): string | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  const value = (result as { asyncTargetId?: unknown }).asyncTargetId;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+/** 同目标的多条任务合并成一条播报时，查询按派发顺序去重后用 `；` 连起来。 */
+function combineQueries(tasks: readonly TaskRecord[]): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const task of tasks) {
+    const query = task.query.trim();
+    if (query === '' || seen.has(query)) continue;
+    seen.add(query);
+    parts.push(query);
+  }
+  return parts.join('；');
 }
 
 /**
@@ -335,6 +408,14 @@ export class BackgroundTaskBus {
   private running: TaskRecord | null = null;
   private readonly reportable: TaskRecord[] = [];
   private readonly silentQueue: TaskRecord[] = [];
+  /**
+   * 已经交给 dsh 异步执行、还在等回调的活。
+   *
+   * 它们没有占住 `running` 槽（那槽一放开，`drain()` 才能取下一件），
+   * 但状态仍是 `running`：`hasActiveReportable` / `activeCount` 都得算上，
+   * 取消时也要在这里一起摘掉。
+   */
+  private readonly asyncPending: TaskRecord[] = [];
   /**
    * 要播报的任务按 turnNo 留到 completed，失败和取消会摘掉，同一会话里才能再派。
    * 进程级总线跨重连还在，轮次却从 1 重新编号；`resetSession()` 必须把这里清掉。
@@ -392,11 +473,20 @@ export class BackgroundTaskBus {
   /**
    * dsh 自己的后台作业 / 子代理跑完了。不进队列（那边已经执行完），
    * 只把正文收成和 `dispatch` 一样的汇报。
+   *
+   * `targetId` 是回调轮带回来的目标 id（`subagent` 的 `senderSessionId` 或 `jobId`）：
+   * 同一次回调可能对应多条挂起任务（同一个可续写子代理被 `send_message` 连续唤醒），
+   * 带 id 时按 id 精确归并结算；不带时仍按旧的查询重合 / FIFO 配对。
    */
-  ingestExternalAnnouncement(rawText: string, emotion?: string, query?: string): void {
+  ingestExternalAnnouncement(rawText: string, emotion?: string, query?: string, targetId?: string): void {
     if (this.phase === 'disposed') return;
     if (typeof rawText !== 'string' || rawText.trim() === '') {
       this.writeLog('  后台    外部播报为空，忽略');
+      return;
+    }
+    // dsh 派发后的 `[ASYNC]` 回执不是结论，绝不能当成一次播报
+    if (isAsyncDispatchTag(rawText)) {
+      this.writeLog('  后台    异步移交标记，忽略');
       return;
     }
     const spoken = speakable(rawText, undefined, emotion);
@@ -404,15 +494,130 @@ export class BackgroundTaskBus {
       this.writeLog('  后台    外部播报为空，忽略');
       return;
     }
+    const normalizedTarget = typeof targetId === 'string' ? targetId.trim() : '';
+    if (normalizedTarget !== '') {
+      if (this.settleByTarget(normalizedTarget, spoken)) return;
+    }
+    if (this.asyncPending.length > 0) {
+      const task = this.takeMatchingAsyncPending(
+        spoken.clean,
+        spoken.canonicalUser,
+        query,
+        normalizedTarget !== '',
+      );
+      if (task !== undefined && move(task, 'completed')) {
+        this.dropTurn(task);
+        const report = this.toReport(task.taskId, task.source, task.query, spoken, task.turnNo);
+        this.writeLog(`  后台    异步回调完成 ${task.taskId} → ${preview(report.summary)}`);
+        this.emitLifecycle({ type: 'completed', ...this.taskLifecycle(task), report });
+        this.deliver(report);
+        return;
+      }
+    }
     const taskId = this.allocateId();
     this.writeLog(`  后台    外部播报 ${taskId} → ${preview(spoken.clean)}`);
     this.deliver(this.toReport(taskId, 'dsh_background', query ?? '', spoken));
+  }
+
+  /**
+   * 按目标 id 归并结算。
+   *
+   * 同一个可续写子代理被 `send_message` 连续唤醒时，语音侧为每卷各排了一条任务；
+   * dsh 只回调一次、带回合并后的总结。这里把同目标的任务一次结清：第一条正常播报
+   * （`query` 合并成 `'卷一；卷二；卷三'`），其余只发 `completed` 生命周期、
+   * 不重复出声，消除幽灵 `running`。
+   *
+   * @returns true = 这次回调属于这个目标，调用方不要再走普通外部播报。
+   */
+  private settleByTarget(targetId: string, spoken: Spoken): boolean {
+    const matched = this.takeAsyncPendingByTarget(targetId);
+    if (matched.length === 0) return false;
+    const running = matched.filter((task) => task.state === 'running');
+    const primary = running[0];
+    if (primary === undefined) return true;
+    const combinedQuery = combineQueries(running);
+    if (!move(primary, 'completed')) return true;
+    this.dropTurn(primary);
+    const report = this.toReport(primary.taskId, primary.source, combinedQuery, spoken, primary.turnNo);
+    this.writeLog(
+      `  后台    异步回调完成 ${primary.taskId}（同目标 ${running.length} 条） → ${preview(report.summary)}`,
+    );
+    this.emitLifecycle({ type: 'completed', ...this.taskLifecycle(primary), query: combinedQuery, report });
+    this.deliver(report);
+    for (const sibling of running.slice(1)) {
+      if (!move(sibling, 'completed')) continue;
+      this.dropTurn(sibling);
+      this.emitLifecycle({ type: 'completed', ...this.taskLifecycle(sibling) });
+    }
+    return true;
+  }
+
+  /** 从 `asyncPending` 按派发顺序摘出所有绑到同一个目标的任务。 */
+  private takeAsyncPendingByTarget(targetId: string): TaskRecord[] {
+    const matched: TaskRecord[] = [];
+    const keep: TaskRecord[] = [];
+    for (const task of this.asyncPending) {
+      if (task.asyncTargetId === targetId) matched.push(task);
+      else keep.push(task);
+    }
+    if (matched.length === 0) return matched;
+    this.asyncPending.length = 0;
+    this.asyncPending.push(...keep);
+    return matched;
+  }
+
+  /**
+   * 从 `asyncPending` 里挑一条最可能是这次回调的任务。
+   *
+   * 只有一条就直接认领。多条时按 **2-gram 重合度** 打分（查询 vs 回调里的
+   * query / 原意 / 正文）；最高分仍为 0（完全不重合）就按 FIFO 取最早那条 ——
+   * 回调没带 query 时，dsh 通常按派发顺序结算。
+   *
+   * `onlyUnbound` 用于「回调带了 targetId、但没有任何任务绑到这个目标」：
+   * 此时只能认领未绑定目标的任务，绝不能把已绑到别的目标的在跑任务错算完成。
+   */
+  private takeMatchingAsyncPending(
+    clean: string,
+    canonicalUser: string | undefined,
+    query: string | undefined,
+    onlyUnbound = false,
+  ): TaskRecord | undefined {
+    const candidates = onlyUnbound
+      ? this.asyncPending.filter((task) => task.asyncTargetId === undefined)
+      : this.asyncPending;
+    if (candidates.length === 0) return undefined;
+    if (candidates.length === 1) {
+      const only = candidates[0];
+      if (only === undefined) return undefined;
+      this.removeAsyncPending(only);
+      return only;
+    }
+    const haystack = bigramsOf(`${query ?? ''} ${canonicalUser ?? ''} ${clean}`);
+    let best: TaskRecord | undefined;
+    let bestScore = 0;
+    for (const task of candidates) {
+      const score = overlapScore(task.query, haystack);
+      if (score > bestScore) {
+        bestScore = score;
+        best = task;
+      }
+    }
+    const picked = best ?? candidates[0];
+    if (picked === undefined) return undefined;
+    this.removeAsyncPending(picked);
+    return picked;
+  }
+
+  private removeAsyncPending(task: TaskRecord): void {
+    const index = this.asyncPending.indexOf(task);
+    if (index >= 0) this.asyncPending.splice(index, 1);
   }
 
   /** 正在跑的或还在排队的里面，有没有要向用户汇报的任务。 */
   hasActiveReportable(): boolean {
     const running = this.running;
     if (running !== null && running.state === 'running' && !running.silent) return true;
+    if (this.asyncPending.some((task) => task.state === 'running' && !task.silent)) return true;
     return this.reportable.some((task) => task.state === 'queued');
   }
 
@@ -427,6 +632,9 @@ export class BackgroundTaskBus {
     let n = this.queuedCount();
     const running = this.running;
     if (running !== null && (running.state === 'queued' || running.state === 'running')) n += 1;
+    for (const task of this.asyncPending) {
+      if (task.state === 'running') n += 1;
+    }
     return n;
   }
 
@@ -622,6 +830,10 @@ export class BackgroundTaskBus {
         ...(task.utterancePcm === undefined ? {} : { utterancePcm: task.utterancePcm }),
         signal: controller.signal,
       });
+      if (readAsyncDispatched(result)) {
+        this.handoffAsync(task, readAsyncTargetId(result));
+        return;
+      }
       this.finishOk(task, result);
     } catch (err) {
       // 宿主侧取消不算失败：不播「刚才那个任务没跑成」。
@@ -631,6 +843,28 @@ export class BackgroundTaskBus {
       if (this.running === task) this.running = null;
       task.controller = null;
     }
+  }
+
+  /**
+   * dsh 说这一轮只是「已派出去」。保留 `running`、从活跃槽里摘掉，让 `drain()`
+   * 立刻取下一件 —— 主对话零阻塞。真正的结算在 `ingestExternalAnnouncement`。
+   *
+   * 等待期间被取消 / 总线被释放时什么都不做：那条已经按取消处理了。
+   */
+  private handoffAsync(task: TaskRecord, asyncTargetId: string | undefined): void {
+    if (this.isDisposed() || task.state !== 'running') return;
+    task.controller = null;
+    if (asyncTargetId !== undefined) task.asyncTargetId = asyncTargetId;
+    // 静默记忆写入不需要等外部播报回调结算，也不得占用播报任务的回调配对槽。
+    if (task.silent) {
+      if (!move(task, 'completed')) return;
+      this.dropTurn(task);
+      this.writeLog(`  后台    静默异步移交完成 ${task.taskId}`);
+      this.emitLifecycle({ type: 'completed', ...this.taskLifecycle(task) });
+      return;
+    }
+    this.asyncPending.push(task);
+    this.writeLog(`  后台    异步移交 ${task.taskId}（等待 dsh 后台回调）`);
   }
 
   private finishOk(task: TaskRecord, result: unknown): void {
@@ -772,14 +1006,21 @@ export class BackgroundTaskBus {
   private stopTasks(reason: string, includeSilent: boolean, cancelRunner: boolean): number {
     let reportableCancelled = this.cancelQueued(this.reportable, reason);
     if (includeSilent) this.cancelQueued(this.silentQueue, reason);
+    let cancelledLive = false;
     const running = this.running;
-    if (running === null || running.state !== 'running') return reportableCancelled;
-    if (running.silent && !includeSilent) return reportableCancelled;
-    if (!move(running, 'cancelled')) return reportableCancelled;
-    this.dropTurn(running);
-    running.controller?.abort(reason);
-    this.emitLifecycle({ type: 'cancelled', ...this.taskLifecycle(running), reason });
-    if (!running.silent) reportableCancelled += 1;
+    if (running !== null && running.state === 'running' && (!running.silent || includeSilent)) {
+      if (move(running, 'cancelled')) {
+        this.dropTurn(running);
+        running.controller?.abort(reason);
+        this.emitLifecycle({ type: 'cancelled', ...this.taskLifecycle(running), reason });
+        if (!running.silent) reportableCancelled += 1;
+        cancelledLive = true;
+      }
+    }
+    const pending = this.cancelAsyncPending(reason, includeSilent);
+    reportableCancelled += pending.reportable;
+    // 只有真取消了底层活才叫 `cancelRunning`；空取消不打扰 dsh。
+    if (!cancelledLive && pending.total === 0) return reportableCancelled;
     if (cancelRunner) {
       try {
         this.runner.cancelRunning?.(reason);
@@ -788,6 +1029,37 @@ export class BackgroundTaskBus {
       }
     }
     return reportableCancelled;
+  }
+
+  /**
+   * 取消还在等 dsh 回调的任务。静默任务默认留着（除非 `includeSilent`）。
+   *
+   * @returns `total` 本次取消条数（驱动 `cancelRunning`），`reportable` 其中要播报的。
+   */
+  private cancelAsyncPending(
+    reason: string,
+    includeSilent: boolean,
+  ): { readonly total: number; readonly reportable: number } {
+    let total = 0;
+    let reportable = 0;
+    const keep: TaskRecord[] = [];
+    for (const task of this.asyncPending) {
+      if (task.silent && !includeSilent) {
+        keep.push(task);
+        continue;
+      }
+      if (task.state !== 'running' || !move(task, 'cancelled')) {
+        keep.push(task);
+        continue;
+      }
+      this.dropTurn(task);
+      this.emitLifecycle({ type: 'cancelled', ...this.taskLifecycle(task), reason });
+      total += 1;
+      if (!task.silent) reportable += 1;
+    }
+    this.asyncPending.length = 0;
+    this.asyncPending.push(...keep);
+    return { total, reportable };
   }
 
   private cancelQueued(queue: TaskRecord[], reason: string): number {

@@ -23,6 +23,7 @@ import {
 } from '../persona.ts';
 import { normalizeForCompare, PrefetchSlot, SPEC_MIN_CHARS } from '../prefetch-slot.ts';
 import type {
+  AgentAnnouncer,
   AgentImage,
   AgentProvider,
   AgentReplyView,
@@ -244,7 +245,7 @@ export class CascadeAgent implements AgentProvider {
     });
   }
 
-  setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
+  setAnnouncer(cb: AgentAnnouncer | null): void {
     this.inner.setAnnouncer?.(cb);
   }
 

@@ -22,6 +22,7 @@ import {
   dshHomeDir,
   loadDshHomeDotEnv,
   loadPersistedSessionId,
+  readJobController,
   readSessionController,
 } from './host-lifecycle.ts'
 import type { HostMountHandle } from './host-mount.ts'
@@ -252,6 +253,10 @@ export async function bootVoiceStack(
         sessionId: effectiveSessionId,
         log: report,
         announceStore,
+        // 用户说「别查了」时能真的停掉 `run_in_background` 的作业。
+        jobController: readJobController(ctx),
+        // 后台 `subagent` / `job` 跑完后 dsh 自己开一轮说结果，那一轮要念出来。
+        watchSpontaneous: true,
         ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
         ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
       })

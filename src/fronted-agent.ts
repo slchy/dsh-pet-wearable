@@ -50,7 +50,7 @@ import {
   TASK_RULE_PLAIN,
 } from './persona.ts';
 import { normalizeForCompare, PrefetchSlot, SPEC_MIN_CHARS } from './prefetch-slot.ts';
-import type { AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TtsProvider, TurnContext } from './providers.ts';
+import type { AgentAnnouncer, AgentImage, AgentProvider, AgentReplyView, DelegateReason, FastLaneAudioLane, InjectKind, TtsProvider, TurnContext } from './providers.ts';
 import {
   isCancelRequest,
   looksLikeAnswer,
@@ -511,7 +511,7 @@ export class FrontedAgent implements AgentProvider {
     });
   }
 
-  setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
+  setAnnouncer(cb: AgentAnnouncer | null): void {
     this.inner.setAnnouncer?.(cb);
   }
 

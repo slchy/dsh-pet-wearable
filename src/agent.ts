@@ -19,11 +19,23 @@
 import type { AskResult, ImageAttachment } from './session.ts';
 import { DshSession } from './session.ts';
 import type { AnnounceStore } from './announce-store.ts';
-import type { AgentProvider, DelegateReason } from './providers.ts';
+import type { AgentAnnouncer, AgentProvider, DelegateReason } from './providers.ts';
 import { cleanForSpeech, parseEmotion } from './emotion.ts';
 import type { TurnTicket } from './dialog-fsm.ts';
 
 export { cleanForSpeech } from './emotion.ts';
+
+/**
+ * 异步移交标记。dsh 把任务派给 `subagent` / 后台 `job` 之后不再耽搁主对话，
+ * 只回这一行；调用方据此结束本轮，结果稍后由 dsh 自己的回调轮经播报口流出。
+ *
+ * 中英文方括号都认。情绪标签可能挡在前面（`[开心][ASYNC]`），所以匹配的是
+ * `parseEmotion()` 剥完情绪之后的剩余文本。
+ */
+const ASYNC_HANDOFF_TAG = /^\s*[\[【]\s*ASYNC\s*[\]】]\s*$/iu;
+/** 保留首行 `[原意: …]` 给上游总线抽 `canonicalUser`，避免被 `cleanForSpeech` 啃掉左括号。 */
+const CANONICAL_USER_TAG =
+  /^\s*[\[【][^\S\r\n]*原意[^\S\r\n]*[:：][^\S\r\n]*([^\r\n\]】]*?)[^\S\r\n]*[\]】][^\S\r\n]*(?:\r?\n)?/u;
 
 /**
  * dsh 的压缩阈值（token）—— 来自 profile 里的 `compaction-basic.thresholdRatio: 0.125`。
@@ -62,6 +74,10 @@ export interface AgentReply extends AskResult {
   path?: 'fast' | 'dsh';
   /** 交给慢车道的原因（`VoiceAgent` 自己不会产生，由 `FrontedAgent` 覆盖） */
   delegate?: DelegateReason;
+  /** dsh 已把本轮异步移交后台，结果稍后从播报口回流（见 {@link ASYNC_HANDOFF_TAG}） */
+  asyncDispatched?: boolean;
+  /** 异步移交的底层目标 id（`subagent` 的 `childId`/`agent_id` 或后台 `jobId`），回调时精确配对。 */
+  asyncTargetId?: string;
 }
 
 export class VoiceAgent implements AgentProvider {
@@ -71,7 +87,7 @@ export class VoiceAgent implements AgentProvider {
   private readonly session: DshSession;
   private readonly log: (line: string) => void;
   /** 播报出口。第二个参数是情绪 key，没有就按平静处理 */
-  private announcer: ((speech: string, emotion?: string) => void) | null = null;
+  private announcer: AgentAnnouncer | null = null;
   /** 上一轮的上下文规模，用来识别「刚压缩过」（见 `compactionHint`） */
   private lastContextTokens: number | undefined;
   /** 没有连接时把汇报存下来，等下次连上补播（null = 不持久化） */
@@ -92,17 +108,25 @@ export class VoiceAgent implements AgentProvider {
     this.session.onAnnounce = (text: string) => {
       // 后台汇报也可能带情绪标签，同样处理
       const { emotion, rest } = parseEmotion(text);
-      const speech = cleanForSpeech(rest);
+      // 异步移交标记不是给人听的内容，静默丢掉
+      if (ASYNC_HANDOFF_TAG.test(rest.trim())) {
+        return;
+      }
+      const canonical = CANONICAL_USER_TAG.exec(rest);
+      const canonicalPrefix = canonical !== null ? (canonical[0] ?? '') : '';
+      const body = canonicalPrefix !== '' ? rest.slice(canonicalPrefix.length) : rest;
+      const speech = cleanForSpeech(body);
       if (!speech) {
         return;
       }
+      const out = canonicalPrefix !== '' ? `${canonicalPrefix.trimEnd()}\n${speech}` : speech;
       if (this.announcer === null) {
         const pending = this.announceStore?.push(speech, emotion) ?? 0;
         this.log(`  后台    没有连接，存入待补播（积压 ${pending} 条）`);
         return;
       }
       this.log(`  后台    任务完成 → 播报 ${JSON.stringify(speech.slice(0, 60))}`);
-      this.announcer(speech, emotion);
+      this.announcer(out, emotion);
     };
   }
 
@@ -110,7 +134,7 @@ export class VoiceAgent implements AgentProvider {
    * 设置播报出口。连接建立时设、断开时清 —— 后台任务属于**会话**，
    * 但播报要落到当时在线的那个连接上。
    */
-  setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
+  setAnnouncer(cb: AgentAnnouncer | null): void {
     this.announcer = cb;
   }
 
@@ -193,6 +217,11 @@ export class VoiceAgent implements AgentProvider {
     const r = await this.session.ask(prompt, image, turn);
     // 情绪标签在最开头；剥掉它，剩下的才是要念的话
     const { emotion, rest } = parseEmotion(r.text);
+    // dsh 已把这一轮异步移交后台：不要当失败，也不要有声 —— 结果稍后从播报口回流
+    if (ASYNC_HANDOFF_TAG.test(rest.trim())) {
+      this.log('  dsh     异步移交后台，本轮主对话结束');
+      return { ...r, text: '', speech: '', emotion, path: 'dsh', asyncDispatched: true };
+    }
     const speech = cleanForSpeech(rest);
     if (!speech) {
       // 放手的那一轮：这一轮已经作废，空答复不是失败 —— 真正的答案之后从播报口出来

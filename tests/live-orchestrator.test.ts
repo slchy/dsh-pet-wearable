@@ -20,6 +20,7 @@ import {
   buildLiveReportPrompt,
 } from '../src/persona.ts';
 import type {
+  AgentAnnouncer,
   AgentAudioAnswer,
   AgentImage,
   AgentProvider,
@@ -102,7 +103,7 @@ function fakeDsh(initial?: Partial<AgentReplyView>): {
   agent: AgentProvider;
   calls: ReplyCall[];
   cancelCount: () => number;
-  announcer: () => ((speech: string, emotion?: string) => void) | null;
+  announcer: () => AgentAnnouncer | null;
   hold: () => void;
   release: () => void;
   setResult: (view: AgentReplyView) => void;
@@ -111,11 +112,13 @@ function fakeDsh(initial?: Partial<AgentReplyView>): {
   const pending: Held[] = [];
   let holding = false;
   let cancels = 0;
-  let announcer: ((speech: string, emotion?: string) => void) | null = null;
+  let announcer: AgentAnnouncer | null = null;
   let result: AgentReplyView = {
     text: initial?.text ?? '后台结论',
     speech: initial?.speech ?? initial?.text ?? '后台结论',
     ...(initial?.emotion === undefined ? {} : { emotion: initial.emotion }),
+    ...(initial?.asyncDispatched === true ? { asyncDispatched: true } : {}),
+    ...(initial?.asyncTargetId === undefined ? {} : { asyncTargetId: initial.asyncTargetId }),
   };
   const agent: AgentProvider = {
     name: 'dsh',
@@ -2349,4 +2352,161 @@ test('已有核实上下文时，显式要求细查仍走守卫轮', async () =>
   assert.equal(must(dsh.calls[before], '细查').text, '去细查一下黄仁勋辞职的原因');
   dsh.release();
   await settle();
+});
+
+// ---------------------------------------------------------------- 异步移交（asyncDispatched）
+
+test('asyncDispatched 异步移交：任务保持 running，第二条并发派单，回调后按原任务结算', async () => {
+  const dsh = fakeDsh({ text: '', speech: '', asyncDispatched: true });
+  const voice = scriptedTts();
+  let phase = 0;
+  const lane = ssotLane({
+    answer: () => {
+      phase += 1;
+      return answerWithIds([PCM], '我查查。', {
+        delegate: { reason: 'delegate', text: null },
+        callId: `call-async-${phase}`,
+      });
+    },
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const engine = host.toEngine();
+
+  await collect(engine.respond(
+    turnOf('查一下北之战', { no: 1 }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  assert.equal(reports.length, 0, '异步移交不能立刻当完成汇报');
+  assert.match(lastSnapshot(lane), /任务 bg-1/);
+  assert.match(lastSnapshot(lane), /状态=running（未执行完）/);
+
+  // 第二条并发派单，不等第一条的回调
+  await collect(engine.respond(
+    turnOf('查一下英伟达新闻', { no: 2 }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(dsh.calls.length, 2, '第一条还在等回调，第二条应已派出去');
+  assert.match(lastSnapshot(lane), /任务 bg-2/);
+  assert.equal(reports.length, 0);
+
+  // dsh 自己的回调轮把第一条结论送回来
+  const push = dsh.announcer();
+  assert.ok(push !== null, '构造时要把 announcer 接到 dsh 上');
+  const answer = '北之战是漫画《大剑》的最终战役，克蕾雅与米里雅率领七剑对抗觉醒者与深渊者，组织真相也随之揭开。';
+  push(`[VERBATIM]${answer}`);
+  await settle();
+
+  assert.equal(reports.length, 1, '回调只结算一次，不得双播');
+  const report = must(reports[0], '异步回调');
+  assert.equal(report.taskId, 'bg-1', '结算要落回原任务，不能新建 dsh_background');
+  assert.equal(report.query, '查一下北之战');
+  assert.equal(report.verbatim, answer);
+  assert.match(lastSnapshot(lane), /任务 bg-1/);
+  assert.match(lastSnapshot(lane), /状态=completed/);
+  assert.match(lastSnapshot(lane), new RegExp(answer));
+  assert.doesNotMatch(lastSnapshot(lane), /任务 bg-1[^\n]*状态=running/);
+  assert.match(
+    lastSnapshot(lane),
+    /任务 bg-2 \| 轮次 2 \| 查询：查一下英伟达新闻 \| 状态=running（未执行完）/,
+  );
+});
+
+test('异步移交待回调时「取消任务」停掉 bg-1，不播失败汇报', async () => {
+  const dsh = fakeDsh({ text: '', speech: '', asyncDispatched: true });
+  const voice = scriptedTts();
+  const lane = ssotLane({
+    answer: () => answerWithIds([PCM], '我查查。', {
+      delegate: { reason: 'delegate', text: null },
+      callId: 'call-cancel',
+    }),
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const engine = host.toEngine();
+
+  await collect(engine.respond(
+    turnOf('查一下北之战', { no: 1 }),
+    new AbortController().signal,
+  ));
+  await settle();
+  assert.equal(dsh.calls.length, 1);
+  assert.equal(dsh.cancelCount(), 0);
+  assert.match(lastSnapshot(lane), /状态=running（未执行完）/);
+
+  const events = await collect(engine.respond(
+    turnOf('取消任务', { no: 2 }),
+    new AbortController().signal,
+  ));
+
+  assert.equal(dsh.cancelCount(), 1, '取消必须真的传给 dsh');
+  assert.equal(reports.length, 0, '取消不播失败汇报');
+  assert.match(lastSnapshot(lane), /任务 bg-1/);
+  assert.match(lastSnapshot(lane), /状态=cancelled/);
+  assert.equal(host.cancelBackgroundTasks(), false);
+  assert.equal(lane.speaks.at(-1)?.kind, 'ack');
+  assert.equal(doneOf(events).speech, '好，我查查。');
+});
+
+test('同一 asyncTargetId 的 3 条委派在一次带 targetId 的回调里合并结算，快照不留 running', async () => {
+  const dsh = fakeDsh({
+    text: '',
+    speech: '',
+    asyncDispatched: true,
+    asyncTargetId: 'sub-1',
+  });
+  const voice = scriptedTts();
+  let phase = 0;
+  const lane = ssotLane({
+    answer: () => {
+      phase += 1;
+      return answerWithIds([PCM], '我查查。', {
+        delegate: { reason: 'delegate', text: null },
+        callId: `call-merge-${phase}`,
+      });
+    },
+  });
+  const reports: BackgroundTaskReport[] = [];
+  const host = orch(dsh.agent, voice.tts, lane);
+  host.setTaskReporter((report) => {
+    reports.push(report);
+  });
+  const engine = host.toEngine();
+
+  const queries = ['查卷一', '查卷二', '查卷三'];
+  for (let i = 0; i < queries.length; i += 1) {
+    const query = queries[i];
+    assert.ok(query !== undefined);
+    await collect(engine.respond(turnOf(query, { no: i + 1 }), new AbortController().signal));
+    await settle();
+  }
+  assert.equal(dsh.calls.length, 3, '三条委派都应交给 dsh');
+  assert.equal(reports.length, 0, '异步移交期间不得提前播报');
+  assert.equal((lastSnapshot(lane).match(/状态=running/g) ?? []).length, 3);
+
+  const push = dsh.announcer();
+  assert.ok(push !== null, '构造时要把 announcer 接到 dsh 上');
+  push('三卷都读完了', 'happy', { targetId: 'sub-1' });
+  await settle();
+
+  assert.equal(reports.length, 1, '一次回调只触发一次 taskReporter');
+  const report = must(reports[0], '合并回调');
+  assert.equal(report.query, '查卷一；查卷二；查卷三');
+  assert.equal(report.summary, '三卷都读完了');
+  assert.equal(report.emotion, 'happy');
+
+  const snapshot = lastSnapshot(lane);
+  assert.doesNotMatch(snapshot, /状态=running/, '合并结算后不得残留 running');
+  // 兄弟任务由 primary 的合并查询一次代表，静默结算后不再单列。
+  assert.match(snapshot, /任务 bg-1 \| 轮次 1 \| 查询：查卷一；查卷二；查卷三 \| 状态=completed/);
+  assert.equal(dsh.calls.length, 3, '结算不得再派新任务');
 });

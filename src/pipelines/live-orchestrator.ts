@@ -29,6 +29,7 @@ import {
   type LiveAckKind,
 } from '../persona.ts';
 import type {
+  AgentAnnouncer,
   AgentAudioAnswer,
   AgentImage,
   AgentProvider,
@@ -245,7 +246,7 @@ export class LiveOrchestrator implements AgentProvider {
 
   private audioLane: LiveAudioLane | null = null;
   private taskReporter: ((report: BackgroundTaskReport) => void) | null = null;
-  private announcer: ((speech: string, emotion?: string) => void) | null = null;
+  private announcer: AgentAnnouncer | null = null;
   /** 同步兜底那一次 `inner.reply` 还在等。插话只取消这一次，不取消后台总线。 */
   private foregroundActive = false;
   /** 正在等的那一次兜底的票据。对不上的 `cancelTurn` 直接丢掉。 */
@@ -276,7 +277,15 @@ export class LiveOrchestrator implements AgentProvider {
             note = refined.note;
           }
           const reply = await this.inner.reply(query, req.image, note);
-          return { text: reply.text, speech: reply.speech, emotion: reply.emotion };
+          return {
+            text: reply.text,
+            speech: reply.speech,
+            emotion: reply.emotion,
+            ...(reply.asyncDispatched === true ? { asyncDispatched: true } : {}),
+            ...(reply.asyncTargetId !== undefined && reply.asyncTargetId !== ''
+              ? { asyncTargetId: reply.asyncTargetId }
+              : {}),
+          };
         },
         cancelRunning: () => {
           this.inner.cancelTurn?.();
@@ -299,8 +308,8 @@ export class LiveOrchestrator implements AgentProvider {
       },
     });
     // dsh 自己的后台作业不另开嗓子：收进同一条总线，再由空窗交给 omni。
-    this.inner.setAnnouncer?.((speech, emotion) => {
-      this.bus.ingestExternalAnnouncement(speech, emotion);
+    this.inner.setAnnouncer?.((speech, emotion, meta) => {
+      this.bus.ingestExternalAnnouncement(speech, emotion, undefined, meta?.targetId);
     });
   }
 
@@ -354,7 +363,7 @@ export class LiveOrchestrator implements AgentProvider {
     return this.audioLane?.willServe() === true;
   }
 
-  setAnnouncer(cb: ((speech: string, emotion?: string) => void) | null): void {
+  setAnnouncer(cb: AgentAnnouncer | null): void {
     this.announcer = cb;
   }
 
@@ -950,6 +959,21 @@ export class LiveOrchestrator implements AgentProvider {
     // dsh 也是文本 LLM：首 token 延迟是真的，照实透出（`llm.first` / `turn.report`）。
     // omni 直出那条没有这个相位，所以只在这一条兜底路径上补。
     yield reply.firstTokenMs === undefined ? meta : { ...meta, firstTokenMs: reply.firstTokenMs };
+    // dsh 已把任务异步移交后台，本轮主对话到此为止：不要拿空文本去播报。
+    // 前台用 omni 补一句短回执，账本记成 live（说话的是 omni）。
+    if (reply.asyncDispatched === true) {
+      const ack = yield* this.speakViaOmni(
+        buildLiveAckPrompt('delegate', turn.text),
+        signal,
+        'ack',
+        turn.text,
+      );
+      if (signal.aborted || this.disposed) return;
+      const said = ack.spokenText.trim();
+      this.remember(turn, said, 'live');
+      yield { type: 'done', fullText: said, speech: said };
+      return;
+    }
     // Pure Live 禁止调用外部 TTS：车道若已恢复则尝试让 omni 自己说，否则仅下发文本收尾。
     if (reply.speech.trim() !== '') {
       const prompt = buildLiveReportPrompt({ query: turn.text, summary: reply.speech });
