@@ -436,18 +436,15 @@ test('deploy.yml 用 known_hosts 严格校验并只走 SSH', () => {
   assert.deepEqual([...new Set(ips)], [], '工作流里不允许出现 IPv4');
 });
 
-test('dsh-voice-web README 面向 npm 用户且无死链或旧占位', () => {
-  const readme = readFileSync(join(repoRoot, 'packages', 'dsh-voice-web', 'README.md'), 'utf8');
-  assert.ok(!readme.includes('0.0.0-stage'), 'npm README 不应残留 0.0.0-stage 占位文案');
-  assert.ok(!readme.includes('尚未发布'), 'npm README 不应残留「尚未发布」文案');
-  assert.ok(readme.includes('dsh plugin --profile web add dsh-voice-web'), '缺少 npm 安装命令');
-  assert.ok(
-    readme.includes('https://github.com/slchy/dsh-pet-wearable'),
-    '缺少指向主项目 GitHub 的绝对链接',
-  );
+test('根 README 面向 npm 与 GitHub 且无相对仓库死链', () => {
+  const rootReadme = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   assert.equal(
-    /\]\(\s*(?:\.\/(?:docs|src)\/|\.\.\/)/.test(readme),
+    /\]\(\s*(?:\.\/(?:docs|src|packages|LICENSE|THIRD-PARTY-NOTICES)|\.\.\/)/.test(rootReadme),
     false,
-    'npm README 不应包含在 npmjs.com 上会 404 的相对仓库链接',
+    '根 README 也会随 dsh-pet-wearable 打进 npm 包，不应包含相对仓库链接',
+  );
+  assert.ok(
+    rootReadme.includes('https://www.npmjs.com/package/dsh-voice-web'),
+    '根 README 应引导即插即用用户到 dsh-voice-web',
   );
 });

@@ -128,7 +128,7 @@ cd packages/dsh-voice-web
 npm install
 npm run typecheck   # 先执行 sync:voice，再分别检查 Node 与浏览器类型
 npm run build       # 编译 lib/、打包 lib/browser.mjs 与 lib/widget.js
-npm test            # 运行全部 104 项插件与桌宠单元测试
+npm test            # 运行全部 105 项插件与桌宠单元测试
 ```
 
 将本地源码直接链接进 `dsh`（路径替换为本机绝对路径）：
