@@ -17,7 +17,8 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { checkBindSafety } from './voice/bind-policy.ts';
+import { checkBindSafety, isLoopbackHost } from './voice/bind-policy.ts';
+import { loadAuthenticator } from './voice/runtime/env-bootstrap.ts';
 
 export interface WebBridgeOptions {
   /** 浏览器连的端口 */
@@ -106,13 +107,16 @@ function originAllowed(origin: string, allowed: readonly string[] | undefined, h
 
 export async function startWebBridge(options: WebBridgeOptions): Promise<WebBridge> {
   // 桥自己就是对外入口。只在 `driver.apply` 里闸一次的话，直接调这个函数
-  // 仍能在 `0.0.0.0` 上开明文端口。判据复用 `checkBindSafety`，不另写一份。
-  // 桥不读 token 文件：有 TLS 时 `hasAuth` 记为已满足，避免合法 wss 被误拒
-  // （设备 token 仍由里层语音栈把关）。非本机且没有 TLS 时这里拒绝启动。
+  // 仍能在 `0.0.0.0` 上开端口。不能把 `hasAuth` 写死成 `true`：未配 `MIAI_TOKENS`
+  // 时非浏览器客户端可留空或伪造 `Origin`，而桥接的是能执行 shell 的语音 agent。
+  // 非回环地址必须真实探测 `MIAI_TOKENS`（文件存在且含有效强 token）并通过 `checkBindSafety`。
+  const hasAuth = isLoopbackHost(options.host)
+    ? false
+    : loadAuthenticator(options.log) !== undefined;
   const safety = checkBindSafety({
     host: options.host,
     hasTls: options.tls !== undefined,
-    hasAuth: true,
+    hasAuth,
   });
   if (!safety.ok) {
     throw new Error(safety.message);
