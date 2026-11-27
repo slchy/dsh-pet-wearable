@@ -863,11 +863,13 @@ export class InProcessDshAgent implements AgentProvider {
   private armWatchdog(turn: TurnState, delay: number | null): void {
     this.clearWatchdog(turn);
     if (delay === null) return;
+    // 不调用 unref()：`replyOnce` 的 `finally` 一定会 `clearWatchdog(turn)`，不会挂住进程；
+    // 若 unref，Node 22 单文件隔离测试里 mock follow 挂在纯 Promise 上时，
+    // 事件循环会因零活跃句柄提前退出而报 Promise pending。
     const timer = setTimeout(() => {
       turn.watchdog = null;
       this.onWatchdogExpired(turn);
     }, Math.max(10, delay));
-    timer.unref?.();
     turn.watchdog = timer;
   }
 
